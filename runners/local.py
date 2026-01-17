@@ -8,16 +8,19 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+import tempfile
 
 import yaml
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-def validate_uuid(v: str) -> str:
-    """Validate that a string is in valid UUID format."""
+def validate_uuid7(v: str) -> str:
+    """Validate that a string is a valid UUID version 7."""
     try:
-        uuid.UUID(v)
+        parsed = uuid.UUID(v)
+        if parsed.version != 7:
+            raise argparse.ArgumentTypeError(f"UUID must be version 7, got version {parsed.version}: {v}")
         return v
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
@@ -90,30 +93,70 @@ def get_stages_from_workflow(inventory_file: Path, workflow_file: Path, repo_roo
     return active_ids, active_stages
 
 
+def merge_config_dirs(source_dirs: list[str], dest_dir: str) -> None:
+    """Merge config directories in sequence. Files at same path are concatenated."""
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)
+    
+    merged_files: dict[str, list[str]] = {}  # dest_path -> list of source file paths
+    
+    for source_dir in source_dirs:
+        for root, _, files in os.walk(source_dir):
+            rel_root = os.path.relpath(root, source_dir)
+            dest_root = os.path.join(dest_dir, rel_root) if rel_root != "." else dest_dir
+            
+            os.makedirs(dest_root, exist_ok=True)
+            
+            for file in files:
+                src_file = os.path.join(root, file)
+                dest_file = os.path.join(dest_root, file)
+                
+                if os.path.exists(dest_file):
+                    with open(src_file, 'r') as f:
+                        content = f.read()
+                    with open(dest_file, 'a') as f:
+                        f.write('\n' + content)
+                    merged_files.setdefault(dest_file, []).append(src_file)
+                else:
+                    shutil.copy2(src_file, dest_file)
+                    merged_files[dest_file] = [src_file]
+    
+    for dest_path, sources in merged_files.items():
+        if len(sources) > 1:
+            logging.info(f"Merged {' + '.join(sources)} -> {dest_path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--main-tag", required=True)
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--env-type", required=True)
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--origin-cfg", required=True)
     parser.add_argument("--ephemeral", required=True, type=str2bool)
-    parser.add_argument("--run-id", required=True, type=validate_uuid)
+    parser.add_argument("--skip-cfg-merge", action="store_true")
+    parser.add_argument("--run-id", required=True, type=validate_uuid7)
 
     args = parser.parse_args()
 
+    main_tag = args.main_tag
     inventory = args.inventory
     env_type = args.env_type
     workflow = args.workflow
+    origin_cfg = args.origin_cfg
     ephemeral = args.ephemeral
+    skip_cfg_merge = args.skip_cfg_merge
+    run_id = args.run_id
+    base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/base_all").resolve())
+    base_test_staging_prod_plt_cfg_dir = str(Path(f"{origin_cfg}/base_test_staging_prod").resolve())
+    plt_cfg_dir = str(Path(f"{origin_cfg}/{env_type}").resolve())
 
     # Validate ephemeral against env_type
     if env_type == "prod" and ephemeral:
         raise RuntimeError(
             "❌ For env-type 'prod', only --ephemeral=false is allowed"
         )
-
-    run_id = args.run_id
 
     # --- PREPARATION ---------------------------------------------------------
     repo_root = Path(
@@ -156,18 +199,36 @@ def main():
         "env_type": env_type,
         "workflow": workflow,
         "active_stages": active_stage_ids,
-        "origin_cfg": args.origin_cfg,
+        "origin_cfg": origin_cfg,
     }
     logging.info(json.dumps(manifest, indent=4))
     # TODO: save manifest if needed
 
     # --- CFG PREPARATION -----------------------------------------------------
-    cfg_resolved = "cfg_resolved"
-    if os.path.exists(cfg_resolved):
-        shutil.rmtree(cfg_resolved)
-    os.makedirs(cfg_resolved)
+    # Step 1: Merge (if needed)
+    if skip_cfg_merge:
+        source_for_resolve = origin_cfg
+    else:
+        tmp_cfg_dir =  tempfile.mkdtemp()
+        logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
+        source_dirs = (
+            [base_all_plt_cfg_dir, base_test_staging_prod_plt_cfg_dir, plt_cfg_dir]
+            if env_type in ("test", "staging", "prod")
+            else [base_all_plt_cfg_dir, plt_cfg_dir]
+        )
+        merge_config_dirs(
+            source_dirs=source_dirs,
+            dest_dir=tmp_cfg_dir
+        )
+        source_for_resolve = tmp_cfg_dir
+
+    # Step 2: Resolve symlinks
+    effective_cfg_dir = "effective_cfg"
+    if os.path.exists(effective_cfg_dir):
+        shutil.rmtree(effective_cfg_dir)
+    os.makedirs(effective_cfg_dir)
     subprocess.run(
-        ["cp", "-aL", args.origin_cfg + "/.", cfg_resolved],
+        ["cp", "-aL", source_for_resolve + "/.", effective_cfg_dir],
         check=True,
     )
 
@@ -179,9 +240,11 @@ def main():
                 f"===================== {stage_id} ====================="
             )
             env = os.environ.copy()
+            env["main_tag"] = main_tag
+            env["env_type"] = env_type
             env["run_id"] = run_id
             env["cfg_keys"] = json.dumps(stage.get("cfg_keys"))
-            env["origin_cfg_base_dir_path"] = cfg_resolved
+            env["origin_cfg_base_dir_path"] = effective_cfg_dir
 
             subprocess.run(
                 args=[f"./pipeline/stages/{stage_id}/run/local.sh"],
@@ -189,8 +252,9 @@ def main():
                 env=env,
             )
     finally:
-        if os.path.exists(cfg_resolved):
-            shutil.rmtree(cfg_resolved)
+        pass
+        if os.path.exists(effective_cfg_dir):
+            shutil.rmtree(effective_cfg_dir)
 
     logging.info(f"✅ All stages completed, run_id: {run_id}")
     print(f"export run_id={run_id}")

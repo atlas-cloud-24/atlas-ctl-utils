@@ -38,7 +38,7 @@ for key in $(echo "$cfg_keys" | jq -r '.[]'); do
         fi
         continue
     fi
-    # normal file merge (including paths like atlas/.versions)
+    # normal file merge (including paths like atlas/.common)
     file="origin_cfg/$key"
     if [ -f "$file" ]; then
         echo "  merging: $file"
