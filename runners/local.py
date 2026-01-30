@@ -148,8 +148,8 @@ def main():
     ephemeral = args.ephemeral
     skip_cfg_merge = args.skip_cfg_merge
     run_id = args.run_id
-    base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/base_all").resolve())
-    base_test_staging_prod_plt_cfg_dir = str(Path(f"{origin_cfg}/base_test_staging_prod").resolve())
+    base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/common__all").resolve())
+    base_test_staging_prod_plt_cfg_dir = str(Path(f"{origin_cfg}/common__test_staging_prod").resolve())
     plt_cfg_dir = str(Path(f"{origin_cfg}/{env_type}").resolve())
 
     # Validate ephemeral against env_type
@@ -212,9 +212,9 @@ def main():
         tmp_cfg_dir =  tempfile.mkdtemp()
         logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
         source_dirs = (
-            [base_all_plt_cfg_dir, base_test_staging_prod_plt_cfg_dir, plt_cfg_dir]
+            [plt_cfg_dir, base_test_staging_prod_plt_cfg_dir, base_all_plt_cfg_dir]
             if env_type in ("test", "staging", "prod")
-            else [base_all_plt_cfg_dir, plt_cfg_dir]
+            else [ plt_cfg_dir, base_all_plt_cfg_dir]
         )
         merge_config_dirs(
             source_dirs=source_dirs,
