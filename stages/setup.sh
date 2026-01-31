@@ -44,7 +44,8 @@ for key in $(echo "$cfg_keys" | jq -r '.[]'); do
         echo "  merging: $file"
         cat "$file" >> .cfg
     else
-        echo "skip: file not found: $file"
+        echo "file not found: $file"
+        exit 1
     fi
 done
 echo "------------------------------------------------------"

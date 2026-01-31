@@ -41,6 +41,39 @@ def str2bool(v):
 def load_yaml(path: Path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
+    
+
+def get_variant_source_dirs(plt_cfg_root: Path, plt_variants: list[str]) -> list[str]:
+    """Return absolute variant directories selected by --plt-variants."""
+    if not plt_variants:
+        return []
+
+    variants_root = plt_cfg_root / "variants"
+    if not variants_root.is_dir():
+        raise RuntimeError(f"Variants dir not found: {variants_root}")
+
+    variants_root = variants_root.resolve()
+    source_dirs: list[str] = []
+    seen: set[str] = set()
+    for rel in plt_variants:
+        if rel in seen:
+            continue
+        seen.add(rel)
+
+        rel_path = Path(rel)
+        src = (variants_root / rel_path).resolve()
+        try:
+            src.relative_to(variants_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Variant path escapes variants/: {rel}") from exc
+        if not src.exists():
+            raise RuntimeError(f"Variant path not found: {src}")
+        if not src.is_dir():
+            raise RuntimeError(f"Variant path must be a directory: {src}")
+
+        source_dirs.append(str(src))
+
+    return source_dirs
 
 
 def _build_active_stages(inventory, active_ids, repo_root: Path):
@@ -93,24 +126,24 @@ def get_stages_from_workflow(inventory_file: Path, workflow_file: Path, repo_roo
     return active_ids, active_stages
 
 
-def merge_config_dirs(source_dirs: list[str], dest_dir: str) -> None:
+def merge_config_dirs(source_dirs: list[str], dest_dir: str, clear_dest: bool = True) -> None:
     """Merge config directories in sequence. Files at same path are concatenated."""
-    if os.path.exists(dest_dir):
+    if clear_dest and os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
-    
+
     merged_files: dict[str, list[str]] = {}  # dest_path -> list of source file paths
-    
+
     for source_dir in source_dirs:
         for root, _, files in os.walk(source_dir):
             rel_root = os.path.relpath(root, source_dir)
             dest_root = os.path.join(dest_dir, rel_root) if rel_root != "." else dest_dir
-            
+
             os.makedirs(dest_root, exist_ok=True)
-            
+
             for file in files:
                 src_file = os.path.join(root, file)
                 dest_file = os.path.join(dest_root, file)
-                
+
                 if os.path.exists(dest_file):
                     with open(src_file, 'r') as f:
                         content = f.read()
@@ -120,7 +153,7 @@ def merge_config_dirs(source_dirs: list[str], dest_dir: str) -> None:
                 else:
                     shutil.copy2(src_file, dest_file)
                     merged_files[dest_file] = [src_file]
-    
+
     for dest_path, sources in merged_files.items():
         if len(sources) > 1:
             logging.info(f"Merged {' + '.join(sources)} -> {dest_path}")
@@ -132,6 +165,11 @@ def main():
     parser.add_argument("--main-tag", required=True)
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--env-type", required=True)
+    parser.add_argument(
+        "--variants",
+        required=False,
+        type=lambda s: [v.strip() for v in s.split(",") if v.strip()],
+    )
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--origin-cfg", required=True)
     parser.add_argument("--ephemeral", required=True, type=str2bool)
@@ -143,14 +181,12 @@ def main():
     main_tag = args.main_tag
     inventory = args.inventory
     env_type = args.env_type
+    variants = args.variants
     workflow = args.workflow
     origin_cfg = args.origin_cfg
     ephemeral = args.ephemeral
     skip_cfg_merge = args.skip_cfg_merge
     run_id = args.run_id
-    base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/common__all").resolve())
-    base_test_staging_prod_plt_cfg_dir = str(Path(f"{origin_cfg}/common__test_staging_prod").resolve())
-    plt_cfg_dir = str(Path(f"{origin_cfg}/{env_type}").resolve())
 
     # Validate ephemeral against env_type
     if env_type == "prod" and ephemeral:
@@ -197,6 +233,7 @@ def main():
         "commit": None,
         "inventory": inventory,
         "env_type": env_type,
+        "variants": variants,
         "workflow": workflow,
         "active_stages": active_stage_ids,
         "origin_cfg": origin_cfg,
@@ -211,6 +248,22 @@ def main():
     else:
         tmp_cfg_dir =  tempfile.mkdtemp()
         logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
+
+        # variants
+        variant_dirs = []
+        if variants:
+            variant_dirs = get_variant_source_dirs(Path(origin_cfg), variants)
+            merge_config_dirs(
+                source_dirs=variant_dirs,
+                dest_dir=tmp_cfg_dir
+            )
+        else:
+            raise RuntimeError("Variants should be provided when --skip-cfg-merge is false")
+
+        # env
+        base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/env/common/all").resolve())
+        base_test_staging_prod_plt_cfg_dir = str(Path(f"{origin_cfg}/env/common/test_staging_prod").resolve())
+        plt_cfg_dir = str(Path(f"{origin_cfg}/env/{env_type}").resolve())
         source_dirs = (
             [plt_cfg_dir, base_test_staging_prod_plt_cfg_dir, base_all_plt_cfg_dir]
             if env_type in ("test", "staging", "prod")
@@ -218,17 +271,18 @@ def main():
         )
         merge_config_dirs(
             source_dirs=source_dirs,
-            dest_dir=tmp_cfg_dir
+            dest_dir=tmp_cfg_dir,
+            clear_dest=not variant_dirs
         )
         source_for_resolve = tmp_cfg_dir
 
     # Step 2: Resolve symlinks
-    effective_cfg_dir = "effective_cfg"
-    if os.path.exists(effective_cfg_dir):
-        shutil.rmtree(effective_cfg_dir)
-    os.makedirs(effective_cfg_dir)
+    merged_cfg_dir = "merged_cfg"
+    if os.path.exists(merged_cfg_dir):
+        shutil.rmtree(merged_cfg_dir)
+    os.makedirs(merged_cfg_dir)
     subprocess.run(
-        ["cp", "-aL", source_for_resolve + "/.", effective_cfg_dir],
+        ["cp", "-aL", source_for_resolve + "/.", merged_cfg_dir],
         check=True,
     )
 
@@ -244,7 +298,7 @@ def main():
             env["env_type"] = env_type
             env["run_id"] = run_id
             env["cfg_keys"] = json.dumps(stage.get("cfg_keys"))
-            env["origin_cfg_base_dir_path"] = effective_cfg_dir
+            env["origin_cfg_base_dir_path"] = merged_cfg_dir
 
             subprocess.run(
                 args=[f"./pipeline/stages/{stage_id}/run/local.sh"],
@@ -252,9 +306,8 @@ def main():
                 env=env,
             )
     finally:
-        pass
-        if os.path.exists(effective_cfg_dir):
-            shutil.rmtree(effective_cfg_dir)
+        if os.path.exists(merged_cfg_dir):
+            shutil.rmtree(merged_cfg_dir)
 
     logging.info(f"✅ All stages completed, run_id: {run_id}")
     print(f"export run_id={run_id}")
