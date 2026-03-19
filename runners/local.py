@@ -6,74 +6,18 @@ import os
 import shutil
 import subprocess
 import sys
-import uuid
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
-import yaml
+from utils.common import (
+    get_variant_source_dirs,
+    load_yaml,
+    merge_config_dirs,
+    str2bool,
+    validate_uuid7,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-
-def validate_uuid7(v: str) -> str:
-    """Validate that a string is a valid UUID version 7."""
-    try:
-        parsed = uuid.UUID(v)
-        if parsed.version != 7:
-            raise argparse.ArgumentTypeError(f"UUID must be version 7, got version {parsed.version}: {v}")
-        return v
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
-
-
-def str2bool(v):
-    """Convert string to boolean for argparse."""
-    if isinstance(v, bool):
-        return v
-    if v == 'true':
-        return True
-    elif v == 'false':
-        return False
-    else:
-        raise argparse.ArgumentTypeError(f"Only 'true' or 'false' allowed, got: {v}")
-
-
-def load_yaml(path: Path):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
-    
-
-def get_variant_source_dirs(plt_cfg_root: Path, plt_variants: list[str]) -> list[str]:
-    """Return absolute variant directories selected by --plt-variants."""
-    if not plt_variants:
-        return []
-
-    variants_root = plt_cfg_root / "variants"
-    if not variants_root.is_dir():
-        raise RuntimeError(f"Variants dir not found: {variants_root}")
-
-    variants_root = variants_root.resolve()
-    source_dirs: list[str] = []
-    seen: set[str] = set()
-    for rel in plt_variants:
-        if rel in seen:
-            continue
-        seen.add(rel)
-
-        rel_path = Path(rel)
-        src = (variants_root / rel_path).resolve()
-        try:
-            src.relative_to(variants_root)
-        except ValueError as exc:
-            raise RuntimeError(f"Variant path escapes variants/: {rel}") from exc
-        if not src.exists():
-            raise RuntimeError(f"Variant path not found: {src}")
-        if not src.is_dir():
-            raise RuntimeError(f"Variant path must be a directory: {src}")
-
-        source_dirs.append(str(src))
-
-    return source_dirs
 
 
 def _build_active_stages(inventory, active_ids, repo_root: Path):
@@ -126,39 +70,6 @@ def get_stages_from_workflow(inventory_file: Path, workflow_file: Path, repo_roo
     return active_ids, active_stages
 
 
-def merge_config_dirs(source_dirs: list[str], dest_dir: str, clear_dest: bool = True) -> None:
-    """Merge config directories in sequence. Files at same path are concatenated."""
-    if clear_dest and os.path.exists(dest_dir):
-        shutil.rmtree(dest_dir)
-
-    merged_files: dict[str, list[str]] = {}  # dest_path -> list of source file paths
-
-    for source_dir in source_dirs:
-        for root, _, files in os.walk(source_dir):
-            rel_root = os.path.relpath(root, source_dir)
-            dest_root = os.path.join(dest_dir, rel_root) if rel_root != "." else dest_dir
-
-            os.makedirs(dest_root, exist_ok=True)
-
-            for file in files:
-                src_file = os.path.join(root, file)
-                dest_file = os.path.join(dest_root, file)
-
-                if os.path.exists(dest_file):
-                    with open(src_file, 'r') as f:
-                        content = f.read()
-                    with open(dest_file, 'a') as f:
-                        f.write('\n' + content)
-                    merged_files.setdefault(dest_file, []).append(src_file)
-                else:
-                    shutil.copy2(src_file, dest_file)
-                    merged_files[dest_file] = [src_file]
-
-    for dest_path, sources in merged_files.items():
-        if len(sources) > 1:
-            logging.info(f"Merged {' + '.join(sources)} -> {dest_path}")
-
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -169,11 +80,16 @@ def main():
         "--variants",
         required=False,
         type=lambda s: [v.strip() for v in s.split(",") if v.strip()],
+        help="Comma-separated cfg variants. Required unless --skip-cfg-merge is set.",
     )
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--origin-cfg", required=True)
     parser.add_argument("--ephemeral", required=True, type=str2bool)
-    parser.add_argument("--skip-cfg-merge", action="store_true")
+    parser.add_argument(
+        "--skip-cfg-merge",
+        action="store_true",
+        help="Use cfg that was already merged by an upstream pipeline step.",
+    )
     parser.add_argument("--run-id", required=True, type=validate_uuid7)
 
     args = parser.parse_args()
@@ -187,6 +103,9 @@ def main():
     ephemeral = args.ephemeral
     skip_cfg_merge = args.skip_cfg_merge
     run_id = args.run_id
+
+    if not skip_cfg_merge and not variants:
+        parser.error("--variants is required unless --skip-cfg-merge is set")
 
     # Validate ephemeral against env_type
     if env_type == "prod" and ephemeral:
@@ -257,8 +176,6 @@ def main():
                 source_dirs=variant_dirs,
                 dest_dir=tmp_cfg_dir
             )
-        else:
-            raise RuntimeError("Variants should be provided when --skip-cfg-merge is false")
 
         # env
         base_all_plt_cfg_dir = str(Path(f"{origin_cfg}/env/common/all").resolve())
