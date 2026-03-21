@@ -25,6 +25,12 @@ ENV_TRUST = {"dev": 0, "test": 1, "staging": 2, "prod": 3}
 ENVS_ALL = tuple(ENV_TRUST.keys())
 ENVS_DEV_TEST = ("dev", "test")
 ENVS_STAGING_PROD = ("staging", "prod")
+REQUIRED_TOOLING_REFS = ("atlas-ctl-utils", "atlas-plt-utils")
+LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
+TOOLING_ENV_PREFIXES = {
+    "atlas-ctl-utils": "ATLAS_CTL_UTILS",
+    "atlas-plt-utils": "ATLAS_PLT_UTILS",
+}
 
 SERVICE_ID = "atlas-ctl-orchestartor-local"
 
@@ -203,24 +209,20 @@ def validate_ephemeral(ctl_env: str, ephemeral: bool) -> None:
         )
 
 
-def validate_stages_have_commits(workflow_cfg: dict, ctl_env: str) -> None:
+def validate_stages_have_commits(active_stages: dict, ctl_env: str) -> None:
     """
-    Validate that all stages have explicit commits for prod environments.
+    Validate that all resolved stages have explicit commits for prod environments.
 
-    For prod environments, using branch references is not allowed - all stages must
-    be pinned to specific commits for reproducibility and auditability.
+    For prod environments, using branch references is not allowed. Validation runs
+    after workflow overrides and env refs have been resolved into active stages.
     """
     if ctl_env not in ENVS_STAGING_PROD:
         return
 
     stages_without_commit = []
-    for st in workflow_cfg.get("stages", []):
-        if isinstance(st, str):
-            stages_without_commit.append(st)
-        else:
-            stage_id = st.get("id", "unknown")
-            if not st.get("commit"):
-                stages_without_commit.append(stage_id)
+    for stage_id, stage_cfg in active_stages.items():
+        if not stage_cfg.get("commit"):
+            stages_without_commit.append(stage_id)
 
     if stages_without_commit:
         raise RuntimeError(
@@ -252,6 +254,33 @@ def validate_cfg_refs_have_commits(
     if errors:
         raise RuntimeError(
             f"❌ For {ENVS_STAGING_PROD} environments, cfg repos must use @commit=sha (not @branch=name).\n"
+            f"   {'; '.join(errors)}"
+        )
+
+
+def validate_tooling_refs_have_commits(tooling_refs: dict, ctl_env: str) -> None:
+    """Validate that tooling refs use commits (not branches) for staging/prod environments."""
+    if ctl_env not in ENVS_STAGING_PROD:
+        return
+
+    errors = []
+    for tooling_name in REQUIRED_TOOLING_REFS:
+        tooling_ref = tooling_refs.get(tooling_name) or {}
+        if not isinstance(tooling_ref, dict):
+            errors.append(f"tooling '{tooling_name}' ref must be a mapping")
+            continue
+
+        if tooling_ref.get("commit"):
+            continue
+
+        if tooling_ref.get("branch"):
+            errors.append(f"tooling '{tooling_name}' uses branch='{tooling_ref['branch']}' but commit is required")
+        else:
+            errors.append(f"tooling '{tooling_name}' is missing commit")
+
+    if errors:
+        raise RuntimeError(
+            f"❌ For {ENVS_STAGING_PROD} environments, tooling refs must use explicit commits.\n"
             f"   {'; '.join(errors)}"
         )
 
@@ -359,11 +388,13 @@ def build_active_stages(
     inventory_cfg: dict,
     repo_key: str = "repo_url",
     require_branch_or_commit: bool = True,
+    stage_refs: dict | None = None,
 ) -> dict:
     inventory_stages = inventory_cfg.get("stages", {})
     if not isinstance(inventory_stages, dict):
         raise RuntimeError("'stages' in inventory must be a mapping: source -> meta")
 
+    stage_refs = stage_refs or {}
     active = {}
 
     for st in workflow_cfg.get("stages", []):
@@ -387,9 +418,21 @@ def build_active_stages(
 
         cat = inventory_stages[stage_source]
 
-        branch = stage_over.get("branch")
-        commit = stage_over.get("commit")
+        stage_ref = stage_refs.get(stage_source) or {}
+        if not isinstance(stage_ref, dict):
+            raise RuntimeError(
+                f"Stage refs for source '{stage_source}' must be a mapping, got: {type(stage_ref).__name__}"
+            )
+
+        branch = stage_over.get("branch") or stage_ref.get("branch")
+        commit = stage_over.get("commit") or stage_ref.get("commit")
         child_workflow = stage_over.get("workflow")
+
+        if branch and commit:
+            raise RuntimeError(
+                f"Stage '{stage_id}' resolved both branch='{branch}' and commit='{commit}'. "
+                "Only one ref type may be set."
+            )
 
         if require_branch_or_commit and not branch and not commit:
             raise RuntimeError(f"Stage '{stage_id}' has neither branch nor commit configured")
@@ -542,7 +585,6 @@ def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_
     return {
         "meta": {
             "name": f"{ctl_env}/{inventory_name}/{workflow_name}",
-            "env_type": ctl_env,
             "inventory": inventory_name,
         },
         "stages": [
@@ -562,16 +604,31 @@ def load_workflow_cfg(
     workflow_name: str,
     allow_target_stage_workflow: bool = False,
 ) -> dict:
-    """Load workflow configuration from yaml file or synthesize a local target-stage workflow."""
-    workflow_path = (
+    """Load env workflow config, then base fallback, then optional local target-stage workflow."""
+    env_workflow_path = (
         ctl_cfg_root
         / "workflows"
         / ctl_env
         / inventory_name
         / f"{workflow_name}.yaml"
     )
-    if workflow_path.is_file():
-        return load_yaml(workflow_path)
+    if env_workflow_path.is_file():
+        return load_yaml(env_workflow_path)
+
+    base_workflow_path = (
+        ctl_cfg_root
+        / "workflows"
+        / "base"
+        / inventory_name
+        / f"{workflow_name}.yaml"
+    )
+    if base_workflow_path.is_file():
+        logging.info(
+            "Workflow file not found for ctl env '%s', using base workflow: %s",
+            ctl_env,
+            base_workflow_path,
+        )
+        return load_yaml(base_workflow_path)
 
     if allow_target_stage_workflow:
         workflow_cfg = build_target_stage_workflow_cfg(ctl_env, inventory_name, workflow_name)
@@ -582,7 +639,10 @@ def load_workflow_cfg(
             )
             return workflow_cfg
 
-    raise RuntimeError(f"❌ workflow file not found: {workflow_path}")
+    raise RuntimeError(
+        f"❌ workflow file not found in ctl env '{ctl_env}' or base: "
+        f"{inventory_name}/{workflow_name}.yaml"
+    )
 
 
 def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
@@ -595,6 +655,164 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
     if not inventory_path.is_file():
         raise RuntimeError(f"❌ inventory file not found: {inventory_path}")
     return load_yaml(inventory_path)
+
+
+def load_env_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> tuple[dict, Path]:
+    """Load env-scoped refs from refs/<ctl_env>.yaml if present."""
+    refs_path = (
+        ctl_cfg_root
+        / "refs"
+        / f"{ctl_env}.yaml"
+    )
+    if not refs_path.is_file():
+        logging.info(f"No refs file found for ctl env '{ctl_env}': {refs_path}")
+        return {}, refs_path
+
+    refs_cfg = load_yaml(refs_path) or {}
+    if not isinstance(refs_cfg, dict):
+        raise RuntimeError(f"❌ refs file must contain a mapping: {refs_path}")
+
+    logging.info(f"Using refs file for ctl env '{ctl_env}': {refs_path}")
+    return refs_cfg, refs_path
+
+
+def load_stage_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> dict:
+    """Load env-scoped stage refs from refs/<ctl_env>.yaml if present."""
+    refs_cfg, refs_path = load_env_refs_cfg(ctl_cfg_root, ctl_env)
+
+    raw_stage_refs = refs_cfg.get("stages") or {}
+    if not isinstance(raw_stage_refs, dict):
+        raise RuntimeError(f"❌ stage refs file must contain a 'stages' mapping: {refs_path}")
+
+    stage_refs = {}
+    for stage_source, stage_ref in raw_stage_refs.items():
+        if not isinstance(stage_source, str):
+            raise RuntimeError(f"❌ stage refs keys must be strings: {refs_path}")
+        if stage_ref is None:
+            stage_ref = {}
+        if not isinstance(stage_ref, dict):
+            raise RuntimeError(
+                f"❌ stage refs for '{stage_source}' must be a mapping: {refs_path}"
+            )
+
+        branch = stage_ref.get("branch")
+        commit = stage_ref.get("commit")
+        if branch and commit:
+            raise RuntimeError(
+                f"❌ stage refs for '{stage_source}' define both branch and commit: {refs_path}"
+            )
+
+        stage_refs[stage_source] = stage_ref
+
+    return stage_refs
+
+
+def load_tooling_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> dict:
+    """Load env-scoped tooling refs from refs/<ctl_env>.yaml if present."""
+    refs_cfg, refs_path = load_env_refs_cfg(ctl_cfg_root, ctl_env)
+
+    raw_tooling_refs = refs_cfg.get("tooling") or {}
+    if not isinstance(raw_tooling_refs, dict):
+        raise RuntimeError(f"❌ refs file must contain a 'tooling' mapping: {refs_path}")
+
+    tooling_refs = {}
+    for tooling_name, tooling_ref in raw_tooling_refs.items():
+        if not isinstance(tooling_name, str):
+            raise RuntimeError(f"❌ tooling refs keys must be strings: {refs_path}")
+        if tooling_ref is None:
+            tooling_ref = {}
+        if not isinstance(tooling_ref, dict):
+            raise RuntimeError(
+                f"❌ tooling refs for '{tooling_name}' must be a mapping: {refs_path}"
+            )
+
+        repo_url = tooling_ref.get("repo_url")
+        if repo_url is not None and not isinstance(repo_url, str):
+            raise RuntimeError(
+                f"❌ tooling repo_url for '{tooling_name}' must be a string: {refs_path}"
+            )
+
+        branch = tooling_ref.get("branch")
+        commit = tooling_ref.get("commit")
+        if branch and commit:
+            raise RuntimeError(
+                f"❌ tooling refs for '{tooling_name}' define both branch and commit: {refs_path}"
+            )
+
+        tooling_refs[tooling_name] = tooling_ref
+
+    return tooling_refs
+
+
+def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
+    """Load local tooling repo paths from local_repos.yaml for local_dev runs."""
+    tooling_path = ctl_cfg_root / LOCAL_TOOLING_CFG_NAME
+    if not tooling_path.is_file():
+        logging.info(f"No local tooling file found: {tooling_path}")
+        return {}
+
+    tooling_cfg_root = load_yaml(tooling_path) or {}
+    if not isinstance(tooling_cfg_root, dict):
+        raise RuntimeError(f"❌ local tooling file must contain a mapping: {tooling_path}")
+
+    raw_tooling_cfg = tooling_cfg_root.get("tooling") or {}
+    if not isinstance(raw_tooling_cfg, dict):
+        raise RuntimeError(
+            f"❌ local tooling file must contain a 'tooling' mapping: {tooling_path}"
+        )
+
+    tooling_refs = {}
+    for tooling_name, tooling_entry in raw_tooling_cfg.items():
+        if not isinstance(tooling_name, str):
+            raise RuntimeError(f"❌ local tooling keys must be strings: {tooling_path}")
+        if tooling_entry is None:
+            tooling_entry = {}
+        if not isinstance(tooling_entry, dict):
+            raise RuntimeError(
+                f"❌ local tooling entry for '{tooling_name}' must be a mapping: {tooling_path}"
+            )
+
+        repo_path = tooling_entry.get("repo_path")
+        if repo_path is None:
+            repo_path = tooling_entry.get("repo_url")
+        if not repo_path:
+            continue
+        if not isinstance(repo_path, str):
+            raise RuntimeError(
+                f"❌ local tooling repo path for '{tooling_name}' must be a string: {tooling_path}"
+            )
+
+        repo_path_obj = Path(repo_path).expanduser()
+        if not repo_path_obj.is_absolute():
+            repo_path_obj = (ctl_cfg_root / repo_path_obj).resolve()
+
+        tooling_refs[tooling_name] = {"repo_url": str(repo_path_obj)}
+
+    logging.info(f"Using local tooling file: {tooling_path}")
+    return tooling_refs
+
+
+def build_tooling_env(tooling_refs: dict) -> dict[str, str]:
+    """Translate tooling refs into environment variables for setup scripts."""
+    env_updates: dict[str, str] = {}
+
+    for tooling_name, env_prefix in TOOLING_ENV_PREFIXES.items():
+        tooling_ref = tooling_refs.get(tooling_name) or {}
+        if not isinstance(tooling_ref, dict):
+            continue
+
+        repo_url = tooling_ref.get("repo_url")
+        branch = tooling_ref.get("branch")
+        commit = tooling_ref.get("commit")
+
+        if repo_url:
+            env_updates[f"{env_prefix}_REPO_URL"] = repo_url
+        if branch:
+            env_updates[f"{env_prefix}_BRANCH"] = branch
+        if commit:
+            env_updates[f"{env_prefix}_COMMIT"] = commit
+
+    return env_updates
 
 
 def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.handlers.MemoryHandler) -> tuple[Path, Path, Path, Path]:
@@ -738,6 +956,7 @@ def prepare_pipeline_cfg(
     plt_variants: list[str],
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
+    stage_refs: dict | None = None,
 ) -> tuple[dict, Path]:
     """
     Merge config dirs, build active stages, and write pipeline_run_cfg.
@@ -777,6 +996,7 @@ def prepare_pipeline_cfg(
         inventory_cfg,
         repo_key=stage_repo_key,
         require_branch_or_commit=require_stage_ref,
+        stage_refs=stage_refs,
     )
 
     # create and write pipeline_run_cfg
@@ -842,9 +1062,11 @@ def run_stages(
     ephemeral: bool,
     run_id: str,
     main_tag: str,
+    tooling_refs: dict,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
+    tooling_env = build_tooling_env(tooling_refs)
     for stage_id, stage in active_stages.items():
         log_stage_banner(stage_id)
         repo_path = run_dir / "stages_source" / stage_id
@@ -870,10 +1092,13 @@ def run_stages(
         stage_setup_cmd = [
             "./pipeline/setup.sh"
         ]
+        stage_env = os.environ.copy()
+        stage_env.update(tooling_env)
         logging.info(" ".join(stage_setup_cmd))
         run_and_log(
             stage_setup_cmd,
             cwd=repo_path,
+            env=stage_env,
         )
 
         # run stage
@@ -892,6 +1117,7 @@ def run_stages(
         run_and_log(
             stage_run_cmd,
             cwd=repo_path,
+            env=stage_env,
         )
 
 
@@ -914,6 +1140,7 @@ def run_pipeline(
     plt_variants: list[str],
     stage_repo_key: str,
     require_stage_ref: bool,
+    use_local_tooling_cfg: bool,
     allow_target_stage_workflow: bool,
     run_dir: Path,
     artifacts_dir: Path,
@@ -941,8 +1168,12 @@ def run_pipeline(
     )
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
 
-    # Validate stages have commits for staging/prod
-    validate_stages_have_commits(workflow_cfg, ctl_env)
+    stage_refs = load_stage_refs_cfg(ctl_cfg_root, ctl_env)
+    if use_local_tooling_cfg:
+        tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
+    else:
+        tooling_refs = load_tooling_refs_cfg(ctl_cfg_root, ctl_env)
+        validate_tooling_refs_have_commits(tooling_refs, ctl_env)
 
     logging.info(f"Environment validation passed: ctl_env={ctl_env} → plt_env={plt_env}")
 
@@ -958,7 +1189,11 @@ def run_pipeline(
         plt_variants,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
+        stage_refs=stage_refs,
     )
+
+    # Validate stages have commits for staging/prod
+    validate_stages_have_commits(active_stages, ctl_env)
 
     # Write git metas
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
@@ -973,6 +1208,7 @@ def run_pipeline(
         active_stages, run_dir, plt_destination_cfg_dir_path,
         inventory_name, plt_env, ephemeral, run_id,
         main_tag=main_tag,
+        tooling_refs=tooling_refs,
     )
 
     print_run_summary(run_id, log_file)

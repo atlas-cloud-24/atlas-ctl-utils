@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+clone_repo_ref() {
+    local repo_url="$1"
+    local dest_path="$2"
+    local branch="${3:-}"
+    local commit="${4:-}"
+
+    if [[ -n "$branch" && -n "$commit" ]]; then
+        echo "❌ both branch and commit were provided for $repo_url"
+        exit 1
+    fi
+
+    if [[ -n "$commit" ]]; then
+        git clone "$repo_url" "$dest_path"
+        git -C "$dest_path" checkout "$commit"
+        return
+    fi
+
+    if [[ -n "$branch" ]]; then
+        git clone --branch "$branch" --depth 1 "$repo_url" "$dest_path"
+        return
+    fi
+
+    git clone --depth 1 "$repo_url" "$dest_path"
+}
+
 echo "=== 🗂️ Get src repo name and dir ==="
 src_repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
 src_repo_path=$GITHUB_WORKSPACE
@@ -51,8 +76,10 @@ done
 echo "------------------------------------------------------"
 
 echo "=== 📦 Cloning plt_utils repo ==="
-plt_utils_repo_url="https://github.com/atlas-cloud-24/atlas-plt-utils.git"
-git clone --depth 1 "$plt_utils_repo_url" "$ext_dir_path/plt_utils"
+plt_utils_repo_url="${ATLAS_PLT_UTILS_REPO_URL:-https://github.com/atlas-cloud-24/atlas-plt-utils.git}"
+plt_utils_branch="${ATLAS_PLT_UTILS_BRANCH:-}"
+plt_utils_commit="${ATLAS_PLT_UTILS_COMMIT:-}"
+clone_repo_ref "$plt_utils_repo_url" "$ext_dir_path/plt_utils" "$plt_utils_branch" "$plt_utils_commit"
 plt_utils_repo_name="plt_utils"
 plt_utils_repo_path="$ext_dir_path/$plt_utils_repo_name"
 echo "plt_utils_repo_path=$plt_utils_repo_path"

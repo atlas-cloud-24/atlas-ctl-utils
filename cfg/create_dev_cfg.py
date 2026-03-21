@@ -7,7 +7,8 @@ The source cfg can be either:
 
 The script copies the source cfg into a target directory, rewrites
 `inventory/*.yaml` so each stage uses `repo_path` instead of `repo_url`,
-and removes ineffective `branch` keys from workflow YAMLs.
+removes ineffective `branch` keys from workflow YAMLs, writes local tooling
+repo paths to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
 Examples:
     ./cfg/create_dev_cfg.py \
@@ -35,11 +36,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 
 REF_SPEC_RE = re.compile(r"^(?P<source>.+)@(?P<kind>branch|tag|commit)=(?P<value>.+)$")
 STAGE_LINE_RE = re.compile(r"^  (?P<stage>[^:\n]+):\s*$")
 REPO_URL_LINE_RE = re.compile(r"^    repo_url:\s*.+$")
 WORKFLOW_BRANCH_LINE_RE = re.compile(r"^\s+branch:\s*.+$")
+LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
             "inventory repo_url values to repo_path using a JSON file with "
-            "stage-to-path mappings."
+            "stage-to-path mappings and optional tooling repo-to-path mappings."
         )
     )
     parser.add_argument(
@@ -69,7 +73,11 @@ def parse_args() -> argparse.Namespace:
         "--repo-map-file",
         required=True,
         dest="repo_map_file",
-        help="Path to a JSON file with stage-to-path mappings.",
+        help=(
+            "Path to a JSON file with stage-to-path mappings and optional tooling "
+            "repo-to-path mappings. Matching tooling entries from source refs are "
+            "written to local_repos.yaml as local repo paths."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -79,17 +87,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_repo_map(repo_map_file: str) -> dict[str, str]:
-    repo_map_path = Path(repo_map_file).expanduser()
+def load_path_map(path_map_file: str, *, map_label: str) -> dict[str, str]:
+    repo_map_path = Path(path_map_file).expanduser()
     raw_json = repo_map_path.read_text(encoding="utf-8")
     data = json.loads(raw_json)
     if not isinstance(data, dict):
-        raise ValueError("repo_map_file must decode to a JSON object")
+        raise ValueError(f"{map_label} must decode to a JSON object")
 
     repo_map: dict[str, str] = {}
     for stage, repo_path in data.items():
         if not isinstance(stage, str) or not isinstance(repo_path, str):
-            raise ValueError("repo_map_file must contain only string keys and values")
+            raise ValueError(f"{map_label} must contain only string keys and values")
 
         normalized_path = Path(repo_path).expanduser()
         if not normalized_path.is_absolute():
@@ -100,12 +108,20 @@ def load_repo_map(repo_map_file: str) -> dict[str, str]:
     return repo_map
 
 
+def load_repo_map(repo_map_file: str) -> dict[str, str]:
+    return load_path_map(repo_map_file, map_label="repo_map_file")
+
+
 def inventory_files(root_dir: Path) -> list[Path]:
     return sorted((root_dir / "inventory").glob("*.yaml"))
 
 
 def workflow_files(root_dir: Path) -> list[Path]:
     return sorted((root_dir / "workflows").rglob("*.yaml"))
+
+
+def refs_files(root_dir: Path) -> list[Path]:
+    return sorted((root_dir / "refs").glob("*.yaml"))
 
 
 def required_stages(paths: list[Path]) -> set[str]:
@@ -123,6 +139,25 @@ def required_stages(paths: list[Path]) -> set[str]:
                 stages.add(current_stage)
 
     return stages
+
+
+def required_tooling(paths: list[Path]) -> set[str]:
+    tooling_names: set[str] = set()
+
+    for path in paths:
+        refs_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(refs_cfg, dict):
+            continue
+
+        tooling_cfg = refs_cfg.get("tooling") or {}
+        if not isinstance(tooling_cfg, dict):
+            continue
+
+        for tooling_name in tooling_cfg:
+            if isinstance(tooling_name, str):
+                tooling_names.add(tooling_name)
+
+    return tooling_names
 
 
 def parse_source_ref(source_cfg: str) -> tuple[str, str | None, str | None]:
@@ -296,13 +331,40 @@ def rewrite_workflows(root_dir: Path) -> list[Path]:
     return rewritten_paths
 
 
-def warn_about_extra_stages(repo_map: dict[str, str], required: set[str]) -> None:
-    extra_stages = sorted(set(repo_map) - required)
-    if not extra_stages:
+def write_local_tooling_file(root_dir: Path, tooling_map: dict[str, str]) -> Path | None:
+    if not tooling_map:
+        return None
+
+    local_tooling_cfg = {
+        "tooling": {
+            tooling_name: {"repo_path": repo_path}
+            for tooling_name, repo_path in tooling_map.items()
+        }
+    }
+    local_tooling_path = root_dir / LOCAL_TOOLING_CFG_NAME
+    local_tooling_path.write_text(
+        yaml.safe_dump(local_tooling_cfg, sort_keys=False),
+        encoding="utf-8",
+    )
+    return local_tooling_path
+
+
+def remove_refs_dir(root_dir: Path) -> bool:
+    refs_dir = root_dir / "refs"
+    if not refs_dir.exists():
+        return False
+
+    shutil.rmtree(refs_dir)
+    return True
+
+
+def warn_about_extra_mappings(path_map: dict[str, str], required: set[str], label: str) -> None:
+    extra_keys = sorted(set(path_map) - required)
+    if not extra_keys:
         return
 
     print(
-        "warning: unused stage mappings: " + ", ".join(extra_stages),
+        f"warning: unused {label} mappings: " + ", ".join(extra_keys),
         file=sys.stderr,
     )
 
@@ -312,24 +374,41 @@ def main() -> int:
     target_dir = Path(args.target_dir).expanduser().resolve()
 
     try:
-        repo_map = load_repo_map(args.repo_map_file)
+        path_map = load_repo_map(args.repo_map_file)
         with contextlib.ExitStack() as stack:
             source_dir = resolve_source_dir(args.source_cfg, stack)
             validate_source_dir(source_dir)
             validate_target_dir(source_dir, target_dir)
 
             source_inventory = inventory_files(source_dir)
-            required = required_stages(source_inventory)
-            missing = sorted(required - set(repo_map))
+            source_refs = refs_files(source_dir)
+            required_stage_names = required_stages(source_inventory)
+            required_tooling_names = required_tooling(source_refs)
+
+            repo_map = {
+                name: path
+                for name, path in path_map.items()
+                if name in required_stage_names
+            }
+            tooling_map = {
+                name: path
+                for name, path in path_map.items()
+                if name in required_tooling_names
+            }
+
+            missing = sorted(required_stage_names - set(repo_map))
             if missing:
                 raise ValueError(
                     "missing repo paths for stages: " + ", ".join(missing)
                 )
 
-            warn_about_extra_stages(repo_map, required)
+            warn_about_extra_mappings(repo_map, required_stage_names, "stage")
+            warn_about_extra_mappings(tooling_map, required_tooling_names, "tooling")
             copy_source_tree(source_dir, target_dir, args.force)
             rewritten_paths = rewrite_inventory(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
+            local_tooling_path = write_local_tooling_file(target_dir, tooling_map)
+            removed_refs_dir = remove_refs_dir(target_dir)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else str(exc)
         print(f"error: git command failed: {stderr}", file=sys.stderr)
@@ -344,6 +423,10 @@ def main() -> int:
         print(f"rewrote inventory: {path}")
     for path in rewritten_workflows:
         print(f"rewrote workflow: {path}")
+    if local_tooling_path is not None:
+        print(f"wrote local tooling config: {local_tooling_path}")
+    if removed_refs_dir:
+        print(f"removed refs dir: {target_dir / 'refs'}")
 
     return 0
 
