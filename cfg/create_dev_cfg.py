@@ -124,21 +124,38 @@ def refs_files(root_dir: Path) -> list[Path]:
     return sorted((root_dir / "refs").glob("*.yaml"))
 
 
-def required_stages(paths: list[Path]) -> set[str]:
-    stages: set[str] = set()
+def required_repo_entries(paths: list[Path]) -> set[str]:
+    repo_entries: set[str] = set()
 
     for path in paths:
-        current_stage: str | None = None
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stage_match = STAGE_LINE_RE.match(line)
-            if stage_match:
-                current_stage = stage_match.group("stage")
+        inventory_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(inventory_cfg, dict):
+            continue
+
+        stages_cfg = inventory_cfg.get("stages") or {}
+        if not isinstance(stages_cfg, dict):
+            continue
+
+        for stage_name, stage_cfg in stages_cfg.items():
+            if not isinstance(stage_name, str) or not isinstance(stage_cfg, dict):
                 continue
 
-            if current_stage and REPO_URL_LINE_RE.match(line):
-                stages.add(current_stage)
+            if isinstance(stage_cfg.get("repo_url"), str):
+                repo_entries.add(stage_name)
 
-    return stages
+            modules_cfg = stage_cfg.get("modules") or {}
+            if not isinstance(modules_cfg, dict):
+                continue
+
+            for module_name, module_cfg in modules_cfg.items():
+                if (
+                    isinstance(module_name, str)
+                    and isinstance(module_cfg, dict)
+                    and isinstance(module_cfg.get("repo_url"), str)
+                ):
+                    repo_entries.add(module_name)
+
+    return repo_entries
 
 
 def required_tooling(paths: list[Path]) -> set[str]:
@@ -272,27 +289,37 @@ def line_ending_for(line: str) -> str:
 
 
 def rewrite_inventory_file(path: Path, repo_map: dict[str, str]) -> int:
-    rewritten_lines: list[str] = []
-    current_stage: str | None = None
+    inventory_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(inventory_cfg, dict):
+        raise ValueError(f"inventory YAML must contain a mapping: {path}")
+
+    stages_cfg = inventory_cfg.get("stages") or {}
+    if not isinstance(stages_cfg, dict):
+        raise ValueError(f"inventory YAML must contain a 'stages' mapping: {path}")
+
     replacements = 0
-
-    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
-        stage_match = STAGE_LINE_RE.match(line)
-        if stage_match:
-            current_stage = stage_match.group("stage")
-            rewritten_lines.append(line)
+    for stage_name, stage_cfg in stages_cfg.items():
+        if not isinstance(stage_cfg, dict):
             continue
 
-        if current_stage and REPO_URL_LINE_RE.match(line):
-            rewritten_lines.append(
-                f"    repo_path: {repo_map[current_stage]}{line_ending_for(line)}"
-            )
+        if isinstance(stage_cfg.get("repo_url"), str):
+            stage_cfg["repo_path"] = repo_map[stage_name]
+            del stage_cfg["repo_url"]
             replacements += 1
+
+        modules_cfg = stage_cfg.get("modules") or {}
+        if not isinstance(modules_cfg, dict):
             continue
 
-        rewritten_lines.append(line)
+        for module_name, module_cfg in modules_cfg.items():
+            if not isinstance(module_cfg, dict):
+                continue
+            if isinstance(module_cfg.get("repo_url"), str):
+                module_cfg["repo_path"] = repo_map[module_name]
+                del module_cfg["repo_url"]
+                replacements += 1
 
-    path.write_text("".join(rewritten_lines), encoding="utf-8")
+    path.write_text(yaml.safe_dump(inventory_cfg, sort_keys=False), encoding="utf-8")
     return replacements
 
 
@@ -382,13 +409,13 @@ def main() -> int:
 
             source_inventory = inventory_files(source_dir)
             source_refs = refs_files(source_dir)
-            required_stage_names = required_stages(source_inventory)
+            required_repo_names = required_repo_entries(source_inventory)
             required_tooling_names = required_tooling(source_refs)
 
             repo_map = {
                 name: path
                 for name, path in path_map.items()
-                if name in required_stage_names
+                if name in required_repo_names
             }
             tooling_map = {
                 name: path
@@ -396,13 +423,13 @@ def main() -> int:
                 if name in required_tooling_names
             }
 
-            missing = sorted(required_stage_names - set(repo_map))
+            missing = sorted(required_repo_names - set(repo_map))
             if missing:
                 raise ValueError(
-                    "missing repo paths for stages: " + ", ".join(missing)
+                    "missing repo paths for inventory repos: " + ", ".join(missing)
                 )
 
-            warn_about_extra_mappings(repo_map, required_stage_names, "stage")
+            warn_about_extra_mappings(repo_map, required_repo_names, "repo")
             warn_about_extra_mappings(tooling_map, required_tooling_names, "tooling")
             copy_source_tree(source_dir, target_dir, args.force)
             rewritten_paths = rewrite_inventory(target_dir, repo_map)
