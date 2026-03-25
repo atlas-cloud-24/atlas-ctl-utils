@@ -31,6 +31,15 @@ TOOLING_ENV_PREFIXES = {
     "atlas-ctl-utils": "ATLAS_CTL_UTILS",
     "atlas-plt-utils": "ATLAS_PLT_UTILS",
 }
+RUN_ACTIONS = ("pipeline", "maintenance")
+MAINTENANCE_ACTIONS = ("force-unlock",)
+FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES = (
+    Path("pipeline/stages/plan/infra/src/stage.sh"),
+    Path("pipeline/stages/provision/infra/src/stage.sh"),
+    Path("pipeline/stages/destroy/infra/src/stage.sh"),
+)
+FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$([A-Za-z_][A-Za-z0-9_]*)")
+FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
 
 SERVICE_ID = "atlas-ctl-orchestartor-local"
 
@@ -207,6 +216,21 @@ def validate_ephemeral(ctl_env: str, ephemeral: bool) -> None:
         raise RuntimeError(
             f"❌ For env-type in {ENVS_STAGING_PROD}, only --ephemeral=false is allowed"
         )
+
+
+def validate_action_args(args: argparse.Namespace) -> None:
+    """Validate CLI arguments for pipeline vs maintenance mode."""
+    if args.action == "pipeline":
+        if not args.workflow:
+            raise RuntimeError("❌ --workflow is required for --action=pipeline")
+        return
+
+    if not args.maintenance_action:
+        raise RuntimeError("❌ --maintenance-action is required for --action=maintenance")
+    if not args.stage_source:
+        raise RuntimeError("❌ --stage-source is required for --action=maintenance")
+    if args.maintenance_action == "force-unlock" and not args.lock_id:
+        raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
 
 
 def validate_stages_have_commits(active_stages: dict, ctl_env: str) -> None:
@@ -531,14 +555,32 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Ctl environment type (e.g. dev|test|staging|prod)",
     )
     parser.add_argument(
+        "--action",
+        default="pipeline",
+        choices=list(RUN_ACTIONS),
+        help="Top-level runner action",
+    )
+    parser.add_argument(
         "--inventory",
         required=True,
-        help="inventory name (e.g. create|destroy)",
+        help="inventory name (e.g. create|destroy|plan)",
     )
     parser.add_argument(
         "--workflow",
-        required=True,
-        help="workflow name (e.g. default|core|test)",
+        help="workflow name (required for --action pipeline)",
+    )
+    parser.add_argument(
+        "--maintenance-action",
+        choices=list(MAINTENANCE_ACTIONS),
+        help="maintenance action name (required for --action maintenance)",
+    )
+    parser.add_argument(
+        "--stage-source",
+        help="target stage source from inventory (required for --action maintenance)",
+    )
+    parser.add_argument(
+        "--lock-id",
+        help="state lock ID to force-unlock (required for force-unlock)",
     )
     parser.add_argument(
         "--ephemeral",
@@ -1053,6 +1095,90 @@ def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_merged_cfg_dir: Path, 
     return plt_destination_cfg_dir_path
 
 
+def prepare_stage_repo(
+    stage_id: str,
+    stage: dict,
+    run_dir: Path,
+    tooling_env: dict[str, str],
+) -> tuple[Path, dict[str, str]]:
+    """Clone/copy a stage repo and run its setup script."""
+    repo_path = run_dir / "stages_source" / stage_id
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
+
+    if "repo_path" in stage:
+        repo_path_value = stage["repo_path"]
+        if not repo_path_value:
+            raise RuntimeError(f"Stage '{stage_id}' has empty repo_path")
+        repo_src = Path(repo_path_value).expanduser()
+        if not repo_src.is_dir():
+            raise RuntimeError(f"Stage '{stage_id}' repo_path not found: {repo_src}")
+        shutil.copytree(repo_src, repo_path, symlinks=True)
+    else:
+        git_clone(
+            repo_url=stage["repo_url"],
+            branch=stage["branch"],
+            commit=stage["commit"],
+            dest=repo_path,
+            token=os.getenv(stage["token_type"]),
+        )
+
+    stage_setup_cmd = ["./pipeline/setup.sh"]
+    stage_env = os.environ.copy()
+    stage_env.update(tooling_env)
+    logging.info(" ".join(stage_setup_cmd))
+    run_and_log(
+        stage_setup_cmd,
+        cwd=repo_path,
+        env=stage_env,
+    )
+    return repo_path, stage_env
+
+
+def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]:
+    """Extract tfstate key/uri variable names from standard infra stage scripts."""
+    key_var = None
+    uri_var = None
+
+    for rel_path in FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES:
+        script_path = repo_path / rel_path
+        if not script_path.is_file():
+            continue
+
+        content = script_path.read_text(encoding="utf-8")
+        key_match = FORCE_UNLOCK_KEY_RE.search(content)
+        uri_match = FORCE_UNLOCK_URI_RE.search(content)
+
+        if key_match:
+            candidate = key_match.group(1)
+            if key_var and candidate != key_var:
+                raise RuntimeError(
+                    f"❌ Conflicting tfstate key variables found for force-unlock in '{repo_path}': "
+                    f"'{key_var}' vs '{candidate}'"
+                )
+            key_var = candidate
+
+        if uri_match:
+            candidate = uri_match.group(1)
+            if uri_var and candidate != uri_var:
+                raise RuntimeError(
+                    f"❌ Conflicting tfstate uri variables found for force-unlock in '{repo_path}': "
+                    f"'{uri_var}' vs '{candidate}'"
+                )
+            uri_var = candidate
+
+    if not key_var:
+        raise RuntimeError(
+            f"❌ force-unlock is not supported for stage repo '{repo_path}'. "
+            "Expected one of pipeline/stages/{plan,provision,destroy}/infra/src/stage.sh to call './bin/tf.sh infra init $..._tfstate_key'."
+        )
+
+    if uri_var is None and key_var.endswith("_key"):
+        uri_var = f"{key_var[:-4]}_uri"
+
+    return key_var, uri_var
+
+
 def run_stages(
     active_stages: dict,
     run_dir: Path,
@@ -1069,39 +1195,8 @@ def run_stages(
     tooling_env = build_tooling_env(tooling_refs)
     for stage_id, stage in active_stages.items():
         log_stage_banner(stage_id)
-        repo_path = run_dir / "stages_source" / stage_id
-        if os.path.exists(repo_path):
-            shutil.rmtree(repo_path)
-        if "repo_path" in stage:
-            repo_path_value = stage["repo_path"]
-            if not repo_path_value:
-                raise RuntimeError(f"Stage '{stage_id}' has empty repo_path")
-            repo_src = Path(repo_path_value).expanduser()
-            if not repo_src.is_dir():
-                raise RuntimeError(f"Stage '{stage_id}' repo_path not found: {repo_src}")
-            shutil.copytree(repo_src, repo_path, symlinks=True)
-        else:
-            git_clone(
-                repo_url=stage["repo_url"],
-                branch=stage["branch"],
-                commit=stage["commit"],
-                dest=repo_path,
-                token=os.getenv(stage["token_type"])
-            )
-        # setup stage
-        stage_setup_cmd = [
-            "./pipeline/setup.sh"
-        ]
-        stage_env = os.environ.copy()
-        stage_env.update(tooling_env)
-        logging.info(" ".join(stage_setup_cmd))
-        run_and_log(
-            stage_setup_cmd,
-            cwd=repo_path,
-            env=stage_env,
-        )
+        repo_path, stage_env = prepare_stage_repo(stage_id, stage, run_dir, tooling_env)
 
-        # run stage
         stage_run_cmd = [
             "./pipeline/runners/local.py",
             "--main-tag", main_tag,
@@ -1125,6 +1220,136 @@ def print_run_summary(run_id: str, log_file: Path) -> None:
     """Print run summary at the end."""
     print(f"export run_id={run_id}")
     print(f"Log file: {log_file}")
+
+
+def run_maintenance(
+    ctl_cfg_root: Path,
+    plt_cfg_root: Path,
+    ctl_env: str,
+    plt_env: str,
+    inventory_name: str,
+    maintenance_action: str,
+    stage_source: str,
+    lock_id: str,
+    ephemeral: bool,
+    run_id: str,
+    main_tag: str,
+    plt_variants: list[str],
+    stage_repo_key: str,
+    require_stage_ref: bool,
+    use_local_tooling_cfg: bool,
+    run_dir: Path,
+    artifacts_dir: Path,
+    plt_merged_cfg_dir: Path,
+    log_file: Path,
+) -> None:
+    """Run a maintenance action against a single stage source."""
+    validate_ephemeral(ctl_env, ephemeral)
+    validate_env_compatibility(ctl_env, plt_env)
+
+    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+    stage_refs = load_stage_refs_cfg(ctl_cfg_root, ctl_env)
+    if use_local_tooling_cfg:
+        tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
+    else:
+        tooling_refs = load_tooling_refs_cfg(ctl_cfg_root, ctl_env)
+        validate_tooling_refs_have_commits(tooling_refs, ctl_env)
+
+    logging.info(f"Environment validation passed: ctl_env={ctl_env} → plt_env={plt_env}")
+
+    workflow_cfg = {
+        "meta": {
+            "name": f"{ctl_env}/{inventory_name}/maintenance/{maintenance_action}/{stage_source}",
+            "inventory": inventory_name,
+        },
+        "stages": [
+            {
+                "id": stage_source,
+                "source": stage_source,
+            }
+        ],
+    }
+
+    plt_cfg_source_dirs = get_plt_cfg_source_dirs(plt_cfg_root, plt_env)
+    active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
+        plt_cfg_root,
+        workflow_cfg,
+        inventory_cfg,
+        plt_merged_cfg_dir,
+        plt_cfg_source_dirs,
+        artifacts_dir,
+        plt_variants,
+        stage_repo_key=stage_repo_key,
+        require_stage_ref=require_stage_ref,
+        stage_refs=stage_refs,
+    )
+
+    validate_stages_have_commits(active_stages, ctl_env)
+    write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
+    plt_destination_cfg_dir_path = run_cfg_distribution(
+        pipeline_run_cfg_path,
+        plt_merged_cfg_dir,
+        run_dir,
+    )
+
+    os.chdir(run_dir)
+    tooling_env = build_tooling_env(tooling_refs)
+    if len(active_stages) != 1:
+        raise RuntimeError(
+            f"❌ maintenance action '{maintenance_action}' expected exactly one active stage, got: {list(active_stages)}"
+        )
+
+    stage_id, stage = next(iter(active_stages.items()))
+    log_stage_banner(f"maintenance/{maintenance_action}/{stage_id}")
+    repo_path, stage_env = prepare_stage_repo(stage_id, stage, run_dir, tooling_env)
+    stage_cfg_dir = plt_destination_cfg_dir_path / stage_id
+    if not stage_cfg_dir.is_dir():
+        raise RuntimeError(f"❌ distributed cfg dir not found for stage '{stage_id}': {stage_cfg_dir}")
+
+    if maintenance_action != "force-unlock":
+        raise RuntimeError(f"❌ Unsupported maintenance action: {maintenance_action}")
+
+    tfstate_key_var, tfstate_uri_var = resolve_force_unlock_tfstate_vars(repo_path)
+    stage_env["GITHUB_WORKSPACE"] = str(repo_path)
+    stage_env["MAINTENANCE_STAGE_CFG_DIR"] = str(stage_cfg_dir)
+    stage_env["TFSTATE_KEY_VAR"] = tfstate_key_var
+    if tfstate_uri_var:
+        stage_env["TFSTATE_URI_VAR"] = tfstate_uri_var
+    stage_env["LOCK_ID"] = lock_id
+
+    maintenance_cmd = [
+        "bash",
+        "-lc",
+        """
+set -euo pipefail
+rm -rf origin_cfg .cfg bin lib
+mkdir -p origin_cfg
+cp -aL "${MAINTENANCE_STAGE_CFG_DIR}/." origin_cfg/
+export cfg_keys='["*"]'
+source ./pipeline/stages/_common/setup.sh
+source ./bin/export_tfvars.sh .cfg
+tfstate_key="${!TFSTATE_KEY_VAR:?resolved tfstate key variable is not set}"
+tfstate_uri=""
+if [[ -n "${TFSTATE_URI_VAR:-}" ]]; then
+  tfstate_uri="${!TFSTATE_URI_VAR:-}"
+fi
+if [[ -n "$tfstate_uri" ]]; then
+  echo "Using $tfstate_uri"
+else
+  echo "Using state key $tfstate_key"
+fi
+./bin/tf.sh infra init "$tfstate_key"
+./bin/tf.sh infra force-unlock "$tfstate_key" "$LOCK_ID"
+""",
+    ]
+    logging.info("bash -lc <force-unlock-script>")
+    run_and_log(
+        maintenance_cmd,
+        cwd=repo_path,
+        env=stage_env,
+    )
+
+    print_run_summary(run_id, log_file)
 
 
 def run_pipeline(
