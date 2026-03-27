@@ -38,13 +38,33 @@ FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES = (
     Path("pipeline/stages/provision/infra/src/stage.sh"),
     Path("pipeline/stages/destroy/infra/src/stage.sh"),
 )
-FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$([A-Za-z_][A-Za-z0-9_]*)")
+FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$?([A-Za-z_][A-Za-z0-9_]*)")
 FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
 
 SERVICE_ID = "atlas-ctl-orchestartor-local"
 
 # ANSI escape code pattern
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+
+
+class UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key: {key}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
 
 
 @dataclass
@@ -58,7 +78,7 @@ class RunContext:
     ephemeral: bool
     run_dir: Path
     artifacts_dir: Path
-    plt_merged_cfg_dir: Path
+    plt_merged_dir: Path
     log_file: Path
     ctl_cfg_root: Path
     plt_cfg_root: Path
@@ -66,7 +86,39 @@ class RunContext:
     inventory_cfg: dict
     active_stages: dict
     pipeline_run_cfg_path: Path
-    plt_destination_cfg_dir_path: Path
+    plt_distributed_dir_path: Path
+
+
+def merge_cfg_values(base, overlay):
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            if key in merged:
+                merged[key] = merge_cfg_values(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return overlay
+
+
+def load_cfg_yaml(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    if not raw.strip():
+        return {}
+
+    data = yaml.load(raw, Loader=UniqueKeySafeLoader)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"cfg file must contain a mapping: {path}")
+    return data
+
+
+def write_cfg_yaml(path: str, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
 
 
 def str2bool(v):
@@ -597,7 +649,7 @@ def merge_config_dirs(
     source_log_roots: tuple[Path, ...] = (),
     dest_log_roots: tuple[Path, ...] = (),
 ) -> None:
-    """Merge config directories in sequence. Files at same path are concatenated."""
+    """Merge config directories in sequence using YAML-aware overlay semantics."""
     if clear_dest and os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
 
@@ -615,10 +667,8 @@ def merge_config_dirs(
                 dest_file = os.path.join(dest_root, file)
 
                 if os.path.exists(dest_file):
-                    with open(src_file, 'r') as f:
-                        content = f.read()
-                    with open(dest_file, 'a') as f:
-                        f.write('\n' + content)
+                    merged_data = merge_cfg_values(load_cfg_yaml(dest_file), load_cfg_yaml(src_file))
+                    write_cfg_yaml(dest_file, merged_data)
                     merged_files.setdefault(dest_file, []).append(src_file)
                 else:
                     shutil.copy2(src_file, dest_file)
@@ -929,9 +979,12 @@ def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
                 f"❌ local tooling entry for '{tooling_name}' must be a mapping: {tooling_path}"
             )
 
+        if tooling_entry.get("repo_url"):
+            raise RuntimeError(
+                f"❌ local tooling entry for '{tooling_name}' must use repo_path, not repo_url: {tooling_path}"
+            )
+
         repo_path = tooling_entry.get("repo_path")
-        if repo_path is None:
-            repo_path = tooling_entry.get("repo_url")
         if not repo_path:
             continue
         if not isinstance(repo_path, str):
@@ -939,11 +992,18 @@ def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
                 f"❌ local tooling repo path for '{tooling_name}' must be a string: {tooling_path}"
             )
 
+        branch = tooling_entry.get("branch")
+        commit = tooling_entry.get("commit")
+        if branch or commit:
+            raise RuntimeError(
+                f"❌ local tooling entry for '{tooling_name}' must not define branch or commit: {tooling_path}"
+            )
+
         repo_path_obj = Path(repo_path).expanduser()
         if not repo_path_obj.is_absolute():
             repo_path_obj = (ctl_cfg_root / repo_path_obj).resolve()
 
-        tooling_refs[tooling_name] = {"repo_url": str(repo_path_obj)}
+        tooling_refs[tooling_name] = {"repo_path": str(repo_path_obj)}
 
     logging.info(f"Using local tooling file: {tooling_path}")
     return tooling_refs
@@ -958,10 +1018,13 @@ def build_tooling_env(tooling_refs: dict) -> dict[str, str]:
         if not isinstance(tooling_ref, dict):
             continue
 
+        repo_path = tooling_ref.get("repo_path")
         repo_url = tooling_ref.get("repo_url")
         branch = tooling_ref.get("branch")
         commit = tooling_ref.get("commit")
 
+        if repo_path:
+            env_updates[f"{env_prefix}_REPO_PATH"] = repo_path
         if repo_url:
             env_updates[f"{env_prefix}_REPO_URL"] = repo_url
         if branch:
@@ -977,7 +1040,7 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
     Create run directories and setup file logging.
 
     Returns:
-        tuple: (run_dir, artifacts_dir, plt_merged_cfg_dir, log_file)
+        tuple: (run_dir, artifacts_dir, plt_merged_dir, log_file)
     """
     # create run_dir
     run_dir = Path("/tmp") / run_id / inventory_name
@@ -1000,8 +1063,8 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
         shutil.rmtree(stages_source_dir)
 
     # create merged cfg dir
-    plt_merged_cfg_dir = cfg_dir / "plt_merged_cfg"
-    os.makedirs(plt_merged_cfg_dir)
+    plt_merged_dir = cfg_dir / "plt" / "merged"
+    os.makedirs(plt_merged_dir)
 
     # Setup file logging and flush buffered early logs
     logs_dir = artifacts_dir / "logs"
@@ -1021,34 +1084,34 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
     logging.info(f"Using artifacts_dir: {artifacts_dir}")
     logging.info(f"Logging to: {log_file}")
 
-    return run_dir, artifacts_dir, plt_merged_cfg_dir, log_file
+    return run_dir, artifacts_dir, plt_merged_dir, log_file
 
 
 def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
     """Get list of plt config source directories based on environment."""
     env_root = (plt_cfg_root / "env").resolve()
     env_specific = (env_root / plt_env).resolve()
-    layers_cfg_path = env_specific / "layers.yaml"
+    layers_cfg_path = env_specific / "import.yaml"
 
     if not env_specific.is_dir():
         raise RuntimeError(f"Platform env dir not found: {env_specific}")
 
     if not layers_cfg_path.is_file():
-        raise RuntimeError(f"Missing required layers.yaml for plt env '{plt_env}': {layers_cfg_path}")
+        raise RuntimeError(f"Missing required import.yaml for plt env '{plt_env}': {layers_cfg_path}")
 
     cfg = load_yaml(layers_cfg_path) or {}
     if not isinstance(cfg, dict):
-        raise RuntimeError(f"layers.yaml must contain a mapping: {layers_cfg_path}")
+        raise RuntimeError(f"import.yaml must contain a mapping: {layers_cfg_path}")
 
-    layers = cfg.get("layers")
+    layers = cfg.get("imports")
     if not isinstance(layers, list):
-        raise RuntimeError(f"layers.yaml must contain a 'layers' list: {layers_cfg_path}")
+        raise RuntimeError(f"import.yaml must contain an 'imports' list: {layers_cfg_path}")
 
-    source_dirs = [str(env_specific)]
-    seen: set[Path] = {env_specific}
+    source_dirs: list[str] = []
+    seen: set[Path] = set()
     for layer in layers:
         if not isinstance(layer, str) or not layer.strip():
-            raise RuntimeError(f"layers.yaml entries must be non-empty strings: {layers_cfg_path}")
+            raise RuntimeError(f"import.yaml entries must be non-empty strings: {layers_cfg_path}")
 
         src = (env_root / layer).resolve()
         try:
@@ -1066,7 +1129,9 @@ def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
         seen.add(src)
         source_dirs.append(str(src))
 
-    logging.info(f"Using layers.yaml for plt env '{plt_env}': {source_dirs}")
+    source_dirs.append(str(env_specific))
+
+    logging.info(f"Using import.yaml for plt env '{plt_env}': {source_dirs}")
     return source_dirs
 
 
@@ -1107,7 +1172,7 @@ def prepare_pipeline_cfg(
     plt_cfg_root: Path,
     workflow_cfg: dict,
     inventory_cfg: dict,
-    plt_merged_cfg_dir: Path,
+    plt_merged_dir: Path,
     plt_cfg_source_dirs: list[str],
     artifacts_dir: Path,
     plt_variants: list[str],
@@ -1122,27 +1187,27 @@ def prepare_pipeline_cfg(
     Returns:
         tuple: (active_stages, pipeline_run_cfg_path)
     """
-    os.makedirs(plt_merged_cfg_dir, exist_ok=True)
+    os.makedirs(plt_merged_dir, exist_ok=True)
     source_log_roots = (plt_cfg_root.resolve(),)
-    dest_log_roots = (plt_merged_cfg_dir.parent.parent.resolve(),)
+    dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
 
     # merge selected variants into merged cfg root (lowest precedence)
     variant_dirs = get_variant_source_dirs(plt_cfg_root, plt_variants)
     if variant_dirs:
-        logging.info(f"Merging variant dirs to {plt_merged_cfg_dir}: {variant_dirs}")
+        logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
         merge_config_dirs(
             source_dirs=variant_dirs,
-            dest_dir=str(plt_merged_cfg_dir),
+            dest_dir=str(plt_merged_dir),
             clear_dest=True,
             source_log_roots=source_log_roots,
             dest_log_roots=dest_log_roots,
         )
 
     # merge env cfg into merged cfg root (higher precedence)
-    logging.info(f"Merging env cfg dirs to {plt_merged_cfg_dir}")
+    logging.info(f"Merging env cfg dirs to {plt_merged_dir}")
     merge_config_dirs(
         source_dirs=plt_cfg_source_dirs,
-        dest_dir=str(plt_merged_cfg_dir),
+        dest_dir=str(plt_merged_dir),
         clear_dest=not variant_dirs,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
@@ -1197,19 +1262,19 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
     )
 
 
-def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_merged_cfg_dir: Path, run_dir: Path) -> Path:
+def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_merged_dir: Path, run_dir: Path) -> Path:
     """Run cfg distribution script and return destination cfg dir path."""
-    plt_destination_cfg_dir_path = run_dir / "cfg" / "plt_distributed_cfg"
+    plt_distributed_dir_path = run_dir / "cfg" / "plt" / "distributed"
     env = os.environ.copy()
     env["pipeline_run_cfg_path"] = str(pipeline_run_cfg_path)
-    env["plt_origin_cfg_dir_path"] = str(plt_merged_cfg_dir)
-    env["plt_destination_cfg_dir_path"] = str(plt_destination_cfg_dir_path)
+    env["plt_merged_dir_path"] = str(plt_merged_dir)
+    env["plt_distributed_dir_path"] = str(plt_distributed_dir_path)
     logging.info(f"Running: {os.getcwd()}/stages/prepare/cfg/run/local.sh")
     run_and_log(
         [f"{os.getcwd()}/stages/prepare/cfg/run/local.sh"],
         env=env,
     )
-    return plt_destination_cfg_dir_path
+    return plt_distributed_dir_path
 
 
 
@@ -1348,13 +1413,14 @@ def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]
 def run_stages(
     active_stages: dict,
     run_dir: Path,
-    plt_destination_cfg_dir_path: Path,
+    plt_distributed_dir_path: Path,
     inventory_name: str,
     plt_env: str,
     ephemeral: bool,
     run_id: str,
     main_tag: str,
     tooling_refs: dict,
+    use_local_tooling_cfg: bool,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
@@ -1363,17 +1429,22 @@ def run_stages(
         log_stage_banner(stage_id)
         repo_path, stage_env = prepare_stage_repo(stage_id, stage, run_dir, tooling_env)
 
+        stage_runner_path = "./pipeline/runners/local_dev.py" if use_local_tooling_cfg else "./pipeline/runners/local.py"
         stage_run_cmd = [
-            "./pipeline/runners/local.py",
+            stage_runner_path,
             "--main-tag", main_tag,
             "--inventory", inventory_name,
             "--env-type", plt_env,
             "--workflow", stage["workflow"],
-            "--origin-cfg", f"{plt_destination_cfg_dir_path}/{stage_id}",
+            "--origin-cfg", f"{plt_distributed_dir_path}/{stage_id}",
             "--ephemeral", bool2str(ephemeral),
             "--skip-cfg-merge",
             "--run-id", run_id,
         ]
+        stage_cfg_dir = run_dir / "cfg" / "plt" / "per_stage" / stage_id
+        os.makedirs(stage_cfg_dir, exist_ok=True)
+        stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
+
         logging.info(" ".join(stage_run_cmd))
         run_and_log(
             stage_run_cmd,
@@ -1406,7 +1477,7 @@ def run_maintenance(
     use_local_tooling_cfg: bool,
     run_dir: Path,
     artifacts_dir: Path,
-    plt_merged_cfg_dir: Path,
+    plt_merged_dir: Path,
     log_file: Path,
 ) -> None:
     """Run a maintenance action against a single stage source."""
@@ -1442,7 +1513,7 @@ def run_maintenance(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
-        plt_merged_cfg_dir,
+        plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
         plt_variants,
@@ -1454,9 +1525,9 @@ def run_maintenance(
 
     validate_stages_have_commits(active_stages, ctl_env)
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
-    plt_destination_cfg_dir_path = run_cfg_distribution(
+    plt_distributed_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path,
-        plt_merged_cfg_dir,
+        plt_merged_dir,
         run_dir,
     )
 
@@ -1470,7 +1541,7 @@ def run_maintenance(
     stage_id, stage = next(iter(active_stages.items()))
     log_stage_banner(f"maintenance/{maintenance_action}/{stage_id}")
     repo_path, stage_env = prepare_stage_repo(stage_id, stage, run_dir, tooling_env)
-    stage_cfg_dir = plt_destination_cfg_dir_path / stage_id
+    stage_cfg_dir = plt_distributed_dir_path / stage_id
     if not stage_cfg_dir.is_dir():
         raise RuntimeError(f"❌ distributed cfg dir not found for stage '{stage_id}': {stage_cfg_dir}")
 
@@ -1481,33 +1552,20 @@ def run_maintenance(
     stage_env["GITHUB_WORKSPACE"] = str(repo_path)
     stage_env["MAINTENANCE_STAGE_CFG_DIR"] = str(stage_cfg_dir)
     stage_env["TFSTATE_KEY_VAR"] = tfstate_key_var
-    if tfstate_uri_var:
-        stage_env["TFSTATE_URI_VAR"] = tfstate_uri_var
     stage_env["LOCK_ID"] = lock_id
+    stage_env["env_type"] = plt_env
+    stage_env["main_tag"] = main_tag
+    stage_env["run_id"] = run_id
 
     maintenance_cmd = [
         "bash",
         "-lc",
         """
 set -euo pipefail
-rm -rf origin_cfg .cfg bin lib
-mkdir -p origin_cfg
-cp -aL "${MAINTENANCE_STAGE_CFG_DIR}/." origin_cfg/
-export cfg_keys='["*"]'
-source ./pipeline/stages/_common/setup.sh
-source ./bin/export_tfvars.sh .cfg
-tfstate_key="${!TFSTATE_KEY_VAR:?resolved tfstate key variable is not set}"
-tfstate_uri=""
-if [[ -n "${TFSTATE_URI_VAR:-}" ]]; then
-  tfstate_uri="${!TFSTATE_URI_VAR:-}"
-fi
-if [[ -n "$tfstate_uri" ]]; then
-  echo "Using $tfstate_uri"
-else
-  echo "Using state key $tfstate_key"
-fi
-./bin/tf.sh infra init "$tfstate_key"
-./bin/tf.sh infra force-unlock "$tfstate_key" "$LOCK_ID"
+source ./pipeline/stages/_common/prepare_stage_runtime.sh
+prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
+./bin/tf.sh infra init "$TFSTATE_KEY_VAR"
+./bin/tf.sh infra force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
 """,
     ]
     logging.info("bash -lc <force-unlock-script>")
@@ -1537,7 +1595,7 @@ def run_pipeline(
     allow_target_stage_workflow: bool,
     run_dir: Path,
     artifacts_dir: Path,
-    plt_merged_cfg_dir: Path,
+    plt_merged_dir: Path,
     log_file: Path,
 ) -> None:
     """
@@ -1577,7 +1635,7 @@ def run_pipeline(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
-        plt_merged_cfg_dir,
+        plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
         plt_variants,
@@ -1594,16 +1652,17 @@ def run_pipeline(
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
 
     # Run cfg distribution
-    plt_destination_cfg_dir_path = run_cfg_distribution(
-        pipeline_run_cfg_path, plt_merged_cfg_dir, run_dir
+    plt_distributed_dir_path = run_cfg_distribution(
+        pipeline_run_cfg_path, plt_merged_dir, run_dir
     )
 
     # Run stages
     run_stages(
-        active_stages, run_dir, plt_destination_cfg_dir_path,
+        active_stages, run_dir, plt_distributed_dir_path,
         inventory_name, plt_env, ephemeral, run_id,
         main_tag=main_tag,
         tooling_refs=tooling_refs,
+        use_local_tooling_cfg=use_local_tooling_cfg,
     )
 
     print_run_summary(run_id, log_file)

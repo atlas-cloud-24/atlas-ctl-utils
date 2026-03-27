@@ -1,11 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-clone_repo_ref() {
-    local repo_url="$1"
-    local dest_path="$2"
-    local branch="${3:-}"
-    local commit="${4:-}"
+materialize_repo_ref() {
+    local repo_path="${1:-}"
+    local repo_url="${2:-}"
+    local dest_path="$3"
+    local branch="${4:-}"
+    local commit="${5:-}"
+
+    if [[ -n "$repo_path" && -n "$repo_url" ]]; then
+        echo "❌ both repo_path and repo_url were provided"
+        exit 1
+    fi
+
+    if [[ -n "$repo_path" ]]; then
+        if [[ -n "$branch" || -n "$commit" ]]; then
+            echo "❌ branch/commit are not supported with local repo_path: $repo_path"
+            exit 1
+        fi
+        if [[ ! -d "$repo_path" ]]; then
+            echo "❌ local repo_path not found: $repo_path"
+            exit 1
+        fi
+        mkdir -p "$dest_path"
+        cp -a "$repo_path"/. "$dest_path"/
+        return
+    fi
+
+    if [[ -z "$repo_url" ]]; then
+        echo "❌ repo_url or repo_path must be provided"
+        exit 1
+    fi
 
     if [[ -n "$branch" && -n "$commit" ]]; then
         echo "❌ both branch and commit were provided for $repo_url"
@@ -41,45 +66,70 @@ echo "ext_dir_path=$ext_dir_path"
 echo "------------------------------------------------------"
 
 echo "=== 🗂️ Prepare cfg ==="
-for key in $(echo "$cfg_keys" | jq -r '.[]'); do
-    echo "processing $key"
-    if [ "$key" = "*" ]; then
-        while IFS= read -r file; do
-            echo "  merging: $file"
-            cat "$file" >> .cfg
-        done < <(find origin_cfg -type f)
-        continue
+stage_write_values_json="${STAGE_WRITE_VALUES_JSON:-true}"
+stage_write_env_sh="${STAGE_WRITE_ENV_SH:-true}"
+values_json_out="-"
+stage_env_out="-"
+
+if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]; then
+  mkdir -p runtime
+  : "${env_type:?must be set}"
+  : "${main_tag:?must be set}"
+  : "${run_id:?must be set}"
+
+  if [[ "$stage_write_values_json" == "true" ]]; then
+    values_json_out="runtime/values.json"
+  fi
+  if [[ "$stage_write_env_sh" == "true" ]]; then
+    stage_env_out="runtime/env.sh"
+  fi
+
+  python3 ./pipeline/stages/_common/cfg_yaml.py \
+    --origin-cfg-dir origin_cfg \
+    --cfg-keys "$cfg_keys" \
+    --values-json-out "$values_json_out" \
+    --stage-env-out "$stage_env_out" \
+    --env-type "$env_type" \
+    --main-tag "$main_tag" \
+    --run-id "$run_id"
+
+  echo "✅ cfg artifacts generated:"
+  if [[ "$stage_write_values_json" == "true" ]]; then
+    echo "  - runtime/values.json"
+  fi
+  if [[ "$stage_write_env_sh" == "true" ]]; then
+    echo "  - runtime/env.sh"
+  fi
+
+  if [[ "$stage_write_values_json" == "true" ]]; then
+    export STAGE_VALUES_JSON="$(realpath runtime/values.json)"
+  else
+    unset STAGE_VALUES_JSON || true
+  fi
+
+  if [[ -n "${STAGE_CFG_DIR:-}" ]]; then
+    mkdir -p "${STAGE_CFG_DIR}/runtime"
+    rm -f "${STAGE_CFG_DIR}/runtime/values.json" "${STAGE_CFG_DIR}/runtime/env.sh"
+    if [[ "$stage_write_values_json" == "true" ]]; then
+      cp runtime/values.json "${STAGE_CFG_DIR}/runtime/values.json"
     fi
-    # if key ends with /* → merge directory contents recursively
-    if [[ "$key" == *'/*' ]]; then
-        dir="origin_cfg/${key%/*}"
-        if [ -d "$dir" ]; then
-            while IFS= read -r file; do
-                echo "  merging: $file"
-                cat "$file" >> .cfg
-            done < <(find "$dir" -type f)
-        else
-            echo "skip: directory not found: $dir"
-        fi
-        continue
+    if [[ "$stage_write_env_sh" == "true" ]]; then
+      cp runtime/env.sh "${STAGE_CFG_DIR}/runtime/env.sh"
     fi
-    # normal file merge (including paths like atlas/.common)
-    file="origin_cfg/$key"
-    if [ -f "$file" ]; then
-        echo "  merging: $file"
-        cat "$file" >> .cfg
-    else
-        echo "file not found: $file"
-        exit 1
-    fi
-done
+    chmod -R a+rwX "${STAGE_CFG_DIR}"
+  fi
+else
+  unset STAGE_VALUES_JSON || true
+  echo "ℹ️ cfg runtime artifacts skipped"
+fi
 echo "------------------------------------------------------"
 
 echo "=== 📦 Cloning plt_utils repo ==="
-plt_utils_repo_url="${ATLAS_PLT_UTILS_REPO_URL:-https://github.com/atlas-cloud-24/atlas-plt-utils.git}"
+plt_utils_repo_path="${ATLAS_PLT_UTILS_REPO_PATH:-}"
+plt_utils_repo_url="${ATLAS_PLT_UTILS_REPO_URL:-}"
 plt_utils_branch="${ATLAS_PLT_UTILS_BRANCH:-}"
 plt_utils_commit="${ATLAS_PLT_UTILS_COMMIT:-}"
-clone_repo_ref "$plt_utils_repo_url" "$ext_dir_path/plt_utils" "$plt_utils_branch" "$plt_utils_commit"
+materialize_repo_ref "$plt_utils_repo_path" "$plt_utils_repo_url" "$ext_dir_path/plt_utils" "$plt_utils_branch" "$plt_utils_commit"
 plt_utils_repo_name="plt_utils"
 plt_utils_repo_path="$ext_dir_path/$plt_utils_repo_name"
 echo "plt_utils_repo_path=$plt_utils_repo_path"
