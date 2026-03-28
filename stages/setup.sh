@@ -84,7 +84,7 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     stage_env_out="runtime/env.sh"
   fi
 
-  python3 ./pipeline/stages/_common/cfg_yaml.py \
+  python3 ./pipeline/stages/_common/build_runtime_cfg.py \
     --origin-cfg-dir origin_cfg \
     --cfg-keys "$cfg_keys" \
     --values-json-out "$values_json_out" \

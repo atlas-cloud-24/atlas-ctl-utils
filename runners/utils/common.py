@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, urlparse
 
 import yaml
 
@@ -30,6 +31,10 @@ LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
 TOOLING_ENV_PREFIXES = {
     "atlas-ctl-utils": "ATLAS_CTL_UTILS",
     "atlas-plt-utils": "ATLAS_PLT_UTILS",
+}
+TOOLING_DEFAULT_REPO_URLS = {
+    "atlas-ctl-utils": "https://github.com/atlas-cloud-24/atlas-ctl-utils.git",
+    "atlas-plt-utils": "https://github.com/atlas-cloud-24/atlas-plt-utils.git",
 }
 RUN_ACTIONS = ("pipeline", "maintenance")
 MAINTENANCE_ACTIONS = ("force-unlock",)
@@ -381,19 +386,22 @@ def validate_tooling_refs_have_commits(tooling_refs: dict, ctl_env: str) -> None
 def git_clone(repo_url: str, branch: str | None, commit: str | None, dest: Path, token: str | None = None):
     env = os.environ.copy()
     url = repo_url
+    log_url = repo_url
     if token:
-        env["GIT_ASKPASS"] = "echo"
-        env["github_token"] = token
-        url = url.replace(
+        url = repo_url.replace(
             "https://github.com/",
-            "https://x-access-token:${github_token}@github.com/",
+            f"https://x-access-token:{quote(token, safe='')}@github.com/",
+        )
+        log_url = repo_url.replace(
+            "https://github.com/",
+            "https://x-access-token:***@github.com/",
         )
 
     # commit pinned → checkout exact commit
     if commit:
-        cmd = f"git clone {url} {dest}"
-        logging.info(f"Running command: {cmd}")
-        run_and_log(cmd, shell=True, env=env)
+        cmd = ["git", "clone", url, str(dest)]
+        logging.info(f"Running command: git clone {log_url} {dest}")
+        run_and_log(cmd, env=env)
 
         cmd = f"git checkout {commit}"
         logging.info(f"Running command: {cmd}")
@@ -404,9 +412,9 @@ def git_clone(repo_url: str, branch: str | None, commit: str | None, dest: Path,
     if not branch:
         raise RuntimeError(f"❌ Either branch or commit must be provided for repo {repo_url}")
 
-    cmd = f"git clone --branch {branch} --depth 1 {url} {dest}"
-    logging.info(f"Running command: {cmd}")
-    run_and_log(cmd, shell=True, env=env)
+    cmd = ["git", "clone", "--branch", branch, "--depth", "1", url, str(dest)]
+    logging.info(f"Running command: git clone --branch {branch} --depth 1 {log_url} {dest}")
+    run_and_log(cmd, env=env)
 
 
 def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
@@ -433,6 +441,12 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
     if not repo_url or not ref_part:
         raise argparse.ArgumentTypeError(
             f"Invalid format: '{value}'. Both URL and ref are required."
+        )
+
+    parsed = urlparse(repo_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid format: '{value}'. local.py accepts only URL@branch=name or URL@commit=sha; use local_dev.py for local paths"
         )
 
     if ref_part.startswith("branch="):
@@ -1019,7 +1033,9 @@ def build_tooling_env(tooling_refs: dict) -> dict[str, str]:
             continue
 
         repo_path = tooling_ref.get("repo_path")
-        repo_url = tooling_ref.get("repo_url")
+        repo_url = tooling_ref.get("repo_url") or (
+            None if repo_path else TOOLING_DEFAULT_REPO_URLS.get(tooling_name)
+        )
         branch = tooling_ref.get("branch")
         commit = tooling_ref.get("commit")
 
