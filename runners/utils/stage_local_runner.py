@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -118,28 +119,30 @@ def _resolve_workflow_file(repo_root: Path, env_type: str, inventory: str, workf
     sys.exit(1)
 
 
-def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, skip_cfg_merge: bool) -> str:
+@contextlib.contextmanager
+def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, skip_cfg_merge: bool):
     if skip_cfg_merge:
-        return origin_cfg
+        yield origin_cfg
+        return
 
-    tmp_cfg_dir = tempfile.mkdtemp()
-    logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
+    with tempfile.TemporaryDirectory() as tmp_cfg_dir:
+        logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
 
-    variant_dirs = []
-    if variants:
-        variant_dirs = get_variant_source_dirs(Path(origin_cfg), variants)
+        variant_dirs = []
+        if variants:
+            variant_dirs = get_variant_source_dirs(Path(origin_cfg), variants)
+            merge_config_dirs(
+                source_dirs=variant_dirs,
+                dest_dir=tmp_cfg_dir,
+            )
+
+        source_dirs = get_plt_cfg_source_dirs(Path(origin_cfg), env_type)
         merge_config_dirs(
-            source_dirs=variant_dirs,
+            source_dirs=source_dirs,
             dest_dir=tmp_cfg_dir,
+            clear_dest=not variant_dirs,
         )
-
-    source_dirs = get_plt_cfg_source_dirs(Path(origin_cfg), env_type)
-    merge_config_dirs(
-        source_dirs=source_dirs,
-        dest_dir=tmp_cfg_dir,
-        clear_dest=not variant_dirs,
-    )
-    return tmp_cfg_dir
+        yield tmp_cfg_dir
 
 
 def run_local_runner(stage_runner_script: str) -> None:
@@ -177,42 +180,36 @@ def run_local_runner(stage_runner_script: str) -> None:
     }
     logging.info(json.dumps(manifest, indent=4))
 
-    source_for_resolve = _prepare_merged(
-        args.origin_cfg,
-        args.env_type,
-        args.variants,
-        args.skip_cfg_merge,
-    )
-
-    merged_dir = "merged"
-    if os.path.exists(merged_dir):
-        shutil.rmtree(merged_dir)
-    os.makedirs(merged_dir)
-    subprocess.run(
-        ["cp", "-aL", source_for_resolve + "/.", merged_dir],
-        check=True,
-    )
-
-    try:
-        for stage in active_stages:
-            stage_id = stage.get("id")
-            logging.info(f"===================== {stage_id} =====================")
-            env = os.environ.copy()
-            env["main_tag"] = args.main_tag
-            env["env_type"] = args.env_type
-            env["run_id"] = args.run_id
-            env["cfg_keys"] = json.dumps(stage.get("cfg_keys"))
-            env["STAGE_WRITE_VALUES_JSON"] = "true" if stage.get("runtime", {}).get("values_json", True) else "false"
-            env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
-            env["origin_cfg_base_dir_path"] = merged_dir
-            subprocess.run(
-                args=[f"./pipeline/stages/{stage_id}/run/{stage_runner_script}"],
-                check=True,
-                env=env,
-            )
-    finally:
+    with _prepare_merged(args.origin_cfg, args.env_type, args.variants, args.skip_cfg_merge) as source_for_resolve:
+        merged_dir = "merged"
         if os.path.exists(merged_dir):
             shutil.rmtree(merged_dir)
+        os.makedirs(merged_dir)
+        subprocess.run(
+            ["cp", "-aL", source_for_resolve + "/.", merged_dir],
+            check=True,
+        )
+
+        try:
+            for stage in active_stages:
+                stage_id = stage.get("id")
+                logging.info(f"===================== {stage_id} =====================")
+                env = os.environ.copy()
+                env["main_tag"] = args.main_tag
+                env["env_type"] = args.env_type
+                env["run_id"] = args.run_id
+                env["cfg_keys"] = json.dumps(stage.get("cfg_keys"))
+                env["STAGE_WRITE_VALUES_JSON"] = "true" if stage.get("runtime", {}).get("values_json", True) else "false"
+                env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
+                env["origin_cfg_base_dir_path"] = merged_dir
+                subprocess.run(
+                    args=[f"./pipeline/stages/{stage_id}/run/{stage_runner_script}"],
+                    check=True,
+                    env=env,
+                )
+        finally:
+            if os.path.exists(merged_dir):
+                shutil.rmtree(merged_dir)
 
     logging.info(f"✅ All stages completed, run_id: {args.run_id}")
     print(f"export run_id={args.run_id}")

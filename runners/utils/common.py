@@ -121,9 +121,38 @@ def load_cfg_yaml(path: str):
     return data
 
 
-def write_cfg_yaml(path: str, data: dict) -> None:
+def render_merged_cfg_header(
+    dest_path: str | Path,
+    sources: list[str],
+    source_log_roots: tuple[Path, ...] = (),
+    dest_log_roots: tuple[Path, ...] = (),
+) -> str:
+    rendered_dest = format_path_for_log(dest_path, dest_log_roots)
+    rendered_sources = [format_path_for_log(src, source_log_roots) for src in sources]
+
+    dest_rel = Path(rendered_dest)
+    section_name = dest_rel.parent.name if dest_rel.parent.name else dest_rel.stem
+    section_name = section_name.replace("_", " ").upper()
+
+    lines = [
+        "###################################",
+        f"# {section_name}",
+        "###################################",
+        "# =================================",
+        f"# {dest_rel.stem} ({rendered_dest})",
+        "# =================================",
+        "# merged from:",
+    ]
+    lines.extend(f"# - {src}" for src in rendered_sources)
+    return "\n".join(lines) + "\n\n"
+
+
+def write_cfg_yaml(path: str, data: dict, *, header_comment: str | None = None) -> None:
+    rendered = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
     with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        if header_comment:
+            f.write(header_comment)
+        f.write(rendered)
 
 
 def str2bool(v):
@@ -662,12 +691,14 @@ def merge_config_dirs(
     *,
     source_log_roots: tuple[Path, ...] = (),
     dest_log_roots: tuple[Path, ...] = (),
-) -> None:
+    merged_files: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
     """Merge config directories in sequence using YAML-aware overlay semantics."""
     if clear_dest and os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
 
-    merged_files: dict[str, list[str]] = {}  # dest_path -> list of source file paths
+    if merged_files is None:
+        merged_files = {}
 
     for source_dir in source_dirs:
         for root, _, files in os.walk(source_dir):
@@ -682,8 +713,17 @@ def merge_config_dirs(
 
                 if os.path.exists(dest_file):
                     merged_data = merge_cfg_values(load_cfg_yaml(dest_file), load_cfg_yaml(src_file))
-                    write_cfg_yaml(dest_file, merged_data)
-                    merged_files.setdefault(dest_file, []).append(src_file)
+                    source_list = merged_files.setdefault(dest_file, [])
+                    source_list.append(src_file)
+                    header_comment = None
+                    if len(source_list) > 1 and (source_log_roots or dest_log_roots):
+                        header_comment = render_merged_cfg_header(
+                            dest_file,
+                            source_list,
+                            source_log_roots=source_log_roots,
+                            dest_log_roots=dest_log_roots,
+                        )
+                    write_cfg_yaml(dest_file, merged_data, header_comment=header_comment)
                 else:
                     shutil.copy2(src_file, dest_file)
                     merged_files[dest_file] = [src_file]
@@ -697,6 +737,8 @@ def merge_config_dirs(
             for src in rendered_sources[1:]:
                 logging.info("  + %s", src)
             logging.info("  = %s", rendered_dest)
+
+    return merged_files
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -1209,14 +1251,16 @@ def prepare_pipeline_cfg(
 
     # merge selected variants into merged cfg root (lowest precedence)
     variant_dirs = get_variant_source_dirs(plt_cfg_root, plt_variants)
+    merged_files: dict[str, list[str]] = {}
     if variant_dirs:
         logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
-        merge_config_dirs(
+        merged_files = merge_config_dirs(
             source_dirs=variant_dirs,
             dest_dir=str(plt_merged_dir),
             clear_dest=True,
             source_log_roots=source_log_roots,
             dest_log_roots=dest_log_roots,
+            merged_files=merged_files,
         )
 
     # merge env cfg into merged cfg root (higher precedence)
@@ -1227,6 +1271,7 @@ def prepare_pipeline_cfg(
         clear_dest=not variant_dirs,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
+        merged_files=merged_files,
     )
 
     # get active stages
