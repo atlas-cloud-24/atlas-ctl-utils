@@ -1249,30 +1249,30 @@ def prepare_pipeline_cfg(
     source_log_roots = (plt_cfg_root.resolve(),)
     dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
 
-    # merge selected variants into merged cfg root (lowest precedence)
-    variant_dirs = get_variant_source_dirs(plt_cfg_root, plt_variants)
+    # merge env cfg into merged cfg root (lowest precedence)
     merged_files: dict[str, list[str]] = {}
-    if variant_dirs:
-        logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
-        merged_files = merge_config_dirs(
-            source_dirs=variant_dirs,
-            dest_dir=str(plt_merged_dir),
-            clear_dest=True,
-            source_log_roots=source_log_roots,
-            dest_log_roots=dest_log_roots,
-            merged_files=merged_files,
-        )
-
-    # merge env cfg into merged cfg root (higher precedence)
     logging.info(f"Merging env cfg dirs to {plt_merged_dir}")
-    merge_config_dirs(
+    merged_files = merge_config_dirs(
         source_dirs=plt_cfg_source_dirs,
         dest_dir=str(plt_merged_dir),
-        clear_dest=not variant_dirs,
+        clear_dest=True,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
         merged_files=merged_files,
     )
+
+    # merge selected variants into merged cfg root (higher precedence)
+    variant_dirs = get_variant_source_dirs(plt_cfg_root, plt_variants)
+    if variant_dirs:
+        logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
+        merge_config_dirs(
+            source_dirs=variant_dirs,
+            dest_dir=str(plt_merged_dir),
+            clear_dest=False,
+            source_log_roots=source_log_roots,
+            dest_log_roots=dest_log_roots,
+            merged_files=merged_files,
+        )
 
     # get active stages
     active_stages = build_active_stages(
