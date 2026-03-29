@@ -10,8 +10,9 @@ from pathlib import Path
 import yaml
 
 
-PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
-EXACT_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}$")
+VAR_NAME_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+PLACEHOLDER_RE = re.compile(rf"\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}")
+EXACT_PLACEHOLDER_RE = re.compile(rf"^\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}$")
 OMIT = object()
 
 
@@ -99,21 +100,45 @@ class Resolver:
         if name in self.cache:
             return deepcopy(self.cache[name])
 
-        if name in self.raw:
-            if name in self.resolving:
-                raise RuntimeError(f"cyclic cfg interpolation reference: {name}")
-            self.resolving.add(name)
-            try:
-                value = self.resolve_value(self.raw[name])
-            finally:
-                self.resolving.remove(name)
-            self.cache[name] = value
+        value = self._lookup_from_raw(name)
+        if value is not OMIT:
             return deepcopy(value)
 
         if name in self.env_ctx:
             return self.env_ctx[name]
 
         return OMIT
+
+    def _lookup_from_raw(self, name: str):
+        if name in self.raw:
+            return self._resolve_named_value(name, self.raw[name])
+
+        if "." not in name:
+            return OMIT
+
+        path = name.split(".")
+        root_name = path[0]
+        if root_name not in self.raw:
+            return OMIT
+
+        current = self.raw[root_name]
+        for part in path[1:]:
+            if not isinstance(current, dict) or part not in current:
+                return OMIT
+            current = current[part]
+
+        return self._resolve_named_value(name, current)
+
+    def _resolve_named_value(self, name: str, raw_value):
+        if name in self.resolving:
+            raise RuntimeError(f"cyclic cfg interpolation reference: {name}")
+        self.resolving.add(name)
+        try:
+            value = self.resolve_value(raw_value)
+        finally:
+            self.resolving.remove(name)
+        self.cache[name] = value
+        return value
 
     @staticmethod
     def parse_default(raw: str):

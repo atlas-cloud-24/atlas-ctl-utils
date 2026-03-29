@@ -12,9 +12,8 @@ from pathlib import Path
 
 from utils.common import (
     get_plt_cfg_source_dirs,
-    get_variant_source_dirs,
     load_yaml,
-    merge_config_dirs,
+    merge_plt_cfg_dirs,
     str2bool,
     validate_uuid7,
 )
@@ -126,21 +125,12 @@ def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, 
         return
 
     with tempfile.TemporaryDirectory() as tmp_cfg_dir:
-        logging.info(f"Merging cfg dirs to {tmp_cfg_dir}")
-
-        variant_dirs = []
-        if variants:
-            variant_dirs = get_variant_source_dirs(Path(origin_cfg), variants)
-            merge_config_dirs(
-                source_dirs=variant_dirs,
-                dest_dir=tmp_cfg_dir,
-            )
-
         source_dirs = get_plt_cfg_source_dirs(Path(origin_cfg), env_type)
-        merge_config_dirs(
-            source_dirs=source_dirs,
-            dest_dir=tmp_cfg_dir,
-            clear_dest=not variant_dirs,
+        merge_plt_cfg_dirs(
+            plt_cfg_root=Path(origin_cfg),
+            plt_merged_dir=Path(tmp_cfg_dir),
+            plt_cfg_source_dirs=source_dirs,
+            plt_variants=variants,
         )
         yield tmp_cfg_dir
 
