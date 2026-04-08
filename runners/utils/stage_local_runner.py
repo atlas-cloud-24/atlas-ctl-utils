@@ -14,6 +14,7 @@ from utils.common import (
     get_plt_cfg_source_dirs,
     load_yaml,
     merge_plt_cfg_dirs,
+    parse_variants_arg,
     str2bool,
     validate_uuid7,
 )
@@ -88,8 +89,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variants",
         required=False,
-        type=lambda s: [v.strip() for v in s.split(",") if v.strip()],
-        help="Comma-separated cfg variants. Required unless --skip-cfg-merge is set.",
+        default=[],
+        type=parse_variants_arg,
+        help="Optional comma-separated cfg variants under variants/.",
     )
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--origin-cfg", required=True)
@@ -138,9 +140,6 @@ def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, 
 def run_local_runner(stage_runner_script: str) -> None:
     parser = _build_parser()
     args = parser.parse_args()
-
-    if not args.skip_cfg_merge and not args.variants:
-        parser.error("--variants is required unless --skip-cfg-merge is set")
 
     if args.env_type == "prod" and args.ephemeral:
         raise RuntimeError("❌ For env-type 'prod', only --ephemeral=false is allowed")

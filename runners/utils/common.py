@@ -750,9 +750,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--plt-variants",
-        required=True,
+        required=False,
+        default=[],
         type=parse_variants_arg,
-        help="Comma-separated variant paths under variants/",
+        help="Optional comma-separated variant paths under variants/",
     )
     parser.add_argument(
         "--ctl-env",
@@ -1193,8 +1194,18 @@ def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
     return source_dirs
 
 
-def get_variant_source_dirs(plt_cfg_root: Path, plt_variants: list[str]) -> list[str]:
-    """Return absolute variant directories selected by --plt-variants."""
+def get_variant_source_dirs(
+    plt_cfg_root: Path,
+    plt_cfg_source_dirs: list[str],
+    plt_variants: list[str],
+) -> list[str]:
+    """Return absolute variant source dirs selected by --plt-variants.
+
+    A variant may be either:
+    - a legacy direct overlay directory merged as-is
+    - an env-layered directory that mirrors env/ source dirs such as
+      common/all, common/non_prod, common/prod_shared, and dev/test/...
+    """
     if not plt_variants:
         return []
 
@@ -1203,6 +1214,20 @@ def get_variant_source_dirs(plt_cfg_root: Path, plt_variants: list[str]) -> list
         raise RuntimeError(f"Variants dir not found: {variants_root}")
 
     variants_root = variants_root.resolve()
+    env_root = (plt_cfg_root / "env").resolve()
+    layer_rels: list[Path] = []
+    seen_layer_rels: set[Path] = set()
+    for src in plt_cfg_source_dirs:
+        src_path = Path(src).resolve()
+        try:
+            rel = src_path.relative_to(env_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Platform cfg source dir is outside env/: {src_path}") from exc
+        if rel in seen_layer_rels:
+            continue
+        seen_layer_rels.add(rel)
+        layer_rels.append(rel)
+
     source_dirs: list[str] = []
     seen: set[str] = set()
     for rel in plt_variants:
@@ -1221,7 +1246,17 @@ def get_variant_source_dirs(plt_cfg_root: Path, plt_variants: list[str]) -> list
         if not src.is_dir():
             raise RuntimeError(f"Variant path must be a directory: {src}")
 
-        source_dirs.append(str(src))
+        layered_dirs: list[str] = []
+        for layer_rel in layer_rels:
+            candidate = (src / layer_rel).resolve()
+            if not candidate.is_dir():
+                continue
+            layered_dirs.append(str(candidate))
+
+        if layered_dirs:
+            source_dirs.extend(layered_dirs)
+        else:
+            source_dirs.append(str(src))
 
     return source_dirs
 
@@ -1256,7 +1291,11 @@ def merge_plt_cfg_dirs(
         merged_files=merged_files,
     )
 
-    variant_dirs = get_variant_source_dirs(plt_cfg_root, plt_variants or [])
+    variant_dirs = get_variant_source_dirs(
+        plt_cfg_root,
+        plt_cfg_source_dirs,
+        plt_variants or [],
+    )
     if variant_dirs:
         logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
         merge_config_dirs(
