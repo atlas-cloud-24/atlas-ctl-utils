@@ -6,7 +6,7 @@ The source cfg can be either:
 - an HTTP/HTTPS git URL, optionally with `@branch=...`, `@tag=...`, or `@commit=...`
 
 The script copies the source cfg into a target directory, rewrites
-`inventory/*.yaml` so each stage uses `repo_path` instead of `repo_url`,
+`inventory/*.yaml` so each stage source uses `repo_path` instead of `repo_url`,
 removes ineffective `branch` keys from workflow YAMLs, writes local tooling
 repo paths to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
-            "inventory repo_url values to repo_path using a JSON file with "
-            "stage-to-path mappings and optional tooling repo-to-path mappings."
+            "inventory stage source repo_url values to repo_path using a JSON file "
+            "with stage-source-to-path mappings and optional tooling repo-to-path mappings."
         )
     )
     parser.add_argument(
@@ -117,7 +117,11 @@ def inventory_files(root_dir: Path) -> list[Path]:
 
 
 def workflow_files(root_dir: Path) -> list[Path]:
-    return sorted((root_dir / "workflows").rglob("*.yaml"))
+    paths = set((root_dir / "workflows").rglob("*.yaml"))
+    variants_root = root_dir / "variants"
+    if variants_root.is_dir():
+        paths.update(variants_root.rglob("workflows/**/*.yaml"))
+    return sorted(paths)
 
 
 def refs_files(root_dir: Path) -> list[Path]:

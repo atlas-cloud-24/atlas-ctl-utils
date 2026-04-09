@@ -311,6 +311,8 @@ def validate_action_args(args: argparse.Namespace) -> None:
             raise RuntimeError("❌ --workflow is required for --action=pipeline")
         return
 
+    if getattr(args, "ctl_variants", None):
+        raise RuntimeError("❌ --ctl-variants is supported only for --action=pipeline")
     if not args.maintenance_action:
         raise RuntimeError("❌ --maintenance-action is required for --action=maintenance")
     if not args.stage_source:
@@ -494,8 +496,8 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
         )
 
 
-def parse_overlays_arg(value: str) -> list[str]:
-    """Parse comma-separated overlay paths under overlays/."""
+def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str) -> list[str]:
+    """Parse comma-separated relative paths under a cfg root directory."""
     if value is None:
         return []
 
@@ -509,14 +511,32 @@ def parse_overlays_arg(value: str) -> list[str]:
         path = Path(item)
         if path.is_absolute():
             raise argparse.ArgumentTypeError(
-                f"Overlay path must be relative to overlays/: {item}"
+                f"{item_label} path must be relative to {root_dir_name}/: {item}"
             )
         if ".." in path.parts:
             raise argparse.ArgumentTypeError(
-                f"Overlay path must not contain '..': {item}"
+                f"{item_label} path must not contain '..': {item}"
             )
 
     return raw
+
+
+def parse_overlays_arg(value: str) -> list[str]:
+    """Parse comma-separated overlay paths under overlays/."""
+    return parse_relative_paths_arg(
+        value,
+        root_dir_name="overlays",
+        item_label="Overlay",
+    )
+
+
+def parse_ctl_variants_arg(value: str) -> list[str]:
+    """Parse comma-separated ctl variant paths under variants/."""
+    return parse_relative_paths_arg(
+        value,
+        root_dir_name="variants",
+        item_label="Ctl variant",
+    )
 
 def build_active_stages(
     workflow_cfg: dict,
@@ -755,6 +775,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Optional comma-separated overlay paths under overlays/",
     )
     parser.add_argument(
+        "--ctl-variants",
+        required=False,
+        default=[],
+        dest="ctl_variants",
+        type=parse_ctl_variants_arg,
+        help="Optional comma-separated ctl variant paths under variants/",
+    )
+    parser.add_argument(
         "--ctl-env",
         required=True,
         choices=list(ENV_TRUST.keys()),
@@ -891,6 +919,219 @@ def load_workflow_cfg(
         f"❌ workflow file not found in ctl env '{ctl_env}' or base: "
         f"{inventory_name}/{workflow_name}.yaml"
     )
+
+
+def get_ctl_variants_root(ctl_cfg_root: Path) -> Path:
+    """Return ctl variant root dir under variants/."""
+    ctl_variants_root = (ctl_cfg_root / "variants").resolve()
+    if ctl_variants_root.is_dir():
+        return ctl_variants_root
+    raise RuntimeError(f"Ctl variants dir not found under: {ctl_cfg_root}")
+
+
+def get_ctl_variant_root(ctl_cfg_root: Path, ctl_variant: str) -> Path:
+    """Resolve one selected ctl variant path under variants/."""
+    ctl_variants_root = get_ctl_variants_root(ctl_cfg_root)
+    variant_root = (ctl_variants_root / ctl_variant).resolve()
+    try:
+        variant_root.relative_to(ctl_variants_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Ctl variant path escapes variants/: {ctl_variant}") from exc
+    if not variant_root.exists():
+        raise RuntimeError(f"Ctl variant path not found: {variant_root}")
+    if not variant_root.is_dir():
+        raise RuntimeError(f"Ctl variant path must be a directory: {variant_root}")
+    return variant_root
+
+
+def load_optional_yaml_mapping(path: Path) -> dict:
+    """Load an optional YAML mapping, returning {} when the file is absent."""
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ YAML file must contain a mapping: {path}")
+    return data
+
+
+def _load_required_string_list(meta: dict, key: str, variant_label: str) -> list[str]:
+    raw = meta.get(key) or []
+    if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
+        raise RuntimeError(
+            f"❌ ctl variant '{variant_label}' meta key '{key}' must be a list of non-empty strings"
+        )
+    return raw
+
+
+def validate_ctl_variant_meta(
+    meta: dict,
+    *,
+    variant_label: str,
+    plt_overlays: list[str],
+) -> None:
+    """Validate ctl variant metadata against selected plt overlays."""
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' meta.yaml must contain a mapping")
+
+    required_plt_overlays = _load_required_string_list(meta, "requires_plt_overlays", variant_label)
+    if required_plt_overlays:
+        missing = [overlay for overlay in required_plt_overlays if overlay not in plt_overlays]
+        if missing:
+            raise RuntimeError(
+                f"❌ ctl variant '{variant_label}' requires plt overlays {missing}, "
+                f"but selected plt overlays are {plt_overlays}"
+            )
+
+
+def get_workflow_stage_id(stage_entry) -> str:
+    """Return the stage id from a workflow stage entry."""
+    if isinstance(stage_entry, str):
+        return stage_entry
+    if isinstance(stage_entry, dict):
+        stage_id = stage_entry.get("id")
+        if isinstance(stage_id, str) and stage_id:
+            return stage_id
+    raise RuntimeError(f"❌ invalid workflow stage entry: {stage_entry!r}")
+
+
+def validate_ctl_variant_stage_patch_entry(raw_stage: dict, variant_label: str) -> tuple[str, dict]:
+    """Validate one ctl variant stage patch entry and return its op plus stage payload."""
+    if not isinstance(raw_stage, dict):
+        raise RuntimeError(
+            f"❌ ctl variant '{variant_label}' workflow patch entries must be mappings"
+        )
+
+    add_before = raw_stage.get("add_before")
+    add_after = raw_stage.get("add_after")
+    op_keys = [key for key, value in (("add_before", add_before), ("add_after", add_after)) if value is not None]
+    if len(op_keys) != 1:
+        raise RuntimeError(
+            f"❌ ctl variant '{variant_label}' stage patch entry must define exactly one of "
+            f"'add_before' or 'add_after': {raw_stage}"
+        )
+
+    anchor_stage_id = raw_stage[op_keys[0]]
+    if not isinstance(anchor_stage_id, str) or not anchor_stage_id:
+        raise RuntimeError(
+            f"❌ ctl variant '{variant_label}' {op_keys[0]} value must be a non-empty stage id"
+        )
+
+    stage_entry = {k: v for k, v in raw_stage.items() if k not in ("add_before", "add_after")}
+    stage_id = stage_entry.get("id")
+    stage_source = stage_entry.get("source")
+    stage_workflow = stage_entry.get("workflow")
+    if not isinstance(stage_id, str) or not stage_id:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' inserted stage must define non-empty 'id'")
+    if not isinstance(stage_source, str) or not stage_source:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'source'")
+    if not isinstance(stage_workflow, str) or not stage_workflow:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'workflow'")
+    if stage_entry.get("branch") and stage_entry.get("commit"):
+        raise RuntimeError(
+            f"❌ ctl variant '{variant_label}' stage '{stage_id}' cannot define both 'branch' and 'commit'"
+        )
+
+    return op_keys[0], stage_entry
+
+
+def apply_ctl_variant_workflow_patch(
+    workflow_cfg: dict,
+    patch_cfg: dict,
+    *,
+    variant_label: str,
+    patch_label: str,
+) -> dict:
+    """Apply add_before/add_after workflow patch entries from one ctl variant patch file."""
+    stages = workflow_cfg.get("stages")
+    if not isinstance(stages, list):
+        raise RuntimeError(f"❌ workflow cfg must contain a 'stages' list before applying ctl variants")
+
+    patch_stages = patch_cfg.get("stages") or []
+    if not isinstance(patch_stages, list):
+        raise RuntimeError(
+            f"❌ ctl variant patch '{patch_label}' must contain a 'stages' list"
+        )
+
+    resolved_stages = list(stages)
+    for raw_stage in patch_stages:
+        op, stage_entry = validate_ctl_variant_stage_patch_entry(raw_stage, variant_label)
+        anchor_stage_id = raw_stage[op]
+        stage_id = stage_entry["id"]
+
+        stage_ids = [get_workflow_stage_id(stage) for stage in resolved_stages]
+        if anchor_stage_id not in stage_ids:
+            raise RuntimeError(
+                f"❌ ctl variant '{variant_label}' patch '{patch_label}' references missing anchor "
+                f"stage id '{anchor_stage_id}'"
+            )
+        if stage_id in stage_ids:
+            raise RuntimeError(
+                f"❌ ctl variant '{variant_label}' patch '{patch_label}' inserts duplicate stage id '{stage_id}'"
+            )
+
+        anchor_index = stage_ids.index(anchor_stage_id)
+        insert_index = anchor_index if op == "add_before" else anchor_index + 1
+        resolved_stages.insert(insert_index, stage_entry)
+        logging.info(
+            "Applied ctl variant '%s': %s stage '%s' %s '%s'",
+            variant_label,
+            op,
+            stage_id,
+            "before" if op == "add_before" else "after",
+            anchor_stage_id,
+        )
+
+    patched_workflow_cfg = dict(workflow_cfg)
+    patched_workflow_cfg["stages"] = resolved_stages
+    return patched_workflow_cfg
+
+
+def apply_ctl_variants_to_workflow_cfg(
+    ctl_cfg_root: Path,
+    workflow_cfg: dict,
+    *,
+    ctl_env: str,
+    plt_env: str,
+    inventory_name: str,
+    workflow_name: str,
+    ctl_variants: list[str],
+    plt_overlays: list[str],
+) -> dict:
+    """Apply selected ctl variants to a loaded workflow cfg."""
+    if not ctl_variants:
+        return workflow_cfg
+
+    patched_workflow_cfg = dict(workflow_cfg)
+    patched_workflow_cfg["stages"] = list(workflow_cfg.get("stages") or [])
+
+    for ctl_variant in ctl_variants:
+        variant_root = get_ctl_variant_root(ctl_cfg_root, ctl_variant)
+        meta = load_optional_yaml_mapping(variant_root / "meta.yaml")
+        validate_ctl_variant_meta(
+            meta,
+            variant_label=ctl_variant,
+            plt_overlays=plt_overlays,
+        )
+
+        patch_path = variant_root / "workflows" / inventory_name / f"{workflow_name}.yaml"
+        patch_cfg = load_optional_yaml_mapping(patch_path)
+        if not patch_cfg:
+            logging.info(
+                "Ctl variant '%s' has no workflow patch for %s/%s",
+                ctl_variant,
+                inventory_name,
+                workflow_name,
+            )
+            continue
+
+        patched_workflow_cfg = apply_ctl_variant_workflow_patch(
+            patched_workflow_cfg,
+            patch_cfg,
+            variant_label=ctl_variant,
+            patch_label=str(patch_path),
+        )
+
+    return patched_workflow_cfg
 
 
 def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
@@ -1355,6 +1596,12 @@ def prepare_pipeline_cfg(
         module_refs=module_refs,
     )
 
+    write_stage_flow_artifact(
+        artifacts_dir / "resolved_stages_flow.yaml",
+        workflow_cfg.get("meta"),
+        active_stages,
+    )
+
     # create and write pipeline_run_cfg
     pipeline_run_cfg = {
         "meta": workflow_cfg.get("meta"),
@@ -1365,6 +1612,88 @@ def prepare_pipeline_cfg(
         yaml.safe_dump(pipeline_run_cfg, f, sort_keys=False)
 
     return active_stages, pipeline_run_cfg_path
+
+
+def write_stage_flow_artifact(path: Path, workflow_meta: dict | None, active_stages: dict) -> None:
+    """Write a compact ordered stage-flow artifact."""
+    stage_flow = {
+        "meta": workflow_meta,
+        "stages": [
+            {
+                "id": stage_id,
+                "source": stage["source"],
+                "workflow": stage["workflow"],
+                "branch": stage.get("branch"),
+                "commit": stage.get("commit"),
+            }
+            for stage_id, stage in active_stages.items()
+        ],
+    }
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(stage_flow, f, sort_keys=False)
+
+
+def write_target_stage_flow_artifact(
+    ctl_cfg_root: Path,
+    artifacts_dir: Path,
+    *,
+    ctl_env: str,
+    plt_env: str,
+    inventory_name: str,
+    workflow_name: str,
+    ctl_variants: list[str],
+    plt_overlays: list[str],
+    stage_repo_key: str,
+    require_stage_ref: bool,
+    allow_target_stage_workflow: bool,
+    stage_source_refs: dict | None,
+    module_refs: dict | None,
+) -> None:
+    """For plan runs, write the matching create-flow preview artifact."""
+    if inventory_name != "plan":
+        return
+
+    target_inventory_name = "create"
+    try:
+        target_workflow_cfg = load_workflow_cfg(
+            ctl_cfg_root,
+            ctl_env,
+            target_inventory_name,
+            workflow_name,
+            allow_target_stage_workflow=allow_target_stage_workflow,
+        )
+        target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
+            ctl_cfg_root,
+            target_workflow_cfg,
+            ctl_env=ctl_env,
+            plt_env=plt_env,
+            inventory_name=target_inventory_name,
+            workflow_name=workflow_name,
+            ctl_variants=ctl_variants,
+            plt_overlays=plt_overlays,
+        )
+        target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name)
+        target_active_stages = build_active_stages(
+            target_workflow_cfg,
+            target_inventory_cfg,
+            repo_key=stage_repo_key,
+            require_branch_or_commit=require_stage_ref,
+            stage_source_refs=stage_source_refs,
+            module_refs=module_refs,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Skipping target_stages_flow.yaml generation for plan/%s: %s",
+            workflow_name,
+            exc,
+        )
+        return
+
+    write_stage_flow_artifact(
+        artifacts_dir / "target_stages_flow.yaml",
+        target_workflow_cfg.get("meta"),
+        target_active_stages,
+    )
 
 
 def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path) -> None:
@@ -1721,6 +2050,7 @@ def run_pipeline(
     run_id: str,
     main_tag: str,
     plt_overlays: list[str],
+    ctl_variants: list[str],
     stage_repo_key: str,
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
@@ -1748,6 +2078,16 @@ def run_pipeline(
         inventory_name,
         workflow_name,
         allow_target_stage_workflow=allow_target_stage_workflow,
+    )
+    workflow_cfg = apply_ctl_variants_to_workflow_cfg(
+        ctl_cfg_root,
+        workflow_cfg,
+        ctl_env=ctl_env,
+        plt_env=plt_env,
+        inventory_name=inventory_name,
+        workflow_name=workflow_name,
+        ctl_variants=ctl_variants,
+        plt_overlays=plt_overlays,
     )
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
 
@@ -1779,6 +2119,22 @@ def run_pipeline(
 
     # Validate stages have commits for staging/prod
     validate_stages_have_commits(active_stages, ctl_env)
+
+    write_target_stage_flow_artifact(
+        ctl_cfg_root,
+        artifacts_dir,
+        ctl_env=ctl_env,
+        plt_env=plt_env,
+        inventory_name=inventory_name,
+        workflow_name=workflow_name,
+        ctl_variants=ctl_variants,
+        plt_overlays=plt_overlays,
+        stage_repo_key=stage_repo_key,
+        require_stage_ref=require_stage_ref,
+        allow_target_stage_workflow=allow_target_stage_workflow,
+        stage_source_refs=stage_source_refs,
+        module_refs=module_refs,
+    )
 
     # Write git metas
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
