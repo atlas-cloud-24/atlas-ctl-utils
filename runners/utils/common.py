@@ -494,8 +494,8 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
         )
 
 
-def parse_variants_arg(value: str) -> list[str]:
-    """Parse comma-separated variant paths under variants/."""
+def parse_overlays_arg(value: str) -> list[str]:
+    """Parse comma-separated overlay paths under overlays/."""
     if value is None:
         return []
 
@@ -509,30 +509,28 @@ def parse_variants_arg(value: str) -> list[str]:
         path = Path(item)
         if path.is_absolute():
             raise argparse.ArgumentTypeError(
-                f"Variant path must be relative to variants/: {item}"
+                f"Overlay path must be relative to overlays/: {item}"
             )
         if ".." in path.parts:
             raise argparse.ArgumentTypeError(
-                f"Variant path must not contain '..': {item}"
+                f"Overlay path must not contain '..': {item}"
             )
 
     return raw
-
-
 
 def build_active_stages(
     workflow_cfg: dict,
     inventory_cfg: dict,
     repo_key: str = "repo_url",
     require_branch_or_commit: bool = True,
-    stage_refs: dict | None = None,
+    stage_source_refs: dict | None = None,
     module_refs: dict | None = None,
 ) -> dict:
-    inventory_stages = inventory_cfg.get("stages", {})
-    if not isinstance(inventory_stages, dict):
-        raise RuntimeError("'stages' in inventory must be a mapping: source -> meta")
+    inventory_stage_sources = inventory_cfg.get("stage_sources", {})
+    if not isinstance(inventory_stage_sources, dict):
+        raise RuntimeError("'stage_sources' in inventory must be a mapping: source -> meta")
 
-    stage_refs = stage_refs or {}
+    stage_source_refs = stage_source_refs or {}
     module_refs = module_refs or {}
     active = {}
 
@@ -550,21 +548,21 @@ def build_active_stages(
                 raise RuntimeError(f"Stage '{stage_id}' has empty 'source'")
             stage_over = st
 
-        if stage_source not in inventory_stages:
+        if stage_source not in inventory_stage_sources:
             raise RuntimeError(
                 f"Stage source '{stage_source}' (stage id='{stage_id}') not found in inventory '{workflow_cfg.get('inventory')}'"
             )
 
-        cat = inventory_stages[stage_source]
+        cat = inventory_stage_sources[stage_source]
         if not isinstance(cat, dict):
             raise RuntimeError(
                 f"Stage source '{stage_source}' metadata must be a mapping, got: {type(cat).__name__}"
             )
 
-        stage_ref = stage_refs.get(stage_source) or {}
+        stage_ref = stage_source_refs.get(stage_source) or {}
         if not isinstance(stage_ref, dict):
             raise RuntimeError(
-                f"Stage refs for source '{stage_source}' must be a mapping, got: {type(stage_ref).__name__}"
+                f"Stage source refs for '{stage_source}' must be a mapping, got: {type(stage_ref).__name__}"
             )
 
         branch = stage_over.get("branch") or stage_ref.get("branch")
@@ -749,11 +747,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Main tag passed to stage runners",
     )
     parser.add_argument(
-        "--plt-variants",
+        "--plt-overlays",
         required=False,
         default=[],
-        type=parse_variants_arg,
-        help="Optional comma-separated variant paths under variants/",
+        dest="plt_overlays",
+        type=parse_overlays_arg,
+        help="Optional comma-separated overlay paths under overlays/",
     )
     parser.add_argument(
         "--ctl-env",
@@ -961,9 +960,9 @@ def load_ref_section_cfg(ctl_cfg_root: Path, ctl_env: str, section_name: str, en
     return resolved_refs
 
 
-def load_stage_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> dict:
-    """Load env-scoped stage refs from refs/<ctl_env>.yaml if present."""
-    return load_ref_section_cfg(ctl_cfg_root, ctl_env, "stages", "stage")
+def load_stage_source_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> dict:
+    """Load env-scoped stage source refs from refs/<ctl_env>.yaml if present."""
+    return load_ref_section_cfg(ctl_cfg_root, ctl_env, "stage_sources", "stage source")
 
 
 def load_module_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> dict:
@@ -1194,26 +1193,31 @@ def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
     return source_dirs
 
 
-def get_variant_source_dirs(
+def get_overlay_root(plt_cfg_root: Path) -> Path:
+    """Return overlay root dir under overlays/."""
+    overlays_root = (plt_cfg_root / "overlays").resolve()
+    if overlays_root.is_dir():
+        return overlays_root
+
+    raise RuntimeError(f"Overlays dir not found under: {plt_cfg_root}")
+
+
+def get_overlay_source_dirs(
     plt_cfg_root: Path,
     plt_cfg_source_dirs: list[str],
-    plt_variants: list[str],
+    plt_overlays: list[str],
 ) -> list[str]:
-    """Return absolute variant source dirs selected by --plt-variants.
+    """Return absolute overlay source dirs selected by --plt-overlays.
 
-    A variant may be either:
+    An overlay may be either:
     - a legacy direct overlay directory merged as-is
     - an env-layered directory that mirrors env/ source dirs such as
       common/all, common/non_prod, common/prod_shared, and dev/test/...
     """
-    if not plt_variants:
+    if not plt_overlays:
         return []
 
-    variants_root = plt_cfg_root / "variants"
-    if not variants_root.is_dir():
-        raise RuntimeError(f"Variants dir not found: {variants_root}")
-
-    variants_root = variants_root.resolve()
+    overlays_root = get_overlay_root(plt_cfg_root)
     env_root = (plt_cfg_root / "env").resolve()
     layer_rels: list[Path] = []
     seen_layer_rels: set[Path] = set()
@@ -1230,21 +1234,21 @@ def get_variant_source_dirs(
 
     source_dirs: list[str] = []
     seen: set[str] = set()
-    for rel in plt_variants:
+    for rel in plt_overlays:
         if rel in seen:
             continue
         seen.add(rel)
 
         rel_path = Path(rel)
-        src = (variants_root / rel_path).resolve()
+        src = (overlays_root / rel_path).resolve()
         try:
-            src.relative_to(variants_root)
+            src.relative_to(overlays_root)
         except ValueError as exc:
-            raise RuntimeError(f"Variant path escapes variants/: {rel}") from exc
+            raise RuntimeError(f"Overlay path escapes overlays/: {rel}") from exc
         if not src.exists():
-            raise RuntimeError(f"Variant path not found: {src}")
+            raise RuntimeError(f"Overlay path not found: {src}")
         if not src.is_dir():
-            raise RuntimeError(f"Variant path must be a directory: {src}")
+            raise RuntimeError(f"Overlay path must be a directory: {src}")
 
         layered_dirs: list[str] = []
         for layer_rel in layer_rels:
@@ -1265,13 +1269,13 @@ def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
     plt_cfg_source_dirs: list[str],
-    plt_variants: list[str] | None = None,
+    plt_overlays: list[str] | None = None,
     *,
     source_log_roots: tuple[Path, ...] | None = None,
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
-    """Merge env layers first and selected variants after them."""
+    """Merge env layers first and selected overlays after them."""
     os.makedirs(plt_merged_dir, exist_ok=True)
 
     if source_log_roots is None:
@@ -1291,15 +1295,15 @@ def merge_plt_cfg_dirs(
         merged_files=merged_files,
     )
 
-    variant_dirs = get_variant_source_dirs(
+    overlay_dirs = get_overlay_source_dirs(
         plt_cfg_root,
         plt_cfg_source_dirs,
-        plt_variants or [],
+        plt_overlays or [],
     )
-    if variant_dirs:
-        logging.info(f"Merging variant dirs to {plt_merged_dir}: {variant_dirs}")
+    if overlay_dirs:
+        logging.info(f"Merging overlay dirs to {plt_merged_dir}: {overlay_dirs}")
         merge_config_dirs(
-            source_dirs=variant_dirs,
+            source_dirs=overlay_dirs,
             dest_dir=str(plt_merged_dir),
             clear_dest=False,
             source_log_roots=source_log_roots,
@@ -1317,10 +1321,10 @@ def prepare_pipeline_cfg(
     plt_merged_dir: Path,
     plt_cfg_source_dirs: list[str],
     artifacts_dir: Path,
-    plt_variants: list[str],
+    plt_overlays: list[str],
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
-    stage_refs: dict | None = None,
+    stage_source_refs: dict | None = None,
     module_refs: dict | None = None,
 ) -> tuple[dict, Path]:
     """
@@ -1336,7 +1340,7 @@ def prepare_pipeline_cfg(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
         plt_cfg_source_dirs=plt_cfg_source_dirs,
-        plt_variants=plt_variants,
+        plt_overlays=plt_overlays,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
     )
@@ -1347,7 +1351,7 @@ def prepare_pipeline_cfg(
         inventory_cfg,
         repo_key=stage_repo_key,
         require_branch_or_commit=require_stage_ref,
-        stage_refs=stage_refs,
+        stage_source_refs=stage_source_refs,
         module_refs=module_refs,
     )
 
@@ -1599,7 +1603,7 @@ def run_maintenance(
     ephemeral: bool,
     run_id: str,
     main_tag: str,
-    plt_variants: list[str],
+    plt_overlays: list[str],
     stage_repo_key: str,
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
@@ -1613,7 +1617,7 @@ def run_maintenance(
     validate_env_compatibility(ctl_env, plt_env)
 
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
-    stage_refs = load_stage_refs_cfg(ctl_cfg_root, ctl_env)
+    stage_source_refs = load_stage_source_refs_cfg(ctl_cfg_root, ctl_env)
     module_refs = load_module_refs_cfg(ctl_cfg_root, ctl_env)
     if use_local_tooling_cfg:
         tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
@@ -1644,10 +1648,10 @@ def run_maintenance(
         plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
-        plt_variants,
+        plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
-        stage_refs=stage_refs,
+        stage_source_refs=stage_source_refs,
         module_refs=module_refs,
     )
 
@@ -1716,7 +1720,7 @@ def run_pipeline(
     ephemeral: bool,
     run_id: str,
     main_tag: str,
-    plt_variants: list[str],
+    plt_overlays: list[str],
     stage_repo_key: str,
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
@@ -1747,7 +1751,7 @@ def run_pipeline(
     )
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
 
-    stage_refs = load_stage_refs_cfg(ctl_cfg_root, ctl_env)
+    stage_source_refs = load_stage_source_refs_cfg(ctl_cfg_root, ctl_env)
     module_refs = load_module_refs_cfg(ctl_cfg_root, ctl_env)
     if use_local_tooling_cfg:
         tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
@@ -1766,10 +1770,10 @@ def run_pipeline(
         plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
-        plt_variants,
+        plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
-        stage_refs=stage_refs,
+        stage_source_refs=stage_source_refs,
         module_refs=module_refs,
     )
 

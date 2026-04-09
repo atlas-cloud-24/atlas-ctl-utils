@@ -14,7 +14,7 @@ from utils.common import (
     get_plt_cfg_source_dirs,
     load_yaml,
     merge_plt_cfg_dirs,
-    parse_variants_arg,
+    parse_overlays_arg,
     str2bool,
     validate_uuid7,
 )
@@ -87,11 +87,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--env-type", required=True)
     parser.add_argument(
-        "--variants",
+        "--overlays",
         required=False,
         default=[],
-        type=parse_variants_arg,
-        help="Optional comma-separated cfg variants under variants/.",
+        dest="overlays",
+        type=parse_overlays_arg,
+        help="Optional comma-separated cfg overlays under overlays/.",
     )
     parser.add_argument("--workflow", required=True)
     parser.add_argument("--origin-cfg", required=True)
@@ -121,7 +122,7 @@ def _resolve_workflow_file(repo_root: Path, env_type: str, inventory: str, workf
 
 
 @contextlib.contextmanager
-def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, skip_cfg_merge: bool):
+def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, skip_cfg_merge: bool):
     if skip_cfg_merge:
         yield origin_cfg
         return
@@ -132,7 +133,7 @@ def _prepare_merged(origin_cfg: str, env_type: str, variants: list[str] | None, 
             plt_cfg_root=Path(origin_cfg),
             plt_merged_dir=Path(tmp_cfg_dir),
             plt_cfg_source_dirs=source_dirs,
-            plt_variants=variants,
+            plt_overlays=overlays,
         )
         yield tmp_cfg_dir
 
@@ -162,14 +163,14 @@ def run_local_runner(stage_runner_script: str) -> None:
         "commit": None,
         "inventory": args.inventory,
         "env_type": args.env_type,
-        "variants": args.variants,
+        "overlays": args.overlays,
         "workflow": args.workflow,
         "active_stages": active_stage_ids,
         "origin_cfg": args.origin_cfg,
     }
     logging.info(json.dumps(manifest, indent=4))
 
-    with _prepare_merged(args.origin_cfg, args.env_type, args.variants, args.skip_cfg_merge) as source_for_resolve:
+    with _prepare_merged(args.origin_cfg, args.env_type, args.overlays, args.skip_cfg_merge) as source_for_resolve:
         merged_dir = "merged"
         if os.path.exists(merged_dir):
             shutil.rmtree(merged_dir)

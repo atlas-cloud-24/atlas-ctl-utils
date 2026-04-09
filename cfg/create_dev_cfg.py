@@ -132,11 +132,13 @@ def required_repo_entries(paths: list[Path]) -> set[str]:
         if not isinstance(inventory_cfg, dict):
             continue
 
-        stages_cfg = inventory_cfg.get("stages") or {}
-        if not isinstance(stages_cfg, dict):
+        stage_sources_cfg = inventory_cfg.get("stage_sources")
+        if stage_sources_cfg is None:
+            stage_sources_cfg = inventory_cfg.get("stages") or {}
+        if not isinstance(stage_sources_cfg, dict):
             continue
 
-        for stage_name, stage_cfg in stages_cfg.items():
+        for stage_name, stage_cfg in stage_sources_cfg.items():
             if not isinstance(stage_name, str) or not isinstance(stage_cfg, dict):
                 continue
 
@@ -293,12 +295,15 @@ def rewrite_inventory_file(path: Path, repo_map: dict[str, str]) -> int:
     if not isinstance(inventory_cfg, dict):
         raise ValueError(f"inventory YAML must contain a mapping: {path}")
 
-    stages_cfg = inventory_cfg.get("stages") or {}
-    if not isinstance(stages_cfg, dict):
-        raise ValueError(f"inventory YAML must contain a 'stages' mapping: {path}")
+    stage_sources_cfg = inventory_cfg.get("stage_sources")
+    if stage_sources_cfg is None:
+        stage_sources_cfg = inventory_cfg.pop("stages", {}) or {}
+    if not isinstance(stage_sources_cfg, dict):
+        raise ValueError(f"inventory YAML must contain a 'stage_sources' mapping: {path}")
+    inventory_cfg["stage_sources"] = stage_sources_cfg
 
     replacements = 0
-    for stage_name, stage_cfg in stages_cfg.items():
+    for stage_name, stage_cfg in stage_sources_cfg.items():
         if not isinstance(stage_cfg, dict):
             continue
 
