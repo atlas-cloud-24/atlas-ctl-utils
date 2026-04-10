@@ -60,9 +60,9 @@ def merge_values(base, overlay):
     return deepcopy(overlay)
 
 
-def iter_cfg_files(origin_cfg_dir: Path, cfg_keys: list[str]) -> list[Path]:
+def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
     files: list[Path] = []
-    for key in cfg_keys:
+    for key in cfg_files:
         if key == "*":
             files.extend(sorted(p for p in origin_cfg_dir.rglob("*") if p.is_file()))
             continue
@@ -213,10 +213,10 @@ class Resolver:
         return value
 
 
-def build_stage_values(origin_cfg_dir: Path, cfg_keys: list[str], env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
+def build_stage_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
     merged: dict = {}
     merged_files: list[str] = []
-    for cfg_file in iter_cfg_files(origin_cfg_dir, cfg_keys):
+    for cfg_file in iter_cfg_files(origin_cfg_dir, cfg_files):
         merged = merge_values(merged, load_yaml_mapping(cfg_file))
         merged_files.append(str(cfg_file))
 
@@ -253,20 +253,20 @@ def write_stage_env(path: Path, values: dict, values_json_path: Path | None) -> 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def parse_cfg_keys(raw: str) -> list[str]:
+def parse_cfg_files(raw: str) -> list[str]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"--cfg-keys must be valid JSON: {exc}") from exc
+        raise argparse.ArgumentTypeError(f"--cfg-files must be valid JSON: {exc}") from exc
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise argparse.ArgumentTypeError("--cfg-keys must be a JSON list of strings")
+        raise argparse.ArgumentTypeError("--cfg-files must be a JSON list of strings")
     return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--origin-cfg-dir", required=True)
-    parser.add_argument("--cfg-keys", required=True, type=parse_cfg_keys)
+    parser.add_argument("--cfg-files", required=True, type=parse_cfg_files)
     parser.add_argument("--values-json-out", required=True)
     parser.add_argument("--stage-env-out", required=True)
     parser.add_argument("--env-type", required=True)
@@ -280,7 +280,7 @@ def main() -> int:
     args = parser.parse_args()
 
     origin_cfg_dir = Path(args.origin_cfg_dir).resolve()
-    cfg_keys = args.cfg_keys
+    cfg_files = args.cfg_files
     values_json_out_arg = args.values_json_out
     stage_env_out_arg = args.stage_env_out
     values_json_out = None if values_json_out_arg == "-" else Path(values_json_out_arg).resolve()
@@ -292,7 +292,7 @@ def main() -> int:
         "run_id": args.run_id,
     }
 
-    stage_values, merged_files = build_stage_values(origin_cfg_dir, cfg_keys, env_ctx)
+    stage_values, merged_files = build_stage_values(origin_cfg_dir, cfg_files, env_ctx)
 
     if values_json_out is not None:
         values_json_out.parent.mkdir(parents=True, exist_ok=True)

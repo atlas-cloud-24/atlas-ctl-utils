@@ -1,6 +1,7 @@
 """Shared utilities for local and local_dev runners."""
 
 import argparse
+import collections
 import logging
 import logging.handlers
 import os
@@ -518,6 +519,12 @@ def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str)
                 f"{item_label} path must not contain '..': {item}"
             )
 
+    duplicates = [item for item, count in collections.Counter(raw).items() if count > 1]
+    if duplicates:
+        raise argparse.ArgumentTypeError(
+            f"{item_label} paths must be unique under {root_dir_name}/; duplicates: {', '.join(sorted(duplicates))}"
+        )
+
     return raw
 
 
@@ -609,7 +616,7 @@ def build_active_stages(
             "branch": branch,
             "commit": commit,
             "workflow": child_workflow,
-            "cfg_keys": cat.get("cfg_keys", []),
+            "cfg_files": cat.get("cfg_files", []),
         }
 
         if repo_key == "repo_path":
@@ -967,11 +974,26 @@ def validate_ctl_variant_meta(
     meta: dict,
     *,
     variant_label: str,
+    ctl_env: str,
+    plt_env: str,
     plt_overlays: list[str],
 ) -> None:
     """Validate ctl variant metadata against selected plt overlays."""
     if not isinstance(meta, dict):
         raise RuntimeError(f"❌ ctl variant '{variant_label}' meta.yaml must contain a mapping")
+
+    allowed_envs = _load_required_string_list(meta, "allowed_envs", variant_label)
+    if allowed_envs:
+        if ctl_env not in allowed_envs:
+            raise RuntimeError(
+                f"❌ ctl variant '{variant_label}' is not allowed for ctl env '{ctl_env}'; "
+                f"allowed_envs={allowed_envs}"
+            )
+        if plt_env not in allowed_envs:
+            raise RuntimeError(
+                f"❌ ctl variant '{variant_label}' is not allowed for plt env '{plt_env}'; "
+                f"allowed_envs={allowed_envs}"
+            )
 
     required_plt_overlays = _load_required_string_list(meta, "requires_plt_overlays", variant_label)
     if required_plt_overlays:
@@ -1110,6 +1132,8 @@ def apply_ctl_variants_to_workflow_cfg(
         validate_ctl_variant_meta(
             meta,
             variant_label=ctl_variant,
+            ctl_env=ctl_env,
+            plt_env=plt_env,
             plt_overlays=plt_overlays,
         )
 

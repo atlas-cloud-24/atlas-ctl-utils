@@ -46,7 +46,7 @@ def _build_active_stages(inventory, active_ids, repo_root: Path):
         active.append(
             {
                 "id": sid,
-                "cfg_keys": st.get("cfg_keys", []),
+                "cfg_files": st.get("cfg_files", []),
                 "runtime": {
                     "values_json": values_json,
                     "env_sh": env_sh,
@@ -188,7 +188,7 @@ def run_local_runner(stage_runner_script: str) -> None:
                 env["main_tag"] = args.main_tag
                 env["env_type"] = args.env_type
                 env["run_id"] = args.run_id
-                env["cfg_keys"] = json.dumps(stage.get("cfg_keys"))
+                env["cfg_files"] = json.dumps(stage.get("cfg_files"))
                 env["STAGE_WRITE_VALUES_JSON"] = "true" if stage.get("runtime", {}).get("values_json", True) else "false"
                 env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
                 env["origin_cfg_base_dir_path"] = merged_dir

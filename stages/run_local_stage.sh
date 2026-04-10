@@ -89,7 +89,7 @@ run_local_stage() {
     -e env_type \
     -e main_tag \
     -e stage_dir="$stage_dir" \
-    -e cfg_keys \
+    -e cfg_files \
     -e STAGE_WRITE_VALUES_JSON \
     -e STAGE_WRITE_ENV_SH \
     -e AWS_PROFILE="$AWS_PROFILE" \
