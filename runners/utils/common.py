@@ -717,6 +717,7 @@ def merge_config_dirs(
     source_log_roots: tuple[Path, ...] = (),
     dest_log_roots: tuple[Path, ...] = (),
     merged_files: dict[str, list[str]] | None = None,
+    skip_filenames: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Merge config directories in sequence using YAML-aware overlay semantics."""
     if clear_dest and os.path.exists(dest_dir):
@@ -733,6 +734,8 @@ def merge_config_dirs(
             os.makedirs(dest_root, exist_ok=True)
 
             for file in files:
+                if skip_filenames and file in skip_filenames:
+                    continue
                 src_file = os.path.join(root, file)
                 dest_file = os.path.join(dest_root, file)
 
@@ -961,11 +964,11 @@ def load_optional_yaml_mapping(path: Path) -> dict:
     return data
 
 
-def _load_required_string_list(meta: dict, key: str, variant_label: str) -> list[str]:
+def _load_meta_string_list(meta: dict, key: str, item_kind: str, item_label: str) -> list[str]:
     raw = meta.get(key) or []
     if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
         raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' meta key '{key}' must be a list of non-empty strings"
+            f"❌ {item_kind} '{item_label}' meta key '{key}' must be a list of non-empty strings"
         )
     return raw
 
@@ -982,7 +985,7 @@ def validate_ctl_variant_meta(
     if not isinstance(meta, dict):
         raise RuntimeError(f"❌ ctl variant '{variant_label}' meta.yaml must contain a mapping")
 
-    allowed_envs = _load_required_string_list(meta, "allowed_envs", variant_label)
+    allowed_envs = _load_meta_string_list(meta, "allowed_envs", "ctl variant", variant_label)
     if allowed_envs:
         if ctl_env not in allowed_envs:
             raise RuntimeError(
@@ -995,13 +998,53 @@ def validate_ctl_variant_meta(
                 f"allowed_envs={allowed_envs}"
             )
 
-    required_plt_overlays = _load_required_string_list(meta, "requires_plt_overlays", variant_label)
+    required_plt_overlays = _load_meta_string_list(meta, "requires_plt_overlays", "ctl variant", variant_label)
     if required_plt_overlays:
         missing = [overlay for overlay in required_plt_overlays if overlay not in plt_overlays]
         if missing:
             raise RuntimeError(
                 f"❌ ctl variant '{variant_label}' requires plt overlays {missing}, "
                 f"but selected plt overlays are {plt_overlays}"
+            )
+
+
+def get_overlay_dir(plt_cfg_root: Path, plt_overlay: str) -> Path:
+    """Resolve one selected overlay path under overlays/."""
+    overlays_root = get_overlay_root(plt_cfg_root)
+    overlay_root = (overlays_root / plt_overlay).resolve()
+    try:
+        overlay_root.relative_to(overlays_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Overlay path escapes overlays/: {plt_overlay}") from exc
+    if not overlay_root.exists():
+        raise RuntimeError(f"Overlay path not found: {overlay_root}")
+    if not overlay_root.is_dir():
+        raise RuntimeError(f"Overlay path must be a directory: {overlay_root}")
+    return overlay_root
+
+
+def validate_overlay_meta(
+    meta: dict,
+    *,
+    overlay_label: str,
+    ctl_env: str,
+    plt_env: str,
+) -> None:
+    """Validate plt overlay metadata against selected envs."""
+    if not isinstance(meta, dict):
+        raise RuntimeError(f"❌ plt overlay '{overlay_label}' meta.yaml must contain a mapping")
+
+    allowed_envs = _load_meta_string_list(meta, "allowed_envs", "plt overlay", overlay_label)
+    if allowed_envs:
+        if ctl_env not in allowed_envs:
+            raise RuntimeError(
+                f"❌ plt overlay '{overlay_label}' is not allowed for ctl env '{ctl_env}'; "
+                f"allowed_envs={allowed_envs}"
+            )
+        if plt_env not in allowed_envs:
+            raise RuntimeError(
+                f"❌ plt overlay '{overlay_label}' is not allowed for plt env '{plt_env}'; "
+                f"allowed_envs={allowed_envs}"
             )
 
 
@@ -1471,6 +1514,9 @@ def get_overlay_source_dirs(
     plt_cfg_root: Path,
     plt_cfg_source_dirs: list[str],
     plt_overlays: list[str],
+    *,
+    ctl_env: str,
+    plt_env: str,
 ) -> list[str]:
     """Return absolute overlay source dirs selected by --plt-overlays.
 
@@ -1482,7 +1528,6 @@ def get_overlay_source_dirs(
     if not plt_overlays:
         return []
 
-    overlays_root = get_overlay_root(plt_cfg_root)
     env_root = (plt_cfg_root / "env").resolve()
     layer_rels: list[Path] = []
     seen_layer_rels: set[Path] = set()
@@ -1504,16 +1549,15 @@ def get_overlay_source_dirs(
             continue
         seen.add(rel)
 
-        rel_path = Path(rel)
-        src = (overlays_root / rel_path).resolve()
-        try:
-            src.relative_to(overlays_root)
-        except ValueError as exc:
-            raise RuntimeError(f"Overlay path escapes overlays/: {rel}") from exc
-        if not src.exists():
-            raise RuntimeError(f"Overlay path not found: {src}")
-        if not src.is_dir():
-            raise RuntimeError(f"Overlay path must be a directory: {src}")
+        src = get_overlay_dir(plt_cfg_root, rel)
+        meta = load_optional_yaml_mapping(src / "meta.yaml")
+        if meta:
+            validate_overlay_meta(
+                meta,
+                overlay_label=rel,
+                ctl_env=ctl_env,
+                plt_env=plt_env,
+            )
 
         layered_dirs: list[str] = []
         for layer_rel in layer_rels:
@@ -1534,6 +1578,8 @@ def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
     plt_cfg_source_dirs: list[str],
+    ctl_env: str,
+    plt_env: str,
     plt_overlays: list[str] | None = None,
     *,
     source_log_roots: tuple[Path, ...] | None = None,
@@ -1564,6 +1610,8 @@ def merge_plt_cfg_dirs(
         plt_cfg_root,
         plt_cfg_source_dirs,
         plt_overlays or [],
+        ctl_env=ctl_env,
+        plt_env=plt_env,
     )
     if overlay_dirs:
         logging.info(f"Merging overlay dirs to {plt_merged_dir}: {overlay_dirs}")
@@ -1574,6 +1622,7 @@ def merge_plt_cfg_dirs(
             source_log_roots=source_log_roots,
             dest_log_roots=dest_log_roots,
             merged_files=merged_files,
+            skip_filenames={"meta.yaml"},
         )
 
     return merged_files
@@ -1586,6 +1635,8 @@ def prepare_pipeline_cfg(
     plt_merged_dir: Path,
     plt_cfg_source_dirs: list[str],
     artifacts_dir: Path,
+    ctl_env: str,
+    plt_env: str,
     plt_overlays: list[str],
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
@@ -1605,6 +1656,8 @@ def prepare_pipeline_cfg(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
         plt_cfg_source_dirs=plt_cfg_source_dirs,
+        ctl_env=ctl_env,
+        plt_env=plt_env,
         plt_overlays=plt_overlays,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
@@ -2001,6 +2054,8 @@ def run_maintenance(
         plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
+        ctl_env,
+        plt_env,
         plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
@@ -2134,6 +2189,8 @@ def run_pipeline(
         plt_merged_dir,
         plt_cfg_source_dirs,
         artifacts_dir,
+        ctl_env,
+        plt_env,
         plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,

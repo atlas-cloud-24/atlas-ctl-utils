@@ -60,7 +60,21 @@ def merge_values(base, overlay):
     return deepcopy(overlay)
 
 
+def resolve_cfg_path(origin_cfg_dir: Path, key: str) -> Path:
+    key_path = Path(key)
+    if key_path.is_absolute():
+        raise RuntimeError(f"cfg path must be relative to the stage cfg root: {key}")
+
+    resolved = (origin_cfg_dir / key_path).resolve()
+    try:
+        resolved.relative_to(origin_cfg_dir)
+    except ValueError as exc:
+        raise RuntimeError(f"cfg path escapes the stage cfg root: {key}") from exc
+    return resolved
+
+
 def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
+    origin_cfg_dir = origin_cfg_dir.resolve()
     files: list[Path] = []
     for key in cfg_files:
         if key == "*":
@@ -68,13 +82,13 @@ def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
             continue
 
         if key.endswith("/*"):
-            dir_path = origin_cfg_dir / key[:-2]
+            dir_path = resolve_cfg_path(origin_cfg_dir, key[:-2])
             if not dir_path.is_dir():
-                continue
+                raise RuntimeError(f"cfg directory not found for wildcard slice '{key}': {dir_path}")
             files.extend(sorted(p for p in dir_path.rglob("*") if p.is_file()))
             continue
 
-        file_path = origin_cfg_dir / key
+        file_path = resolve_cfg_path(origin_cfg_dir, key)
         if not file_path.is_file():
             raise RuntimeError(f"cfg file not found: {file_path}")
         files.append(file_path)
@@ -142,12 +156,16 @@ class Resolver:
 
     @staticmethod
     def parse_default(raw: str):
+        if raw.strip() == "":
+            raise RuntimeError("empty cfg interpolation fallback is not allowed")
         if raw == "null":
             return None
         if raw == "true":
             return True
         if raw == "false":
             return False
+        if raw.startswith("{") or raw.startswith("["):
+            return json.loads(raw)
         if re.fullmatch(r"-?\d+", raw):
             return int(raw)
         if re.fullmatch(r"-?\d+\.\d+", raw):
@@ -162,7 +180,9 @@ class Resolver:
             looked_up = self.lookup(var_name)
             if looked_up is OMIT and default_raw is not None:
                 return self.parse_default(default_raw)
-            return OMIT if looked_up is OMIT else looked_up
+            if looked_up is OMIT:
+                raise RuntimeError(f"missing cfg interpolation reference: {var_name}")
+            return looked_up
 
         def replace(match: re.Match[str]) -> str:
             var_name = match.group(1)
@@ -194,7 +214,7 @@ class Resolver:
             for item in value:
                 item_value = self.resolve_value(item)
                 if item_value is OMIT:
-                    continue
+                    raise RuntimeError("unexpected unresolved cfg list item")
                 resolved.append(item_value)
             return resolved
 
@@ -203,10 +223,10 @@ class Resolver:
             for key, item in value.items():
                 item_value = self.resolve_value(item)
                 if item_value is OMIT:
-                    continue
+                    raise RuntimeError(f"unexpected unresolved cfg value for key: {key}")
                 resolved_key = self.resolve_string(key) if isinstance(key, str) else key
                 if resolved_key is OMIT:
-                    continue
+                    raise RuntimeError(f"unexpected unresolved cfg key: {key}")
                 resolved[resolved_key] = item_value
             return resolved
 
