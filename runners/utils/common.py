@@ -9,11 +9,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import yaml
 
@@ -188,7 +189,17 @@ def validate_uuid7(v: str) -> str:
 
 def load_yaml(path: Path):
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = f.read()
+
+    if not raw.strip():
+        return {}
+
+    data = yaml.load(raw, Loader=UniqueKeySafeLoader)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ YAML file must contain a mapping: {path}")
+    return data
 
 
 def format_path_for_log(path: str | Path, relative_roots: tuple[Path, ...] = ()) -> str:
@@ -417,36 +428,51 @@ def validate_tooling_refs_have_commits(tooling_refs: dict, ctl_env: str) -> None
 
 def git_clone(repo_url: str, branch: str | None, commit: str | None, dest: Path, token: str | None = None):
     env = os.environ.copy()
-    url = repo_url
-    log_url = repo_url
+    askpass_path: str | None = None
     if token:
-        url = repo_url.replace(
-            "https://github.com/",
-            f"https://x-access-token:{quote(token, safe='')}@github.com/",
-        )
-        log_url = repo_url.replace(
-            "https://github.com/",
-            "https://x-access-token:***@github.com/",
-        )
+        fd, askpass_path = tempfile.mkstemp(suffix=".sh")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    "case \"$1\" in\n"
+                    "  *Username*) printf '%s\\n' \"${GIT_HTTP_USERNAME:-x-access-token}\" ;;\n"
+                    "  *Password*) printf '%s\\n' \"${GIT_HTTP_PASSWORD:-}\" ;;\n"
+                    "  *) printf '\\n' ;;\n"
+                    "esac\n"
+                )
+            os.chmod(askpass_path, 0o700)
+        except Exception:
+            os.unlink(askpass_path)
+            raise
 
-    # commit pinned → checkout exact commit
-    if commit:
-        cmd = ["git", "clone", url, str(dest)]
-        logging.info(f"Running command: git clone {log_url} {dest}")
+        env["GIT_ASKPASS"] = askpass_path
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_HTTP_USERNAME"] = "x-access-token"
+        env["GIT_HTTP_PASSWORD"] = token
+
+    try:
+        # commit pinned → checkout exact commit
+        if commit:
+            cmd = ["git", "clone", repo_url, str(dest)]
+            logging.info(f"Running command: git clone {repo_url} {dest}")
+            run_and_log(cmd, env=env)
+
+            cmd = f"git checkout {commit}"
+            logging.info(f"Running command: {cmd}")
+            run_and_log(cmd.split(), cwd=dest, env=env)
+            return
+
+        # no commit → use branch HEAD
+        if not branch:
+            raise RuntimeError(f"❌ Either branch or commit must be provided for repo {repo_url}")
+
+        cmd = ["git", "clone", "--branch", branch, "--depth", "1", repo_url, str(dest)]
+        logging.info(f"Running command: git clone --branch {branch} --depth 1 {repo_url} {dest}")
         run_and_log(cmd, env=env)
-
-        cmd = f"git checkout {commit}"
-        logging.info(f"Running command: {cmd}")
-        run_and_log(cmd.split(), cwd=dest, env=env)
-        return
-
-    # no commit → use branch HEAD
-    if not branch:
-        raise RuntimeError(f"❌ Either branch or commit must be provided for repo {repo_url}")
-
-    cmd = ["git", "clone", "--branch", branch, "--depth", "1", url, str(dest)]
-    logging.info(f"Running command: git clone --branch {branch} --depth 1 {log_url} {dest}")
-    run_and_log(cmd, env=env)
+    finally:
+        if askpass_path:
+            os.unlink(askpass_path)
 
 
 def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
