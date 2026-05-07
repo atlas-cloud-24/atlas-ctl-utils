@@ -137,13 +137,13 @@ echo "------------------------------------------------------"
 
 echo "=== 🚚 Copying bin ==="
 mkdir -p "$src_repo_path/bin"
-cp -r "$plt_utils_repo_path/bin" "$src_repo_path"
+cp -a "$plt_utils_repo_path/bin/." "$src_repo_path/bin/"
 echo "✅ bin copied"
 echo "------------------------------------------------------"
 
 echo "=== 📚 Copying lib ==="
 mkdir -p "$src_repo_path/lib"
-cp -r "$plt_utils_repo_path/lib" "$src_repo_path"
+cp -a "$plt_utils_repo_path/lib/." "$src_repo_path/lib/"
 echo "✅ lib copied"
 echo "------------------------------------------------------"
 
