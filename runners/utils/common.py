@@ -22,12 +22,12 @@ from utils.git_meta import write_git_meta_to_file
 
 # Environment trust hierarchy: higher value = higher trust/security requirements
 # Control plane must have equal or higher trust than target platform
-ENV_TRUST = {"dev": 0, "test": 1, "staging": 2, "prod": 3}
+ENV_TRUST = {"dev": 0, "test": 1, "stg": 2, "prod": 3}
 
 # Environment groupings
 ENVS_ALL = tuple(ENV_TRUST.keys())
 ENVS_DEV_TEST = ("dev", "test")
-ENVS_STAGING_PROD = ("staging", "prod")
+ENVS_STG_PROD = ("stg", "prod")
 REQUIRED_TOOLING_REFS = ("atlas-ctl-utils", "atlas-plt-utils")
 LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
 TOOLING_ENV_PREFIXES = {
@@ -310,9 +310,9 @@ def validate_env_compatibility(ctl_env: str, plt_env: str) -> None:
 
 def validate_ephemeral(ctl_env: str, ephemeral: bool) -> None:
     """Validate ephemeral flag against ctl_env."""
-    if ctl_env in ENVS_STAGING_PROD and ephemeral:
+    if ctl_env in ENVS_STG_PROD and ephemeral:
         raise RuntimeError(
-            f"❌ For env-type in {ENVS_STAGING_PROD}, only --ephemeral=false is allowed"
+            f"❌ For env-type in {ENVS_STG_PROD}, only --ephemeral=false is allowed"
         )
 
 
@@ -343,7 +343,7 @@ def validate_stages_have_commits(active_stages: dict, ctl_env: str) -> None:
     For prod environments, using branch references is not allowed. Validation runs
     after workflow overrides and env refs have been resolved into active stages.
     """
-    if ctl_env not in ENVS_STAGING_PROD:
+    if ctl_env not in ENVS_STG_PROD:
         return
 
     stages_without_commit = []
@@ -368,9 +368,9 @@ def validate_stages_have_commits(active_stages: dict, ctl_env: str) -> None:
         if modules_without_commit:
             details.append(f"Modules missing 'commit': {modules_without_commit}")
         raise RuntimeError(
-            f"❌ For {ENVS_STAGING_PROD} environments, all stages and modules must have explicit 'commit' specified.\n"
+            f"❌ For {ENVS_STG_PROD} environments, all stages and modules must have explicit 'commit' specified.\n"
             f"   {'; '.join(details)}\n"
-            f"   Using branch references is not allowed in {ENVS_STAGING_PROD} for reproducibility."
+            f"   Using branch references is not allowed in {ENVS_STG_PROD} for reproducibility."
         )
 
 def validate_cfg_refs_have_commits(
@@ -381,9 +381,9 @@ def validate_cfg_refs_have_commits(
     plt_cfg_commit: str | None,
 ) -> None:
     """
-    Validate that cfg repos use commits (not branches) for staging/prod environments.
+    Validate that cfg repos use commits (not branches) for stg/prod environments.
     """
-    if ctl_env not in ENVS_STAGING_PROD:
+    if ctl_env not in ENVS_STG_PROD:
         return
 
     errors = []
@@ -394,14 +394,14 @@ def validate_cfg_refs_have_commits(
 
     if errors:
         raise RuntimeError(
-            f"❌ For {ENVS_STAGING_PROD} environments, cfg repos must use @commit=sha (not @branch=name).\n"
+            f"❌ For {ENVS_STG_PROD} environments, cfg repos must use @commit=sha (not @branch=name).\n"
             f"   {'; '.join(errors)}"
         )
 
 
 def validate_tooling_refs_have_commits(tooling_refs: dict, ctl_env: str) -> None:
-    """Validate that tooling refs use commits (not branches) for staging/prod environments."""
-    if ctl_env not in ENVS_STAGING_PROD:
+    """Validate that tooling refs use commits (not branches) for stg/prod environments."""
+    if ctl_env not in ENVS_STG_PROD:
         return
 
     errors = []
@@ -421,7 +421,7 @@ def validate_tooling_refs_have_commits(tooling_refs: dict, ctl_env: str) -> None
 
     if errors:
         raise RuntimeError(
-            f"❌ For {ENVS_STAGING_PROD} environments, tooling refs must use explicit commits.\n"
+            f"❌ For {ENVS_STG_PROD} environments, tooling refs must use explicit commits.\n"
             f"   {'; '.join(errors)}"
         )
 
@@ -822,7 +822,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--ctl-env",
         required=True,
         choices=list(ENV_TRUST.keys()),
-        help="Ctl environment type (e.g. dev|test|staging|prod)",
+        help="Ctl environment type (e.g. dev|test|stg|prod)",
     )
     parser.add_argument(
         "--action",
@@ -861,7 +861,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--plt-env",
         required=True,
         choices=list(ENV_TRUST.keys()),
-        help="Plt environment type (e.g. dev|test|staging|prod)",
+        help="Plt environment type (e.g. dev|test|stg|prod)",
     )
     parser.add_argument(
         "--run-id",
@@ -2224,7 +2224,7 @@ def run_pipeline(
         module_refs=module_refs,
     )
 
-    # Validate stages have commits for staging/prod
+    # Validate stages have commits for stg/prod
     validate_stages_have_commits(active_stages, ctl_env)
 
     write_target_stage_flow_artifact(
