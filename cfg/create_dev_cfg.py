@@ -6,7 +6,7 @@ The source cfg can be either:
 - an HTTP/HTTPS git URL, optionally with `@branch=...`, `@tag=...`, or `@commit=...`
 
 The script copies the source cfg into a target directory, rewrites
-`inventory/*.yaml` so each stage source uses `repo_path` instead of `repo_url`,
+`stage_sources.yaml` so each stage source uses `repo_path` instead of `repo_url`,
 removes ineffective `branch` keys from workflow YAMLs, writes local tooling
 repo paths to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
-            "inventory stage source repo_url values to repo_path using a JSON file "
+            "stage_sources.yaml repo_url values to repo_path using a JSON file "
             "with stage-source-to-path mappings and optional tooling repo-to-path mappings."
         )
     )
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         dest="repo_map_file",
         help=(
-            "Path to a JSON file with stage-to-path mappings and optional tooling "
+            "Path to a JSON file with stage-source-to-path mappings and optional tooling "
             "repo-to-path mappings. Matching tooling entries from source refs are "
             "written to local_repos.yaml as local repo paths."
         ),
@@ -112,8 +112,11 @@ def load_repo_map(repo_map_file: str) -> dict[str, str]:
     return load_path_map(repo_map_file, map_label="repo_map_file")
 
 
-def inventory_files(root_dir: Path) -> list[Path]:
-    return sorted((root_dir / "inventory").glob("*.yaml"))
+def stage_sources_files(root_dir: Path) -> list[Path]:
+    # Only stage_sources.yaml carries repo_url/modules to rewrite; per-action
+    # targets/*.yaml reference sources by name and have nothing to rewrite.
+    sources_path = root_dir / "stage_sources.yaml"
+    return [sources_path] if sources_path.is_file() else []
 
 
 def workflow_files(root_dir: Path) -> list[Path]:
@@ -132,13 +135,13 @@ def required_repo_entries(paths: list[Path]) -> set[str]:
     repo_entries: set[str] = set()
 
     for path in paths:
-        inventory_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not isinstance(inventory_cfg, dict):
+        sources_doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(sources_doc, dict):
             continue
 
-        stage_sources_cfg = inventory_cfg.get("stage_sources")
+        stage_sources_cfg = sources_doc.get("stage_sources")
         if stage_sources_cfg is None:
-            stage_sources_cfg = inventory_cfg.get("stages") or {}
+            stage_sources_cfg = sources_doc.get("stages") or {}
         if not isinstance(stage_sources_cfg, dict):
             continue
 
@@ -255,8 +258,8 @@ def validate_source_dir(source_dir: Path) -> None:
     if not source_dir.is_dir():
         raise ValueError(f"source cfg directory not found: {source_dir}")
 
-    if not inventory_files(source_dir):
-        raise ValueError(f"source cfg has no inventory YAML files: {source_dir}")
+    if not stage_sources_files(source_dir):
+        raise ValueError(f"source cfg has no stage_sources.yaml file: {source_dir}")
 
 
 def validate_target_dir(source_dir: Path, target_dir: Path) -> None:
@@ -294,17 +297,17 @@ def line_ending_for(line: str) -> str:
     return ""
 
 
-def rewrite_inventory_file(path: Path, repo_map: dict[str, str]) -> int:
-    inventory_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(inventory_cfg, dict):
-        raise ValueError(f"inventory YAML must contain a mapping: {path}")
+def rewrite_stage_sources_file(path: Path, repo_map: dict[str, str]) -> int:
+    sources_doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(sources_doc, dict):
+        raise ValueError(f"stage_sources YAML must contain a mapping: {path}")
 
-    stage_sources_cfg = inventory_cfg.get("stage_sources")
+    stage_sources_cfg = sources_doc.get("stage_sources")
     if stage_sources_cfg is None:
-        stage_sources_cfg = inventory_cfg.pop("stages", {}) or {}
+        stage_sources_cfg = sources_doc.pop("stages", {}) or {}
     if not isinstance(stage_sources_cfg, dict):
-        raise ValueError(f"inventory YAML must contain a 'stage_sources' mapping: {path}")
-    inventory_cfg["stage_sources"] = stage_sources_cfg
+        raise ValueError(f"stage_sources YAML must contain a 'stage_sources' mapping: {path}")
+    sources_doc["stage_sources"] = stage_sources_cfg
 
     replacements = 0
     for stage_name, stage_cfg in stage_sources_cfg.items():
@@ -328,16 +331,16 @@ def rewrite_inventory_file(path: Path, repo_map: dict[str, str]) -> int:
                 del module_cfg["repo_url"]
                 replacements += 1
 
-    path.write_text(yaml.safe_dump(inventory_cfg, sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(sources_doc, sort_keys=False), encoding="utf-8")
     return replacements
 
 
-def rewrite_inventory(root_dir: Path, repo_map: dict[str, str]) -> list[Path]:
+def rewrite_stage_sources(root_dir: Path, repo_map: dict[str, str]) -> list[Path]:
     rewritten_paths: list[Path] = []
 
-    for inventory_path in inventory_files(root_dir):
-        if rewrite_inventory_file(inventory_path, repo_map):
-            rewritten_paths.append(inventory_path)
+    for sources_path in stage_sources_files(root_dir):
+        if rewrite_stage_sources_file(sources_path, repo_map):
+            rewritten_paths.append(sources_path)
 
     return rewritten_paths
 
@@ -416,9 +419,9 @@ def main() -> int:
             validate_source_dir(source_dir)
             validate_target_dir(source_dir, target_dir)
 
-            source_inventory = inventory_files(source_dir)
+            source_stage_sources = stage_sources_files(source_dir)
             source_refs = refs_files(source_dir)
-            required_repo_names = required_repo_entries(source_inventory)
+            required_repo_names = required_repo_entries(source_stage_sources)
             required_tooling_names = required_tooling(source_refs)
 
             repo_map = {
@@ -435,13 +438,13 @@ def main() -> int:
             missing = sorted(required_repo_names - set(repo_map))
             if missing:
                 raise ValueError(
-                    "missing repo paths for inventory repos: " + ", ".join(missing)
+                    "missing repo paths for stage_sources repos: " + ", ".join(missing)
                 )
 
             warn_about_extra_mappings(repo_map, required_repo_names, "repo")
             warn_about_extra_mappings(tooling_map, required_tooling_names, "tooling")
             copy_source_tree(source_dir, target_dir, args.force)
-            rewritten_paths = rewrite_inventory(target_dir, repo_map)
+            rewritten_paths = rewrite_stage_sources(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
             local_tooling_path = write_local_tooling_file(target_dir, tooling_map)
             removed_refs_dir = remove_refs_dir(target_dir)
@@ -456,7 +459,7 @@ def main() -> int:
     print(f"source cfg: {source_dir}")
     print(f"created dev config: {target_dir}")
     for path in rewritten_paths:
-        print(f"rewrote inventory: {path}")
+        print(f"rewrote stage_sources: {path}")
     for path in rewritten_workflows:
         print(f"rewrote workflow: {path}")
     if local_tooling_path is not None:

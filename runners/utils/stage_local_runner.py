@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/envdef python3
 import argparse
 import contextlib
 import json
@@ -92,9 +92,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         dest="overlays",
         type=parse_overlays_arg,
-        help="Optional comma-separated cfg overlays under overlays/.",
+        help="Optional comma-separated cfg overlays under env/overlays/.",
     )
     parser.add_argument("--workflow", required=True)
+    parser.add_argument(
+        "--cfg-root",
+        default="/env",
+        help="Scoped cfg root to use when merging origin cfg locally. Use /env, /org, /bootstrap, or /.",
+    )
     parser.add_argument("--origin-cfg", required=True)
     parser.add_argument("--ephemeral", required=True, type=str2bool)
     parser.add_argument(
@@ -121,23 +126,55 @@ def _resolve_workflow_file(repo_root: Path, env_type: str, inventory: str, workf
     sys.exit(1)
 
 
+def _normalize_cfg_root(raw_value: str) -> str:
+    value = raw_value if raw_value is not None else "/env"
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("cfg-root must be a non-empty string")
+
+    value = value.strip()
+    if "\\" in value:
+        raise RuntimeError(f"cfg-root must use forward slashes: {value}")
+    if not value.startswith("/"):
+        raise RuntimeError(f"cfg-root must start with /: {value}")
+
+    parts = [part for part in value.split("/") if part]
+    if any(part in (".", "..") for part in parts):
+        raise RuntimeError(f"cfg-root must not contain . or ..: {value}")
+
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _resolve_cfg_root(merged_root: Path, cfg_root: str) -> Path:
+    normalized = _normalize_cfg_root(cfg_root)
+    rel = normalized.lstrip("/")
+    scoped = (merged_root / rel).resolve() if rel else merged_root.resolve()
+    try:
+        scoped.relative_to(merged_root.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"cfg-root escapes merged cfg: {normalized}") from exc
+    if not scoped.is_dir():
+        raise RuntimeError(f"cfg-root not found in merged cfg: {normalized} ({scoped})")
+    return scoped
+
+
 @contextlib.contextmanager
-def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, skip_cfg_merge: bool):
+def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, skip_cfg_merge: bool, cfg_root: str):
     if skip_cfg_merge:
         yield origin_cfg
         return
 
     with tempfile.TemporaryDirectory() as tmp_cfg_dir:
+        merged_root = Path(tmp_cfg_dir)
         source_dirs = get_plt_cfg_source_dirs(Path(origin_cfg), env_type)
         merge_plt_cfg_dirs(
             plt_cfg_root=Path(origin_cfg),
-            plt_merged_dir=Path(tmp_cfg_dir),
+            plt_merged_dir=merged_root,
             plt_cfg_source_dirs=source_dirs,
             ctl_env=env_type,
             plt_env=env_type,
             plt_overlays=overlays,
         )
-        yield tmp_cfg_dir
+        yield str(_resolve_cfg_root(merged_root, cfg_root))
 
 
 def run_local_runner(stage_runner_script: str) -> None:
@@ -169,10 +206,11 @@ def run_local_runner(stage_runner_script: str) -> None:
         "workflow": args.workflow,
         "active_stages": active_stage_ids,
         "origin_cfg": args.origin_cfg,
+        "cfg_root": args.cfg_root,
     }
     logging.info(json.dumps(manifest, indent=4))
 
-    with _prepare_merged(args.origin_cfg, args.env_type, args.overlays, args.skip_cfg_merge) as source_for_resolve:
+    with _prepare_merged(args.origin_cfg, args.env_type, args.overlays, args.skip_cfg_merge, args.cfg_root) as source_for_resolve:
         merged_dir = "merged"
         if os.path.exists(merged_dir):
             shutil.rmtree(merged_dir)

@@ -327,8 +327,8 @@ def validate_action_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ --ctl-variants is supported only for --action=pipeline")
     if not args.maintenance_action:
         raise RuntimeError("❌ --maintenance-action is required for --action=maintenance")
-    if not args.stage_source:
-        raise RuntimeError("❌ --stage-source is required for --action=maintenance")
+    if not args.stage_target:
+        raise RuntimeError("❌ --stage-target is required for --action=maintenance")
     if args.maintenance_action == "force-unlock" and not args.lock_id:
         raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
 
@@ -555,10 +555,10 @@ def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str)
 
 
 def parse_overlays_arg(value: str) -> list[str]:
-    """Parse comma-separated overlay paths under overlays/."""
+    """Parse comma-separated overlay paths under env/overlays/."""
     return parse_relative_paths_arg(
         value,
-        root_dir_name="overlays",
+        root_dir_name="env/overlays",
         item_label="Overlay",
     )
 
@@ -583,39 +583,71 @@ def build_active_stages(
     if not isinstance(inventory_stage_sources, dict):
         raise RuntimeError("'stage_sources' in inventory must be a mapping: source -> meta")
 
+    inventory_stage_targets = inventory_cfg.get("stage_targets", {})
+    if not isinstance(inventory_stage_targets, dict):
+        raise RuntimeError("'stage_targets' in inventory must be a mapping: target -> meta")
+
     stage_source_refs = stage_source_refs or {}
     module_refs = module_refs or {}
     active = {}
 
+    def normalize_cfg_root(raw_value, *, stage_target: str) -> str:
+        value = raw_value if raw_value is not None else "/"
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must be a non-empty string")
+        value = value.strip()
+        if "\\" in value:
+            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must use forward slashes: {value}")
+        if not value.startswith("/"):
+            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must start with /: {value}")
+        parts = [part for part in value.split("/") if part]
+        if any(part in (".", "..") for part in parts):
+            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must not contain . or ..: {value}")
+        return "/" + "/".join(parts) if parts else "/"
+
     for st in workflow_cfg.get("stages", []):
         if isinstance(st, str):
             stage_id = st
-            stage_source = st
+            stage_target = st
             stage_over = {}
         else:
             stage_id = st.get("id")
             if not stage_id:
                 raise RuntimeError("Stage entry missing required field 'id'")
-            stage_source = st.get("source")
-            if not stage_source:
-                raise RuntimeError(f"Stage '{stage_id}' has empty 'source'")
+            stage_target = st.get("target")
+            if not stage_target:
+                raise RuntimeError(f"Stage {stage_id!r} has empty 'target'")
             stage_over = st
 
-        if stage_source not in inventory_stage_sources:
+        if stage_target not in inventory_stage_targets:
             raise RuntimeError(
-                f"Stage source '{stage_source}' (stage id='{stage_id}') not found in inventory '{workflow_cfg.get('inventory')}'"
+                f"Stage target {stage_target!r} (stage id={stage_id!r}) not found in inventory {workflow_cfg.get('inventory')!r}"
             )
 
-        cat = inventory_stage_sources[stage_source]
-        if not isinstance(cat, dict):
+        target_cfg = inventory_stage_targets[stage_target]
+        if not isinstance(target_cfg, dict):
             raise RuntimeError(
-                f"Stage source '{stage_source}' metadata must be a mapping, got: {type(cat).__name__}"
+                f"Stage target {stage_target!r} metadata must be a mapping, got: {type(target_cfg).__name__}"
+            )
+
+        stage_source = target_cfg.get("source")
+        if not isinstance(stage_source, str) or not stage_source:
+            raise RuntimeError(f"Stage target {stage_target!r} must define non-empty 'source'")
+        if stage_source not in inventory_stage_sources:
+            raise RuntimeError(
+                f"Stage target {stage_target!r} references missing source {stage_source!r} in inventory {workflow_cfg.get('inventory')!r}"
+            )
+
+        source_cfg = inventory_stage_sources[stage_source]
+        if not isinstance(source_cfg, dict):
+            raise RuntimeError(
+                f"Stage source {stage_source!r} metadata must be a mapping, got: {type(source_cfg).__name__}"
             )
 
         stage_ref = stage_source_refs.get(stage_source) or {}
         if not isinstance(stage_ref, dict):
             raise RuntimeError(
-                f"Stage source refs for '{stage_source}' must be a mapping, got: {type(stage_ref).__name__}"
+                f"Stage source refs for {stage_source!r} must be a mapping, got: {type(stage_ref).__name__}"
             )
 
         branch = stage_over.get("branch") or stage_ref.get("branch")
@@ -624,90 +656,98 @@ def build_active_stages(
 
         if branch and commit:
             raise RuntimeError(
-                f"Stage '{stage_id}' resolved both branch='{branch}' and commit='{commit}'. "
+                f"Stage {stage_id!r} resolved both branch={branch!r} and commit={commit!r}. "
                 "Only one ref type may be set."
             )
 
         if require_branch_or_commit and not branch and not commit:
-            raise RuntimeError(f"Stage '{stage_id}' has neither branch nor commit configured")
+            raise RuntimeError(f"Stage {stage_id!r} source {stage_source!r} has neither branch nor commit configured")
 
-        repo_value = cat.get(repo_key)
+        repo_value = source_cfg.get(repo_key)
         if not repo_value:
             raise RuntimeError(
-                f"Stage '{stage_id}' (source='{stage_source}') missing '{repo_key}' in inventory '{workflow_cfg.get('inventory')}'"
+                f"Stage {stage_id!r} (target={stage_target!r}, source={stage_source!r}) missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
             )
 
+        cfg_files = target_cfg.get("cfg_files", [])
+        if cfg_files is None:
+            cfg_files = []
+        if not isinstance(cfg_files, list):
+            raise RuntimeError(f"Stage target {stage_target!r} cfg_files must be a list")
+
         active_stage = {
+            "target": stage_target,
             "source": stage_source,
             "branch": branch,
             "commit": commit,
             "workflow": child_workflow,
-            "cfg_files": cat.get("cfg_files", []),
+            "cfg_root": normalize_cfg_root(target_cfg.get("cfg_root", "/"), stage_target=stage_target),
+            "cfg_files": cfg_files,
         }
 
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
             if not repo_path.is_absolute():
                 raise RuntimeError(
-                    f"Stage '{stage_id}' repo_path must be absolute, got: {repo_value}"
+                    f"Stage {stage_id!r} source {stage_source!r} repo_path must be absolute, got: {repo_value}"
                 )
             active_stage["repo_path"] = str(repo_path.resolve())
         else:
             active_stage["repo_url"] = repo_value
-            active_stage["token_type"] = cat.get("token_type")
+            active_stage["token_type"] = source_cfg.get("token_type")
 
-        raw_modules = cat.get("modules") or {}
+        raw_modules = source_cfg.get("modules") or {}
         if raw_modules and not isinstance(raw_modules, dict):
             raise RuntimeError(
-                f"Stage '{stage_id}' modules must be a mapping, got: {type(raw_modules).__name__}"
+                f"Stage {stage_id!r} source {stage_source!r} modules must be a mapping, got: {type(raw_modules).__name__}"
             )
 
         resolved_modules = {}
         for module_name, module_meta in raw_modules.items():
             if not isinstance(module_name, str):
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module names must be strings, got: {type(module_name).__name__}"
+                    f"Stage {stage_id!r} module names must be strings, got: {type(module_name).__name__}"
                 )
             if module_meta is None:
                 module_meta = {}
             if not isinstance(module_meta, dict):
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' metadata must be a mapping, got: {type(module_meta).__name__}"
+                    f"Stage {stage_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
                 )
 
             module_ref = module_refs.get(module_name) or {}
             if not isinstance(module_ref, dict):
                 raise RuntimeError(
-                    f"Module refs for '{module_name}' must be a mapping, got: {type(module_ref).__name__}"
+                    f"Module refs for {module_name!r} must be a mapping, got: {type(module_ref).__name__}"
                 )
 
             module_branch = module_ref.get("branch")
             module_commit = module_ref.get("commit")
             if module_branch and module_commit:
                 raise RuntimeError(
-                    f"Module '{module_name}' resolved both branch='{module_branch}' and commit='{module_commit}'. "
+                    f"Module {module_name!r} resolved both branch={module_branch!r} and commit={module_commit!r}. "
                     "Only one ref type may be set."
                 )
             if require_branch_or_commit and not module_branch and not module_commit:
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' has neither branch nor commit configured"
+                    f"Stage {stage_id!r} module {module_name!r} has neither branch nor commit configured"
                 )
 
             dest = module_meta.get("dest")
             if not isinstance(dest, str) or not dest.strip():
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' must define non-empty 'dest'"
+                    f"Stage {stage_id!r} module {module_name!r} must define non-empty 'dest'"
                 )
             dest_path = Path(dest)
             if dest_path.is_absolute() or ".." in dest_path.parts:
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' dest must stay within the stage repo: {dest}"
+                    f"Stage {stage_id!r} module {module_name!r} dest must stay within the stage repo: {dest}"
                 )
 
             module_repo_value = module_meta.get(repo_key)
             if not module_repo_value:
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' missing '{repo_key}' in inventory '{workflow_cfg.get('inventory')}'"
+                    f"Stage {stage_id!r} module {module_name!r} missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
                 )
 
             resolved_module = {
@@ -719,7 +759,7 @@ def build_active_stages(
                 module_repo_path = Path(module_repo_value).expanduser()
                 if not module_repo_path.is_absolute():
                     raise RuntimeError(
-                        f"Stage '{stage_id}' module '{module_name}' repo_path must be absolute, got: {module_repo_value}"
+                        f"Stage {stage_id!r} module {module_name!r} repo_path must be absolute, got: {module_repo_value}"
                     )
                 resolved_module["repo_path"] = str(module_repo_path.resolve())
             else:
@@ -734,6 +774,7 @@ def build_active_stages(
         active[stage_id] = active_stage
 
     return active
+
 
 def merge_config_dirs(
     source_dirs: list[str],
@@ -808,7 +849,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         dest="plt_overlays",
         type=parse_overlays_arg,
-        help="Optional comma-separated overlay paths under overlays/",
+        help="Optional comma-separated overlay paths under env/overlays/",
     )
     parser.add_argument(
         "--ctl-variants",
@@ -845,8 +886,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="maintenance action name (required for --action maintenance)",
     )
     parser.add_argument(
-        "--stage-source",
-        help="target stage source from inventory (required for --action maintenance)",
+        "--stage-target",
+        help="stage target from inventory (required for --action maintenance)",
     )
     parser.add_argument(
         "--lock-id",
@@ -882,7 +923,7 @@ def setup_logging() -> logging.handlers.MemoryHandler:
 
 def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_name: str) -> dict | None:
     """
-    Build an in-memory single-stage workflow config from <stage-source>/<stage-workflow>.
+    Build an in-memory single-stage workflow config from <stage-target>/<stage-workflow>.
 
     This is used by local_dev.py, which supports targeting one local stage directly
     without requiring a dedicated workflow yaml file in ctl-cfg.
@@ -890,8 +931,8 @@ def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_
     if "/" not in workflow_name:
         return None
 
-    stage_source, child_workflow = workflow_name.rsplit("/", 1)
-    if not stage_source or not child_workflow:
+    stage_target, child_workflow = workflow_name.rsplit("/", 1)
+    if not stage_target or not child_workflow:
         return None
 
     return {
@@ -902,7 +943,7 @@ def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_
         "stages": [
             {
                 "id": workflow_name,
-                "source": stage_source,
+                "target": stage_target,
                 "workflow": child_workflow,
             }
         ],
@@ -1035,13 +1076,13 @@ def validate_ctl_variant_meta(
 
 
 def get_overlay_dir(plt_cfg_root: Path, plt_overlay: str) -> Path:
-    """Resolve one selected overlay path under overlays/."""
+    """Resolve one selected overlay path under env/overlays/."""
     overlays_root = get_overlay_root(plt_cfg_root)
     overlay_root = (overlays_root / plt_overlay).resolve()
     try:
         overlay_root.relative_to(overlays_root)
     except ValueError as exc:
-        raise RuntimeError(f"Overlay path escapes overlays/: {plt_overlay}") from exc
+        raise RuntimeError(f"Overlay path escapes env/overlays/: {plt_overlay}") from exc
     if not overlay_root.exists():
         raise RuntimeError(f"Overlay path not found: {overlay_root}")
     if not overlay_root.is_dir():
@@ -1109,12 +1150,12 @@ def validate_ctl_variant_stage_patch_entry(raw_stage: dict, variant_label: str) 
 
     stage_entry = {k: v for k, v in raw_stage.items() if k not in ("add_before", "add_after")}
     stage_id = stage_entry.get("id")
-    stage_source = stage_entry.get("source")
+    stage_target = stage_entry.get("target")
     stage_workflow = stage_entry.get("workflow")
     if not isinstance(stage_id, str) or not stage_id:
         raise RuntimeError(f"❌ ctl variant '{variant_label}' inserted stage must define non-empty 'id'")
-    if not isinstance(stage_source, str) or not stage_source:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'source'")
+    if not isinstance(stage_target, str) or not stage_target:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'target'")
     if not isinstance(stage_workflow, str) or not stage_workflow:
         raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'workflow'")
     if stage_entry.get("branch") and stage_entry.get("commit"):
@@ -1227,16 +1268,115 @@ def apply_ctl_variants_to_workflow_cfg(
     return patched_workflow_cfg
 
 
+def expand_cfg_file_includes(
+    entries: list,
+    cfg_sets: dict,
+    cfg_sets_path: Path,
+    _stack: tuple = (),
+) -> list:
+    """Expand a cfg_files list, inlining any '@other_set' include entries."""
+    resolved: list = []
+    for entry in entries or []:
+        if isinstance(entry, str) and entry.startswith("@"):
+            name = entry[1:]
+            if name in _stack:
+                cycle = " -> ".join([*_stack, name])
+                raise RuntimeError(f"❌ cfg_set include cycle: {cycle} ({cfg_sets_path})")
+            cfg_set = cfg_sets.get(name)
+            if cfg_set is None:
+                raise RuntimeError(f"❌ missing cfg_set {name!r}: {cfg_sets_path}")
+            if not isinstance(cfg_set, dict):
+                raise RuntimeError(f"❌ cfg_set {name!r} must be a mapping: {cfg_sets_path}")
+            resolved.extend(
+                expand_cfg_file_includes(
+                    cfg_set.get("cfg_files", []), cfg_sets, cfg_sets_path, (*_stack, name)
+                )
+            )
+        else:
+            resolved.append(entry)
+    return resolved
+
+
+def resolve_cfg_set_files(cfg_set_name: str, cfg_sets: dict, cfg_sets_path: Path) -> list:
+    """Resolve a named cfg_set's cfg_files, expanding '@other_set' includes."""
+    return expand_cfg_file_includes([f"@{cfg_set_name}"], cfg_sets, cfg_sets_path)
+
+
 def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
-    """Load inventory configuration from yaml file."""
-    inventory_path = (
-        ctl_cfg_root
-        / "inventory"
-        / f"{inventory_name}.yaml"
-    )
-    if not inventory_path.is_file():
-        raise RuntimeError(f"❌ inventory file not found: {inventory_path}")
-    return load_yaml(inventory_path)
+    """Compose inventory cfg from stage_sources + cfg_sets + per-action targets.
+
+    Layout under ctl_cfg_root:
+      - stage_sources.yaml  source repos: source -> meta
+      - cfg_sets.yaml       config views: cfg_set -> {cfg_root, cfg_files}
+      - targets/<name>.yaml per-action targets: target -> {source, cfg_set},
+                            joining a source repo with a config view.
+
+    Returns the flat shape build_active_stages consumes ({stage_sources,
+    stage_targets}), where each target carries source + cfg_root + cfg_files
+    resolved from its cfg_set.
+    """
+    sources_path = ctl_cfg_root / "stage_sources.yaml"
+    cfg_sets_path = ctl_cfg_root / "cfg_sets.yaml"
+    targets_path = ctl_cfg_root / "targets" / f"{inventory_name}.yaml"
+
+    for path, label in (
+        (sources_path, "stage_sources"),
+        (cfg_sets_path, "cfg_sets"),
+        (targets_path, "targets"),
+    ):
+        if not path.is_file():
+            raise RuntimeError(f"❌ {label} file not found: {path}")
+
+    stage_sources = (load_yaml(sources_path) or {}).get("stage_sources", {})
+    cfg_sets = (load_yaml(cfg_sets_path) or {}).get("cfg_sets", {})
+    stage_targets = (load_yaml(targets_path) or {}).get("stage_targets", {})
+
+    if not isinstance(cfg_sets, dict):
+        raise RuntimeError(f"❌ 'cfg_sets' must be a mapping: {cfg_sets_path}")
+    if not isinstance(stage_targets, dict):
+        raise RuntimeError(f"❌ 'stage_targets' must be a mapping: {targets_path}")
+
+    resolved_targets: dict = {}
+    for target_name, target_def in stage_targets.items():
+        if not isinstance(target_def, dict):
+            raise RuntimeError(f"❌ target {target_name!r} must be a mapping: {targets_path}")
+
+        source = target_def.get("source")
+        if not isinstance(source, str) or not source:
+            raise RuntimeError(
+                f"❌ target {target_name!r} must define a non-empty 'source': {targets_path}"
+            )
+
+        cfg_set_name = target_def.get("cfg_set")
+        if not isinstance(cfg_set_name, str) or not cfg_set_name:
+            raise RuntimeError(
+                f"❌ target {target_name!r} must define a non-empty 'cfg_set': {targets_path}"
+            )
+        cfg_set = cfg_sets.get(cfg_set_name)
+        if cfg_set is None:
+            raise RuntimeError(
+                f"❌ target {target_name!r} references missing cfg_set {cfg_set_name!r}: {cfg_sets_path}"
+            )
+        if not isinstance(cfg_set, dict):
+            raise RuntimeError(f"❌ cfg_set {cfg_set_name!r} must be a mapping: {cfg_sets_path}")
+
+        extra_files = target_def.get("cfg_files", []) or []
+        if not isinstance(extra_files, list):
+            raise RuntimeError(f"❌ target {target_name!r} cfg_files must be a list: {targets_path}")
+
+        resolved_targets[target_name] = {
+            "source": source,
+            "cfg_root": cfg_set.get("cfg_root", "/"),
+            "cfg_files": [
+                *resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
+                *expand_cfg_file_includes(extra_files, cfg_sets, cfg_sets_path),
+            ],
+        }
+
+    return {
+        "stage_sources": stage_sources,
+        "stage_targets": resolved_targets,
+    }
 
 
 def load_env_refs_cfg(ctl_cfg_root: Path, ctl_env: str) -> tuple[dict, Path]:
@@ -1528,12 +1668,13 @@ def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
 
 
 def get_overlay_root(plt_cfg_root: Path) -> Path:
-    """Return overlay root dir under overlays/."""
-    overlays_root = (plt_cfg_root / "overlays").resolve()
+    """Return env overlay root dir under env/overlays/."""
+    overlays_root = (plt_cfg_root / "env" / "overlays").resolve()
     if overlays_root.is_dir():
         return overlays_root
 
-    raise RuntimeError(f"Overlays dir not found under: {plt_cfg_root}")
+    env_root = plt_cfg_root / "env"
+    raise RuntimeError(f"Env overlays dir not found under: {env_root}")
 
 
 def get_overlay_source_dirs(
@@ -1544,13 +1685,7 @@ def get_overlay_source_dirs(
     ctl_env: str,
     plt_env: str,
 ) -> list[str]:
-    """Return absolute overlay source dirs selected by --plt-overlays.
-
-    An overlay may be either:
-    - a legacy direct overlay directory merged as-is
-    - an env-layered directory that mirrors env/ source dirs such as
-      common/all, common/non_prod, common/prod_shared, and dev/test/...
-    """
+    """Return absolute env overlay source dirs selected by --plt-overlays."""
     if not plt_overlays:
         return []
 
@@ -1561,12 +1696,17 @@ def get_overlay_source_dirs(
         src_path = Path(src).resolve()
         try:
             rel = src_path.relative_to(env_root)
-        except ValueError as exc:
-            raise RuntimeError(f"Platform cfg source dir is outside env/: {src_path}") from exc
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] == "overlays":
+            continue
         if rel in seen_layer_rels:
             continue
         seen_layer_rels.add(rel)
         layer_rels.append(rel)
+
+    if not layer_rels:
+        raise RuntimeError(f"No env cfg source dirs found for overlay resolution: {plt_env}")
 
     source_dirs: list[str] = []
     seen: set[str] = set()
@@ -1612,7 +1752,9 @@ def merge_plt_cfg_dirs(
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
-    """Merge env layers first and selected overlays after them."""
+    """Build scoped merged cfg trees for org, bootstrap, and env targets."""
+    if plt_merged_dir.exists():
+        shutil.rmtree(plt_merged_dir)
     os.makedirs(plt_merged_dir, exist_ok=True)
 
     if source_log_roots is None:
@@ -1622,10 +1764,46 @@ def merge_plt_cfg_dirs(
     if merged_files is None:
         merged_files = {}
 
-    logging.info(f"Merging env cfg dirs to {plt_merged_dir}")
-    merged_files = merge_config_dirs(
-        source_dirs=plt_cfg_source_dirs,
-        dest_dir=str(plt_merged_dir),
+    def require_scope_dirs(*rel_paths: str) -> list[str]:
+        dirs: list[str] = []
+        for rel_path in rel_paths:
+            src = (plt_cfg_root / rel_path).resolve()
+            if not src.is_dir():
+                raise RuntimeError(f"Required cfg scope dir not found: {src}")
+            dirs.append(str(src))
+        return dirs
+
+    global_dirs = require_scope_dirs("global")
+    org_dirs = require_scope_dirs("org")
+    bootstrap_dirs = require_scope_dirs("bootstrap")
+
+    org_dest = plt_merged_dir / "org"
+    logging.info(f"Merging org cfg scope to {org_dest}")
+    merge_config_dirs(
+        source_dirs=global_dirs + org_dirs,
+        dest_dir=str(org_dest),
+        clear_dest=True,
+        source_log_roots=source_log_roots,
+        dest_log_roots=dest_log_roots,
+        merged_files=merged_files,
+    )
+
+    bootstrap_dest = plt_merged_dir / "bootstrap"
+    logging.info(f"Merging bootstrap cfg scope to {bootstrap_dest}")
+    merge_config_dirs(
+        source_dirs=global_dirs + bootstrap_dirs,
+        dest_dir=str(bootstrap_dest),
+        clear_dest=True,
+        source_log_roots=source_log_roots,
+        dest_log_roots=dest_log_roots,
+        merged_files=merged_files,
+    )
+
+    env_dest = plt_merged_dir / "env"
+    logging.info(f"Merging env cfg scope to {env_dest}")
+    merge_config_dirs(
+        source_dirs=global_dirs + plt_cfg_source_dirs,
+        dest_dir=str(env_dest),
         clear_dest=True,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
@@ -1640,10 +1818,10 @@ def merge_plt_cfg_dirs(
         plt_env=plt_env,
     )
     if overlay_dirs:
-        logging.info(f"Merging overlay dirs to {plt_merged_dir}: {overlay_dirs}")
+        logging.info(f"Merging env overlay dirs to {env_dest}: {overlay_dirs}")
         merge_config_dirs(
             source_dirs=overlay_dirs,
-            dest_dir=str(plt_merged_dir),
+            dest_dir=str(env_dest),
             clear_dest=False,
             source_log_roots=source_log_roots,
             dest_log_roots=dest_log_roots,
@@ -1724,6 +1902,7 @@ def write_stage_flow_artifact(path: Path, workflow_meta: dict | None, active_sta
         "stages": [
             {
                 "id": stage_id,
+                "target": stage.get("target"),
                 "source": stage["source"],
                 "workflow": stage["workflow"],
                 "branch": stage.get("branch"),
@@ -2030,7 +2209,7 @@ def run_maintenance(
     plt_env: str,
     inventory_name: str,
     maintenance_action: str,
-    stage_source: str,
+    stage_target: str,
     lock_id: str,
     ephemeral: bool,
     run_id: str,
@@ -2044,7 +2223,7 @@ def run_maintenance(
     plt_merged_dir: Path,
     log_file: Path,
 ) -> None:
-    """Run a maintenance action against a single stage source."""
+    """Run a maintenance action against a single stage target."""
     validate_ephemeral(ctl_env, ephemeral)
     validate_env_compatibility(ctl_env, plt_env)
 
@@ -2061,13 +2240,13 @@ def run_maintenance(
 
     workflow_cfg = {
         "meta": {
-            "name": f"{ctl_env}/{inventory_name}/maintenance/{maintenance_action}/{stage_source}",
+            "name": f"{ctl_env}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
             "inventory": inventory_name,
         },
         "stages": [
             {
-                "id": stage_source,
-                "source": stage_source,
+                "id": stage_target,
+                "target": stage_target,
             }
         ],
     }
