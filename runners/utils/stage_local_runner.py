@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 
 from utils.common import (
-    get_plt_cfg_source_dirs,
     load_yaml,
     merge_plt_cfg_dirs,
     parse_overlays_arg,
@@ -92,7 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         dest="overlays",
         type=parse_overlays_arg,
-        help="Optional comma-separated cfg overlays under env/overlays/.",
+        help="Optional comma-separated plt overlay names.",
     )
     parser.add_argument("--workflow", required=True)
     parser.add_argument(
@@ -165,11 +164,9 @@ def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, 
 
     with tempfile.TemporaryDirectory() as tmp_cfg_dir:
         merged_root = Path(tmp_cfg_dir)
-        source_dirs = get_plt_cfg_source_dirs(Path(origin_cfg), env_type)
         merge_plt_cfg_dirs(
             plt_cfg_root=Path(origin_cfg),
             plt_merged_dir=merged_root,
-            plt_cfg_source_dirs=source_dirs,
             ctl_env=env_type,
             plt_env=env_type,
             plt_overlays=overlays,

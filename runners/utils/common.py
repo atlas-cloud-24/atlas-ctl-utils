@@ -555,12 +555,31 @@ def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str)
 
 
 def parse_overlays_arg(value: str) -> list[str]:
-    """Parse comma-separated overlay paths under env/overlays/."""
-    return parse_relative_paths_arg(
-        value,
-        root_dir_name="env/overlays",
-        item_label="Overlay",
-    )
+    """Parse comma-separated plt overlay names."""
+    if value is None:
+        return []
+
+    raw = [v.strip() for v in value.split(",") if v.strip()]
+    if not raw:
+        return []
+    if len(raw) == 1 and raw[0].lower() in ("none", "null", "-"):
+        return []
+
+    for item in raw:
+        if "/" in item or "\\" in item:
+            raise argparse.ArgumentTypeError(
+                f"Overlay must be a metadata name, not a path: {item}"
+            )
+        if item in (".", ".."):
+            raise argparse.ArgumentTypeError(f"Overlay name is invalid: {item}")
+
+    duplicates = [item for item, count in collections.Counter(raw).items() if count > 1]
+    if duplicates:
+        raise argparse.ArgumentTypeError(
+            f"Overlay names must be unique; duplicates: {', '.join(sorted(duplicates))}"
+        )
+
+    return raw
 
 
 def parse_ctl_variants_arg(value: str) -> list[str]:
@@ -603,7 +622,12 @@ def build_active_stages(
         parts = [part for part in value.split("/") if part]
         if any(part in (".", "..") for part in parts):
             raise RuntimeError(f"Stage target {stage_target!r} cfg_root must not contain . or ..: {value}")
-        return "/" + "/".join(parts) if parts else "/"
+        if len(parts) != 1:
+            raise RuntimeError(
+                f"Stage target {stage_target!r} cfg_root must be exactly one top-level scope "
+                f"(a single path segment), not {value!r} — a stage may not span scopes"
+            )
+        return "/" + parts[0]
 
     for st in workflow_cfg.get("stages", []):
         if isinstance(st, str):
@@ -849,7 +873,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         dest="plt_overlays",
         type=parse_overlays_arg,
-        help="Optional comma-separated overlay paths under env/overlays/",
+        help="Optional comma-separated plt overlay names",
     )
     parser.add_argument(
         "--ctl-variants",
@@ -1050,7 +1074,7 @@ def validate_ctl_variant_meta(
 ) -> None:
     """Validate ctl variant metadata against selected plt overlays."""
     if not isinstance(meta, dict):
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' meta.yaml must contain a mapping")
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' __meta__.yaml must contain a mapping")
 
     allowed_envs = _load_meta_string_list(meta, "allowed_envs", "ctl variant", variant_label)
     if allowed_envs:
@@ -1074,45 +1098,6 @@ def validate_ctl_variant_meta(
                 f"but selected plt overlays are {plt_overlays}"
             )
 
-
-def get_overlay_dir(plt_cfg_root: Path, plt_overlay: str) -> Path:
-    """Resolve one selected overlay path under env/overlays/."""
-    overlays_root = get_overlay_root(plt_cfg_root)
-    overlay_root = (overlays_root / plt_overlay).resolve()
-    try:
-        overlay_root.relative_to(overlays_root)
-    except ValueError as exc:
-        raise RuntimeError(f"Overlay path escapes env/overlays/: {plt_overlay}") from exc
-    if not overlay_root.exists():
-        raise RuntimeError(f"Overlay path not found: {overlay_root}")
-    if not overlay_root.is_dir():
-        raise RuntimeError(f"Overlay path must be a directory: {overlay_root}")
-    return overlay_root
-
-
-def validate_overlay_meta(
-    meta: dict,
-    *,
-    overlay_label: str,
-    ctl_env: str,
-    plt_env: str,
-) -> None:
-    """Validate plt overlay metadata against selected envs."""
-    if not isinstance(meta, dict):
-        raise RuntimeError(f"❌ plt overlay '{overlay_label}' meta.yaml must contain a mapping")
-
-    allowed_envs = _load_meta_string_list(meta, "allowed_envs", "plt overlay", overlay_label)
-    if allowed_envs:
-        if ctl_env not in allowed_envs:
-            raise RuntimeError(
-                f"❌ plt overlay '{overlay_label}' is not allowed for ctl env '{ctl_env}'; "
-                f"allowed_envs={allowed_envs}"
-            )
-        if plt_env not in allowed_envs:
-            raise RuntimeError(
-                f"❌ plt overlay '{overlay_label}' is not allowed for plt env '{plt_env}'; "
-                f"allowed_envs={allowed_envs}"
-            )
 
 
 def get_workflow_stage_id(stage_entry) -> str:
@@ -1238,7 +1223,7 @@ def apply_ctl_variants_to_workflow_cfg(
 
     for ctl_variant in ctl_variants:
         variant_root = get_ctl_variant_root(ctl_cfg_root, ctl_variant)
-        meta = load_optional_yaml_mapping(variant_root / "meta.yaml")
+        meta = load_optional_yaml_mapping(variant_root / "__meta__.yaml")
         validate_ctl_variant_meta(
             meta,
             variant_label=ctl_variant,
@@ -1619,131 +1604,367 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
     return run_dir, artifacts_dir, plt_merged_dir, log_file
 
 
-def get_plt_cfg_source_dirs(plt_cfg_root: Path, plt_env: str) -> list[str]:
-    """Get list of plt config source directories based on environment."""
-    env_root = (plt_cfg_root / "env").resolve()
-    env_specific = (env_root / plt_env).resolve()
-    layers_cfg_path = env_specific / "import.yaml"
-
-    if not env_specific.is_dir():
-        raise RuntimeError(f"Platform env dir not found: {env_specific}")
-
-    if not layers_cfg_path.is_file():
-        raise RuntimeError(f"Missing required import.yaml for plt env '{plt_env}': {layers_cfg_path}")
-
-    cfg = load_yaml(layers_cfg_path) or {}
-    if not isinstance(cfg, dict):
-        raise RuntimeError(f"import.yaml must contain a mapping: {layers_cfg_path}")
-
-    layers = cfg.get("imports")
-    if not isinstance(layers, list):
-        raise RuntimeError(f"import.yaml must contain an 'imports' list: {layers_cfg_path}")
-
-    source_dirs: list[str] = []
-    seen: set[Path] = set()
-    for layer in layers:
-        if not isinstance(layer, str) or not layer.strip():
-            raise RuntimeError(f"import.yaml entries must be non-empty strings: {layers_cfg_path}")
-
-        src = (env_root / layer).resolve()
-        try:
-            src.relative_to(env_root)
-        except ValueError as exc:
-            raise RuntimeError(f"Layer path escapes env/: {layer}") from exc
-
-        if src in seen:
-            raise RuntimeError(f"Duplicate layer path in {layers_cfg_path}: {layer}")
-        if not src.exists():
-            raise RuntimeError(f"Layer path not found: {src}")
-        if not src.is_dir():
-            raise RuntimeError(f"Layer path must be a directory: {src}")
-
-        seen.add(src)
-        source_dirs.append(str(src))
-
-    source_dirs.append(str(env_specific))
-
-    logging.info(f"Using import.yaml for plt env '{plt_env}': {source_dirs}")
-    return source_dirs
+SCOPE_META_FILENAME = "__meta__.yaml"
+SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME}
+SUPPORTED_CFG_SELECTORS = {"plt_env"}
 
 
-def get_overlay_root(plt_cfg_root: Path) -> Path:
-    """Return env overlay root dir under env/overlays/."""
-    overlays_root = (plt_cfg_root / "env" / "overlays").resolve()
-    if overlays_root.is_dir():
-        return overlays_root
+def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = True) -> str:
+    """Normalize a cfg-root absolute path such as /__common/all."""
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise RuntimeError(f"{label} must be a non-empty string")
 
-    env_root = plt_cfg_root / "env"
-    raise RuntimeError(f"Env overlays dir not found under: {env_root}")
+    value = raw_value.strip()
+    if "\\" in value:
+        raise RuntimeError(f"{label} must use forward slashes: {value}")
+    if not value.startswith("/"):
+        raise RuntimeError(f"{label} must start with /: {value}")
+
+    parts = [part for part in value.split("/") if part]
+    if any(part in (".", "..") for part in parts):
+        raise RuntimeError(f"{label} must not contain . or ..: {value}")
+    if not parts and not allow_root:
+        raise RuntimeError(f"{label} must not be /")
+
+    return "/" + "/".join(parts) if parts else "/"
 
 
-def get_overlay_source_dirs(
-    plt_cfg_root: Path,
-    plt_cfg_source_dirs: list[str],
-    plt_overlays: list[str],
-    *,
-    ctl_env: str,
-    plt_env: str,
-) -> list[str]:
-    """Return absolute env overlay source dirs selected by --plt-overlays."""
-    if not plt_overlays:
-        return []
+def cfg_abs_path_to_dir(cfg_root: Path, cfg_path: str, *, label: str) -> Path:
+    """Resolve a normalized cfg-root absolute path under cfg_root."""
+    normalized = normalize_cfg_absolute_path(cfg_path, label=label, allow_root=False)
+    dest = (cfg_root / normalized.lstrip("/")).resolve()
+    try:
+        dest.relative_to(cfg_root)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} escapes plt cfg root: {cfg_path}") from exc
+    return dest
 
-    env_root = (plt_cfg_root / "env").resolve()
-    layer_rels: list[Path] = []
-    seen_layer_rels: set[Path] = set()
-    for src in plt_cfg_source_dirs:
-        src_path = Path(src).resolve()
-        try:
-            rel = src_path.relative_to(env_root)
-        except ValueError:
-            continue
-        if rel.parts and rel.parts[0] == "overlays":
-            continue
-        if rel in seen_layer_rels:
-            continue
-        seen_layer_rels.add(rel)
-        layer_rels.append(rel)
 
-    if not layer_rels:
-        raise RuntimeError(f"No env cfg source dirs found for overlay resolution: {plt_env}")
+def default_scope_target_path(cfg_root: Path, scope_root: Path) -> str:
+    rel = scope_root.relative_to(cfg_root)
+    if not rel.parts:
+        return "/"
+    return "/" + "/".join(rel.parts)
 
-    source_dirs: list[str] = []
-    seen: set[str] = set()
-    for rel in plt_overlays:
-        if rel in seen:
-            continue
-        seen.add(rel)
 
-        src = get_overlay_dir(plt_cfg_root, rel)
-        meta = load_optional_yaml_mapping(src / "meta.yaml")
-        if meta:
-            validate_overlay_meta(
-                meta,
-                overlay_label=rel,
-                ctl_env=ctl_env,
-                plt_env=plt_env,
+def selector_matches(selectors: dict, runtime_selectors: dict[str, str], *, meta_path: Path) -> bool:
+    """Return whether cfg metadata selectors match runtime inputs."""
+    if not isinstance(selectors, dict):
+        raise RuntimeError(f"selectors must be a mapping: {meta_path}")
+
+    for selector_name, expected in selectors.items():
+        if selector_name not in SUPPORTED_CFG_SELECTORS:
+            raise RuntimeError(f"Unsupported selector {selector_name!r}: {meta_path}")
+        if selector_name not in runtime_selectors:
+            raise RuntimeError(f"Missing runtime selector {selector_name!r} for {meta_path}")
+
+        actual = runtime_selectors[selector_name]
+        if isinstance(expected, str):
+            allowed = [expected]
+        elif isinstance(expected, list) and all(isinstance(item, str) and item for item in expected):
+            allowed = expected
+        else:
+            raise RuntimeError(
+                f"Selector {selector_name!r} must be a string or list of strings: {meta_path}"
             )
 
-        layered_dirs: list[str] = []
-        for layer_rel in layer_rels:
-            candidate = (src / layer_rel).resolve()
-            if not candidate.is_dir():
-                continue
-            layered_dirs.append(str(candidate))
+        if actual not in allowed:
+            return False
 
-        if layered_dirs:
-            source_dirs.extend(layered_dirs)
-        else:
-            source_dirs.append(str(src))
+    return True
 
-    return source_dirs
 
+def discover_cfg_meta_paths(plt_cfg_root: Path) -> list[Path]:
+    """Find cfg metadata files, excluding git internals."""
+    cfg_root = plt_cfg_root.resolve()
+    meta_paths: list[Path] = []
+    for meta_path in sorted(cfg_root.rglob(SCOPE_META_FILENAME)):
+        rel = meta_path.relative_to(cfg_root)
+        if ".git" in rel.parts:
+            continue
+        meta_paths.append(meta_path)
+    return meta_paths
+
+
+def load_cfg_meta(meta_path: Path) -> dict:
+    """Load typed cfg metadata from __meta__.yaml."""
+    meta_cfg = load_yaml(meta_path) or {}
+    if not isinstance(meta_cfg, dict):
+        raise RuntimeError(f"{SCOPE_META_FILENAME} must contain a mapping: {meta_path}")
+
+    meta_type = meta_cfg.get("type")
+    if meta_type not in ("scope", "overlay"):
+        raise RuntimeError(
+            f"{SCOPE_META_FILENAME} type must be 'scope' or 'overlay': {meta_path}"
+        )
+    return meta_cfg
+
+
+def find_nested_cfg_meta(root: Path, *, exclude: Path | None = None) -> Path | None:
+    """Return a nested metadata file under root, ignoring an optional root meta."""
+    root_resolved = root.resolve()
+    exclude_resolved = exclude.resolve() if exclude is not None else None
+    for meta_path in sorted(root_resolved.rglob(SCOPE_META_FILENAME)):
+        if exclude_resolved is not None and meta_path.resolve() == exclude_resolved:
+            continue
+        rel = meta_path.relative_to(root_resolved)
+        if ".git" in rel.parts:
+            continue
+        return meta_path
+    return None
+
+
+def validate_no_cfg_meta_inside_data_dir(src: Path, *, import_path: str, meta_path: Path) -> None:
+    """Reject imports that point at another metadata-owned tree."""
+    nested_meta = find_nested_cfg_meta(src)
+    if nested_meta is not None:
+        raise RuntimeError(
+            f"Import path must be a data directory, not a tree containing {SCOPE_META_FILENAME}: "
+            f"{import_path} ({meta_path}); found {nested_meta}"
+        )
+
+
+def load_scope_candidate(
+    plt_cfg_root: Path,
+    meta_path: Path,
+    meta_cfg: dict,
+    runtime_selectors: dict[str, str],
+) -> dict | None:
+    """Load one scope __meta__.yaml and return an active merge scope, or None."""
+    cfg_root = plt_cfg_root.resolve()
+    scope_root = meta_path.parent.resolve()
+    try:
+        scope_root.relative_to(cfg_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Scope metadata escapes plt cfg root: {meta_path}") from exc
+
+    selectors = meta_cfg.get("selectors") or {}
+    if not selector_matches(selectors, runtime_selectors, meta_path=meta_path):
+        logging.info("Skipping inactive cfg scope %s for selectors %s", meta_path, runtime_selectors)
+        return None
+
+    default_target = default_scope_target_path(cfg_root, scope_root)
+    target_path = normalize_cfg_absolute_path(
+        meta_cfg.get("target_path", default_target),
+        label=f"target_path in {meta_path}",
+        allow_root=False,
+    )
+
+    raw_imports = meta_cfg.get("imports") or []
+    if not isinstance(raw_imports, list):
+        raise RuntimeError(f"imports must be a list: {meta_path}")
+
+    source_dirs: list[str] = []
+    seen_imports: set[Path] = set()
+    for raw_import in raw_imports:
+        import_path = normalize_cfg_absolute_path(
+            raw_import,
+            label=f"import path in {meta_path}",
+            allow_root=False,
+        )
+        src = cfg_abs_path_to_dir(cfg_root, import_path, label=f"import path in {meta_path}")
+        if src in seen_imports:
+            raise RuntimeError(f"Duplicate import path in {meta_path}: {import_path}")
+        if not src.exists():
+            raise RuntimeError(f"Import path not found: {src}")
+        if not src.is_dir():
+            raise RuntimeError(f"Import path must be a directory: {src}")
+        validate_no_cfg_meta_inside_data_dir(src, import_path=import_path, meta_path=meta_path)
+
+        seen_imports.add(src)
+        source_dirs.append(str(src))
+
+    if scope_root in seen_imports:
+        raise RuntimeError(f"Scope imports itself in {meta_path}: {default_target}")
+
+    source_dirs.append(str(scope_root))
+    return {
+        "meta_path": meta_path,
+        "scope_root": scope_root,
+        "scope_path": default_target,
+        "target_path": target_path,
+        "source_dirs": source_dirs,
+    }
+
+
+def discover_active_cfg_scopes(
+    plt_cfg_root: Path,
+    *,
+    plt_env: str,
+) -> list[dict]:
+    """Discover active cfg merge scopes from type: scope metadata."""
+    cfg_root = plt_cfg_root.resolve()
+    runtime_selectors = {"plt_env": plt_env}
+    active_scopes: list[dict] = []
+    target_paths: dict[str, Path] = {}
+
+    for meta_path in discover_cfg_meta_paths(cfg_root):
+        meta_cfg = load_cfg_meta(meta_path)
+        if meta_cfg["type"] == "overlay":
+            continue
+
+        scope = load_scope_candidate(cfg_root, meta_path, meta_cfg, runtime_selectors)
+        if scope is None:
+            continue
+
+        target_path = scope["target_path"]
+        previous_meta_path = target_paths.get(target_path)
+        if previous_meta_path is not None and previous_meta_path != scope["meta_path"]:
+            raise RuntimeError(
+                f"Duplicate active cfg target_path {target_path!r}: {previous_meta_path} and {scope['meta_path']}"
+            )
+        target_paths[target_path] = scope["meta_path"]
+        active_scopes.append(scope)
+
+    if not active_scopes:
+        raise RuntimeError(f"No active cfg scopes found under: {cfg_root}")
+
+    logging.info(
+        "Active cfg scopes: %s",
+        [f"{scope['scope_path']} -> {scope['target_path']}" for scope in active_scopes],
+    )
+    return active_scopes
+
+
+def normalize_overlay_name(raw_value, *, label: str) -> str:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise RuntimeError(f"{label} must be a non-empty string")
+    value = raw_value.strip()
+    if "/" in value or "\\" in value:
+        raise RuntimeError(f"{label} must be a metadata name, not a path: {value}")
+    if value in (".", ".."):
+        raise RuntimeError(f"{label} is invalid: {value}")
+    return value
+
+
+def validate_overlay_data_tree(overlay_root: Path, *, meta_path: Path) -> None:
+    """Reject overlay payloads that can change cfg topology or escape by symlink."""
+    root_resolved = overlay_root.resolve()
+    for path in sorted(root_resolved.rglob("*")):
+        rel = path.relative_to(root_resolved)
+        if ".git" in rel.parts:
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"Overlay data must not contain symlinks: {path}")
+        if path.name == SCOPE_META_FILENAME and path.resolve() != meta_path.resolve():
+            raise RuntimeError(
+                f"Overlay data must not contain nested {SCOPE_META_FILENAME}: {path}"
+            )
+
+
+def load_overlay_candidate(
+    plt_cfg_root: Path,
+    meta_path: Path,
+    meta_cfg: dict,
+    runtime_selectors: dict[str, str],
+) -> dict:
+    """Load one overlay metadata file."""
+    cfg_root = plt_cfg_root.resolve()
+    overlay_root = meta_path.parent.resolve()
+    try:
+        overlay_root.relative_to(cfg_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Overlay metadata escapes plt cfg root: {meta_path}") from exc
+
+    overlay_name = normalize_overlay_name(
+        meta_cfg.get("name"),
+        label=f"overlay name in {meta_path}",
+    )
+    selectors = meta_cfg.get("selectors") or {}
+    matches = selector_matches(selectors, runtime_selectors, meta_path=meta_path)
+    validate_overlay_data_tree(overlay_root, meta_path=meta_path)
+
+    return {
+        "name": overlay_name,
+        "root": overlay_root,
+        "meta_path": meta_path,
+        "selectors": selectors,
+        "matches": matches,
+    }
+
+
+def discover_overlay_candidates(
+    plt_cfg_root: Path,
+    *,
+    plt_env: str,
+) -> dict[str, dict]:
+    """Discover all type: overlay metadata entries by unique overlay name."""
+    cfg_root = plt_cfg_root.resolve()
+    runtime_selectors = {"plt_env": plt_env}
+    candidates: dict[str, dict] = {}
+
+    for meta_path in discover_cfg_meta_paths(cfg_root):
+        meta_cfg = load_cfg_meta(meta_path)
+        if meta_cfg["type"] == "scope":
+            continue
+
+        overlay = load_overlay_candidate(cfg_root, meta_path, meta_cfg, runtime_selectors)
+        previous = candidates.get(overlay["name"])
+        if previous is not None:
+            raise RuntimeError(
+                f"Duplicate plt overlay name {overlay['name']!r}: {previous['meta_path']} and {meta_path}"
+            )
+        candidates[overlay["name"]] = overlay
+
+    return candidates
+
+
+def copy_cfg_root_without_overlay_catalog(plt_cfg_root: Path, dest_root: Path) -> None:
+    """Copy cfg source to a temp root, excluding git metadata and overlay catalog."""
+    cfg_root = plt_cfg_root.resolve()
+
+    def ignore(src_dir: str, names: list[str]) -> set[str]:
+        ignored: set[str] = set()
+        src_path = Path(src_dir).resolve()
+        if ".git" in names:
+            ignored.add(".git")
+        if src_path == cfg_root and "_overlays" in names:
+            ignored.add("_overlays")
+        return ignored
+
+    shutil.copytree(cfg_root, dest_root, ignore=ignore)
+
+
+def apply_selected_overlays_to_cfg_root(
+    plt_cfg_root: Path,
+    effective_cfg_root: Path,
+    plt_overlays: list[str],
+    *,
+    plt_env: str,
+) -> None:
+    """Apply selected overlay data to a temporary cfg root before scope merge."""
+    if not plt_overlays:
+        return
+
+    duplicates = [item for item, count in collections.Counter(plt_overlays).items() if count > 1]
+    if duplicates:
+        raise RuntimeError(f"plt overlays must be unique; duplicates: {', '.join(sorted(duplicates))}")
+
+    candidates = discover_overlay_candidates(plt_cfg_root, plt_env=plt_env)
+    for overlay_name in plt_overlays:
+        overlay = candidates.get(overlay_name)
+        if overlay is None:
+            available = ", ".join(sorted(candidates)) or "none"
+            raise RuntimeError(
+                f"Unknown plt overlay {overlay_name!r}; available overlays: {available}"
+            )
+        if not overlay["matches"]:
+            raise RuntimeError(
+                f"plt overlay {overlay_name!r} is not allowed for plt env {plt_env!r}; "
+                f"selectors={overlay['selectors']}"
+            )
+
+        logging.info("Applying plt overlay %s from %s", overlay_name, overlay["root"])
+        merge_config_dirs(
+            source_dirs=[str(overlay["root"])],
+            dest_dir=str(effective_cfg_root),
+            clear_dest=False,
+            skip_filenames={SCOPE_META_FILENAME},
+        )
 
 def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
-    plt_cfg_source_dirs: list[str],
     ctl_env: str,
     plt_env: str,
     plt_overlays: list[str] | None = None,
@@ -1752,92 +1973,72 @@ def merge_plt_cfg_dirs(
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
-    """Build scoped merged cfg trees for org, bootstrap, and env targets."""
+    """Build scoped merged cfg trees from typed __meta__.yaml metadata."""
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
     os.makedirs(plt_merged_dir, exist_ok=True)
 
-    if source_log_roots is None:
-        source_log_roots = (plt_cfg_root.resolve(),)
     if dest_log_roots is None:
         dest_log_roots = (plt_merged_dir.resolve(),)
     if merged_files is None:
         merged_files = {}
 
-    def require_scope_dirs(*rel_paths: str) -> list[str]:
-        dirs: list[str] = []
-        for rel_path in rel_paths:
-            src = (plt_cfg_root / rel_path).resolve()
-            if not src.is_dir():
-                raise RuntimeError(f"Required cfg scope dir not found: {src}")
-            dirs.append(str(src))
-        return dirs
+    selected_overlays = plt_overlays or []
+    composition_files = set(SCOPE_META_SKIP_FILENAMES)
 
-    global_dirs = require_scope_dirs("global")
-    org_dirs = require_scope_dirs("org")
-    bootstrap_dirs = require_scope_dirs("bootstrap")
+    def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> None:
+        active_scopes = discover_active_cfg_scopes(effective_cfg_root, plt_env=plt_env)
 
-    org_dest = plt_merged_dir / "org"
-    logging.info(f"Merging org cfg scope to {org_dest}")
-    merge_config_dirs(
-        source_dirs=global_dirs + org_dirs,
-        dest_dir=str(org_dest),
-        clear_dest=True,
-        source_log_roots=source_log_roots,
-        dest_log_roots=dest_log_roots,
-        merged_files=merged_files,
-    )
+        for scope in active_scopes:
+            target_path = scope["target_path"]
+            target_rel = target_path.lstrip("/")
+            target_dest = (plt_merged_dir / target_rel).resolve()
+            try:
+                target_dest.relative_to(plt_merged_dir.resolve())
+            except ValueError as exc:
+                raise RuntimeError(f"Scope target_path escapes merged cfg dir: {target_path}") from exc
 
-    bootstrap_dest = plt_merged_dir / "bootstrap"
-    logging.info(f"Merging bootstrap cfg scope to {bootstrap_dest}")
-    merge_config_dirs(
-        source_dirs=global_dirs + bootstrap_dirs,
-        dest_dir=str(bootstrap_dest),
-        clear_dest=True,
-        source_log_roots=source_log_roots,
-        dest_log_roots=dest_log_roots,
-        merged_files=merged_files,
-    )
+            logging.info(
+                "Merging cfg scope %s to %s",
+                scope["scope_path"],
+                target_dest,
+            )
+            merge_config_dirs(
+                source_dirs=scope["source_dirs"],
+                dest_dir=str(target_dest),
+                clear_dest=True,
+                source_log_roots=effective_source_log_roots,
+                dest_log_roots=dest_log_roots,
+                merged_files=merged_files,
+                skip_filenames=composition_files,
+            )
 
-    env_dest = plt_merged_dir / "env"
-    logging.info(f"Merging env cfg scope to {env_dest}")
-    merge_config_dirs(
-        source_dirs=global_dirs + plt_cfg_source_dirs,
-        dest_dir=str(env_dest),
-        clear_dest=True,
-        source_log_roots=source_log_roots,
-        dest_log_roots=dest_log_roots,
-        merged_files=merged_files,
-    )
-
-    overlay_dirs = get_overlay_source_dirs(
-        plt_cfg_root,
-        plt_cfg_source_dirs,
-        plt_overlays or [],
-        ctl_env=ctl_env,
-        plt_env=plt_env,
-    )
-    if overlay_dirs:
-        logging.info(f"Merging env overlay dirs to {env_dest}: {overlay_dirs}")
-        merge_config_dirs(
-            source_dirs=overlay_dirs,
-            dest_dir=str(env_dest),
-            clear_dest=False,
-            source_log_roots=source_log_roots,
-            dest_log_roots=dest_log_roots,
-            merged_files=merged_files,
-            skip_filenames={"meta.yaml"},
-        )
+    if selected_overlays:
+        with tempfile.TemporaryDirectory(prefix="atlas-plt-cfg-") as tmp_dir:
+            effective_cfg_root = Path(tmp_dir) / "source"
+            copy_cfg_root_without_overlay_catalog(plt_cfg_root, effective_cfg_root)
+            apply_selected_overlays_to_cfg_root(
+                plt_cfg_root,
+                effective_cfg_root,
+                selected_overlays,
+                plt_env=plt_env,
+            )
+            effective_source_log_roots = source_log_roots or (
+                effective_cfg_root.resolve(),
+                plt_cfg_root.resolve(),
+            )
+            merge_scopes(effective_cfg_root, effective_source_log_roots)
+    else:
+        effective_source_log_roots = source_log_roots or (plt_cfg_root.resolve(),)
+        merge_scopes(plt_cfg_root, effective_source_log_roots)
 
     return merged_files
-
 
 def prepare_pipeline_cfg(
     plt_cfg_root: Path,
     workflow_cfg: dict,
     inventory_cfg: dict,
     plt_merged_dir: Path,
-    plt_cfg_source_dirs: list[str],
     artifacts_dir: Path,
     ctl_env: str,
     plt_env: str,
@@ -1859,7 +2060,6 @@ def prepare_pipeline_cfg(
     merged_files = merge_plt_cfg_dirs(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
-        plt_cfg_source_dirs=plt_cfg_source_dirs,
         ctl_env=ctl_env,
         plt_env=plt_env,
         plt_overlays=plt_overlays,
@@ -2251,13 +2451,11 @@ def run_maintenance(
         ],
     }
 
-    plt_cfg_source_dirs = get_plt_cfg_source_dirs(plt_cfg_root, plt_env)
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
         plt_merged_dir,
-        plt_cfg_source_dirs,
         artifacts_dir,
         ctl_env,
         plt_env,
@@ -2386,13 +2584,11 @@ def run_pipeline(
     logging.info(f"Environment validation passed: ctl_env={ctl_env} → plt_env={plt_env}")
 
     # Prepare pipeline config
-    plt_cfg_source_dirs = get_plt_cfg_source_dirs(plt_cfg_root, plt_env)
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
         plt_merged_dir,
-        plt_cfg_source_dirs,
         artifacts_dir,
         ctl_env,
         plt_env,
