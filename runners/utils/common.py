@@ -335,6 +335,8 @@ def validate_ephemeral(ctl_env: str, ephemeral: bool) -> None:
 
 def validate_action_args(args: argparse.Namespace) -> None:
     """Validate CLI arguments for pipeline vs maintenance mode."""
+    if args.aws_identity and not args.allow_synthetic_workflow:
+        raise RuntimeError("❌ --aws-identity is only valid with --allow-synthetic-workflow")
     if args.action == "pipeline":
         if not args.workflow:
             raise RuntimeError("❌ --workflow is required for --action=pipeline")
@@ -1186,6 +1188,22 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=validate_uuid7,
         help="Run id (must be a valid UUID format)",
     )
+    parser.add_argument(
+        "--allow-synthetic-workflow",
+        action="store_true",
+        help=(
+            "Allow running a single stage directly as --workflow "
+            "<stage-target>/<stage-workflow> when no ctl workflow yaml exists"
+        ),
+    )
+    parser.add_argument(
+        "--aws-identity",
+        default=None,
+        help=(
+            "Logical AWS identity (from aws_identities.yaml) to attach to a "
+            "synthetic workflow stage; only valid with --allow-synthetic-workflow"
+        ),
+    )
 
 
 def setup_logging() -> logging.handlers.MemoryHandler:
@@ -1197,12 +1215,19 @@ def setup_logging() -> logging.handlers.MemoryHandler:
     return memory_handler
 
 
-def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_name: str) -> dict | None:
+def build_target_stage_workflow_cfg(
+    ctl_env: str,
+    inventory_name: str,
+    workflow_name: str,
+    aws_identity: str | None = None,
+) -> dict | None:
     """
     Build an in-memory single-stage workflow config from <stage-target>/<stage-workflow>.
 
-    This is used by local_dev.py, which supports targeting one local stage directly
-    without requiring a dedicated workflow yaml file in ctl-cfg.
+    Used when a runner allows a synthetic workflow: targeting one stage directly
+    without a dedicated workflow yaml in ctl-cfg. When aws_identity is given it is
+    attached to the stage, so identity validation and assertion apply exactly as
+    they would for a stage entry in a real workflow file.
     """
     if "/" not in workflow_name:
         return None
@@ -1211,18 +1236,20 @@ def build_target_stage_workflow_cfg(ctl_env: str, inventory_name: str, workflow_
     if not stage_target or not child_workflow:
         return None
 
+    stage = {
+        "id": workflow_name,
+        "target": stage_target,
+        "workflow": child_workflow,
+    }
+    if aws_identity is not None:
+        stage["aws_identity"] = aws_identity
+
     return {
         "meta": {
             "name": f"{ctl_env}/{inventory_name}/{workflow_name}",
             "inventory": inventory_name,
         },
-        "stages": [
-            {
-                "id": workflow_name,
-                "target": stage_target,
-                "workflow": child_workflow,
-            }
-        ],
+        "stages": [stage],
     }
 
 
@@ -1232,6 +1259,7 @@ def load_workflow_cfg(
     inventory_name: str,
     workflow_name: str,
     allow_target_stage_workflow: bool = False,
+    synthetic_aws_identity: str | None = None,
 ) -> dict:
     """Load env workflow config, then base fallback, then optional local target-stage workflow."""
     env_workflow_path = (
@@ -1260,7 +1288,9 @@ def load_workflow_cfg(
         return load_yaml(base_workflow_path)
 
     if allow_target_stage_workflow:
-        workflow_cfg = build_target_stage_workflow_cfg(ctl_env, inventory_name, workflow_name)
+        workflow_cfg = build_target_stage_workflow_cfg(
+            ctl_env, inventory_name, workflow_name, aws_identity=synthetic_aws_identity
+        )
         if workflow_cfg is not None:
             logging.info(
                 "Workflow file not found, using synthesized single-stage workflow for local dev: %s",
@@ -2381,6 +2411,7 @@ def write_target_stage_flow_artifact(
     stage_repo_key: str,
     require_stage_ref: bool,
     allow_target_stage_workflow: bool,
+    synthetic_aws_identity: str | None,
     stage_source_refs: dict | None,
     module_refs: dict | None,
 ) -> None:
@@ -2396,6 +2427,7 @@ def write_target_stage_flow_artifact(
             target_inventory_name,
             workflow_name,
             allow_target_stage_workflow=allow_target_stage_workflow,
+            synthetic_aws_identity=synthetic_aws_identity,
         )
         target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
@@ -2802,6 +2834,7 @@ def run_pipeline(
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
     allow_target_stage_workflow: bool,
+    synthetic_aws_identity: str | None,
     run_dir: Path,
     artifacts_dir: Path,
     plt_merged_dir: Path,
@@ -2825,6 +2858,7 @@ def run_pipeline(
         inventory_name,
         workflow_name,
         allow_target_stage_workflow=allow_target_stage_workflow,
+        synthetic_aws_identity=synthetic_aws_identity,
     )
     workflow_cfg = apply_ctl_variants_to_workflow_cfg(
         ctl_cfg_root,
@@ -2881,6 +2915,7 @@ def run_pipeline(
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
         allow_target_stage_workflow=allow_target_stage_workflow,
+        synthetic_aws_identity=synthetic_aws_identity,
         stage_source_refs=stage_source_refs,
         module_refs=module_refs,
     )
