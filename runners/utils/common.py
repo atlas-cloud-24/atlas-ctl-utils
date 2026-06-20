@@ -47,6 +47,23 @@ FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES = (
 )
 FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$?([A-Za-z_][A-Za-z0-9_]*)")
 FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
+AWS_CREDENTIAL_ENV_VARS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+)
+AWS_IDENTITY_STAGE_ENV_VARS = (
+    "ATLAS_AWS_ASSERT_IDENTITY",
+    "ATLAS_AWS_IDENTITY",
+    "ATLAS_AWS_EXPECT_ACCOUNT_ID",
+    "ATLAS_AWS_EXPECT_SSO_PERMISSION_SET",
+    "ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME",
+)
 
 SERVICE_ID = "atlas-ctl-orchestrator-local"
 
@@ -709,6 +726,12 @@ def build_active_stages(
             "cfg_files": cfg_files,
         }
 
+        aws_identity = stage_over.get("aws_identity")
+        if aws_identity is not None:
+            if not isinstance(aws_identity, str) or not aws_identity.strip():
+                raise RuntimeError(f"Stage {stage_id!r} aws_identity must be a non-empty string")
+            active_stage["aws_identity"] = aws_identity.strip()
+
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
             if not repo_path.is_absolute():
@@ -798,6 +821,235 @@ def build_active_stages(
         active[stage_id] = active_stage
 
     return active
+
+
+def load_aws_identities_cfg(ctl_cfg_root: Path) -> dict:
+    """Load and validate optional logical AWS execution identities."""
+    path = ctl_cfg_root / "aws_identities.yaml"
+    if not path.is_file():
+        return {}
+
+    doc = load_yaml(path) or {}
+    identities = doc.get("aws_identities", {})
+    if not isinstance(identities, dict):
+        raise RuntimeError(f"❌ 'aws_identities' must be a mapping: {path}")
+
+    for identity_name, identity_cfg in identities.items():
+        if not isinstance(identity_name, str) or not identity_name.strip():
+            raise RuntimeError(f"❌ aws identity names must be non-empty strings: {path}")
+        if not isinstance(identity_cfg, dict):
+            raise RuntimeError(f"❌ aws identity {identity_name!r} must be a mapping: {path}")
+
+        local_cfg = identity_cfg.get("local")
+        if local_cfg is not None:
+            _validate_aws_identity_local_cfg(identity_name, local_cfg, path)
+
+        expect_cfg = identity_cfg.get("expect")
+        if expect_cfg is not None:
+            _validate_aws_identity_expect_cfg(identity_name, expect_cfg, path)
+
+    return identities
+
+
+def _validate_aws_identity_local_cfg(identity_name: str, local_cfg: dict, path: Path) -> None:
+    if not isinstance(local_cfg, dict):
+        raise RuntimeError(f"❌ aws identity {identity_name!r} local must be a mapping: {path}")
+
+    has_profile = "profile" in local_cfg
+    has_by_env = "profile_by_plt_env" in local_cfg
+    if has_profile == has_by_env:
+        raise RuntimeError(
+            f"❌ aws identity {identity_name!r} local must define exactly one of "
+            f"'profile' or 'profile_by_plt_env': {path}"
+        )
+
+    if has_profile:
+        _require_non_empty_string(local_cfg["profile"], f"aws identity {identity_name!r} local.profile", path)
+    if has_by_env:
+        _validate_env_string_map(
+            local_cfg["profile_by_plt_env"],
+            f"aws identity {identity_name!r} local.profile_by_plt_env",
+            path,
+        )
+
+
+def _validate_aws_identity_expect_cfg(identity_name: str, expect_cfg: dict, path: Path) -> None:
+    if not isinstance(expect_cfg, dict):
+        raise RuntimeError(f"❌ aws identity {identity_name!r} expect must be a mapping: {path}")
+
+    paired_fields = (
+        ("account_id", "account_id_by_plt_env"),
+        ("sso_permission_set", "sso_permission_set_by_plt_env"),
+        ("assumed_role_name", "assumed_role_name_by_plt_env"),
+    )
+    for direct_key, by_env_key in paired_fields:
+        if direct_key in expect_cfg and by_env_key in expect_cfg:
+            raise RuntimeError(
+                f"❌ aws identity {identity_name!r} expect cannot define both "
+                f"{direct_key!r} and {by_env_key!r}: {path}"
+            )
+        if direct_key in expect_cfg:
+            _require_non_empty_string(expect_cfg[direct_key], f"aws identity {identity_name!r} expect.{direct_key}", path)
+        if by_env_key in expect_cfg:
+            _validate_env_string_map(expect_cfg[by_env_key], f"aws identity {identity_name!r} expect.{by_env_key}", path)
+
+
+def _require_non_empty_string(value, label: str, path: Path) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"❌ {label} must be a non-empty string: {path}")
+    return value.strip()
+
+
+def _validate_env_string_map(value, label: str, path: Path) -> None:
+    if not isinstance(value, dict) or not value:
+        raise RuntimeError(f"❌ {label} must be a non-empty mapping: {path}")
+    unknown_envs = sorted(set(value) - set(ENVS_ALL))
+    if unknown_envs:
+        raise RuntimeError(
+            f"❌ {label} has unsupported plt_env keys {unknown_envs}; allowed: {list(ENVS_ALL)}: {path}"
+        )
+    for env_name, item in value.items():
+        _require_non_empty_string(item, f"{label}.{env_name}", path)
+
+
+def aws_identity_override_env_name(identity_name: str) -> str:
+    suffix = re.sub(r"[^A-Za-z0-9]", "_", identity_name).upper()
+    return f"ATLAS_AWS_PROFILE_{suffix}"
+
+
+def _resolve_direct_or_env_value(cfg: dict, direct_key: str, by_env_key: str, plt_env: str, *, label: str) -> str | None:
+    if direct_key in cfg:
+        return cfg[direct_key].strip()
+    if by_env_key not in cfg:
+        return None
+    by_env = cfg[by_env_key]
+    if plt_env not in by_env:
+        raise RuntimeError(f"❌ {label}.{by_env_key} has no value for plt_env={plt_env!r}")
+    return by_env[plt_env].strip()
+
+
+def resolve_stage_aws_profile(stage: dict, aws_identities: dict, plt_env: str) -> str | None:
+    identity_name = stage.get("aws_identity")
+    if not identity_name:
+        return None
+
+    identity_cfg = aws_identities.get(identity_name)
+    if identity_cfg is None:
+        raise RuntimeError(f"❌ Stage aws_identity {identity_name!r} is not defined in aws_identities.yaml")
+
+    local_cfg = identity_cfg.get("local")
+    if not isinstance(local_cfg, dict):
+        raise RuntimeError(f"❌ aws identity {identity_name!r} has no local profile mapping")
+
+    override_name = aws_identity_override_env_name(identity_name)
+    override_value = os.getenv(override_name)
+    if override_value:
+        return override_value.strip()
+
+    profile = _resolve_direct_or_env_value(
+        local_cfg,
+        "profile",
+        "profile_by_plt_env",
+        plt_env,
+        label=f"aws identity {identity_name!r} local",
+    )
+    if not profile:
+        raise RuntimeError(f"❌ aws identity {identity_name!r} resolved to an empty local profile")
+    return profile
+
+
+def resolve_stage_aws_expectations(stage: dict, aws_identities: dict, plt_env: str) -> dict[str, str]:
+    identity_name = stage.get("aws_identity")
+    if not identity_name:
+        return {}
+
+    identity_cfg = aws_identities.get(identity_name) or {}
+    expect_cfg = identity_cfg.get("expect") or {}
+    if not isinstance(expect_cfg, dict):
+        raise RuntimeError(f"❌ aws identity {identity_name!r} expect must be a mapping")
+
+    resolved = {}
+    account_id = _resolve_direct_or_env_value(
+        expect_cfg,
+        "account_id",
+        "account_id_by_plt_env",
+        plt_env,
+        label=f"aws identity {identity_name!r} expect",
+    )
+    permission_set = _resolve_direct_or_env_value(
+        expect_cfg,
+        "sso_permission_set",
+        "sso_permission_set_by_plt_env",
+        plt_env,
+        label=f"aws identity {identity_name!r} expect",
+    )
+    role_name = _resolve_direct_or_env_value(
+        expect_cfg,
+        "assumed_role_name",
+        "assumed_role_name_by_plt_env",
+        plt_env,
+        label=f"aws identity {identity_name!r} expect",
+    )
+
+    if account_id:
+        resolved["account_id"] = account_id
+    if permission_set:
+        resolved["sso_permission_set"] = permission_set
+    if role_name:
+        resolved["assumed_role_name"] = role_name
+    return resolved
+
+
+
+def validate_active_stage_aws_identities(active_stages: dict, aws_identities: dict, plt_env: str) -> None:
+    """Validate selected stages can resolve their configured logical AWS identities."""
+    for stage_id, stage in active_stages.items():
+        if not stage.get("aws_identity"):
+            continue
+        resolve_stage_aws_profile(stage, aws_identities, plt_env)
+        resolve_stage_aws_expectations(stage, aws_identities, plt_env)
+        logging.info(
+            "Validated AWS identity mapping for stage %s: aws_identity=%s",
+            stage_id,
+            stage["aws_identity"],
+        )
+
+
+def configure_stage_aws_env(stage_id: str, stage: dict, stage_env: dict[str, str], aws_identities: dict, plt_env: str) -> None:
+    """Set a stage-specific AWS_PROFILE and assertion metadata when aws_identity is configured."""
+    for var_name in AWS_IDENTITY_STAGE_ENV_VARS:
+        stage_env.pop(var_name, None)
+
+    identity_name = stage.get("aws_identity")
+    if not identity_name:
+        return
+
+    profile = resolve_stage_aws_profile(stage, aws_identities, plt_env)
+    expectations = resolve_stage_aws_expectations(stage, aws_identities, plt_env)
+
+    for var_name in AWS_CREDENTIAL_ENV_VARS:
+        stage_env.pop(var_name, None)
+    stage_env["AWS_EC2_METADATA_DISABLED"] = "true"
+    stage_env["AWS_PROFILE"] = profile
+    stage_env["ATLAS_AWS_ASSERT_IDENTITY"] = "true"
+    stage_env["ATLAS_AWS_IDENTITY"] = identity_name
+
+    env_var_map = {
+        "account_id": "ATLAS_AWS_EXPECT_ACCOUNT_ID",
+        "sso_permission_set": "ATLAS_AWS_EXPECT_SSO_PERMISSION_SET",
+        "assumed_role_name": "ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME",
+    }
+    for key, var_name in env_var_map.items():
+        if expectations.get(key):
+            stage_env[var_name] = expectations[key]
+
+    logging.info(
+        "Resolved AWS identity for stage %s: aws_identity=%s profile=%s expectations=%s",
+        stage_id,
+        identity_name,
+        profile,
+        sorted(expectations.keys()),
+    )
 
 
 def merge_config_dirs(
@@ -2105,6 +2357,7 @@ def write_stage_flow_artifact(path: Path, workflow_meta: dict | None, active_sta
                 "target": stage.get("target"),
                 "source": stage["source"],
                 "workflow": stage["workflow"],
+                "aws_identity": stage.get("aws_identity"),
                 "branch": stage.get("branch"),
                 "commit": stage.get("commit"),
             }
@@ -2272,6 +2525,8 @@ def prepare_stage_repo(
     stage: dict,
     run_dir: Path,
     tooling_env: dict[str, str],
+    aws_identities: dict | None = None,
+    plt_env: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Clone/copy a stage repo, materialize child modules, and run its setup script."""
     repo_path = run_dir / "stages_source" / stage_id
@@ -2300,6 +2555,8 @@ def prepare_stage_repo(
     stage_setup_cmd = ["./pipeline/setup.sh"]
     stage_env = os.environ.copy()
     stage_env.update(tooling_env)
+    if aws_identities is not None and plt_env is not None:
+        configure_stage_aws_env(stage_id, stage, stage_env, aws_identities, plt_env)
     logging.info(" ".join(stage_setup_cmd))
     run_and_log(
         stage_setup_cmd,
@@ -2364,13 +2621,21 @@ def run_stages(
     main_tag: str,
     tooling_refs: dict,
     use_local_tooling_cfg: bool,
+    aws_identities: dict,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
     for stage_id, stage in active_stages.items():
         log_stage_banner(stage_id)
-        repo_path, stage_env = prepare_stage_repo(stage_id, stage, run_dir, tooling_env)
+        repo_path, stage_env = prepare_stage_repo(
+            stage_id,
+            stage,
+            run_dir,
+            tooling_env,
+            aws_identities=aws_identities,
+            plt_env=plt_env,
+        )
 
         stage_runner_path = "./pipeline/runners/local_dev.py" if use_local_tooling_cfg else "./pipeline/runners/local.py"
         stage_run_cmd = [
@@ -2572,6 +2837,7 @@ def run_pipeline(
         plt_overlays=plt_overlays,
     )
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+    aws_identities = load_aws_identities_cfg(ctl_cfg_root)
 
     stage_source_refs = load_stage_source_refs_cfg(ctl_cfg_root, ctl_env)
     module_refs = load_module_refs_cfg(ctl_cfg_root, ctl_env)
@@ -2601,6 +2867,7 @@ def run_pipeline(
 
     # Validate stages have commits for stg/prod
     validate_stages_have_commits(active_stages, ctl_env)
+    validate_active_stage_aws_identities(active_stages, aws_identities, plt_env)
 
     write_target_stage_flow_artifact(
         ctl_cfg_root,
@@ -2633,6 +2900,7 @@ def run_pipeline(
         main_tag=main_tag,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
+        aws_identities=aws_identities,
     )
 
     print_run_summary(run_id, log_file)
