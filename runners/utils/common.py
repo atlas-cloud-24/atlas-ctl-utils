@@ -333,23 +333,33 @@ def validate_ephemeral(ctl_env: str, ephemeral: bool) -> None:
         )
 
 
-def validate_action_args(args: argparse.Namespace) -> None:
-    """Validate CLI arguments for pipeline vs maintenance mode."""
-    if args.aws_identity and not args.allow_synthetic_workflow:
-        raise RuntimeError("❌ --aws-identity is only valid with --allow-synthetic-workflow")
-    if args.action == "pipeline":
-        if not args.workflow:
-            raise RuntimeError("❌ --workflow is required for --action=pipeline")
-        return
+def validate_baseline_args(args: argparse.Namespace) -> None:
+    """Validate args for a baseline (pipeline) run: --workflow xor --target."""
+    if not args.workflow and not args.target:
+        raise RuntimeError("❌ baseline needs --workflow or --target")
+    if args.workflow and args.target:
+        raise RuntimeError("❌ baseline takes --workflow or --target, not both")
 
+
+def validate_maintenance_args(args: argparse.Namespace) -> None:
+    """Validate args for a maintenance run."""
     if getattr(args, "ctl_variants", None):
-        raise RuntimeError("❌ --ctl-variants is supported only for --action=pipeline")
+        raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
     if not args.maintenance_action:
-        raise RuntimeError("❌ --maintenance-action is required for --action=maintenance")
-    if not args.stage_target:
-        raise RuntimeError("❌ --stage-target is required for --action=maintenance")
+        raise RuntimeError("❌ --maintenance-action is required for maintenance")
+    if not args.target:
+        raise RuntimeError("❌ --target is required for maintenance")
     if args.maintenance_action == "force-unlock" and not args.lock_id:
         raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
+
+
+def validate_adhoc_args(args: argparse.Namespace) -> None:
+    """Validate args for an ad-hoc synthetic-target run."""
+    missing = [f for f in ("source", "ref", "cfg_set", "sub_workflow") if not getattr(args, f, None)]
+    if missing:
+        raise RuntimeError(
+            "❌ adhoc needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
+        )
 
 
 
@@ -523,7 +533,7 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
     parsed = urlparse(repo_url)
     if not parsed.scheme or not parsed.netloc:
         raise argparse.ArgumentTypeError(
-            f"Invalid format: '{value}'. local.py accepts only URL@branch=name or URL@commit=sha; use local_dev.py for local paths"
+            f"Invalid format: '{value}'. With --dev false only URL@branch=name or URL@commit=sha is accepted; use --dev true for local paths"
         )
 
     if ref_part.startswith("branch="):
@@ -614,8 +624,8 @@ def build_active_stages(
     inventory_cfg: dict,
     repo_key: str = "repo_url",
     require_branch_or_commit: bool = True,
-    stage_source_refs: dict | None = None,
-    module_refs: dict | None = None,
+    refs: dict | None = None,
+    plt_env: str = "",
 ) -> dict:
     inventory_stage_sources = inventory_cfg.get("stage_sources", {})
     if not isinstance(inventory_stage_sources, dict):
@@ -625,8 +635,8 @@ def build_active_stages(
     if not isinstance(inventory_stage_targets, dict):
         raise RuntimeError("'stage_targets' in inventory must be a mapping: target -> meta")
 
-    stage_source_refs = stage_source_refs or {}
-    module_refs = module_refs or {}
+    refs = refs or {}
+    scoped_refs = refs.get("scoped") or {}
     active = {}
 
     def normalize_cfg_root(raw_value, *, stage_target: str) -> str:
@@ -641,12 +651,9 @@ def build_active_stages(
         parts = [part for part in value.split("/") if part]
         if any(part in (".", "..") for part in parts):
             raise RuntimeError(f"Stage target {stage_target!r} cfg_root must not contain . or ..: {value}")
-        if len(parts) != 1:
-            raise RuntimeError(
-                f"Stage target {stage_target!r} cfg_root must be exactly one top-level scope "
-                f"(a single path segment), not {value!r} — a stage may not span scopes"
-            )
-        return "/" + parts[0]
+        # cfg_root is freed (Phase 2d): any safe path incl. "/" (root) and multi-segment; it no
+        # longer must be a single scope segment and is independent of the target's ref/context.
+        return "/" + "/".join(parts)
 
     for st in workflow_cfg.get("stages", []):
         if isinstance(st, str):
@@ -687,7 +694,21 @@ def build_active_stages(
                 f"Stage source {stage_source!r} metadata must be a mapping, got: {type(source_cfg).__name__}"
             )
 
-        stage_ref = stage_source_refs.get(stage_source) or {}
+        # Phase 2d: resolve this target's ref context → per-context source/module pins.
+        target_ref = target_cfg.get("ref")
+        ctx_stage_refs: dict = {}
+        ctx_module_refs: dict = {}
+        if scoped_refs and target_ref:
+            ctx = resolve_ref_context(target_ref, plt_env)
+            ctx_block = scoped_refs.get(ctx)
+            if ctx_block is None:
+                raise RuntimeError(
+                    f"Stage target {stage_target!r} ref context {ctx!r} not found in refs.scoped"
+                )
+            ctx_stage_refs = ctx_block.get("stage_sources") or {}
+            ctx_module_refs = ctx_block.get("modules") or {}
+
+        stage_ref = ctx_stage_refs.get(stage_source) or {}
         if not isinstance(stage_ref, dict):
             raise RuntimeError(
                 f"Stage source refs for {stage_source!r} must be a mapping, got: {type(stage_ref).__name__}"
@@ -695,7 +716,8 @@ def build_active_stages(
 
         branch = stage_over.get("branch") or stage_ref.get("branch")
         commit = stage_over.get("commit") or stage_ref.get("commit")
-        child_workflow = stage_over.get("workflow")
+        # fat target carries the repo-local sub_workflow; a dict stage entry may still override
+        child_workflow = stage_over.get("workflow") or target_cfg.get("sub_workflow")
 
         if branch and commit:
             raise RuntimeError(
@@ -705,6 +727,10 @@ def build_active_stages(
 
         if require_branch_or_commit and not branch and not commit:
             raise RuntimeError(f"Stage {stage_id!r} source {stage_source!r} has neither branch nor commit configured")
+        if require_branch_or_commit and ref_requires_commit(target_ref, plt_env) and not commit:
+            raise RuntimeError(
+                f"Stage {stage_id!r} ref {target_ref!r} requires an explicit commit (not a branch) for reproducibility"
+            )
 
         repo_value = source_cfg.get(repo_key)
         if not repo_value:
@@ -721,6 +747,7 @@ def build_active_stages(
         active_stage = {
             "target": stage_target,
             "source": stage_source,
+            "ref": target_ref,
             "branch": branch,
             "commit": commit,
             "workflow": child_workflow,
@@ -728,7 +755,8 @@ def build_active_stages(
             "cfg_files": cfg_files,
         }
 
-        aws_identity = stage_over.get("aws_identity")
+        # fat target carries aws_identity; a dict stage entry may still override
+        aws_identity = stage_over.get("aws_identity") or target_cfg.get("aws_identity")
         if aws_identity is not None:
             if not isinstance(aws_identity, str) or not aws_identity.strip():
                 raise RuntimeError(f"Stage {stage_id!r} aws_identity must be a non-empty string")
@@ -764,7 +792,7 @@ def build_active_stages(
                     f"Stage {stage_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
                 )
 
-            module_ref = module_refs.get(module_name) or {}
+            module_ref = ctx_module_refs.get(module_name) or {}
             if not isinstance(module_ref, dict):
                 raise RuntimeError(
                     f"Module refs for {module_name!r} must be a mapping, got: {type(module_ref).__name__}"
@@ -780,6 +808,10 @@ def build_active_stages(
             if require_branch_or_commit and not module_branch and not module_commit:
                 raise RuntimeError(
                     f"Stage {stage_id!r} module {module_name!r} has neither branch nor commit configured"
+                )
+            if require_branch_or_commit and ref_requires_commit(target_ref, plt_env) and not module_commit:
+                raise RuntimeError(
+                    f"Stage {stage_id!r} module {module_name!r} ref {target_ref!r} requires an explicit commit"
                 )
 
             dest = module_meta.get("dest")
@@ -825,30 +857,164 @@ def build_active_stages(
     return active
 
 
-def load_aws_identities_cfg(ctl_cfg_root: Path) -> dict:
-    """Load and validate optional logical AWS execution identities."""
-    path = ctl_cfg_root / "aws_identities.yaml"
-    if not path.is_file():
-        return {}
+# After the Phase 2d cutover, targets / workflows / refs are all content-key
+# resources (identified by their top-level key, not by a dir), so nothing is skipped.
+_CONTENT_KEY_SKIP_TOP = ()
 
-    doc = load_yaml(path) or {}
-    identities = doc.get("aws_identities", {})
-    if not isinstance(identities, dict):
-        raise RuntimeError(f"❌ 'aws_identities' must be a mapping: {path}")
+
+def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> dict:
+    """Merge a top-level resource map identified by `key` across every cfg file.
+
+    A resource's type is its top-level YAML key (content-key), not its filename: a
+    file with a `cfg_sets:` key contributes cfg-sets wherever it lives. The maps are
+    unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
+    error (same rule as targets), order-independent. `entry_depth` is how deep the
+    unique entries sit: 1 for flat catalogs (stage_sources/cfg_sets/aws_identities),
+    2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>`.
+    Intermediate levels merge; the entry level collides. Dir-routed trees (see
+    `_CONTENT_KEY_SKIP_TOP`) are skipped — they have dedicated loaders.
+    """
+    merged: dict = {}
+    origin: dict = {}
+
+    def _merge(dst: dict, src: dict, prefix: str, yf: Path) -> None:
+        for name, val in src.items():
+            path = f"{prefix}.{name}" if prefix else str(name)
+            depth = path.count(".") + 1
+            if depth < entry_depth:
+                if not isinstance(val, dict):
+                    raise RuntimeError(f"❌ {key} {path!r} must be a mapping: {yf}")
+                node = dst.setdefault(name, {})
+                if not isinstance(node, dict):
+                    raise RuntimeError(f"❌ {key} {path!r} must be a mapping: {yf}")
+                _merge(node, val, path, yf)
+            else:
+                if name in dst:
+                    raise RuntimeError(
+                        f"❌ duplicate {key} entry {path!r}: {yf} (also defined in {origin[path]})"
+                    )
+                dst[name] = val
+                origin[path] = yf
+
+    for yf in sorted(ctl_cfg_root.rglob("*.yaml")):
+        rel = yf.relative_to(ctl_cfg_root)
+        if rel.parts and rel.parts[0] in _CONTENT_KEY_SKIP_TOP:
+            continue
+        data = load_yaml(yf) or {}
+        if not isinstance(data, dict):
+            continue
+        section = data.get(key)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ '{key}' must be a mapping: {yf}")
+        _merge(merged, section, "", yf)
+
+    return merged
+
+
+def _deep_merge_refs(dst: dict, src: dict, yf: Path, path: str = "") -> None:
+    """Deep-merge a `refs` subtree across files; a duplicate leaf is a load error."""
+    for k, v in src.items():
+        cur = f"{path}.{k}" if path else str(k)
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _deep_merge_refs(dst[k], v, yf, cur)
+        elif k in dst:
+            raise RuntimeError(f"❌ duplicate refs entry {cur!r}: {yf}")
+        else:
+            dst[k] = v
+
+
+def load_refs_cfg(ctl_cfg_root: Path) -> dict:
+    """Collect the content-key `refs` resource (deep tree-merge).
+
+    Returns `{global: {tooling...}, scoped: {<ctx>: {stage_sources, modules}}}`.
+    `global` = run-level shared pins (the engine/tooling, one version everywhere).
+    `scoped` = per-context pins keyed by a flat dotted context. Both optional; in
+    dev the refs may be absent entirely → `{}`.
+    """
+    merged: dict = {}
+    for yf in sorted(ctl_cfg_root.rglob("*.yaml")):
+        data = load_yaml(yf) or {}
+        if not isinstance(data, dict):
+            continue
+        section = data.get("refs")
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ 'refs' must be a mapping: {yf}")
+        _deep_merge_refs(merged, section, yf)
+    return merged
+
+
+def resolve_ref_context(target_ref: str, plt_env: str) -> str:
+    """Substitute `${plt_env}` in a target's `ref` → the refs.scoped context key."""
+    if not isinstance(target_ref, str) or not target_ref.strip():
+        raise RuntimeError("❌ target 'ref' must be a non-empty string")
+    return target_ref.strip().replace("${plt_env}", plt_env)
+
+
+def ref_requires_commit(target_ref: str, plt_env: str) -> bool:
+    """Commit required when the ref is literal (no `${plt_env}` — a permanent
+    foundation like org/deployments) or when plt_env is a pinned env (stg/prod)."""
+    if "${plt_env}" not in (target_ref or ""):
+        return True
+    return plt_env in ENVS_STG_PROD
+
+
+def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = ()) -> list:
+    """Ordered stages for a workflow: imported stages (recursively, in order) then
+    its own `stages`. Cycles and post-expansion duplicate stages are errors."""
+    if name in _stack:
+        raise RuntimeError(f"❌ workflow import cycle: {' -> '.join([*_stack, name])}")
+    wf = action_workflows.get(name)
+    if wf is None:
+        raise RuntimeError(f"❌ workflow {name!r} not found (imported)")
+    if not isinstance(wf, dict):
+        raise RuntimeError(f"❌ workflow {name!r} must be a mapping")
+    stages: list = []
+    for imp in (wf.get("imports") or []):
+        stages.extend(expand_workflow_imports(action_workflows, imp, (*_stack, name)))
+    stages.extend(wf.get("stages") or [])
+    seen: set = set()
+    for s in stages:
+        if s in seen:
+            raise RuntimeError(f"❌ workflow {name!r} has duplicate stage {s!r} after import expansion")
+        seen.add(s)
+    return stages
+
+
+def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tuple = ()) -> dict:
+    """A workflow's selectors intersected with all imported workflows' selectors
+    (an import cannot widen availability)."""
+    if name in _stack:
+        return {}
+    wf = action_workflows.get(name) or {}
+    sel = {dim: list(vals) for dim, vals in (wf.get("selectors") or {}).items()}
+    for imp in (wf.get("imports") or []):
+        imp_sel = workflow_effective_selectors(action_workflows, imp, (*_stack, name))
+        for dim, vals in imp_sel.items():
+            sel[dim] = [v for v in sel[dim] if v in vals] if dim in sel else list(vals)
+    return sel
+
+
+def load_aws_identities_cfg(ctl_cfg_root: Path) -> dict:
+    """Load and validate optional logical AWS execution identities (content-key)."""
+    identities = collect_resource(ctl_cfg_root, "aws_identities")
 
     for identity_name, identity_cfg in identities.items():
         if not isinstance(identity_name, str) or not identity_name.strip():
-            raise RuntimeError(f"❌ aws identity names must be non-empty strings: {path}")
+            raise RuntimeError(f"❌ aws identity names must be non-empty strings: {ctl_cfg_root}")
         if not isinstance(identity_cfg, dict):
-            raise RuntimeError(f"❌ aws identity {identity_name!r} must be a mapping: {path}")
+            raise RuntimeError(f"❌ aws identity {identity_name!r} must be a mapping: {ctl_cfg_root}")
 
         local_cfg = identity_cfg.get("local")
         if local_cfg is not None:
-            _validate_aws_identity_local_cfg(identity_name, local_cfg, path)
+            _validate_aws_identity_local_cfg(identity_name, local_cfg, ctl_cfg_root)
 
         expect_cfg = identity_cfg.get("expect")
         if expect_cfg is not None:
-            _validate_aws_identity_expect_cfg(identity_name, expect_cfg, path)
+            _validate_aws_identity_expect_cfg(identity_name, expect_cfg, ctl_cfg_root)
 
     return identities
 
@@ -1144,28 +1310,29 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Ctl environment type (e.g. dev|test|stg|prod)",
     )
     parser.add_argument(
-        "--action",
-        default="pipeline",
-        choices=list(RUN_ACTIONS),
-        help="Top-level runner action",
+        "--dev",
+        type=str2bool,
+        default=False,
+        help="true = local-path cfg (dev); false = git-URL cfg (CI)",
     )
     parser.add_argument(
-        "--inventory",
+        "--action",
         required=True,
-        help="inventory name (e.g. create|destroy|plan)",
+        choices=["provision", "plan", "destroy", "readonly"],
+        help="Lifecycle action (provision|plan|destroy|readonly)",
     )
     parser.add_argument(
         "--workflow",
-        help="workflow name (required for --action pipeline)",
+        help="ordered workflow name (baseline runs)",
+    )
+    parser.add_argument(
+        "--target",
+        help="a single target name (baseline), or the target to operate on (maintenance)",
     )
     parser.add_argument(
         "--maintenance-action",
         choices=list(MAINTENANCE_ACTIONS),
-        help="maintenance action name (required for --action maintenance)",
-    )
-    parser.add_argument(
-        "--stage-target",
-        help="stage target from inventory (required for --action maintenance)",
+        help="maintenance action (maintenance runs)",
     )
     parser.add_argument(
         "--lock-id",
@@ -1189,20 +1356,28 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Run id (must be a valid UUID format)",
     )
     parser.add_argument(
-        "--allow-synthetic-workflow",
-        action="store_true",
-        help=(
-            "Allow running a single stage directly as --workflow "
-            "<stage-target>/<stage-workflow> when no ctl workflow yaml exists"
-        ),
+        "--source",
+        help="adhoc: source repo for a synthetic target",
+    )
+    parser.add_argument(
+        "--ref",
+        help="adhoc: ref context (a key in refs.scoped, e.g. env.${plt_env} or org) for a synthetic target",
+    )
+    parser.add_argument(
+        "--cfg-set",
+        dest="cfg_set",
+        help="adhoc: cfg_set for a synthetic target",
+    )
+    parser.add_argument(
+        "--sub-workflow",
+        dest="sub_workflow",
+        help="adhoc: repo sub_workflow for a synthetic target",
     )
     parser.add_argument(
         "--aws-identity",
+        dest="aws_identity",
         default=None,
-        help=(
-            "Logical AWS identity (from aws_identities.yaml) to attach to a "
-            "synthetic workflow stage; only valid with --allow-synthetic-workflow"
-        ),
+        help="adhoc: aws identity for a synthetic target",
     )
 
 
@@ -1258,50 +1433,39 @@ def load_workflow_cfg(
     ctl_env: str,
     inventory_name: str,
     workflow_name: str,
+    plt_env: str = "",
     allow_target_stage_workflow: bool = False,
     synthetic_aws_identity: str | None = None,
 ) -> dict:
-    """Load env workflow config, then base fallback, then optional local target-stage workflow."""
-    env_workflow_path = (
-        ctl_cfg_root
-        / "workflows"
-        / ctl_env
-        / inventory_name
-        / f"{workflow_name}.yaml"
-    )
-    if env_workflow_path.is_file():
-        return load_yaml(env_workflow_path)
+    """Load a content-key workflow: `workflows.<action>.<name>` (imports + selectors).
 
-    base_workflow_path = (
-        ctl_cfg_root
-        / "workflows"
-        / "base"
-        / inventory_name
-        / f"{workflow_name}.yaml"
-    )
-    if base_workflow_path.is_file():
-        logging.info(
-            "Workflow file not found for ctl env '%s', using base workflow: %s",
-            ctl_env,
-            base_workflow_path,
+    Expands `imports` (ordered, recursive) then the workflow's own `stages`; applies
+    `selectors` (intersected through imports) to gate availability on plt_env. The
+    workflow name is an opaque key (slashes are cosmetic). `ctl_env`,
+    `allow_target_stage_workflow`, and `synthetic_aws_identity` are accepted for
+    backward-compatible call sites and otherwise unused.
+    """
+    workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
+    action_workflows = workflows.get(inventory_name)
+    if not isinstance(action_workflows, dict) or not action_workflows:
+        raise RuntimeError(f"❌ no workflows defined for action {inventory_name!r}")
+    if workflow_name not in action_workflows:
+        raise RuntimeError(
+            f"❌ workflow {workflow_name!r} not found for action {inventory_name!r}"
         )
-        return load_yaml(base_workflow_path)
 
-    if allow_target_stage_workflow:
-        workflow_cfg = build_target_stage_workflow_cfg(
-            ctl_env, inventory_name, workflow_name, aws_identity=synthetic_aws_identity
+    effective_selectors = workflow_effective_selectors(action_workflows, workflow_name)
+    if plt_env and not _selectors_allow_env(effective_selectors, plt_env):
+        raise RuntimeError(
+            f"❌ workflow {inventory_name}/{workflow_name} is not available for "
+            f"plt_env {plt_env!r} (selectors {effective_selectors})"
         )
-        if workflow_cfg is not None:
-            logging.info(
-                "Workflow file not found, using synthesized single-stage workflow for local dev: %s",
-                workflow_name,
-            )
-            return workflow_cfg
 
-    raise RuntimeError(
-        f"❌ workflow file not found in ctl env '{ctl_env}' or base: "
-        f"{inventory_name}/{workflow_name}.yaml"
-    )
+    stages = expand_workflow_imports(action_workflows, workflow_name)
+    return {
+        "meta": {"name": f"{inventory_name}/{workflow_name}", "action": inventory_name},
+        "stages": stages,
+    }
 
 
 def get_ctl_variants_root(ctl_cfg_root: Path) -> Path:
@@ -1485,54 +1649,121 @@ def apply_ctl_variant_workflow_patch(
     return patched_workflow_cfg
 
 
+def load_variants_cfg(ctl_cfg_root: Path) -> dict:
+    """Load variants.yaml (action-keyed placements); {} if absent."""
+    path = ctl_cfg_root / "variants.yaml"
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    variants = data.get("variants", {})
+    if not isinstance(variants, dict):
+        raise RuntimeError(f"❌ 'variants' must be a mapping: {path}")
+    return variants
+
+
+def _selectors_subset(child: dict | None, parent: dict | None):
+    """(ok, reason) — True if child selectors are a subset of parent's, per dimension."""
+    if not child:
+        return True, None
+    parent = parent or {}
+    for dim, child_vals in child.items():
+        pvals = parent.get(dim)
+        if pvals is None:
+            continue
+        extra = [v for v in (child_vals or []) if v not in pvals]
+        if extra:
+            return False, f"{dim}={extra} not allowed by target {dim}={pvals}"
+    return True, None
+
+
+def _selectors_allow_env(selectors: dict | None, plt_env: str) -> bool:
+    """True if plt_env satisfies selectors' plt_env (or it is unset)."""
+    if not selectors:
+        return True
+    allowed = selectors.get("plt_env")
+    return allowed is None or plt_env in allowed
+
+
 def apply_ctl_variants_to_workflow_cfg(
     ctl_cfg_root: Path,
     workflow_cfg: dict,
+    inventory_cfg: dict,
     *,
-    ctl_env: str,
     plt_env: str,
     inventory_name: str,
     workflow_name: str,
     ctl_variants: list[str],
-    plt_overlays: list[str],
 ) -> dict:
-    """Apply selected ctl variants to a loaded workflow cfg."""
+    """Apply selected variants.yaml placements to a loaded workflow cfg.
+
+    A variant is `variants.<action>.<name> = {target, workflow, after|before, [selectors]}`.
+    For each selected variant whose `workflow` matches the running one: validate its target
+    exists and `variant.selectors ⊆ target.selectors`, gate on plt_env (the target ceiling AND
+    the variant subset), then insert the target name at the after/before anchor (skip + log if
+    the anchor is absent in this workflow).
+    """
     if not ctl_variants:
         return workflow_cfg
 
-    patched_workflow_cfg = dict(workflow_cfg)
-    patched_workflow_cfg["stages"] = list(workflow_cfg.get("stages") or [])
+    variants = load_variants_cfg(ctl_cfg_root).get(inventory_name, {})
+    targets = inventory_cfg.get("stage_targets", {})
+    stages = list(workflow_cfg.get("stages") or [])
 
-    for ctl_variant in ctl_variants:
-        variant_root = get_ctl_variant_root(ctl_cfg_root, ctl_variant)
-        meta = load_optional_yaml_mapping(variant_root / "__meta__.yaml")
-        validate_ctl_variant_meta(
-            meta,
-            variant_label=ctl_variant,
-            ctl_env=ctl_env,
-            plt_env=plt_env,
-            plt_overlays=plt_overlays,
-        )
+    for name in ctl_variants:
+        v = variants.get(name)
+        if v is None:
+            raise RuntimeError(
+                f"❌ variant {name!r} not found under action {inventory_name!r} in variants.yaml"
+            )
+        if not isinstance(v, dict):
+            raise RuntimeError(f"❌ variant {name!r} must be a mapping")
 
-        patch_path = variant_root / "workflows" / inventory_name / f"{workflow_name}.yaml"
-        patch_cfg = load_optional_yaml_mapping(patch_path)
-        if not patch_cfg:
+        if v.get("workflow") != workflow_name:
             logging.info(
-                "Ctl variant '%s' has no workflow patch for %s/%s",
-                ctl_variant,
-                inventory_name,
-                workflow_name,
+                "Variant '%s' targets workflow '%s', not the running '%s' — skipped",
+                name, v.get("workflow"), workflow_name,
             )
             continue
 
-        patched_workflow_cfg = apply_ctl_variant_workflow_patch(
-            patched_workflow_cfg,
-            patch_cfg,
-            variant_label=ctl_variant,
-            patch_label=str(patch_path),
+        target_name = v.get("target")
+        target = targets.get(target_name)
+        if target is None:
+            raise RuntimeError(
+                f"❌ variant {name!r} references missing target {target_name!r} (action {inventory_name!r})"
+            )
+
+        ok, why = _selectors_subset(v.get("selectors"), target.get("selectors"))
+        if not ok:
+            raise RuntimeError(f"❌ variant {name!r} selectors exceed target {target_name!r}: {why}")
+
+        if not _selectors_allow_env(target.get("selectors"), plt_env):
+            logging.info("Variant '%s' target forbids plt_env '%s' — skipped", name, plt_env)
+            continue
+        if not _selectors_allow_env(v.get("selectors"), plt_env):
+            logging.info("Variant '%s' placement gated off for plt_env '%s' — skipped", name, plt_env)
+            continue
+
+        before, after = v.get("before"), v.get("after")
+        if before and after:
+            raise RuntimeError(f"❌ variant {name!r} cannot set both 'before' and 'after'")
+        anchor = before or after
+        if anchor is None:
+            raise RuntimeError(f"❌ variant {name!r} must define 'after' or 'before'")
+        if anchor not in stages:
+            logging.info("Variant '%s' anchor '%s' absent from '%s' — skipped", name, anchor, workflow_name)
+            continue
+        if target_name in stages:
+            raise RuntimeError(f"❌ variant {name!r} inserts duplicate target {target_name!r}")
+        idx = stages.index(anchor)
+        stages.insert(idx if before else idx + 1, target_name)
+        logging.info(
+            "Applied variant '%s': inserted '%s' %s '%s'",
+            name, target_name, "before" if before else "after", anchor,
         )
 
-    return patched_workflow_cfg
+    patched = dict(workflow_cfg)
+    patched["stages"] = stages
+    return patched
 
 
 def expand_cfg_file_includes(
@@ -1570,55 +1801,52 @@ def resolve_cfg_set_files(cfg_set_name: str, cfg_sets: dict, cfg_sets_path: Path
 
 
 def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
-    """Compose inventory cfg from stage_sources + cfg_sets + per-action targets.
+    """Compose action cfg from stage_sources + cfg_sets + targets/<action>/*.yaml.
 
-    Layout under ctl_cfg_root:
+    `inventory_name` is the action (provision/plan/destroy/readonly). Layout:
       - stage_sources.yaml  source repos: source -> meta
       - cfg_sets.yaml       config views: cfg_set -> {cfg_root, cfg_files}
-      - targets/<name>.yaml per-action targets: target -> {source, cfg_set},
-                            joining a source repo with a config view.
+      - targets/<action>/*.yaml  fat targets (the directory IS the action). Each
+            file is a flat `targets:` map; all files for an action merge (duplicate
+            names rejected). A target is self-contained:
+              {source, cfg_set, sub_workflow, aws_identity,
+               [cfg_files], [selectors], [requires_plt_overlays]}.
 
     Returns the flat shape build_active_stages consumes ({stage_sources,
     stage_targets}), where each target carries source + cfg_root + cfg_files
-    resolved from its cfg_set.
+    (resolved from its cfg_set) + sub_workflow + aws_identity (+ selectors /
+    requires_plt_overlays when present).
     """
-    sources_path = ctl_cfg_root / "stage_sources.yaml"
-    cfg_sets_path = ctl_cfg_root / "cfg_sets.yaml"
-    targets_path = ctl_cfg_root / "targets" / f"{inventory_name}.yaml"
+    # global resources + targets are content-key (collected by top-level key)
+    stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
+    cfg_sets = collect_resource(ctl_cfg_root, "cfg_sets")
+    cfg_sets_path = ctl_cfg_root  # label for include/error messages
+    if not stage_sources:
+        raise RuntimeError(f"❌ no 'stage_sources' defined under: {ctl_cfg_root}")
+    if not cfg_sets:
+        raise RuntimeError(f"❌ no 'cfg_sets' defined under: {ctl_cfg_root}")
 
-    for path, label in (
-        (sources_path, "stage_sources"),
-        (cfg_sets_path, "cfg_sets"),
-        (targets_path, "targets"),
-    ):
-        if not path.is_file():
-            raise RuntimeError(f"❌ {label} file not found: {path}")
-
-    stage_sources = (load_yaml(sources_path) or {}).get("stage_sources", {})
-    cfg_sets = (load_yaml(cfg_sets_path) or {}).get("cfg_sets", {})
-    stage_targets = (load_yaml(targets_path) or {}).get("stage_targets", {})
-
-    if not isinstance(cfg_sets, dict):
-        raise RuntimeError(f"❌ 'cfg_sets' must be a mapping: {cfg_sets_path}")
-    if not isinstance(stage_targets, dict):
-        raise RuntimeError(f"❌ 'stage_targets' must be a mapping: {targets_path}")
+    all_targets = collect_resource(ctl_cfg_root, "targets", entry_depth=2)
+    stage_targets = all_targets.get(inventory_name)
+    if not isinstance(stage_targets, dict) or not stage_targets:
+        raise RuntimeError(f"❌ no targets defined for action {inventory_name!r}")
 
     resolved_targets: dict = {}
     for target_name, target_def in stage_targets.items():
         if not isinstance(target_def, dict):
-            raise RuntimeError(f"❌ target {target_name!r} must be a mapping: {targets_path}")
+            raise RuntimeError(f"❌ target {target_name!r} must be a mapping (action {inventory_name!r})")
 
         source = target_def.get("source")
         if not isinstance(source, str) or not source:
-            raise RuntimeError(
-                f"❌ target {target_name!r} must define a non-empty 'source': {targets_path}"
-            )
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'source'")
+
+        target_ref = target_def.get("ref")
+        if not isinstance(target_ref, str) or not target_ref.strip():
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'ref'")
 
         cfg_set_name = target_def.get("cfg_set")
         if not isinstance(cfg_set_name, str) or not cfg_set_name:
-            raise RuntimeError(
-                f"❌ target {target_name!r} must define a non-empty 'cfg_set': {targets_path}"
-            )
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'cfg_set'")
         cfg_set = cfg_sets.get(cfg_set_name)
         if cfg_set is None:
             raise RuntimeError(
@@ -1627,18 +1855,35 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         if not isinstance(cfg_set, dict):
             raise RuntimeError(f"❌ cfg_set {cfg_set_name!r} must be a mapping: {cfg_sets_path}")
 
+        sub_workflow = target_def.get("sub_workflow")
+        if not isinstance(sub_workflow, str) or not sub_workflow:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'sub_workflow'")
+
+        aws_identity = target_def.get("aws_identity")
+        if aws_identity is not None and (not isinstance(aws_identity, str) or not aws_identity.strip()):
+            raise RuntimeError(f"❌ target {target_name!r} aws_identity must be a non-empty string")
+
         extra_files = target_def.get("cfg_files", []) or []
         if not isinstance(extra_files, list):
-            raise RuntimeError(f"❌ target {target_name!r} cfg_files must be a list: {targets_path}")
+            raise RuntimeError(f"❌ target {target_name!r} cfg_files must be a list")
 
-        resolved_targets[target_name] = {
+        resolved = {
             "source": source,
+            "ref": target_ref.strip(),
+            "sub_workflow": sub_workflow,
             "cfg_root": cfg_set.get("cfg_root", "/"),
             "cfg_files": [
                 *resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
                 *expand_cfg_file_includes(extra_files, cfg_sets, cfg_sets_path),
             ],
         }
+        if aws_identity is not None:
+            resolved["aws_identity"] = aws_identity.strip()
+        if "selectors" in target_def:
+            resolved["selectors"] = target_def["selectors"]
+        if "requires_plt_overlays" in target_def:
+            resolved["requires_plt_overlays"] = target_def["requires_plt_overlays"]
+        resolved_targets[target_name] = resolved
 
     return {
         "stage_sources": stage_sources,
@@ -2327,8 +2572,7 @@ def prepare_pipeline_cfg(
     plt_overlays: list[str],
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
-    stage_source_refs: dict | None = None,
-    module_refs: dict | None = None,
+    refs: dict | None = None,
 ) -> tuple[dict, Path]:
     """
     Merge config dirs, build active stages, and write pipeline_run_cfg.
@@ -2355,8 +2599,8 @@ def prepare_pipeline_cfg(
         inventory_cfg,
         repo_key=stage_repo_key,
         require_branch_or_commit=require_stage_ref,
-        stage_source_refs=stage_source_refs,
-        module_refs=module_refs,
+        refs=refs,
+        plt_env=plt_env,
     )
 
     write_stage_flow_artifact(
@@ -2412,41 +2656,40 @@ def write_target_stage_flow_artifact(
     require_stage_ref: bool,
     allow_target_stage_workflow: bool,
     synthetic_aws_identity: str | None,
-    stage_source_refs: dict | None,
-    module_refs: dict | None,
+    refs: dict | None,
 ) -> None:
     """For plan runs, write the matching create-flow preview artifact."""
     if inventory_name != "plan":
         return
 
-    target_inventory_name = "create"
+    target_inventory_name = "provision"
     try:
         target_workflow_cfg = load_workflow_cfg(
             ctl_cfg_root,
             ctl_env,
             target_inventory_name,
             workflow_name,
+            plt_env=plt_env,
             allow_target_stage_workflow=allow_target_stage_workflow,
             synthetic_aws_identity=synthetic_aws_identity,
         )
+        target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name)
         target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             target_workflow_cfg,
-            ctl_env=ctl_env,
+            target_inventory_cfg,
             plt_env=plt_env,
             inventory_name=target_inventory_name,
             workflow_name=workflow_name,
             ctl_variants=ctl_variants,
-            plt_overlays=plt_overlays,
         )
-        target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name)
         target_active_stages = build_active_stages(
             target_workflow_cfg,
             target_inventory_cfg,
             repo_key=stage_repo_key,
             require_branch_or_commit=require_stage_ref,
-            stage_source_refs=stage_source_refs,
-            module_refs=module_refs,
+            refs=refs,
+            plt_env=plt_env,
         )
     except Exception as exc:
         logging.warning(
@@ -2725,12 +2968,11 @@ def run_maintenance(
     validate_env_compatibility(ctl_env, plt_env)
 
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
-    stage_source_refs = load_stage_source_refs_cfg(ctl_cfg_root, ctl_env)
-    module_refs = load_module_refs_cfg(ctl_cfg_root, ctl_env)
+    refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
         tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
     else:
-        tooling_refs = load_tooling_refs_cfg(ctl_cfg_root, ctl_env)
+        tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_env)
 
     logging.info(f"Environment validation passed: ctl_env={ctl_env} → plt_env={plt_env}")
@@ -2759,8 +3001,7 @@ def run_maintenance(
         plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
-        stage_source_refs=stage_source_refs,
-        module_refs=module_refs,
+        refs=refs,
     )
 
     validate_stages_have_commits(active_stages, ctl_env)
@@ -2818,6 +3059,60 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
     print_run_summary(run_id, log_file)
 
 
+def validate_workflow_scope(workflow_name: str | None, workflow_cfg: dict, inventory_cfg: dict) -> None:
+    """A workflow under scope X (first segment of its name) may only reference targets of scope X."""
+    if not workflow_name or "/" not in workflow_name:
+        return
+    scope = workflow_name.split("/", 1)[0]
+    targets = inventory_cfg.get("stage_targets", {})
+    for entry in workflow_cfg.get("stages", []):
+        name = entry if isinstance(entry, str) else entry.get("target")
+        tscope = targets.get(name, {}).get("scope")
+        if tscope and tscope != scope:
+            raise RuntimeError(
+                f"❌ workflow scope {scope!r} references target {name!r} of scope {tscope!r}"
+            )
+
+
+def build_adhoc_cfg(
+    ctl_cfg_root: Path,
+    action: str,
+    *,
+    source: str,
+    ref: str,
+    cfg_set_name: str,
+    sub_workflow: str,
+    aws_identity: str | None,
+) -> tuple[dict, dict]:
+    """Build a one-target (workflow_cfg, inventory_cfg) for an ad-hoc run.
+
+    The synthetic target is composed directly from CLI args (source + cfg_set +
+    sub_workflow + aws_identity) — it need not exist in targets/<action>/.
+    """
+    stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
+    cfg_sets = collect_resource(ctl_cfg_root, "cfg_sets")
+    cfg_sets_path = ctl_cfg_root
+    cfg_set = cfg_sets.get(cfg_set_name)
+    if not isinstance(cfg_set, dict):
+        raise RuntimeError(f"❌ adhoc cfg_set {cfg_set_name!r} not found under {cfg_sets_path}")
+    resolved = {
+        "source": source,
+        "ref": ref,
+        "sub_workflow": sub_workflow,
+        "cfg_root": cfg_set.get("cfg_root", "/"),
+        "cfg_files": resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
+    }
+    if aws_identity:
+        resolved["aws_identity"] = aws_identity
+    name = "adhoc"
+    inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
+    workflow_cfg = {
+        "meta": {"name": f"adhoc/{source}/{sub_workflow}", "action": action},
+        "stages": [name],
+    }
+    return workflow_cfg, inventory_cfg
+
+
 def run_pipeline(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
@@ -2839,46 +3134,56 @@ def run_pipeline(
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
+    target_name: str | None = None,
+    adhoc: dict | None = None,
 ) -> None:
     """
     Run the full pipeline with given cfg roots.
 
-    This is the main entry point that both local.py and local_dev.py call
-    after obtaining cfg roots (via cloning or local paths). The caller must
-    pass stage repo settings and pre-created run/log directories.
+    Baseline shapes: a `--workflow` (ordered), a single `--target` (one catalog
+    target), or an ad-hoc synthetic target (`adhoc` dict). The caller passes stage
+    repo settings and pre-created run/log directories.
     """
     # Validation
     validate_ephemeral(ctl_env, ephemeral)
     validate_env_compatibility(ctl_env, plt_env)
 
-    # Load workflow and inventory (validate before creating dirs)
-    workflow_cfg = load_workflow_cfg(
-        ctl_cfg_root,
-        ctl_env,
-        inventory_name,
-        workflow_name,
-        allow_target_stage_workflow=allow_target_stage_workflow,
-        synthetic_aws_identity=synthetic_aws_identity,
-    )
-    workflow_cfg = apply_ctl_variants_to_workflow_cfg(
-        ctl_cfg_root,
-        workflow_cfg,
-        ctl_env=ctl_env,
-        plt_env=plt_env,
-        inventory_name=inventory_name,
-        workflow_name=workflow_name,
-        ctl_variants=ctl_variants,
-        plt_overlays=plt_overlays,
-    )
-    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+    # Load workflow + inventory (validate before creating dirs).
+    if adhoc:
+        workflow_cfg, inventory_cfg = build_adhoc_cfg(
+            ctl_cfg_root,
+            inventory_name,
+            source=adhoc["source"],
+            ref=adhoc["ref"],
+            cfg_set_name=adhoc["cfg_set"],
+            sub_workflow=adhoc["sub_workflow"],
+            aws_identity=adhoc.get("aws_identity"),
+        )
+    elif target_name:
+        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+        workflow_cfg = {
+            "meta": {"name": f"{ctl_env}/{inventory_name}/{target_name}", "action": inventory_name},
+            "stages": [target_name],
+        }
+    else:
+        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_env, inventory_name, workflow_name, plt_env=plt_env)
+        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+        workflow_cfg = apply_ctl_variants_to_workflow_cfg(
+            ctl_cfg_root,
+            workflow_cfg,
+            inventory_cfg,
+            plt_env=plt_env,
+            inventory_name=inventory_name,
+            workflow_name=workflow_name,
+            ctl_variants=ctl_variants,
+        )
     aws_identities = load_aws_identities_cfg(ctl_cfg_root)
 
-    stage_source_refs = load_stage_source_refs_cfg(ctl_cfg_root, ctl_env)
-    module_refs = load_module_refs_cfg(ctl_cfg_root, ctl_env)
+    refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
         tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
     else:
-        tooling_refs = load_tooling_refs_cfg(ctl_cfg_root, ctl_env)
+        tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_env)
 
     logging.info(f"Environment validation passed: ctl_env={ctl_env} → plt_env={plt_env}")
@@ -2895,8 +3200,7 @@ def run_pipeline(
         plt_overlays,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
-        stage_source_refs=stage_source_refs,
-        module_refs=module_refs,
+        refs=refs,
     )
 
     # Validate stages have commits for stg/prod
@@ -2916,8 +3220,7 @@ def run_pipeline(
         require_stage_ref=require_stage_ref,
         allow_target_stage_workflow=allow_target_stage_workflow,
         synthetic_aws_identity=synthetic_aws_identity,
-        stage_source_refs=stage_source_refs,
-        module_refs=module_refs,
+        refs=refs,
     )
 
     # Write git metas

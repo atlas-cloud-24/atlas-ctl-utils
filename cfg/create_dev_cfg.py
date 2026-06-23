@@ -128,7 +128,16 @@ def workflow_files(root_dir: Path) -> list[Path]:
 
 
 def refs_files(root_dir: Path) -> list[Path]:
-    return sorted((root_dir / "refs").glob("*.yaml"))
+    """All cfg files contributing a content-key `refs:` resource."""
+    found: list[Path] = []
+    for path in sorted(root_dir.rglob("*.yaml")):
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if isinstance(doc, dict) and isinstance(doc.get("refs"), dict):
+            found.append(path)
+    return found
 
 
 def required_repo_entries(paths: list[Path]) -> set[str]:
@@ -171,15 +180,16 @@ def required_tooling(paths: list[Path]) -> set[str]:
     tooling_names: set[str] = set()
 
     for path in paths:
-        refs_cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if not isinstance(refs_cfg, dict):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(doc, dict):
             continue
 
-        tooling_cfg = refs_cfg.get("tooling") or {}
-        if not isinstance(tooling_cfg, dict):
+        refs_cfg = doc.get("refs") or {}
+        global_cfg = refs_cfg.get("global") if isinstance(refs_cfg, dict) else {}
+        if not isinstance(global_cfg, dict):
             continue
 
-        for tooling_name in tooling_cfg:
+        for tooling_name in global_cfg:
             if isinstance(tooling_name, str):
                 tooling_names.add(tooling_name)
 
@@ -388,13 +398,24 @@ def write_local_tooling_file(root_dir: Path, tooling_map: dict[str, str]) -> Pat
     return local_tooling_path
 
 
-def remove_refs_dir(root_dir: Path) -> bool:
-    refs_dir = root_dir / "refs"
-    if not refs_dir.exists():
-        return False
-
-    shutil.rmtree(refs_dir)
-    return True
+def remove_refs(root_dir: Path) -> list[Path]:
+    """Strip the content-key `refs:` resource from the dev cfg — dev runs on local
+    repo paths with no branch/commit refs. A file that held only refs is deleted."""
+    removed: list[Path] = []
+    for path in sorted(root_dir.rglob("*.yaml")):
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if not isinstance(doc, dict) or "refs" not in doc:
+            continue
+        doc.pop("refs", None)
+        if doc:
+            path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+        else:
+            path.unlink()
+        removed.append(path)
+    return removed
 
 
 def warn_about_extra_mappings(path_map: dict[str, str], required: set[str], label: str) -> None:
@@ -447,7 +468,7 @@ def main() -> int:
             rewritten_paths = rewrite_stage_sources(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
             local_tooling_path = write_local_tooling_file(target_dir, tooling_map)
-            removed_refs_dir = remove_refs_dir(target_dir)
+            removed_refs = remove_refs(target_dir)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else str(exc)
         print(f"error: git command failed: {stderr}", file=sys.stderr)
@@ -464,8 +485,8 @@ def main() -> int:
         print(f"rewrote workflow: {path}")
     if local_tooling_path is not None:
         print(f"wrote local tooling config: {local_tooling_path}")
-    if removed_refs_dir:
-        print(f"removed refs dir: {target_dir / 'refs'}")
+    for path in removed_refs:
+        print(f"stripped refs from: {path}")
 
     return 0
 

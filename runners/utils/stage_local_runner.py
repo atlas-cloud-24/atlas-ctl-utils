@@ -97,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cfg-root",
         default="/env",
-        help="Scoped cfg root to use when merging origin cfg locally. Use /env, /org, /bootstrap, or /.",
+        help="Scoped cfg root to use when merging origin cfg locally. Use /env, /org, /deployments, or /.",
     )
     parser.add_argument("--origin-cfg", required=True)
     parser.add_argument("--ephemeral", required=True, type=str2bool)
