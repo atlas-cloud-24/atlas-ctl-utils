@@ -28,15 +28,15 @@ ENV_TRUST = {"dev": 0, "test": 1, "stg": 2, "prod": 3}
 ENVS_ALL = tuple(ENV_TRUST.keys())
 ENVS_DEV_TEST = ("dev", "test")
 ENVS_STG_PROD = ("stg", "prod")
-REQUIRED_TOOLING_REFS = ("atlas-ctl-utils", "atlas-plt-utils")
+REQUIRED_TOOLING_REFS = ("ctl-utils", "plt-utils")
 LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
 TOOLING_ENV_PREFIXES = {
-    "atlas-ctl-utils": "ATLAS_CTL_UTILS",
-    "atlas-plt-utils": "ATLAS_PLT_UTILS",
+    "ctl-utils": "ATLAS_CTL_UTILS",
+    "plt-utils": "ATLAS_PLT_UTILS",
 }
 TOOLING_DEFAULT_REPO_URLS = {
-    "atlas-ctl-utils": "https://github.com/atlas-cloud-24/atlas-ctl-utils.git",
-    "atlas-plt-utils": "https://github.com/atlas-cloud-24/atlas-plt-utils.git",
+    "ctl-utils": "https://github.com/atlas-cloud-24/atlas-ctl-utils.git",
+    "plt-utils": "https://github.com/atlas-cloud-24/atlas-plt-utils.git",
 }
 RUN_ACTIONS = ("pipeline", "maintenance")
 MAINTENANCE_ACTIONS = ("force-unlock",)
