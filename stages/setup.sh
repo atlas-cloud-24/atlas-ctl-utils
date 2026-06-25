@@ -84,7 +84,7 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     stage_env_out="runtime/env.sh"
   fi
 
-  python3 ./pipeline/stages/_common/build_runtime_cfg.py \
+  python3 ./atlas_ctl_adapter/stages/_common/build_runtime_cfg.py \
     --origin-cfg-dir origin_cfg \
     --cfg-files "$cfg_files" \
     --values-json-out "$values_json_out" \

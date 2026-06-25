@@ -1,4 +1,4 @@
-#!/usr/bin/envdef python3
+#!/usr/bin/env python3
 import argparse
 import contextlib
 import json
@@ -20,17 +20,20 @@ from utils.common import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+ADAPTER_DIR = "atlas_ctl_adapter"
 
-def _build_active_stages(inventory, active_ids, repo_root: Path):
-    inventory_env = inventory.get("env_vars", {})
-    inventory_stage_ids = inventory.get("stages", [])
 
+def _build_active_stages(action_manifest, active_ids, repo_root: Path):
     active = []
     for sid in active_ids:
-        if sid not in inventory_stage_ids:
-            raise RuntimeError(f"Stage '{sid}' not listed in inventory")
+        entry = action_manifest.get(sid)
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Stage '{sid}' not declared in manifest")
+        stage_path = entry.get("path")
+        if not isinstance(stage_path, str) or not stage_path:
+            raise RuntimeError(f"Stage '{sid}' manifest entry must define a non-empty 'path'")
 
-        stage_meta_path = repo_root / "pipeline" / "stages" / sid / "stage.yaml"
+        stage_meta_path = repo_root / stage_path / "stage.yaml"
         if not stage_meta_path.is_file():
             raise RuntimeError(f"Stage metadata not found: {stage_meta_path}")
         st = load_yaml(stage_meta_path)
@@ -45,13 +48,14 @@ def _build_active_stages(inventory, active_ids, repo_root: Path):
         active.append(
             {
                 "id": sid,
+                "path": stage_path,
                 "cfg_files": st.get("cfg_files", []),
                 "runtime": {
                     "values_json": values_json,
                     "env_sh": env_sh,
                 },
                 "env_vars": {
-                    "inventory": inventory_env,
+                    "inventory": {},
                     "stage": st.get("env_vars", {}),
                 },
             }
@@ -59,31 +63,35 @@ def _build_active_stages(inventory, active_ids, repo_root: Path):
     return active
 
 
-def get_stages_from_workflow(inventory_file: Path, workflow_file: Path, repo_root: Path):
-    inventory = load_yaml(inventory_file)
-    workflow = load_yaml(workflow_file)
+def get_stages_from_workflow(manifest_file: Path, workflows_file: Path, action: str, workflow_name: str, repo_root: Path):
+    manifest = (load_yaml(manifest_file) or {}).get("manifest", {})
+    workflows = (load_yaml(workflows_file) or {}).get("workflows", {})
 
-    inventory_stage_ids = inventory.get("stages", [])
-    if not isinstance(inventory_stage_ids, list):
-        raise RuntimeError(f"inventory {inventory_file} 'stages' must be a list of ids")
+    action_manifest = manifest.get(action)
+    if not isinstance(action_manifest, dict) or not action_manifest:
+        raise RuntimeError(f"manifest {manifest_file} declares no stages for action '{action}'")
 
-    if "stages" in workflow:
-        active_ids = []
-        for sid in workflow.get("stages", []):
-            if sid not in inventory_stage_ids:
-                raise RuntimeError(f"Stage '{sid}' not found in inventory {inventory_file}")
-            active_ids.append(sid)
-    else:
-        raise RuntimeError(f"workflow {workflow_file} must have 'stages'")
+    action_workflows = workflows.get(action)
+    if not isinstance(action_workflows, dict) or workflow_name not in action_workflows:
+        raise RuntimeError(f"workflow '{action}/{workflow_name}' not found in {workflows_file}")
+    wf = action_workflows[workflow_name]
+    if not isinstance(wf, dict) or "stages" not in wf:
+        raise RuntimeError(f"workflow '{action}/{workflow_name}' must have 'stages'")
 
-    active_stages = _build_active_stages(inventory, active_ids, repo_root)
+    active_ids = []
+    for sid in wf.get("stages", []):
+        if sid not in action_manifest:
+            raise RuntimeError(f"Stage '{sid}' not declared in manifest for action '{action}'")
+        active_ids.append(sid)
+
+    active_stages = _build_active_stages(action_manifest, active_ids, repo_root)
     return active_ids, active_stages
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--main-tag", required=True)
-    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--action", required=True)
     parser.add_argument("--env-type", required=True)
     parser.add_argument(
         "--overlays",
@@ -104,25 +112,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skip-cfg-merge",
         action="store_true",
-        help="Use cfg that was already merged by an upstream pipeline step.",
+        help="Use cfg that was already merged by an upstream step.",
     )
     parser.add_argument("--run-id", required=True, type=validate_uuid7)
     return parser
-
-
-def _resolve_workflow_file(repo_root: Path, env_type: str, inventory: str, workflow: str) -> Path:
-    workflow_file = repo_root / f"pipeline/workflows/{env_type}/{inventory}/{workflow}.yaml"
-    if workflow_file.is_file():
-        logging.info(f"📋 Using environment-specific workflow: {workflow_file.relative_to(repo_root)}")
-        return workflow_file
-
-    base_workflow_file = repo_root / f"pipeline/workflows/base/{inventory}/{workflow}.yaml"
-    if base_workflow_file.is_file():
-        logging.info(f"📋 Using base workflow: {base_workflow_file.relative_to(repo_root)}")
-        return base_workflow_file
-
-    logging.error(f"❌ workflow file not found in {env_type} or base: {workflow}.yaml")
-    sys.exit(1)
 
 
 def _normalize_cfg_root(raw_value: str) -> str:
@@ -185,19 +178,24 @@ def run_local_runner(stage_runner_script: str) -> None:
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
     )
 
-    inventory_file = repo_root / f"pipeline/inventory/{args.inventory}.yaml"
-    if not inventory_file.is_file():
-        logging.error(f"❌ inventory file not found: {inventory_file}")
+    manifest_file = repo_root / ADAPTER_DIR / "manifest.yaml"
+    if not manifest_file.is_file():
+        logging.error(f"❌ manifest file not found: {manifest_file}")
+        sys.exit(1)
+    workflows_file = repo_root / ADAPTER_DIR / "workflows.yaml"
+    if not workflows_file.is_file():
+        logging.error(f"❌ workflows file not found: {workflows_file}")
         sys.exit(1)
 
-    workflow_file = _resolve_workflow_file(repo_root, args.env_type, args.inventory, args.workflow)
-    active_stage_ids, active_stages = get_stages_from_workflow(inventory_file, workflow_file, repo_root)
+    active_stage_ids, active_stages = get_stages_from_workflow(
+        manifest_file, workflows_file, args.action, args.workflow, repo_root
+    )
 
-    manifest = {
+    run_manifest = {
         "run_id": args.run_id,
         "branch": None,
         "commit": None,
-        "inventory": args.inventory,
+        "action": args.action,
         "env_type": args.env_type,
         "overlays": args.overlays,
         "workflow": args.workflow,
@@ -205,7 +203,7 @@ def run_local_runner(stage_runner_script: str) -> None:
         "origin_cfg": args.origin_cfg,
         "cfg_root": args.cfg_root,
     }
-    logging.info(json.dumps(manifest, indent=4))
+    logging.info(json.dumps(run_manifest, indent=4))
 
     with _prepare_merged(args.origin_cfg, args.env_type, args.overlays, args.skip_cfg_merge, args.cfg_root) as source_for_resolve:
         merged_dir = "merged"
@@ -220,6 +218,7 @@ def run_local_runner(stage_runner_script: str) -> None:
         try:
             for stage in active_stages:
                 stage_id = stage.get("id")
+                stage_path = stage.get("path")
                 logging.info(f"===================== {stage_id} =====================")
                 env = os.environ.copy()
                 env["main_tag"] = args.main_tag
@@ -230,7 +229,7 @@ def run_local_runner(stage_runner_script: str) -> None:
                 env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
                 env["origin_cfg_base_dir_path"] = merged_dir
                 subprocess.run(
-                    args=[f"./pipeline/stages/{stage_id}/run/{stage_runner_script}"],
+                    args=[f"./{stage_path}/run/{stage_runner_script}"],
                     check=True,
                     env=env,
                 )

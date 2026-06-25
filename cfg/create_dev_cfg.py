@@ -114,7 +114,7 @@ def load_repo_map(repo_map_file: str) -> dict[str, str]:
 
 def stage_sources_files(root_dir: Path) -> list[Path]:
     # Only stage_sources.yaml carries repo_url/modules to rewrite; per-action
-    # targets/*.yaml reference sources by name and have nothing to rewrite.
+    # targets/*.yaml reference sources through source_key and have nothing to rewrite.
     sources_path = root_dir / "stage_sources.yaml"
     return [sources_path] if sources_path.is_file() else []
 

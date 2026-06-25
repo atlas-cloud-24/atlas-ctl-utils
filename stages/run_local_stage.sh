@@ -92,12 +92,14 @@ run_local_stage() {
     -e cfg_files \
     -e STAGE_WRITE_VALUES_JSON \
     -e STAGE_WRITE_ENV_SH \
-    -e AWS_PROFILE="$AWS_PROFILE" \
-    -e ATLAS_AWS_ASSERT_IDENTITY \
-    -e ATLAS_AWS_IDENTITY \
+    -e AWS_PROFILE="${AWS_PROFILE:-}" \
+    -e ATLAS_AWS_ASSERT_ACCESS \
+    -e ATLAS_AWS_ACCOUNT_KEY \
+    -e ATLAS_AWS_ACCESS_CONTEXT_KEY \
+    -e ATLAS_AWS_IMPLEMENTATION_KEY \
     -e ATLAS_AWS_EXPECT_ACCOUNT_ID \
-    -e ATLAS_AWS_EXPECT_SSO_PERMISSION_SET \
-    -e ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME \
+    -e ATLAS_AWS_EXPECT_PERMISSION_SET_NAME \
+    -e ATLAS_AWS_EXPECT_ROLE_NAME \
     -e AWS_EC2_METADATA_DISABLED \
     -e GITHUB_WORKSPACE="$github_workspace" \
     "${tooling_args[@]}" \
@@ -110,47 +112,8 @@ run_local_stage() {
       cp -a /mnt/origin_cfg "$GITHUB_WORKSPACE"/origin_cfg
       cd "$GITHUB_WORKSPACE"
 
-      if [ "${ATLAS_AWS_ASSERT_IDENTITY:-false}" = "true" ]; then
-        if [ -z "${AWS_PROFILE:-}" ]; then
-          echo "❌ ATLAS_AWS_ASSERT_IDENTITY=true but AWS_PROFILE is empty"
-          exit 1
-        fi
-
-        if ! caller_json="$(aws sts get-caller-identity --profile "$AWS_PROFILE" --output json 2>&1)"; then
-          echo "❌ AWS identity assertion failed for profile '$AWS_PROFILE'"
-          printf '%s\n' "$caller_json"
-          exit 1
-        fi
-
-        actual_account="$(printf '%s\n' "$caller_json" | jq -r '.Account')"
-        actual_arn="$(printf '%s\n' "$caller_json" | jq -r '.Arn')"
-        echo "AWS identity: aws_identity=${ATLAS_AWS_IDENTITY:-} profile=$AWS_PROFILE account=$actual_account arn=$actual_arn"
-
-        if [ -n "${ATLAS_AWS_EXPECT_ACCOUNT_ID:-}" ] && [ "$actual_account" != "$ATLAS_AWS_EXPECT_ACCOUNT_ID" ]; then
-          echo "❌ AWS account mismatch for ${ATLAS_AWS_IDENTITY:-unknown}: expected $ATLAS_AWS_EXPECT_ACCOUNT_ID, got $actual_account"
-          exit 1
-        fi
-
-        if [ -n "${ATLAS_AWS_EXPECT_SSO_PERMISSION_SET:-}" ]; then
-          expected_prefix="AWSReservedSSO_${ATLAS_AWS_EXPECT_SSO_PERMISSION_SET}_"
-          case "$actual_arn" in
-            *":assumed-role/${expected_prefix}"*"/"*) ;;
-            *)
-              echo "❌ AWS SSO permission set mismatch for ${ATLAS_AWS_IDENTITY:-unknown}: expected $expected_prefix, got $actual_arn"
-              exit 1
-              ;;
-          esac
-        fi
-
-        if [ -n "${ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME:-}" ]; then
-          case "$actual_arn" in
-            *":assumed-role/${ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME}/"*) ;;
-            *)
-              echo "❌ AWS assumed role mismatch for ${ATLAS_AWS_IDENTITY:-unknown}: expected $ATLAS_AWS_EXPECT_ASSUMED_ROLE_NAME, got $actual_arn"
-              exit 1
-              ;;
-          esac
-        fi
+      if [ "${ATLAS_AWS_ASSERT_ACCESS:-false}" = "true" ]; then
+        python3 ./atlas_ctl_adapter/stages/_common/assert_aws_access.py
       fi
 
       exec "./${stage_dir}/src/stage.sh"
