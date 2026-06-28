@@ -33,6 +33,23 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 "local": {"profile_key": "${plt_env}_deploy"}
             },
         }
+        self.identities = {
+            "org_admin": {
+                "provider": "aws",
+                "account_key": "management",
+                "access_context_key": "org_admin",
+            },
+            "env_deploy": {
+                "provider": "aws",
+                "account_key": "${plt_env}",
+                "access_context_key": "env_deploy",
+            },
+            "prod_deploy": {
+                "provider": "aws",
+                "account_key": "prod",
+                "access_context_key": "env_deploy",
+            },
+        }
         self.catalogs = {
             "profiles": {
                 "dev_deploy": {
@@ -55,9 +72,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ):
             resolved = common.resolve_stage_aws_access(
                 {
-                    "aws_account_key": "${plt_env}",
-                    "aws_access_context_key": "env_deploy",
+                    "execution_identity_key": "env_deploy",
                 },
+                self.identities,
                 self.levels,
                 self.catalogs,
                 main_tag="oxygen",
@@ -72,12 +89,12 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_profile_catalog_account_must_match_target(self):
-        with self.assertRaisesRegex(RuntimeError, "target requires 'prod'"):
+        with self.assertRaisesRegex(RuntimeError, "execution identity .* requires 'prod'"):
             common.resolve_stage_aws_access(
                 {
-                    "aws_account_key": "prod",
-                    "aws_access_context_key": "env_deploy",
+                    "execution_identity_key": "prod_deploy",
                 },
+                self.identities,
                 self.levels,
                 self.catalogs,
                 main_tag="oxygen",
@@ -103,9 +120,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "profile override"):
                 common.resolve_stage_aws_access(
                     {
-                        "aws_account_key": "dev",
-                        "aws_access_context_key": "env_deploy",
+                        "execution_identity_key": "env_deploy",
                     },
+                    self.identities,
                     self.levels,
                     self.catalogs,
                     main_tag="oxygen",
@@ -122,9 +139,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ):
             resolved = common.resolve_stage_aws_access(
                 {
-                    "aws_account_key": "management",
-                    "aws_access_context_key": "org_admin",
+                    "execution_identity_key": "org_admin",
                 },
+                self.identities,
                 self.levels,
                 self.catalogs,
                 main_tag="oxygen",
@@ -135,10 +152,11 @@ class AwsAccessResolutionTests(unittest.TestCase):
         self.assertEqual(resolved["permission_set_name"], "AdministratorAccess")
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_missing_account_or_access_context_fails(self):
-        with self.assertRaisesRegex(RuntimeError, "must define both"):
+    def test_missing_execution_identity_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "is not defined in execution_identities"):
             common.resolve_stage_aws_access(
-                {"aws_account_key": "dev"},
+                {"execution_identity_key": "missing"},
+                self.identities,
                 self.levels,
                 self.catalogs,
                 main_tag="oxygen",
@@ -152,9 +170,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "has no 'ci' implementation"):
             common.resolve_stage_aws_access(
                 {
-                    "aws_account_key": "dev",
-                    "aws_access_context_key": "env_deploy",
+                    "execution_identity_key": "env_deploy",
                 },
+                self.identities,
                 self.levels,
                 self.catalogs,
                 main_tag="oxygen",
@@ -176,6 +194,14 @@ class AwsAccessResolutionTests(unittest.TestCase):
             **self.levels,
             "env_readonly": {"local": {"profile_key": "${plt_env}_readonly"}},
         }
+        identities = {
+            **self.identities,
+            "env_readonly": {
+                "provider": "aws",
+                "account_key": "${plt_env}",
+                "access_context_key": "env_readonly",
+            },
+        }
         catalogs = {
             "profiles": {
                 **self.catalogs["profiles"],
@@ -195,14 +221,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "oxygen-dev-readonly": "222222222222",
         }
         stages = {
-            "deploy": {
-                "aws_account_key": "dev",
-                "aws_access_context_key": "env_deploy",
-            },
-            "readonly": {
-                "aws_account_key": "dev",
-                "aws_access_context_key": "env_readonly",
-            },
+            "deploy": {"execution_identity_key": "env_deploy"},
+            "readonly": {"execution_identity_key": "env_readonly"},
         }
         with mock.patch.object(
             common,
@@ -212,6 +232,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Conflicting AWS account IDs"):
                 common.validate_active_stage_aws_access(
                     stages,
+                    identities,
                     levels,
                     catalogs,
                     main_tag="oxygen",
@@ -232,6 +253,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "test",
             {},
             stage_env,
+            self.identities,
             self.levels,
             self.catalogs,
             main_tag="oxygen",
@@ -244,6 +266,121 @@ class AwsAccessResolutionTests(unittest.TestCase):
         self.assertNotIn("AWS_CONFIG_FILE", stage_env)
         self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", stage_env)
         self.assertNotIn("AWS_ACCESS_KEY_ID", stage_env)
+
+    @mock.patch.dict(os.environ, {"AWS_PROFILE": "ambient-dev-profile"}, clear=True)
+    def test_profile_only_requires_explicit_aws_profile_arg(self):
+        resolved = common.resolve_stage_aws_access(
+            {},
+            self.identities,
+            self.levels,
+            self.catalogs,
+            main_tag="oxygen",
+            plt_env="dev",
+            implementation_key="local",
+            allow_profile_only=True,
+        )
+        self.assertIsNone(resolved)
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_profile_only_access_uses_explicit_aws_profile_arg(self):
+        resolved = common.resolve_stage_aws_access(
+            {},
+            self.identities,
+            self.levels,
+            self.catalogs,
+            main_tag="oxygen",
+            plt_env="dev",
+            implementation_key="local",
+            allow_profile_only=True,
+            profile_only_aws_profile="legacy-dev-profile",
+        )
+        self.assertEqual(resolved["profile_name"], "legacy-dev-profile")
+        self.assertEqual(resolved["credential_provider_kind"], "aws_profile_only")
+        self.assertEqual(resolved["profile_only"], "true")
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_profile_only_configures_stage_env_without_expected_account(self):
+        stage_env = {"AWS_ACCESS_KEY_ID": "secret"}
+        common.configure_stage_aws_env(
+            "test",
+            {},
+            stage_env,
+            self.identities,
+            self.levels,
+            self.catalogs,
+            main_tag="oxygen",
+            plt_env="dev",
+            implementation_key="local",
+            account_registry={},
+            allow_profile_only=True,
+            profile_only_aws_profile="legacy-dev-profile",
+        )
+        self.assertEqual(stage_env["AWS_PROFILE"], "legacy-dev-profile")
+        self.assertEqual(stage_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"], "true")
+        self.assertNotIn("ATLAS_AWS_EXPECT_ACCOUNT_ID", stage_env)
+        self.assertNotIn("AWS_ACCESS_KEY_ID", stage_env)
+
+    def test_profile_only_validation_requires_all_selected_stages_without_identity(self):
+        stages = {
+            "declared": {"execution_identity_key": "env_deploy"},
+            "fallback": {},
+        }
+        with self.assertRaisesRegex(RuntimeError, "--aws-profile can be used only"):
+            common.validate_active_stage_aws_access(
+                stages,
+                self.identities,
+                self.levels,
+                self.catalogs,
+                main_tag="oxygen",
+                plt_env="dev",
+                implementation_key="local",
+                allow_profile_only=True,
+                profile_only_aws_profile="legacy-dev-profile",
+            )
+
+    def test_profile_only_validation_rejects_override_of_declared_identity(self):
+        stages = {"declared": {"execution_identity_key": "env_deploy"}}
+        with self.assertRaisesRegex(RuntimeError, "declared execution identities cannot be overridden"):
+            common.validate_active_stage_aws_access(
+                stages,
+                self.identities,
+                self.levels,
+                self.catalogs,
+                main_tag="oxygen",
+                plt_env="dev",
+                implementation_key="local",
+                allow_profile_only=True,
+                profile_only_aws_profile="legacy-dev-profile",
+            )
+
+    def test_profile_only_validation_requires_profile_when_all_identities_missing(self):
+        stages = {"fallback": {}}
+        with self.assertRaisesRegex(RuntimeError, "require --aws-profile"):
+            common.validate_active_stage_aws_access(
+                stages,
+                self.identities,
+                self.levels,
+                self.catalogs,
+                main_tag="oxygen",
+                plt_env="dev",
+                implementation_key="local",
+                allow_profile_only=True,
+            )
+
+    def test_profile_only_validation_allows_all_missing_with_profile_and_policy(self):
+        stages = {"fallback": {}}
+        resolved = common.validate_active_stage_aws_access(
+            stages,
+            self.identities,
+            self.levels,
+            self.catalogs,
+            main_tag="oxygen",
+            plt_env="dev",
+            implementation_key="local",
+            allow_profile_only=True,
+            profile_only_aws_profile="legacy-dev-profile",
+        )
+        self.assertEqual(resolved, {})
 
 
 class CallerIdentityAssertionTests(unittest.TestCase):

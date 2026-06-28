@@ -55,6 +55,8 @@ AWS_CREDENTIAL_ENV_VARS = (
 )
 AWS_ACCESS_STAGE_ENV_VARS = (
     "ATLAS_AWS_ASSERT_ACCESS",
+    "ATLAS_AWS_PROFILE_ONLY_ACCESS",
+    "ATLAS_EXECUTION_IDENTITY_KEY",
     "ATLAS_AWS_ACCOUNT_KEY",
     "ATLAS_AWS_ACCESS_CONTEXT_KEY",
     "ATLAS_AWS_IMPLEMENTATION_KEY",
@@ -156,6 +158,28 @@ def bool2str(v: bool) -> str:
         return "true" if v else "false"
     raise argparse.ArgumentTypeError(f"Expected bool, got: {type(v).__name__} ({v!r})")
 
+def str2bool(v: str) -> bool:
+    """Convert 'true'/'false' string to boolean."""
+    if isinstance(v, str):
+        value = v.lower()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+
+    raise argparse.ArgumentTypeError(
+        f"Expected 'true' or 'false', got: {type(v).__name__} ({v!r})"
+    )
+
+def validate_uuid7(v: str) -> str:
+    """Validate that a string is a valid UUID version 7."""
+    try:
+        parsed = uuid.UUID(v)
+        if parsed.version != 7:
+            raise argparse.ArgumentTypeError(f"UUID must be version 7, got version {parsed.version}: {v}")
+        return v
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
 
 def parse_selector_arg(value: str) -> tuple[str, str]:
     if "=" not in value:
@@ -254,13 +278,22 @@ def validate_runtime_selectors_against_registry(
             )
 
 
-def ctl_ref_policy(ctl_cfg_root: Path, ctl_env: str) -> str:
+def ctl_selector_policy(ctl_cfg_root: Path, ctl_env: str) -> dict:
     registry = load_selector_registry(ctl_cfg_root, "ctl")
-    policy = selector_policy(registry, "ctl_env", ctl_env, owner="ctl")
+    return selector_policy(registry, "ctl_env", ctl_env, owner="ctl")
+
+
+def ctl_ref_policy(ctl_cfg_root: Path, ctl_env: str) -> str:
+    policy = ctl_selector_policy(ctl_cfg_root, ctl_env)
     ref_policy = policy.get("ref_policy")
     if not isinstance(ref_policy, str) or not ref_policy.strip():
         raise RuntimeError(f"❌ ctl selector ctl_env={ctl_env!r} must define non-empty ref_policy")
     return ref_policy.strip()
+
+
+def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_env: str) -> bool:
+    policy = ctl_selector_policy(ctl_cfg_root, ctl_env)
+    return policy.get("allow_aws_profile_only") is True
 
 
 def ref_policy_requires_commits(ref_policy: str) -> bool:
@@ -346,23 +379,42 @@ def validate_destroy_allowed(
             f"❌ destroy is not allowed for plt_env={plt_env!r}; set selectors.plt_env.{plt_env}.allow_destroy=true to allow it"
         )
 
+def normalize_ctl_results_root(value: str) -> Path:
+    """Normalize the operator-provided ctl results root directory."""
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("❌ --ctl-results-root must be a non-empty directory path")
+    root = Path(value.strip()).expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"❌ --ctl-results-root exists but is not a directory: {root}")
+    return root
+
+
+def normalize_optional_aws_profile(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("❌ --aws-profile must be a non-empty profile name when provided")
+    return value.strip()
+
+
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize split selector CLI into runtime maps and common selector values."""
     args.plt_runtime_selectors = selectors_to_map(args.plt_selector, label="plt")
     args.ctl_runtime_selectors = selectors_to_map(args.ctl_selector, label="ctl")
     args.ctl_env = require_selector(args.ctl_runtime_selectors, "ctl_env", label="ctl")
     args.plt_env = args.plt_runtime_selectors.get("plt_env", "")
+    args.ctl_results_root = normalize_ctl_results_root(args.ctl_results_root)
+    args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
+    args.run_id = generate_uuid7()
 
 
-def validate_uuid7(v: str) -> str:
-    """Validate that a string is a valid UUID version 7."""
-    try:
-        parsed = uuid.UUID(v)
-        if parsed.version != 7:
-            raise argparse.ArgumentTypeError(f"UUID must be version 7, got version {parsed.version}: {v}")
-        return v
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
+def generate_uuid7() -> str:
+    """Generate a UUIDv7 string for one ctl run execution."""
+    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000) & ((1 << 48) - 1)
+    rand_a = uuid.uuid4().int & ((1 << 12) - 1)
+    rand_b = uuid.uuid4().int & ((1 << 62) - 1)
+    value = (timestamp_ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
+    return str(uuid.UUID(int=value))
 
 
 def load_yaml(path: Path):
@@ -481,10 +533,9 @@ def validate_adhoc_args(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "❌ adhoc needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
         )
-    if bool(args.aws_account_key) != bool(args.aws_access_context_key):
-        raise RuntimeError(
-            "❌ adhoc AWS access requires both --aws-account-key and --aws-access-context-key"
-        )
+    identity_key = getattr(args, "execution_identity_key", None)
+    if identity_key is not None and not identity_key.strip():
+        raise RuntimeError("❌ --execution-identity-key must be a non-empty string when provided")
 
 
 
@@ -880,16 +931,17 @@ def build_active_stages(
             "cfg_files": cfg_files,
         }
 
-        for aws_field in ("aws_account_key", "aws_access_context_key"):
-            aws_value = stage_over.get(aws_field) or target_cfg.get(aws_field)
-            if aws_value is not None:
-                if not isinstance(aws_value, str) or not aws_value.strip():
-                    raise RuntimeError(f"Stage {stage_id!r} {aws_field} must be a non-empty string")
-                active_stage[aws_field] = aws_value.strip()
-        if ("aws_account_key" in active_stage) != ("aws_access_context_key" in active_stage):
-            raise RuntimeError(
-                f"Stage {stage_id!r} must define both aws_account_key and aws_access_context_key"
-            )
+        for legacy_field in ("aws_account_key", "aws_access_context_key"):
+            if legacy_field in stage_over or legacy_field in target_cfg:
+                raise RuntimeError(
+                    f"Stage {stage_id!r} uses deprecated {legacy_field}; use execution_identity_key"
+                )
+
+        execution_identity_key = stage_over.get("execution_identity_key") or target_cfg.get("execution_identity_key")
+        if execution_identity_key is not None:
+            if not isinstance(execution_identity_key, str) or not execution_identity_key.strip():
+                raise RuntimeError(f"Stage {stage_id!r} execution_identity_key must be a non-empty string")
+            active_stage["execution_identity_key"] = execution_identity_key.strip()
 
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
@@ -1147,6 +1199,43 @@ def resolve_runtime_scalar(value, context: dict[str, str], *, label: str) -> str
     return resolved
 
 
+def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
+    """Load provider-neutral execution identities from ctl cfg."""
+    identities = collect_resource(ctl_cfg_root, "execution_identities")
+
+    for identity_key, identity_cfg in identities.items():
+        if not isinstance(identity_key, str) or not identity_key.strip():
+            raise RuntimeError(f"❌ execution identity keys must be non-empty strings: {ctl_cfg_root}")
+        if not isinstance(identity_cfg, dict) or not identity_cfg:
+            raise RuntimeError(
+                f"❌ execution identity {identity_key!r} must be a non-empty mapping: {ctl_cfg_root}"
+            )
+        provider = identity_cfg.get("provider")
+        if not isinstance(provider, str) or not provider.strip():
+            raise RuntimeError(f"❌ execution identity {identity_key!r} must define non-empty provider")
+        provider = provider.strip()
+        if provider == "aws":
+            allowed_fields = {"provider", "account_key", "access_context_key"}
+            unknown = sorted(set(identity_cfg) - allowed_fields)
+            if unknown:
+                raise RuntimeError(f"❌ execution identity {identity_key!r} has unknown fields {unknown}")
+            for field in ("account_key", "access_context_key"):
+                _require_non_empty_string(
+                    identity_cfg.get(field),
+                    f"execution_identities.{identity_key}.{field}",
+                    ctl_cfg_root,
+                )
+        else:
+            provider_fields = sorted(set(identity_cfg) - {"provider"})
+            if not provider_fields:
+                raise RuntimeError(
+                    f"❌ execution identity {identity_key!r} provider {provider!r} must define "
+                    "provider-specific fields"
+                )
+
+    return identities
+
+
 def load_aws_access_contexts_cfg(ctl_cfg_root: Path) -> dict:
     """Load logical AWS access contexts and runner-specific implementations."""
     access_contexts = collect_resource(ctl_cfg_root, "aws_access_contexts")
@@ -1348,6 +1437,7 @@ def resolve_configured_profile_account_id(profile_name: str) -> str:
 
 def resolve_stage_aws_access(
     stage: dict,
+    execution_identities: dict,
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
@@ -1356,15 +1446,43 @@ def resolve_stage_aws_access(
     plt_runtime_selectors: dict[str, str] | None = None,
     implementation_key: str,
     account_registry: dict[str, str] | None = None,
+    allow_profile_only: bool = False,
+    profile_only_aws_profile: str | None = None,
 ) -> dict[str, str] | None:
-    raw_account_key = stage.get("aws_account_key")
-    raw_access_context_key = stage.get("aws_access_context_key")
-    if raw_account_key is None and raw_access_context_key is None:
+    for legacy_field in ("aws_account_key", "aws_access_context_key"):
+        if legacy_field in stage:
+            raise RuntimeError(f"❌ stage uses deprecated {legacy_field}; use execution_identity_key")
+
+    identity_key = stage.get("execution_identity_key")
+    if identity_key is None:
+        profile_name = (profile_only_aws_profile or "").strip()
+        if allow_profile_only and profile_name:
+            return {
+                "provider": "aws",
+                "execution_identity_key": "profile_only",
+                "implementation_key": "profile_only",
+                "credential_provider_kind": "aws_profile_only",
+                "profile_name": profile_name,
+                "profile_only": "true",
+            }
         return None
-    if raw_account_key is None or raw_access_context_key is None:
+    if not isinstance(identity_key, str) or not identity_key.strip():
+        raise RuntimeError("❌ stage execution_identity_key must be a non-empty string")
+    identity_key = identity_key.strip()
+
+    identity_cfg = execution_identities.get(identity_key)
+    if not isinstance(identity_cfg, dict):
         raise RuntimeError(
-            "❌ AWS-touching stages must define both aws_account_key and aws_access_context_key"
+            f"❌ stage execution_identity_key {identity_key!r} is not defined in execution_identities.yaml"
         )
+    provider = identity_cfg.get("provider")
+    if provider != "aws":
+        raise RuntimeError(
+            f"❌ execution identity {identity_key!r} provider {provider!r} is not implemented by this runner"
+        )
+
+    raw_account_key = identity_cfg.get("account_key")
+    raw_access_context_key = identity_cfg.get("access_context_key")
 
     context = dict(plt_runtime_selectors or {})
     if plt_env and "plt_env" not in context:
@@ -1373,12 +1491,12 @@ def resolve_stage_aws_access(
     account_key = resolve_runtime_scalar(
         raw_account_key,
         context,
-        label="stage aws_account_key",
+        label=f"execution_identities.{identity_key}.account_key",
     )
     access_context_key = resolve_runtime_scalar(
         raw_access_context_key,
         context,
-        label="stage aws_access_context_key",
+        label=f"execution_identities.{identity_key}.access_context_key",
     )
 
     access_context_cfg = aws_access_contexts.get(access_context_key)
@@ -1393,6 +1511,8 @@ def resolve_stage_aws_access(
         )
 
     resolved: dict[str, str] = {
+        "provider": "aws",
+        "execution_identity_key": identity_key,
         "account_key": account_key,
         "access_context_key": access_context_key,
         "implementation_key": implementation_key,
@@ -1415,8 +1535,8 @@ def resolve_stage_aws_access(
         )
         if profile_account_key != account_key:
             raise RuntimeError(
-                f"❌ AWS account mismatch in cfg: target requires {account_key!r}, but profile "
-                f"{profile_key!r} references {profile_account_key!r}"
+                f"❌ AWS account mismatch in cfg: execution identity {identity_key!r} requires "
+                f"{account_key!r}, but profile {profile_key!r} references {profile_account_key!r}"
             )
 
         canonical_profile_name = resolve_runtime_scalar(
@@ -1497,8 +1617,56 @@ def resolve_stage_aws_access(
     return resolved
 
 
+def validate_profile_only_request(
+    active_stages: dict,
+    *,
+    allow_profile_only: bool,
+    profile_only_aws_profile: str | None,
+) -> None:
+    stages_with_identity = sorted(
+        stage_id for stage_id, stage in active_stages.items()
+        if stage.get("execution_identity_key") is not None
+    )
+    stages_without_identity = sorted(
+        stage_id for stage_id, stage in active_stages.items()
+        if stage.get("execution_identity_key") is None
+    )
+
+    if profile_only_aws_profile and stages_with_identity:
+        raise RuntimeError(
+            "❌ --aws-profile can be used only when every selected stage has no "
+            "execution_identity_key; declared execution identities cannot be overridden. "
+            f"Stages with identity: {', '.join(stages_with_identity)}"
+        )
+
+    if stages_with_identity and stages_without_identity:
+        raise RuntimeError(
+            "❌ selected stages mix declared execution_identity_key with missing identities. "
+            "Either declare execution_identity_key for every selected stage, or comment/remove it "
+            "from every selected stage and use profile-only fallback. "
+            f"With identity: {', '.join(stages_with_identity)}; "
+            f"without identity: {', '.join(stages_without_identity)}"
+        )
+
+    if not stages_without_identity:
+        return
+
+    rendered = ", ".join(stages_without_identity)
+    if not allow_profile_only:
+        raise RuntimeError(
+            "❌ selected stages have no execution_identity_key and profile-only fallback is not "
+            f"allowed by ctl cfg policy: {rendered}"
+        )
+    if not profile_only_aws_profile:
+        raise RuntimeError(
+            "❌ selected stages have no execution_identity_key and require --aws-profile because "
+            f"profile-only fallback is enabled for this ctl policy: {rendered}"
+        )
+
+
 def validate_active_stage_aws_access(
     active_stages: dict,
+    execution_identities: dict,
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
@@ -1506,20 +1674,37 @@ def validate_active_stage_aws_access(
     plt_env: str,
     plt_runtime_selectors: dict[str, str] | None = None,
     implementation_key: str,
+    allow_profile_only: bool = False,
+    profile_only_aws_profile: str | None = None,
 ) -> dict[str, str]:
     """Validate selected bindings and return a normalized account-key registry."""
+    validate_profile_only_request(
+        active_stages,
+        allow_profile_only=allow_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
+    )
     account_registry: dict[str, str] = {}
     for stage_id, stage in active_stages.items():
         resolved = resolve_stage_aws_access(
             stage,
+            execution_identities,
             aws_access_contexts,
             plt_aws_catalogs,
             main_tag=main_tag,
             plt_env=plt_env,
             plt_runtime_selectors=plt_runtime_selectors,
             implementation_key=implementation_key,
+            allow_profile_only=allow_profile_only,
+            profile_only_aws_profile=profile_only_aws_profile,
         )
         if resolved is None:
+            continue
+        if resolved.get("profile_only") == "true":
+            logging.info(
+                "Using temporary explicit --aws-profile access for stage %s: profile=%s",
+                stage_id,
+                resolved["profile_name"],
+            )
             continue
         account_key = resolved["account_key"]
         account_id = resolved["expected_account_id"]
@@ -1530,9 +1715,10 @@ def validate_active_stage_aws_access(
             )
         account_registry[account_key] = account_id
         logging.info(
-            "Validated AWS access for stage %s: account_key=%s access_context_key=%s "
-            "implementation_key=%s credential_provider_kind=%s",
+            "Validated AWS access for stage %s: execution_identity_key=%s account_key=%s "
+            "access_context_key=%s implementation_key=%s credential_provider_kind=%s",
             stage_id,
+            resolved["execution_identity_key"],
             account_key,
             resolved["access_context_key"],
             resolved["implementation_key"],
@@ -1545,6 +1731,7 @@ def configure_stage_aws_env(
     stage_id: str,
     stage: dict,
     stage_env: dict[str, str],
+    execution_identities: dict,
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
@@ -1553,6 +1740,8 @@ def configure_stage_aws_env(
     plt_runtime_selectors: dict[str, str] | None = None,
     implementation_key: str,
     account_registry: dict[str, str],
+    allow_profile_only: bool = False,
+    profile_only_aws_profile: str | None = None,
 ) -> None:
     """Apply one stage's selected AWS access implementation and assertion metadata."""
     for var_name in AWS_ACCESS_STAGE_ENV_VARS:
@@ -1563,6 +1752,7 @@ def configure_stage_aws_env(
 
     resolved = resolve_stage_aws_access(
         stage,
+        execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
         main_tag=main_tag,
@@ -1570,6 +1760,8 @@ def configure_stage_aws_env(
         plt_runtime_selectors=plt_runtime_selectors,
         implementation_key=implementation_key,
         account_registry=account_registry,
+        allow_profile_only=allow_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
     )
     if resolved is None:
         return
@@ -1577,6 +1769,17 @@ def configure_stage_aws_env(
     stage_env["AWS_EC2_METADATA_DISABLED"] = "true"
     stage_env["AWS_PROFILE"] = resolved["profile_name"]
     stage_env["ATLAS_AWS_ASSERT_ACCESS"] = "true"
+    stage_env["ATLAS_EXECUTION_IDENTITY_KEY"] = resolved["execution_identity_key"]
+
+    if resolved.get("profile_only") == "true":
+        stage_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"] = "true"
+        logging.info(
+            "Resolved temporary explicit --aws-profile access for stage %s: profile=%s",
+            stage_id,
+            resolved["profile_name"],
+        )
+        return
+
     stage_env["ATLAS_AWS_ACCOUNT_KEY"] = resolved["account_key"]
     stage_env["ATLAS_AWS_ACCESS_CONTEXT_KEY"] = resolved["access_context_key"]
     stage_env["ATLAS_AWS_IMPLEMENTATION_KEY"] = resolved["implementation_key"]
@@ -1587,9 +1790,10 @@ def configure_stage_aws_env(
         stage_env["ATLAS_AWS_EXPECT_ROLE_NAME"] = resolved["role_name"]
 
     logging.info(
-        "Resolved AWS access for stage %s: account_key=%s access_context_key=%s "
-        "implementation_key=%s credential_provider_kind=%s expected_account_id=%s",
+        "Resolved AWS access for stage %s: execution_identity_key=%s account_key=%s "
+        "access_context_key=%s implementation_key=%s credential_provider_kind=%s expected_account_id=%s",
         stage_id,
+        resolved["execution_identity_key"],
         resolved["account_key"],
         resolved["access_context_key"],
         resolved["implementation_key"],
@@ -1666,6 +1870,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Main tag passed to stage runners",
     )
     parser.add_argument(
+        "--ctl-results-root",
+        required=True,
+        help="Directory where ctl results are stored; runner appends <action>/<run_type>/<name>",
+    )
+    parser.add_argument(
+        "--aws-profile",
+        default=None,
+        help="Temporary profile-only fallback for runs where every selected stage lacks execution_identity_key",
+    )
+    parser.add_argument(
         "--plt-overlays",
         required=False,
         default=[],
@@ -1720,12 +1934,6 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Plt selector in key=value form; repeatable",
     )
     parser.add_argument(
-        "--run-id",
-        required=True,
-        type=validate_uuid7,
-        help="Run id (must be a valid UUID format)",
-    )
-    parser.add_argument(
         "--source",
         help="adhoc: source repo for a synthetic target",
     )
@@ -1744,16 +1952,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="adhoc: repo sub_workflow for a synthetic target",
     )
     parser.add_argument(
-        "--aws-account-key",
-        dest="aws_account_key",
+        "--execution-identity-key",
+        dest="execution_identity_key",
         default=None,
-        help="adhoc: logical AWS account key for a synthetic target",
-    )
-    parser.add_argument(
-        "--aws-access-context-key",
-        dest="aws_access_context_key",
-        default=None,
-        help="adhoc: logical AWS access-context key for a synthetic target",
+        help="adhoc: execution identity key for a synthetic target",
     )
 
 
@@ -2145,12 +2347,12 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
             file is a flat `targets:` map; all files for an action merge (duplicate
             names rejected). A target is self-contained:
               {source_key, ref_key, sub_workflow_key, cfg_set_key,
-               [aws_account_key, aws_access_context_key], [cfg_files], [selectors],
+               [execution_identity_key], [cfg_files], [selectors],
                [required_plt_overlay_keys]}.
 
     Returns the flat shape build_active_stages consumes ({stage_sources,
     stage_targets}), where each target carries source + cfg_root + cfg_files
-    (resolved from its cfg_set_key) + sub_workflow + AWS access requirements
+    (resolved from its cfg_set_key) + sub_workflow + execution identity requirement
     (+ selectors /
     requires_plt_overlays when present).
     """
@@ -2196,22 +2398,18 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         if not isinstance(sub_workflow, str) or not sub_workflow:
             raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'sub_workflow_key'")
 
-        aws_account_key = target_def.get("aws_account_key")
-        aws_access_context_key = target_def.get("aws_access_context_key")
-        if (aws_account_key is None) != (aws_access_context_key is None):
-            raise RuntimeError(
-                f"❌ target {target_name!r} must define both aws_account_key and aws_access_context_key"
-            )
-        for field_name, field_value in (
-            ("aws_account_key", aws_account_key),
-            ("aws_access_context_key", aws_access_context_key),
-        ):
-            if field_value is not None and (
-                not isinstance(field_value, str) or not field_value.strip()
-            ):
+        for legacy_field in ("aws_account_key", "aws_access_context_key"):
+            if legacy_field in target_def:
                 raise RuntimeError(
-                    f"❌ target {target_name!r} {field_name} must be a non-empty string"
+                    f"❌ target {target_name!r} uses deprecated {legacy_field}; use execution_identity_key"
                 )
+        execution_identity_key = target_def.get("execution_identity_key")
+        if execution_identity_key is not None and (
+            not isinstance(execution_identity_key, str) or not execution_identity_key.strip()
+        ):
+            raise RuntimeError(
+                f"❌ target {target_name!r} execution_identity_key must be a non-empty string"
+            )
 
         extra_files = target_def.get("cfg_files", []) or []
         if not isinstance(extra_files, list):
@@ -2227,9 +2425,8 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
                 *extra_files,
             ],
         }
-        if aws_account_key is not None:
-            resolved["aws_account_key"] = aws_account_key.strip()
-            resolved["aws_access_context_key"] = aws_access_context_key.strip()
+        if execution_identity_key is not None:
+            resolved["execution_identity_key"] = execution_identity_key.strip()
         if "selectors" in target_def:
             resolved["selectors"] = target_def["selectors"]
         if "required_plt_overlay_keys" in target_def:
@@ -2336,38 +2533,70 @@ def build_tooling_env(tooling_refs: dict) -> dict[str, str]:
     return env_updates
 
 
-def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.handlers.MemoryHandler) -> tuple[Path, Path, Path, Path]:
-    """
-    Create run directories and setup file logging.
+def normalize_result_name(value: str, *, label: str) -> str:
+    """Normalize a result key name as a safe relative slash path."""
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"❌ {label} must be a non-empty result name")
+    path = Path(value.strip())
+    if path.is_absolute() or ".." in path.parts:
+        raise RuntimeError(f"❌ {label} must be a relative path without '..': {value}")
+    parts = [part for part in path.parts if part not in ("", ".")]
+    if not parts:
+        raise RuntimeError(f"❌ {label} must contain at least one path segment: {value}")
+    return "/".join(parts)
 
-    Returns:
-        tuple: (run_dir, artifacts_dir, plt_merged_dir, log_file)
-    """
-    # create run_dir
-    run_dir = Path("/tmp") / run_id / inventory_name
+
+def ref_context_to_result_path(ref_context: str) -> str:
+    return ref_context.replace(".", "/")
+
+
+def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
+    """Resolve the stable ctl result name for the selected runner mode."""
+    if run_type == "baseline":
+        raw_name = args.workflow or args.target
+    elif run_type == "adhoc":
+        ref_context = resolve_ref_context(args.ref, args.plt_runtime_selectors) if args.ref else "adhoc"
+        raw_name = f"{ref_context_to_result_path(ref_context)}/{args.source or 'unknown'}/{args.sub_workflow or 'unknown'}"
+    elif run_type == "maintenance":
+        raw_name = f"{args.maintenance_action or 'maintenance'}/{args.target or 'unknown'}"
+    else:
+        raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
+
+    return normalize_result_name(raw_name, label=f"{run_type} result name")
+
+
+def setup_run_dirs(
+    run_id: str,
+    action: str,
+    run_type: str,
+    result_name: str,
+    ctl_results_root: Path,
+    memory_handler: logging.handlers.MemoryHandler,
+) -> tuple[Path, Path, Path, Path]:
+    """Create run directories under the stable ctl result key and setup file logging."""
+    result_name = normalize_result_name(result_name, label="ctl result name")
+    ctl_result_dir = Path(ctl_results_root) / action / run_type / result_name
+    runs_dir = ctl_result_dir / "runs"
+    run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Using ctl_result_dir: {ctl_result_dir}")
     logging.info(f"Using run_dir: {run_dir}")
 
-    # create artifacts_dir
     artifacts_dir = run_dir / "artifacts"
     os.makedirs(artifacts_dir, exist_ok=True)
 
-    # create cfg root
     cfg_dir = run_dir / "cfg"
     if cfg_dir.exists():
         shutil.rmtree(cfg_dir)
     os.makedirs(cfg_dir)
 
-    # clear stages source
     stages_source_dir = run_dir / "stages_source"
     if stages_source_dir.exists():
         shutil.rmtree(stages_source_dir)
 
-    # create merged cfg dir
     plt_merged_dir = cfg_dir / "plt" / "merged"
     os.makedirs(plt_merged_dir)
 
-    # Setup file logging and flush buffered early logs
     logs_dir = artifacts_dir / "logs"
     os.makedirs(logs_dir, exist_ok=True)
     logs_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
@@ -2377,7 +2606,6 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logging.getLogger().addHandler(file_handler)
 
-    # Flush early logs from memory to file
     memory_handler.setTarget(file_handler)
     memory_handler.flush()
     logging.getLogger().removeHandler(memory_handler)
@@ -2386,6 +2614,83 @@ def setup_run_dirs(run_id: str, inventory_name: str, memory_handler: logging.han
     logging.info(f"Logging to: {log_file}")
 
     return run_dir, artifacts_dir, plt_merged_dir, log_file
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def ctl_result_dir_from_run_dir(run_dir: Path) -> Path:
+    if run_dir.parent.name != "runs":
+        raise RuntimeError(f"run_dir must be under a runs/ directory: {run_dir}")
+    return run_dir.parent.parent
+
+
+def write_yaml_file(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+
+
+def remove_state_slot(run_dir: Path, state: str) -> None:
+    slot_dir = ctl_result_dir_from_run_dir(run_dir) / state
+    if slot_dir.exists():
+        shutil.rmtree(slot_dir)
+
+
+def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
+    slot_dir = ctl_result_dir_from_run_dir(run_dir) / state
+    slot_payload = dict(payload)
+    slot_payload["state_slot"] = state
+    slot_payload["run_path"] = f"runs/{run_dir.name}"
+    write_yaml_file(slot_dir / "STATUS.yaml", slot_payload)
+    write_yaml_file(
+        slot_dir / "MANIFEST.yaml",
+        {
+            "run_id": run_dir.name,
+            "run_path": f"runs/{run_dir.name}",
+            "status_path": f"runs/{run_dir.name}/STATUS.yaml",
+            "artifacts_path": f"runs/{run_dir.name}/artifacts",
+            "updated_at": slot_payload["updated_at"],
+        },
+    )
+
+
+def mark_run_started(run_dir: Path) -> None:
+    payload = {
+        "run_id": run_dir.name,
+        "status": "in_progress",
+        "updated_at": utc_timestamp(),
+    }
+    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    write_state_slot(run_dir, "in_progress", payload)
+
+
+def mark_run_succeeded(run_dir: Path) -> None:
+    payload = {
+        "run_id": run_dir.name,
+        "status": "ok",
+        "updated_at": utc_timestamp(),
+    }
+    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    write_state_slot(run_dir, "committed", payload)
+    remove_state_slot(run_dir, "in_progress")
+    remove_state_slot(run_dir, "failed")
+
+
+def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
+    payload = {
+        "run_id": run_dir.name,
+        "status": "failed",
+        "updated_at": utc_timestamp(),
+        "error": {
+            "type": type(exc).__name__,
+            "summary": str(exc),
+        },
+    }
+    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    write_state_slot(run_dir, "failed", payload)
+    remove_state_slot(run_dir, "in_progress")
 
 
 SCOPE_META_FILENAME = "__meta__.yaml"
@@ -2459,6 +2764,37 @@ def selector_matches(
             return False
     return True
 
+def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = False) -> str:
+    """Normalize a cfg-root absolute path used by plt metadata."""
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise RuntimeError(f"{label} must be a non-empty string")
+    value = raw_value.strip()
+    if "\\" in value:
+        raise RuntimeError(f"{label} must use forward slashes: {value}")
+    if not value.startswith("/"):
+        raise RuntimeError(f"{label} must start with /: {value}")
+
+    parts = [part for part in value.split("/") if part]
+    if any(part in (".", "..") for part in parts):
+        raise RuntimeError(f"{label} must not contain . or ..: {value}")
+    normalized = "/" + "/".join(parts)
+    if normalized == "/" and not allow_root:
+        raise RuntimeError(f"{label} must not be /")
+    return normalized
+
+
+def cfg_abs_path_to_dir(cfg_root: Path, abs_path: str, *, label: str) -> Path:
+    """Resolve a normalized cfg-root absolute path to a directory under cfg_root."""
+    normalized = normalize_cfg_absolute_path(abs_path, label=label, allow_root=True)
+    rel = normalized.lstrip("/")
+    path = (cfg_root / rel).resolve() if rel else cfg_root.resolve()
+    try:
+        path.relative_to(cfg_root.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"{label} escapes cfg root: {abs_path}") from exc
+    return path
+
+
 def discover_cfg_meta_paths(plt_cfg_root: Path) -> list[Path]:
     """Find cfg metadata files, excluding git internals."""
     cfg_root = plt_cfg_root.resolve()
@@ -2523,17 +2859,16 @@ def load_scope_candidate(
     except ValueError as exc:
         raise RuntimeError(f"Scope metadata escapes plt cfg root: {meta_path}") from exc
 
+    scope_rel = scope_root.relative_to(cfg_root).as_posix()
+    scope_path = "/" + scope_rel if scope_rel != "." else "/"
+
     selectors = meta_cfg.get("selectors") or {}
     if not selector_matches(selectors, {"plt": runtime_selectors}, label=str(meta_path)):
         logging.info("Skipping inactive cfg scope %s for selectors %s", meta_path, runtime_selectors)
         return None
 
-    default_target = default_scope_target_path(cfg_root, scope_root)
     if "target_path" not in meta_cfg:
-        raise RuntimeError(
-            f"target_path is required in scope {SCOPE_META_FILENAME}: {meta_path} "
-            f"(e.g. target_path: {default_target})"
-        )
+        raise RuntimeError(f"target_path is required in scope {SCOPE_META_FILENAME}: {meta_path}")
     target_path = normalize_cfg_absolute_path(
         meta_cfg["target_path"],
         label=f"target_path in {meta_path}",
@@ -2565,13 +2900,13 @@ def load_scope_candidate(
         source_dirs.append(str(src))
 
     if scope_root in seen_imports:
-        raise RuntimeError(f"Scope imports itself in {meta_path}: {default_target}")
+        raise RuntimeError(f"Scope imports itself in {meta_path}: {scope_path}")
 
     source_dirs.append(str(scope_root))
     return {
         "meta_path": meta_path,
         "scope_root": scope_root,
-        "scope_path": default_target,
+        "scope_path": scope_path,
         "target_path": target_path,
         "source_dirs": source_dirs,
     }
@@ -2901,8 +3236,7 @@ def write_stage_flow_artifact(path: Path, workflow_meta: dict | None, active_sta
                 "target": stage.get("target"),
                 "source": stage["source"],
                 "workflow": stage["workflow"],
-                "aws_account_key": stage.get("aws_account_key"),
-                "aws_access_context_key": stage.get("aws_access_context_key"),
+                "execution_identity_key": stage.get("execution_identity_key"),
                 "branch": stage.get("branch"),
                 "commit": stage.get("commit"),
             }
@@ -3073,6 +3407,7 @@ def prepare_stage_repo(
     stage: dict,
     run_dir: Path,
     tooling_env: dict[str, str],
+    execution_identities: dict | None = None,
     aws_access_contexts: dict | None = None,
     plt_aws_catalogs: dict[str, dict] | None = None,
     aws_account_registry: dict[str, str] | None = None,
@@ -3080,6 +3415,8 @@ def prepare_stage_repo(
     plt_env: str | None = None,
     plt_runtime_selectors: dict[str, str] | None = None,
     aws_implementation_key: str | None = None,
+    allow_aws_profile_only: bool = False,
+    profile_only_aws_profile: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Clone/copy a stage repo, materialize child modules, and run its setup script."""
     repo_path = run_dir / "stages_source" / stage_id
@@ -3110,7 +3447,8 @@ def prepare_stage_repo(
     stage_env.update(tooling_env)
     if aws_access_contexts is not None:
         if (
-            plt_aws_catalogs is None
+            execution_identities is None
+            or plt_aws_catalogs is None
             or aws_account_registry is None
             or main_tag is None
             or plt_env is None
@@ -3121,6 +3459,7 @@ def prepare_stage_repo(
             stage_id,
             stage,
             stage_env,
+            execution_identities,
             aws_access_contexts,
             plt_aws_catalogs,
             main_tag=main_tag,
@@ -3128,6 +3467,8 @@ def prepare_stage_repo(
             plt_runtime_selectors=plt_runtime_selectors,
             implementation_key=aws_implementation_key,
             account_registry=aws_account_registry,
+            allow_profile_only=allow_aws_profile_only,
+            profile_only_aws_profile=profile_only_aws_profile,
         )
     logging.info(" ".join(stage_setup_cmd))
     run_and_log(
@@ -3193,10 +3534,13 @@ def run_stages(
     main_tag: str,
     tooling_refs: dict,
     use_local_tooling_cfg: bool,
+    execution_identities: dict,
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     aws_account_registry: dict[str, str],
     aws_implementation_key: str,
+    allow_aws_profile_only: bool,
+    profile_only_aws_profile: str | None,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
@@ -3208,6 +3552,7 @@ def run_stages(
             stage,
             run_dir,
             tooling_env,
+            execution_identities=execution_identities,
             aws_access_contexts=aws_access_contexts,
             plt_aws_catalogs=plt_aws_catalogs,
             aws_account_registry=aws_account_registry,
@@ -3215,6 +3560,8 @@ def run_stages(
             plt_env=plt_env,
             plt_runtime_selectors=plt_runtime_selectors,
             aws_implementation_key=aws_implementation_key,
+            allow_aws_profile_only=allow_aws_profile_only,
+            profile_only_aws_profile=profile_only_aws_profile,
         )
 
         stage_runner_path = "./atlas_ctl_adapter/runners/local_dev.py" if use_local_tooling_cfg else "./atlas_ctl_adapter/runners/local.py"
@@ -3243,7 +3590,7 @@ def run_stages(
 
 def print_run_summary(run_id: str, log_file: Path) -> None:
     """Print run summary at the end."""
-    print(f"export run_id={run_id}")
+    print(f"Run id: {run_id}")
     print(f"Log file: {log_file}")
 
 
@@ -3270,6 +3617,7 @@ def run_maintenance(
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
+    profile_only_aws_profile: str | None,
 ) -> None:
     """Run a maintenance action against a single stage target."""
     runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
@@ -3317,16 +3665,21 @@ def run_maintenance(
     )
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
+    execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
     plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_env)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
+        execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
         main_tag=main_tag,
         plt_env=plt_env,
         plt_runtime_selectors=plt_runtime_selectors,
         implementation_key=aws_implementation_key,
+        allow_profile_only=allow_aws_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
     plt_distributed_dir_path = run_cfg_distribution(
@@ -3349,6 +3702,7 @@ def run_maintenance(
         stage,
         run_dir,
         tooling_env,
+        execution_identities=execution_identities,
         aws_access_contexts=aws_access_contexts,
         plt_aws_catalogs=plt_aws_catalogs,
         aws_account_registry=aws_account_registry,
@@ -3356,6 +3710,8 @@ def run_maintenance(
         plt_env=plt_env,
         plt_runtime_selectors=plt_runtime_selectors,
         aws_implementation_key=aws_implementation_key,
+        allow_aws_profile_only=allow_aws_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
     )
     run_and_log(
         ["python3", "./atlas_ctl_adapter/stages/_common/assert_aws_access.py"],
@@ -3426,8 +3782,7 @@ def build_adhoc_cfg(
     ref: str,
     cfg_set_name: str,
     sub_workflow: str,
-    aws_account_key: str | None,
-    aws_access_context_key: str | None,
+    execution_identity_key: str | None,
 ) -> tuple[dict, dict]:
     """Build a one-target (workflow_cfg, inventory_cfg) for an ad-hoc run.
 
@@ -3447,9 +3802,8 @@ def build_adhoc_cfg(
         "cfg_root": cfg_set.get("cfg_root", "/"),
         "cfg_files": resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
     }
-    if aws_account_key:
-        resolved["aws_account_key"] = aws_account_key
-        resolved["aws_access_context_key"] = aws_access_context_key
+    if execution_identity_key:
+        resolved["execution_identity_key"] = execution_identity_key
     name = "adhoc"
     inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
     workflow_cfg = {
@@ -3481,6 +3835,7 @@ def run_pipeline(
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
+    profile_only_aws_profile: str | None,
     target_name: str | None = None,
     adhoc: dict | None = None,
 ) -> None:
@@ -3505,8 +3860,7 @@ def run_pipeline(
             ref=adhoc["ref"],
             cfg_set_name=adhoc["cfg_set"],
             sub_workflow=adhoc["sub_workflow"],
-            aws_account_key=adhoc.get("aws_account_key"),
-            aws_access_context_key=adhoc.get("aws_access_context_key"),
+            execution_identity_key=adhoc.get("execution_identity_key"),
         )
     elif target_name:
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
@@ -3528,7 +3882,6 @@ def run_pipeline(
         )
     if not adhoc:
         validate_workflow_target_selectors(workflow_cfg, inventory_cfg, runtime_selector_maps)
-    aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
 
     refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
@@ -3558,15 +3911,21 @@ def run_pipeline(
 
     # Validate stages have commits and resolvable AWS access before execution.
     validate_stages_have_commits(active_stages, ctl_ref_policy)
+    execution_identities = load_execution_identities_cfg(ctl_cfg_root)
+    aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
     plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_env)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
+        execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
         main_tag=main_tag,
         plt_env=plt_env,
         plt_runtime_selectors=plt_runtime_selectors,
         implementation_key=aws_implementation_key,
+        allow_profile_only=allow_aws_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
     )
 
     write_target_stage_flow_artifact(
@@ -3601,10 +3960,13 @@ def run_pipeline(
         main_tag=main_tag,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
+        execution_identities=execution_identities,
         aws_access_contexts=aws_access_contexts,
         plt_aws_catalogs=plt_aws_catalogs,
         aws_account_registry=aws_account_registry,
         aws_implementation_key=aws_implementation_key,
+        allow_aws_profile_only=allow_aws_profile_only,
+        profile_only_aws_profile=profile_only_aws_profile,
     )
 
     print_run_summary(run_id, log_file)

@@ -69,12 +69,7 @@ def require_env(name: str) -> str:
     return value
 
 
-def main() -> int:
-    profile_name = require_env("AWS_PROFILE")
-    expected_account_id = require_env("ATLAS_AWS_EXPECT_ACCOUNT_ID")
-    permission_set_name = os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
-    role_name = os.getenv("ATLAS_AWS_EXPECT_ROLE_NAME", "").strip() or None
-
+def get_caller_identity(profile_name: str) -> dict:
     result = subprocess.run(
         [
             "aws",
@@ -99,6 +94,29 @@ def main() -> int:
         caller = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("STS GetCallerIdentity returned invalid JSON") from exc
+    return caller
+
+
+def main() -> int:
+    profile_name = require_env("AWS_PROFILE")
+    caller = get_caller_identity(profile_name)
+
+    profile_only = os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"
+    if profile_only:
+        actual_account_id = caller.get("Account")
+        actual_arn = caller.get("Arn")
+        if not actual_account_id or not actual_arn:
+            raise RuntimeError("STS GetCallerIdentity returned no Account or Arn")
+        print(
+            "AWS access: "
+            "mode=profile_only "
+            f"profile={profile_name} account={actual_account_id} arn={actual_arn}"
+        )
+        return 0
+
+    expected_account_id = require_env("ATLAS_AWS_EXPECT_ACCOUNT_ID")
+    permission_set_name = os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
+    role_name = os.getenv("ATLAS_AWS_EXPECT_ROLE_NAME", "").strip() or None
 
     actual_account_id, actual_arn = validate_caller_identity(
         caller,
@@ -108,6 +126,7 @@ def main() -> int:
     )
     print(
         "AWS access: "
+        f"execution_identity_key={os.getenv('ATLAS_EXECUTION_IDENTITY_KEY', '')} "
         f"account_key={os.getenv('ATLAS_AWS_ACCOUNT_KEY', '')} "
         f"access_context_key={os.getenv('ATLAS_AWS_ACCESS_CONTEXT_KEY', '')} "
         f"implementation_key={os.getenv('ATLAS_AWS_IMPLEMENTATION_KEY', '')} "
