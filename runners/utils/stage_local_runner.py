@@ -160,7 +160,7 @@ def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, 
         merge_plt_cfg_dirs(
             plt_cfg_root=Path(origin_cfg),
             plt_merged_dir=merged_root,
-            ctl_env=env_type,
+            ctl_context=env_type,
             plt_env=env_type,
             plt_overlays=overlays,
         )

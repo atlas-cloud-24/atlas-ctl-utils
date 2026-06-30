@@ -2,15 +2,18 @@
 
 import argparse
 import collections
+import fcntl
 import functools
 import logging
 import logging.handlers
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +69,12 @@ AWS_ACCESS_STAGE_ENV_VARS = (
 )
 
 SERVICE_ID = "atlas-ctl-orchestrator-local"
+CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
+CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
+RUN_METADATA_FILENAME = "RUN.yaml"
+MUTATING_ACTIONS = ("provision", "destroy")
+_UUID7_LAST_TIMESTAMP_MS = -1
+_UUID7_COUNTER = 0
 
 # ANSI escape code pattern
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
@@ -278,21 +287,21 @@ def validate_runtime_selectors_against_registry(
             )
 
 
-def ctl_selector_policy(ctl_cfg_root: Path, ctl_env: str) -> dict:
+def ctl_selector_policy(ctl_cfg_root: Path, ctl_context: str) -> dict:
     registry = load_selector_registry(ctl_cfg_root, "ctl")
-    return selector_policy(registry, "ctl_env", ctl_env, owner="ctl")
+    return selector_policy(registry, "ctl_context", ctl_context, owner="ctl")
 
 
-def ctl_ref_policy(ctl_cfg_root: Path, ctl_env: str) -> str:
-    policy = ctl_selector_policy(ctl_cfg_root, ctl_env)
+def ctl_ref_policy(ctl_cfg_root: Path, ctl_context: str) -> str:
+    policy = ctl_selector_policy(ctl_cfg_root, ctl_context)
     ref_policy = policy.get("ref_policy")
     if not isinstance(ref_policy, str) or not ref_policy.strip():
-        raise RuntimeError(f"❌ ctl selector ctl_env={ctl_env!r} must define non-empty ref_policy")
+        raise RuntimeError(f"❌ ctl selector ctl_context={ctl_context!r} must define non-empty ref_policy")
     return ref_policy.strip()
 
 
-def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_env: str) -> bool:
-    policy = ctl_selector_policy(ctl_cfg_root, ctl_env)
+def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_context: str) -> bool:
+    policy = ctl_selector_policy(ctl_cfg_root, ctl_context)
     return policy.get("allow_aws_profile_only") is True
 
 
@@ -401,17 +410,36 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize split selector CLI into runtime maps and common selector values."""
     args.plt_runtime_selectors = selectors_to_map(args.plt_selector, label="plt")
     args.ctl_runtime_selectors = selectors_to_map(args.ctl_selector, label="ctl")
-    args.ctl_env = require_selector(args.ctl_runtime_selectors, "ctl_env", label="ctl")
+    args.ctl_context = require_selector(args.ctl_runtime_selectors, "ctl_context", label="ctl")
     args.plt_env = args.plt_runtime_selectors.get("plt_env", "")
     args.ctl_results_root = normalize_ctl_results_root(args.ctl_results_root)
     args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
     args.run_id = generate_uuid7()
 
 
+def _uuid7_timestamp_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000) & ((1 << 48) - 1)
+
+
 def generate_uuid7() -> str:
-    """Generate a UUIDv7 string for one ctl run execution."""
-    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000) & ((1 << 48) - 1)
-    rand_a = uuid.uuid4().int & ((1 << 12) - 1)
+    """Generate a monotonic UUIDv7 string for one ctl run execution."""
+    global _UUID7_LAST_TIMESTAMP_MS, _UUID7_COUNTER
+
+    timestamp_ms = _uuid7_timestamp_ms()
+    if timestamp_ms > _UUID7_LAST_TIMESTAMP_MS:
+        _UUID7_LAST_TIMESTAMP_MS = timestamp_ms
+        _UUID7_COUNTER = 0
+    else:
+        timestamp_ms = _UUID7_LAST_TIMESTAMP_MS
+        _UUID7_COUNTER += 1
+        if _UUID7_COUNTER >= (1 << 12):
+            while timestamp_ms <= _UUID7_LAST_TIMESTAMP_MS:
+                time.sleep(0.001)
+                timestamp_ms = _uuid7_timestamp_ms()
+            _UUID7_LAST_TIMESTAMP_MS = timestamp_ms
+            _UUID7_COUNTER = 0
+
+    rand_a = _UUID7_COUNTER
     rand_b = uuid.uuid4().int & ((1 << 62) - 1)
     value = (timestamp_ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b
     return str(uuid.UUID(int=value))
@@ -452,7 +480,7 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text)
 
 
-def log_stage_banner(stage_id: str, *, ch: str = "#", min_width: int = 100) -> None:
+def log_stage_banner(stage_id: str, *, ch: str = "#", min_width: int = 70) -> None:
     title = f" {stage_id} "
     width = max(min_width, len(title) + 2)  # ensure it always fits
     line = ch * width
@@ -506,36 +534,63 @@ def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
     return returncode
 
 
-def validate_baseline_args(args: argparse.Namespace) -> None:
-    """Validate args for a baseline (pipeline) run: --workflow xor --target."""
-    if not args.workflow and not args.target:
-        raise RuntimeError("❌ baseline needs --workflow or --target")
-    if args.workflow and args.target:
-        raise RuntimeError("❌ baseline takes --workflow or --target, not both")
+def validate_workflow_args(args: argparse.Namespace) -> None:
+    """Validate args for a declared workflow run."""
+    if not args.workflow:
+        raise RuntimeError("❌ workflow runner requires --workflow")
+    if args.target:
+        raise RuntimeError("❌ workflow runner does not accept --target")
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+        raise RuntimeError("❌ workflow runner does not accept sub-workflow synthetic target args")
+
+
+def validate_target_args(args: argparse.Namespace) -> None:
+    """Validate args for a declared single-target run."""
+    if not args.target:
+        raise RuntimeError("❌ target runner requires --target")
+    if args.workflow:
+        raise RuntimeError("❌ target runner does not accept --workflow")
+    if getattr(args, "ctl_variants", None):
+        raise RuntimeError("❌ --ctl-variants is not supported for target runs")
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+        raise RuntimeError("❌ target runner does not accept sub-workflow synthetic target args")
 
 
 def validate_maintenance_args(args: argparse.Namespace) -> None:
     """Validate args for a maintenance run."""
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+        raise RuntimeError("❌ maintenance runner does not accept sub-workflow synthetic target args")
     if not args.maintenance_action:
         raise RuntimeError("❌ --maintenance-action is required for maintenance")
-    if not args.target:
-        raise RuntimeError("❌ --target is required for maintenance")
     if args.maintenance_action == "force-unlock" and not args.lock_id:
         raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
+    if args.maintenance_action == "force-unlock" and ctl_results_lock_matches(args.ctl_results_root, args.lock_id):
+        return
+    if not args.target:
+        raise RuntimeError("❌ --target is required for maintenance")
 
 
-def validate_adhoc_args(args: argparse.Namespace) -> None:
-    """Validate args for an ad-hoc synthetic-target run."""
-    missing = [f for f in ("source", "ref", "cfg_set", "sub_workflow") if not getattr(args, f, None)]
+def validate_sub_workflow_args(args: argparse.Namespace) -> None:
+    """Validate args for a synthetic repo-local sub_workflow run."""
+    if args.workflow or args.target:
+        raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
+    if getattr(args, "ctl_variants", None):
+        raise RuntimeError("❌ --ctl-variants is not supported for sub_workflow runs")
+    missing = [f for f in ("source", "ref", "cfg_file_set", "sub_workflow") if not getattr(args, f, None)]
     if missing:
         raise RuntimeError(
-            "❌ adhoc needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
+            "❌ sub_workflow needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
         )
     identity_key = getattr(args, "execution_identity_key", None)
     if identity_key is not None and not identity_key.strip():
         raise RuntimeError("❌ --execution-identity-key must be a non-empty string when provided")
+    affected_target_keys = getattr(args, "affected_target_keys", None) or []
+    if affected_target_keys:
+        args.affected_target_keys = normalize_target_keys(affected_target_keys, label="--affected-target-key")
+    if args.action in MUTATING_ACTIONS and not args.affected_target_keys:
+        raise RuntimeError("❌ mutating sub_workflow runs require at least one --affected-target-key")
 
 
 
@@ -1047,10 +1102,10 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     """Merge a top-level resource map identified by `key` across every cfg file.
 
     A resource's type is its top-level YAML key (content-key), not its filename: a
-    file with a `cfg_sets:` key contributes cfg-sets wherever it lives. The maps are
+    file with a `cfg_file_sets:` key contributes cfg-file-sets wherever it lives. The maps are
     unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
     error (same rule as targets), order-independent. `entry_depth` is how deep the
-    unique entries sit: 1 for flat catalogs (stage_sources/cfg_sets/aws_access_contexts),
+    unique entries sit: 1 for flat catalogs (stage_sources/cfg_file_sets/aws_access_contexts),
     2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
     `_CONTENT_KEY_SKIP_TOP`) are skipped — they have dedicated loaders.
@@ -1911,11 +1966,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--workflow",
-        help="ordered workflow name (baseline runs)",
+        help="declared ctl workflow name (workflow runs)",
     )
     parser.add_argument(
         "--target",
-        help="a single target name (baseline), or the target to operate on (maintenance)",
+        help="declared target name (target runs), or target to operate on (maintenance)",
     )
     parser.add_argument(
         "--maintenance-action",
@@ -1924,7 +1979,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--lock-id",
-        help="state lock ID to force-unlock (required for force-unlock)",
+        help="ctl run ID or Terraform state lock ID to force-unlock (required for force-unlock)",
     )
     parser.add_argument(
         "--plt-selector",
@@ -1935,27 +1990,34 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--source",
-        help="adhoc: source repo for a synthetic target",
+        help="sub_workflow: source repo for a synthetic target",
     )
     parser.add_argument(
         "--ref",
-        help="adhoc: ref context (a key in refs.scoped, e.g. env/${plt_env} or org) for a synthetic target",
+        help="sub_workflow: ref context (a key in refs.scoped, e.g. env.${plt_env} or org) for a synthetic target",
     )
     parser.add_argument(
-        "--cfg-set",
-        dest="cfg_set",
-        help="adhoc: cfg_set for a synthetic target",
+        "--cfg-file-set",
+        dest="cfg_file_set",
+        help="sub_workflow: cfg_file_set for a synthetic target",
     )
     parser.add_argument(
         "--sub-workflow",
         dest="sub_workflow",
-        help="adhoc: repo sub_workflow for a synthetic target",
+        help="sub_workflow: repo-local sub_workflow to run",
     )
     parser.add_argument(
         "--execution-identity-key",
         dest="execution_identity_key",
         default=None,
-        help="adhoc: execution identity key for a synthetic target",
+        help="sub_workflow: execution identity key for a synthetic target",
+    )
+    parser.add_argument(
+        "--affected-target-key",
+        dest="affected_target_keys",
+        action="append",
+        default=[],
+        help="sub_workflow: affected declared target key; repeatable and required for mutating synthetic runs",
     )
 
 
@@ -1970,7 +2032,7 @@ def setup_logging() -> logging.handlers.MemoryHandler:
 
 def load_workflow_cfg(
     ctl_cfg_root: Path,
-    ctl_env: str,
+    ctl_context: str,
     inventory_name: str,
     workflow_name: str,
     runtime_selector_maps: dict[str, dict[str, str]],
@@ -1979,7 +2041,7 @@ def load_workflow_cfg(
 
     Expands `import_workflow_keys` (ordered, recursive) then the workflow's own `target_keys`; applies
     `selectors` (intersected through imports) through the generic selector matcher.
-    The workflow name is an opaque key (slashes are cosmetic). `ctl_env` is retained
+    The workflow name is an opaque key (slashes are cosmetic). `ctl_context` is retained
     for the generated workflow metadata.
     """
     workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
@@ -2055,7 +2117,7 @@ def validate_ctl_variant_meta(
     meta: dict,
     *,
     variant_label: str,
-    ctl_env: str,
+    ctl_context: str,
     plt_env: str,
     plt_overlays: list[str],
 ) -> None:
@@ -2065,9 +2127,9 @@ def validate_ctl_variant_meta(
 
     allowed_envs = _load_meta_string_list(meta, "allowed_envs", "ctl variant", variant_label)
     if allowed_envs:
-        if ctl_env not in allowed_envs:
+        if ctl_context not in allowed_envs:
             raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' is not allowed for ctl env '{ctl_env}'; "
+                f"❌ ctl variant '{variant_label}' is not allowed for ctl context '{ctl_context}'; "
                 f"allowed_envs={allowed_envs}"
             )
         if plt_env not in allowed_envs:
@@ -2307,63 +2369,63 @@ def apply_ctl_variants_to_workflow_cfg(
     return patched
 
 
-def resolve_cfg_set_files(
-    cfg_set_key: str,
-    cfg_sets: dict,
-    cfg_sets_path: Path,
+def resolve_cfg_file_set_files(
+    cfg_file_set_key: str,
+    cfg_file_sets: dict,
+    cfg_file_sets_path: Path,
     _stack: tuple = (),
 ) -> list:
-    """Resolve cfg_set_keys in order, then append the selected cfg_set's cfg_files."""
-    if cfg_set_key in _stack:
-        cycle = " -> ".join([*_stack, cfg_set_key])
-        raise RuntimeError(f"❌ cfg_set key cycle: {cycle} ({cfg_sets_path})")
-    cfg_set = cfg_sets.get(cfg_set_key)
-    if cfg_set is None:
-        raise RuntimeError(f"❌ missing cfg_set key {cfg_set_key!r}: {cfg_sets_path}")
-    if not isinstance(cfg_set, dict):
-        raise RuntimeError(f"❌ cfg_set {cfg_set_key!r} must be a mapping: {cfg_sets_path}")
+    """Resolve cfg_file_set_keys in order, then append the selected cfg_file_set's cfg_files."""
+    if cfg_file_set_key in _stack:
+        cycle = " -> ".join([*_stack, cfg_file_set_key])
+        raise RuntimeError(f"❌ cfg_file_set key cycle: {cycle} ({cfg_file_sets_path})")
+    cfg_file_set = cfg_file_sets.get(cfg_file_set_key)
+    if cfg_file_set is None:
+        raise RuntimeError(f"❌ missing cfg_file_set key {cfg_file_set_key!r}: {cfg_file_sets_path}")
+    if not isinstance(cfg_file_set, dict):
+        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} must be a mapping: {cfg_file_sets_path}")
 
-    included_keys = cfg_set.get("cfg_set_keys") or []
-    cfg_files = cfg_set.get("cfg_files") or []
+    included_keys = cfg_file_set.get("cfg_file_set_keys") or []
+    cfg_files = cfg_file_set.get("cfg_files") or []
     if not isinstance(included_keys, list) or not all(isinstance(key, str) and key for key in included_keys):
-        raise RuntimeError(f"❌ cfg_set {cfg_set_key!r} cfg_set_keys must be a list of non-empty strings")
+        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} cfg_file_set_keys must be a list of non-empty strings")
     if not isinstance(cfg_files, list) or not all(isinstance(path, str) and path for path in cfg_files):
-        raise RuntimeError(f"❌ cfg_set {cfg_set_key!r} cfg_files must be a list of non-empty strings")
+        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} cfg_files must be a list of non-empty strings")
 
     resolved: list = []
     for included_key in included_keys:
-        resolved.extend(resolve_cfg_set_files(included_key, cfg_sets, cfg_sets_path, (*_stack, cfg_set_key)))
+        resolved.extend(resolve_cfg_file_set_files(included_key, cfg_file_sets, cfg_file_sets_path, (*_stack, cfg_file_set_key)))
     resolved.extend(cfg_files)
     return resolved
 
 
 def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
-    """Compose action cfg from stage_sources + cfg_sets + targets/<action>/*.yaml.
+    """Compose action cfg from stage_sources + cfg_file_sets + targets/<action>/*.yaml.
 
     `inventory_name` is the action (provision/plan/destroy/readonly). Layout:
       - stage_sources.yaml  source repos: source key -> meta
-      - cfg_sets.yaml       config views: cfg-set key -> {cfg_root, cfg_set_keys, cfg_files}
+      - cfg_file_sets.yaml       config views: cfg-file-set key -> {cfg_root, cfg_file_set_keys, cfg_files}
       - targets/<action>/*.yaml  fat targets (the directory IS the action). Each
             file is a flat `targets:` map; all files for an action merge (duplicate
             names rejected). A target is self-contained:
-              {source_key, ref_key, sub_workflow_key, cfg_set_key,
+              {source_key, ref_key, sub_workflow_key, cfg_file_set_key,
                [execution_identity_key], [cfg_files], [selectors],
                [required_plt_overlay_keys]}.
 
     Returns the flat shape build_active_stages consumes ({stage_sources,
     stage_targets}), where each target carries source + cfg_root + cfg_files
-    (resolved from its cfg_set_key) + sub_workflow + execution identity requirement
+    (resolved from its cfg_file_set_key) + sub_workflow + execution identity requirement
     (+ selectors /
     requires_plt_overlays when present).
     """
     # global resources + targets are content-key (collected by top-level key)
     stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
-    cfg_sets = collect_resource(ctl_cfg_root, "cfg_sets")
-    cfg_sets_path = ctl_cfg_root  # label for include/error messages
+    cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
+    cfg_file_sets_path = ctl_cfg_root  # label for include/error messages
     if not stage_sources:
         raise RuntimeError(f"❌ no 'stage_sources' defined under: {ctl_cfg_root}")
-    if not cfg_sets:
-        raise RuntimeError(f"❌ no 'cfg_sets' defined under: {ctl_cfg_root}")
+    if not cfg_file_sets:
+        raise RuntimeError(f"❌ no 'cfg_file_sets' defined under: {ctl_cfg_root}")
 
     all_targets = collect_resource(ctl_cfg_root, "targets", entry_depth=2)
     stage_targets = all_targets.get(inventory_name)
@@ -2383,16 +2445,16 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         if not isinstance(target_ref, str) or not target_ref.strip():
             raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'ref_key'")
 
-        cfg_set_name = target_def.get("cfg_set_key")
-        if not isinstance(cfg_set_name, str) or not cfg_set_name:
-            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'cfg_set_key'")
-        cfg_set = cfg_sets.get(cfg_set_name)
-        if cfg_set is None:
+        cfg_file_set_name = target_def.get("cfg_file_set_key")
+        if not isinstance(cfg_file_set_name, str) or not cfg_file_set_name:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'cfg_file_set_key'")
+        cfg_file_set = cfg_file_sets.get(cfg_file_set_name)
+        if cfg_file_set is None:
             raise RuntimeError(
-                f"❌ target {target_name!r} references missing cfg_set {cfg_set_name!r}: {cfg_sets_path}"
+                f"❌ target {target_name!r} references missing cfg_file_set {cfg_file_set_name!r}: {cfg_file_sets_path}"
             )
-        if not isinstance(cfg_set, dict):
-            raise RuntimeError(f"❌ cfg_set {cfg_set_name!r} must be a mapping: {cfg_sets_path}")
+        if not isinstance(cfg_file_set, dict):
+            raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_name!r} must be a mapping: {cfg_file_sets_path}")
 
         sub_workflow = target_def.get("sub_workflow_key")
         if not isinstance(sub_workflow, str) or not sub_workflow:
@@ -2419,9 +2481,9 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
             "source": source,
             "ref": target_ref.strip(),
             "sub_workflow": sub_workflow,
-            "cfg_root": cfg_set.get("cfg_root", "/"),
+            "cfg_root": cfg_file_set.get("cfg_root", "/"),
             "cfg_files": [
-                *resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
+                *resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
                 *extra_files,
             ],
         }
@@ -2552,13 +2614,22 @@ def ref_context_to_result_path(ref_context: str) -> str:
 
 def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
     """Resolve the stable ctl result name for the selected runner mode."""
-    if run_type == "baseline":
-        raw_name = args.workflow or args.target
-    elif run_type == "adhoc":
-        ref_context = resolve_ref_context(args.ref, args.plt_runtime_selectors) if args.ref else "adhoc"
+    if run_type == "workflow":
+        if args.target:
+            raise RuntimeError("❌ workflow runner does not accept --target")
+        raw_name = args.workflow
+    elif run_type == "target":
+        if args.workflow:
+            raise RuntimeError("❌ target runner does not accept --workflow")
+        raw_name = args.target
+    elif run_type == "sub_workflow":
+        if args.workflow or args.target:
+            raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
+        ref_context = resolve_ref_context(args.ref, args.plt_runtime_selectors) if args.ref else "sub_workflow"
         raw_name = f"{ref_context_to_result_path(ref_context)}/{args.source or 'unknown'}/{args.sub_workflow or 'unknown'}"
     elif run_type == "maintenance":
-        raw_name = f"{args.maintenance_action or 'maintenance'}/{args.target or 'unknown'}"
+        maintenance_target = args.target or args.lock_id or "unknown"
+        raw_name = f"{args.maintenance_action or 'maintenance'}/{maintenance_target}"
     else:
         raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
 
@@ -2610,6 +2681,23 @@ def setup_run_dirs(
     memory_handler.flush()
     logging.getLogger().removeHandler(memory_handler)
 
+    write_run_metadata(
+        run_dir,
+        {
+            "run_id": run_id,
+            "action": action,
+            "run_type": run_type,
+            "result_name": result_name,
+            "result_key": f"{action}/{run_type}/{result_name}",
+            "ctl_results_root": str(Path(ctl_results_root)),
+            "ctl_result_dir": str(ctl_result_dir),
+            "run_dir": str(run_dir),
+            "log_path": str(log_file),
+            "target_keys": [],
+            "mutation_started": False,
+        },
+    )
+
     logging.info(f"Using artifacts_dir: {artifacts_dir}")
     logging.info(f"Logging to: {log_file}")
 
@@ -2626,10 +2714,92 @@ def ctl_result_dir_from_run_dir(run_dir: Path) -> Path:
     return run_dir.parent.parent
 
 
+def run_metadata_path(run_dir: Path) -> Path:
+    return Path(run_dir) / RUN_METADATA_FILENAME
+
+
 def write_yaml_file(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, sort_keys=False)
+
+
+def load_run_metadata(run_dir: Path) -> dict:
+    path = run_metadata_path(run_dir)
+    if not path.is_file():
+        return {"run_id": Path(run_dir).name}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ run metadata must be a mapping: {path}")
+    data.setdefault("run_id", Path(run_dir).name)
+    return data
+
+
+def write_run_metadata(run_dir: Path, metadata: dict) -> None:
+    write_yaml_file(run_metadata_path(run_dir), metadata)
+
+
+def update_run_metadata(run_dir: Path, updates: dict) -> dict:
+    metadata = load_run_metadata(run_dir)
+    metadata.update(updates)
+    write_run_metadata(run_dir, metadata)
+    return metadata
+
+
+def normalize_target_keys(values: list[str], *, label: str) -> list[str]:
+    if not isinstance(values, list):
+        raise RuntimeError(f"❌ {label} must be a list")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = normalize_result_name(value, label=label)
+        if key in seen:
+            raise RuntimeError(f"❌ duplicate target key in {label}: {key}")
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def target_keys_from_active_stages(active_stages: dict) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for stage in active_stages.values():
+        target_key = stage.get("target")
+        if not isinstance(target_key, str) or not target_key:
+            continue
+        target_key = normalize_result_name(target_key, label="resolved target key")
+        if target_key not in seen:
+            seen.add(target_key)
+            keys.append(target_key)
+    return keys
+
+
+def build_status_payload(run_dir: Path, status: str, extra: dict | None = None) -> dict:
+    payload = dict(load_run_metadata(run_dir))
+    payload["run_id"] = Path(run_dir).name
+    payload["status"] = status
+    payload["updated_at"] = utc_timestamp()
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def current_status_path(run_dir: Path) -> Path:
+    return Path(run_dir) / "STATUS.yaml"
+
+
+def load_current_status(run_dir: Path) -> dict:
+    path = current_status_path(run_dir)
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ run STATUS.yaml must be a mapping: {path}")
+    return data
+
+
+def write_current_status(run_dir: Path, payload: dict) -> None:
+    write_yaml_file(current_status_path(run_dir), payload)
 
 
 def remove_state_slot(run_dir: Path, state: str) -> None:
@@ -2656,41 +2826,523 @@ def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
     )
 
 
+def rewrite_in_progress_slot_if_present(run_dir: Path, payload: dict) -> None:
+    slot_dir = ctl_result_dir_from_run_dir(run_dir) / "in_progress"
+    if slot_dir.exists():
+        write_state_slot(run_dir, "in_progress", payload)
+
+
 def mark_run_started(run_dir: Path) -> None:
-    payload = {
-        "run_id": run_dir.name,
-        "status": "in_progress",
-        "updated_at": utc_timestamp(),
-    }
-    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    payload = build_status_payload(run_dir, "in_progress")
+    write_current_status(run_dir, payload)
     write_state_slot(run_dir, "in_progress", payload)
 
 
+def record_run_target_keys(run_dir: Path, target_keys: list[str]) -> None:
+    normalized = normalize_target_keys(target_keys, label="target_keys")
+    metadata = update_run_metadata(run_dir, {"target_keys": normalized})
+    status = load_current_status(run_dir)
+    if status:
+        status.update({"target_keys": normalized, "updated_at": utc_timestamp()})
+        for key in ("action", "run_type", "result_name", "result_key", "ctl_results_root", "ctl_result_dir", "run_dir", "log_path"):
+            if key in metadata:
+                status[key] = metadata[key]
+        write_current_status(run_dir, status)
+        if status.get("status") == "in_progress":
+            rewrite_in_progress_slot_if_present(run_dir, status)
+
+
+def mark_mutation_started(run_dir: Path, stage_id: str) -> None:
+    metadata = update_run_metadata(
+        run_dir,
+        {
+            "mutation_started": True,
+            "mutation_started_at": utc_timestamp(),
+            "mutation_stage_id": stage_id,
+        },
+    )
+    status = load_current_status(run_dir)
+    if status:
+        status.update(
+            {
+                "mutation_started": True,
+                "mutation_started_at": metadata["mutation_started_at"],
+                "mutation_stage_id": stage_id,
+                "updated_at": utc_timestamp(),
+            }
+        )
+        write_current_status(run_dir, status)
+        if status.get("status") == "in_progress":
+            rewrite_in_progress_slot_if_present(run_dir, status)
+
+
+def tail_log_lines(log_path: str | None, limit: int = 40) -> list[str]:
+    if not log_path:
+        return []
+    path = Path(log_path)
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return lines[-limit:]
+
+
+def extract_error_summary(log_path: str | None, fallback: str) -> dict:
+    tail = tail_log_lines(log_path)
+    summary = fallback
+    for line in reversed(tail):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "Error:" in stripped or "CalledProcessError" in stripped or "failed" in stripped.lower():
+            summary = stripped
+            break
+    return {"summary": summary, "tail_lines": tail}
+
+
+def print_failure_summary(payload: dict) -> None:
+    error = payload.get("error") or {}
+    print("Run failed", file=sys.stderr)
+    if payload.get("result_key"):
+        print(f"result: {payload['result_key']}", file=sys.stderr)
+    if payload.get("mutation_stage_id"):
+        print(f"stage: {payload['mutation_stage_id']}", file=sys.stderr)
+    if error.get("summary"):
+        print(f"error: {error['summary']}", file=sys.stderr)
+    if payload.get("log_path"):
+        print(f"log: {payload['log_path']}", file=sys.stderr)
+
+
 def mark_run_succeeded(run_dir: Path) -> None:
-    payload = {
-        "run_id": run_dir.name,
-        "status": "ok",
-        "updated_at": utc_timestamp(),
-    }
-    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    payload = build_status_payload(run_dir, "ok")
+    write_current_status(run_dir, payload)
     write_state_slot(run_dir, "committed", payload)
     remove_state_slot(run_dir, "in_progress")
     remove_state_slot(run_dir, "failed")
+    mark_outdated_for_run(run_dir, include_current_result=False)
 
 
 def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
-    payload = {
-        "run_id": run_dir.name,
-        "status": "failed",
-        "updated_at": utc_timestamp(),
-        "error": {
-            "type": type(exc).__name__,
-            "summary": str(exc),
+    metadata = load_run_metadata(run_dir)
+    extracted = extract_error_summary(metadata.get("log_path"), str(exc))
+    payload = build_status_payload(
+        run_dir,
+        "failed",
+        {
+            "error": {
+                "type": type(exc).__name__,
+                "summary": extracted["summary"],
+            },
+            "log_path": metadata.get("log_path"),
+            "tail_lines": extracted["tail_lines"],
         },
-    }
-    write_yaml_file(run_dir / "STATUS.yaml", payload)
+    )
+    write_current_status(run_dir, payload)
     write_state_slot(run_dir, "failed", payload)
     remove_state_slot(run_dir, "in_progress")
+    mark_outdated_for_run(run_dir, include_current_result=True)
+    print_failure_summary(payload)
+
+
+def parse_result_dir(ctl_results_root: Path, result_dir: Path) -> dict | None:
+    try:
+        rel = Path(result_dir).resolve().relative_to(Path(ctl_results_root).resolve())
+    except ValueError:
+        return None
+    parts = rel.parts
+    if len(parts) < 3:
+        return None
+    action, run_type = parts[0], parts[1]
+    result_name = "/".join(parts[2:])
+    if not action or not run_type or not result_name:
+        return None
+    return {
+        "action": action,
+        "run_type": run_type,
+        "result_name": result_name,
+        "result_key": f"{action}/{run_type}/{result_name}",
+    }
+
+
+def iter_committed_status_paths(ctl_results_root: Path):
+    root = Path(ctl_results_root)
+    if not root.is_dir():
+        return
+    yield from sorted(root.rglob("committed/STATUS.yaml"))
+
+
+def load_status_mapping(path: Path) -> dict:
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ STATUS.yaml must contain a mapping: {path}")
+    return data
+
+
+def status_result_info(ctl_results_root: Path, status_path: Path, status: dict) -> dict | None:
+    result_dir = status_path.parent.parent
+    parsed = parse_result_dir(ctl_results_root, result_dir)
+    if parsed is None:
+        return None
+    info = dict(parsed)
+    for key in ("action", "run_type", "result_name", "result_key"):
+        if isinstance(status.get(key), str) and status[key]:
+            info[key] = status[key]
+    return info
+
+
+def status_target_keys(status: dict) -> list[str]:
+    raw = status.get("target_keys") or []
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str) and item]
+
+
+def update_committed_manifest(status_path: Path, payload: dict) -> None:
+    manifest_path = status_path.parent / "MANIFEST.yaml"
+    manifest = {
+        "run_id": payload.get("run_id"),
+        "run_path": payload.get("run_path") or (f"runs/{payload.get('run_id')}" if payload.get("run_id") else None),
+        "status_path": payload.get("status_path") or (f"runs/{payload.get('run_id')}/STATUS.yaml" if payload.get("run_id") else None),
+        "artifacts_path": payload.get("artifacts_path") or (f"runs/{payload.get('run_id')}/artifacts" if payload.get("run_id") else None),
+        "updated_at": payload.get("updated_at"),
+    }
+    write_yaml_file(manifest_path, {k: v for k, v in manifest.items() if v is not None})
+
+
+def mark_committed_status_outdated(status_path: Path, status: dict, *, reason: str, caused_by: dict | None = None) -> None:
+    payload = dict(status)
+    payload["status"] = "outdated"
+    payload["updated_at"] = utc_timestamp()
+    outdated = {
+        "reason": reason,
+        "at": payload["updated_at"],
+    }
+    if caused_by is not None:
+        outdated["caused_by"] = caused_by
+    payload["outdated"] = outdated
+    write_yaml_file(status_path, payload)
+    update_committed_manifest(status_path, payload)
+
+
+def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force: bool = False) -> None:
+    metadata = load_run_metadata(run_dir)
+    action = metadata.get("action")
+    if action not in MUTATING_ACTIONS:
+        return
+    if not force and metadata.get("mutation_started") is not True:
+        return
+
+    affected_target_keys = status_target_keys(metadata)
+    if not affected_target_keys:
+        return
+    affected = set(affected_target_keys)
+
+    ctl_results_root = metadata.get("ctl_results_root")
+    current_result_key = metadata.get("result_key")
+    if not isinstance(ctl_results_root, str) or not ctl_results_root:
+        return
+
+    caused_by = {
+        "action": metadata.get("action"),
+        "run_type": metadata.get("run_type"),
+        "result_name": metadata.get("result_name"),
+        "result_key": metadata.get("result_key"),
+        "run_id": metadata.get("run_id") or Path(run_dir).name,
+        "target_keys": affected_target_keys,
+    }
+
+    for status_path in iter_committed_status_paths(Path(ctl_results_root)):
+        status = load_status_mapping(status_path)
+        info = status_result_info(Path(ctl_results_root), status_path, status)
+        if info is None:
+            continue
+        if info.get("action") == "readonly":
+            continue
+        if not include_current_result and info.get("result_key") == current_result_key:
+            continue
+        committed_keys = set(status_target_keys(status))
+        if not committed_keys or not committed_keys.intersection(affected):
+            continue
+        mark_committed_status_outdated(
+            status_path,
+            status,
+            reason="affected_by_mutating_run",
+            caused_by=caused_by,
+        )
+
+
+def mark_removed_definitions_outdated(ctl_results_root: Path, ctl_cfg_root: Path) -> None:
+    try:
+        workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
+    except Exception as exc:
+        logging.warning("Skipping definition_removed scan: failed to load workflows: %s", exc)
+        workflows = {}
+    try:
+        targets = collect_resource(ctl_cfg_root, "targets", entry_depth=2)
+    except Exception as exc:
+        logging.warning("Skipping definition_removed scan: failed to load targets: %s", exc)
+        targets = {}
+
+    for status_path in iter_committed_status_paths(Path(ctl_results_root)):
+        status = load_status_mapping(status_path)
+        info = status_result_info(Path(ctl_results_root), status_path, status)
+        if info is None:
+            continue
+        run_type = info.get("run_type")
+        action = info.get("action")
+        result_name = info.get("result_name")
+        if run_type == "workflow":
+            exists = result_name in (workflows.get(action) or {})
+        elif run_type == "target":
+            exists = result_name in (targets.get(action) or {})
+        else:
+            continue
+        if exists or status.get("status") == "outdated":
+            continue
+        mark_committed_status_outdated(
+            status_path,
+            status,
+            reason="definition_removed",
+            caused_by={
+                "action": action,
+                "run_type": run_type,
+                "result_name": result_name,
+                "result_key": info.get("result_key"),
+            },
+        )
+
+
+def ctl_results_lock_path(ctl_results_root: Path) -> Path:
+    return Path(ctl_results_root) / CTL_RESULTS_LOCK_FILENAME
+
+
+def ctl_results_lock_metadata_path(ctl_results_root: Path) -> Path:
+    return Path(ctl_results_root) / CTL_RESULTS_LOCK_META_FILENAME
+
+
+def load_ctl_results_lock_metadata(ctl_results_root: Path) -> dict:
+    path = ctl_results_lock_metadata_path(ctl_results_root)
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ ctl results lock metadata must be a mapping: {path}")
+    return data
+
+
+def ctl_results_lock_matches(ctl_results_root: Path, lock_id: str | None) -> bool:
+    if not lock_id:
+        return False
+    metadata = load_ctl_results_lock_metadata(ctl_results_root)
+    return metadata.get("run_id") == lock_id
+
+
+def format_ctl_results_lock_error(ctl_results_root: Path, metadata: dict, *, reason: str) -> str:
+    lock_id = metadata.get("run_id") or "unknown"
+    details = [
+        f"❌ ctl results root is locked: {ctl_results_root}",
+        f"reason: {reason}",
+        f"lock_id/run_id: {lock_id}",
+    ]
+    for key in ("action", "run_type", "result_name", "run_dir", "host", "pid", "started_at"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            details.append(f"{key}: {value}")
+    details.append("If the owning ctl process is gone, run maintenance force-unlock with --lock-id " + str(lock_id))
+    return "\n".join(details)
+
+
+class CtlResultsLock:
+    """Local ctl results root lock backed by flock plus explicit metadata."""
+
+    def __init__(self, ctl_results_root: Path):
+        self.ctl_results_root = Path(ctl_results_root)
+        self.lock_path = ctl_results_lock_path(self.ctl_results_root)
+        self.metadata_path = ctl_results_lock_metadata_path(self.ctl_results_root)
+        self._file = None
+        self.run_id: str | None = None
+
+    def acquire(self, *, allow_stale_metadata: bool = False) -> "CtlResultsLock":
+        self.ctl_results_root.mkdir(parents=True, exist_ok=True)
+        self._file = self.lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+            self._file.close()
+            self._file = None
+            raise RuntimeError(
+                format_ctl_results_lock_error(
+                    self.ctl_results_root,
+                    metadata,
+                    reason="another ctl process still holds the OS lock",
+                )
+            ) from exc
+
+        if not allow_stale_metadata:
+            metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+            if metadata:
+                self.release(clear_metadata=False)
+                raise RuntimeError(
+                    format_ctl_results_lock_error(
+                        self.ctl_results_root,
+                        metadata,
+                        reason="stale ctl lock metadata exists",
+                    )
+                )
+        return self
+
+    def write_metadata(self, payload: dict) -> None:
+        if self._file is None:
+            raise RuntimeError("❌ cannot write ctl lock metadata before acquiring the lock")
+        self.run_id = payload.get("run_id")
+        write_yaml_file(self.metadata_path, payload)
+        self._file.seek(0)
+        self._file.truncate()
+        self._file.write(f"run_id: {payload.get('run_id', '')}\n")
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def release(self, *, clear_metadata: bool = True) -> None:
+        if self._file is None:
+            return
+        remove_lock_file = clear_metadata
+        try:
+            if clear_metadata and self.metadata_path.exists():
+                metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+                if not self.run_id or metadata.get("run_id") == self.run_id:
+                    self.metadata_path.unlink()
+                else:
+                    remove_lock_file = False
+            elif not clear_metadata:
+                remove_lock_file = False
+
+            if clear_metadata and remove_lock_file:
+                self._file.seek(0)
+                self._file.truncate()
+                self._file.flush()
+                os.fsync(self._file.fileno())
+                try:
+                    self.lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+def acquire_ctl_results_lock(ctl_results_root: Path) -> CtlResultsLock:
+    return CtlResultsLock(ctl_results_root).acquire()
+
+
+def release_ctl_results_lock(lock: CtlResultsLock | None) -> None:
+    if lock is not None:
+        lock.release()
+
+
+def should_bypass_ctl_results_lock(args: argparse.Namespace, run_type: str) -> bool:
+    return (
+        run_type == "maintenance"
+        and getattr(args, "maintenance_action", None) == "force-unlock"
+        and ctl_results_lock_matches(args.ctl_results_root, getattr(args, "lock_id", None))
+    )
+
+
+def write_ctl_results_lock_metadata(
+    lock: CtlResultsLock,
+    *,
+    run_id: str,
+    action: str,
+    run_type: str,
+    result_name: str,
+    run_dir: Path,
+) -> None:
+    lock.write_metadata(
+        {
+            "run_id": run_id,
+            "action": action,
+            "run_type": run_type,
+            "result_name": result_name,
+            "run_dir": str(run_dir),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "started_at": utc_timestamp(),
+        }
+    )
+
+
+def mark_run_force_unlocked(run_dir: Path, metadata: dict, maintenance_run_dir: Path) -> None:
+    run_metadata = load_run_metadata(run_dir)
+    metadata_updates = {}
+    for key in ("action", "run_type", "result_name", "run_dir"):
+        if not run_metadata.get(key) and metadata.get(key):
+            metadata_updates[key] = metadata[key]
+    if metadata_updates:
+        run_metadata = update_run_metadata(run_dir, metadata_updates)
+
+    payload = build_status_payload(
+        run_dir,
+        "failed",
+        {
+            "failure_reason": "force_unlocked",
+            "error": {
+                "type": "ForceUnlocked",
+                "summary": "ctl results lock was cleared by maintenance force-unlock",
+            },
+            "force_unlocked": {
+                "at": utc_timestamp(),
+                "maintenance_run_id": maintenance_run_dir.name,
+                "lock_metadata": metadata,
+            },
+        },
+    )
+    write_current_status(run_dir, payload)
+    write_state_slot(run_dir, "failed", payload)
+    remove_state_slot(run_dir, "in_progress")
+
+    mutating = payload.get("action") in MUTATING_ACTIONS
+    force_outdated = mutating and payload.get("mutation_started") is not False
+    mark_outdated_for_run(run_dir, include_current_result=True, force=force_outdated)
+
+
+def force_unlock_ctl_results_lock(ctl_results_root: Path, lock_id: str, maintenance_run_dir: Path) -> bool:
+    metadata = load_ctl_results_lock_metadata(ctl_results_root)
+    if not metadata:
+        return False
+
+    active_run_id = metadata.get("run_id")
+    if active_run_id != lock_id:
+        raise RuntimeError(
+            f"❌ ctl results lock id mismatch: active lock_id/run_id is {active_run_id!r}, got {lock_id!r}"
+        )
+
+    lock = CtlResultsLock(ctl_results_root).acquire(allow_stale_metadata=True)
+    try:
+        metadata = load_ctl_results_lock_metadata(ctl_results_root)
+        if metadata.get("run_id") != lock_id:
+            raise RuntimeError(
+                f"❌ ctl results lock changed while force-unlock was starting: expected {lock_id!r}, got {metadata.get('run_id')!r}"
+            )
+
+        raw_run_dir = metadata.get("run_dir")
+        if not isinstance(raw_run_dir, str) or not raw_run_dir:
+            raise RuntimeError("❌ ctl results lock metadata is missing run_dir")
+        run_dir = Path(raw_run_dir).expanduser().resolve()
+        root = Path(ctl_results_root).resolve()
+        try:
+            run_dir.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(f"❌ ctl results lock run_dir is outside ctl_results_root: {run_dir}") from exc
+
+        mark_run_force_unlocked(run_dir, metadata, maintenance_run_dir)
+        logging.warning("Ctl results lock force-unlocked for run_id=%s", lock_id)
+        lock.run_id = lock_id
+        return True
+    finally:
+        lock.release(clear_metadata=True)
 
 
 SCOPE_META_FILENAME = "__meta__.yaml"
@@ -3090,7 +3742,7 @@ def apply_selected_overlays_to_cfg_root(
 def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
-    ctl_env: str,
+    ctl_context: str,
     plt_env: str,
     plt_overlays: list[str] | None = None,
     plt_runtime_selectors: dict[str, str] | None = None,
@@ -3167,7 +3819,7 @@ def prepare_pipeline_cfg(
     inventory_cfg: dict,
     plt_merged_dir: Path,
     artifacts_dir: Path,
-    ctl_env: str,
+    ctl_context: str,
     plt_env: str,
     plt_overlays: list[str],
     plt_runtime_selectors: dict[str, str] | None = None,
@@ -3188,7 +3840,7 @@ def prepare_pipeline_cfg(
     merged_files = merge_plt_cfg_dirs(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
-        ctl_env=ctl_env,
+        ctl_context=ctl_context,
         plt_env=plt_env,
         plt_overlays=plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
@@ -3251,12 +3903,12 @@ def write_target_stage_flow_artifact(
     ctl_cfg_root: Path,
     artifacts_dir: Path,
     *,
-    ctl_env: str,
+    ctl_context: str,
     plt_env: str,
     plt_runtime_selectors: dict[str, str],
     runtime_selector_maps: dict[str, dict[str, str]],
     inventory_name: str,
-    workflow_name: str,
+    workflow_name: str | None,
     ctl_variants: list[str],
     plt_overlays: list[str],
     stage_repo_key: str,
@@ -3265,14 +3917,14 @@ def write_target_stage_flow_artifact(
     refs: dict | None,
 ) -> None:
     """For plan runs, write the matching create-flow preview artifact."""
-    if inventory_name != "plan":
+    if inventory_name != "plan" or not workflow_name:
         return
 
     target_inventory_name = "provision"
     try:
         target_workflow_cfg = load_workflow_cfg(
             ctl_cfg_root,
-            ctl_env,
+            ctl_context,
             target_inventory_name,
             workflow_name,
             runtime_selector_maps,
@@ -3545,8 +4197,9 @@ def run_stages(
     """Clone and run all active stages."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
+    mutation_marked = False
     for stage_id, stage in active_stages.items():
-        log_stage_banner(stage_id)
+        log_stage_banner(f"[{inventory_name}] [{stage_id}]")
         repo_path, stage_env = prepare_stage_repo(
             stage_id,
             stage,
@@ -3580,6 +4233,10 @@ def run_stages(
         os.makedirs(stage_cfg_dir, exist_ok=True)
         stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
 
+        if inventory_name in MUTATING_ACTIONS and not mutation_marked:
+            mark_mutation_started(run_dir, stage_id)
+            mutation_marked = True
+
         logging.info(" ".join(stage_run_cmd))
         run_and_log(
             stage_run_cmd,
@@ -3597,7 +4254,8 @@ def print_run_summary(run_id: str, log_file: Path) -> None:
 def run_maintenance(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
-    ctl_env: str,
+    ctl_results_root: Path,
+    ctl_context: str,
     plt_env: str,
     ctl_runtime_selectors: dict[str, str],
     plt_runtime_selectors: dict[str, str],
@@ -3620,6 +4278,10 @@ def run_maintenance(
     profile_only_aws_profile: str | None,
 ) -> None:
     """Run a maintenance action against a single stage target."""
+    if maintenance_action == "force-unlock" and force_unlock_ctl_results_lock(ctl_results_root, lock_id, run_dir):
+        print_run_summary(run_id, log_file)
+        return
+
     runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
     validate_destroy_allowed(inventory_name, plt_cfg_root, plt_runtime_selectors)
@@ -3632,11 +4294,11 @@ def run_maintenance(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_env={ctl_env}, plt_env={plt_env}")
+    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}, plt_env={plt_env}")
 
     workflow_cfg = {
         "meta": {
-            "name": f"{ctl_env}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
+            "name": f"{ctl_context}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
             "inventory": inventory_name,
         },
         "stages": [
@@ -3654,7 +4316,7 @@ def run_maintenance(
         inventory_cfg,
         plt_merged_dir,
         artifacts_dir,
-        ctl_env,
+        ctl_context,
         plt_env,
         plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
@@ -3663,12 +4325,13 @@ def run_maintenance(
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
+    record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
     plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_env)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
@@ -3696,7 +4359,7 @@ def run_maintenance(
         )
 
     stage_id, stage = next(iter(active_stages.items()))
-    log_stage_banner(f"maintenance/{maintenance_action}/{stage_id}")
+    log_stage_banner(f"[{inventory_name}] [maintenance/{maintenance_action}/{stage_id}]")
     repo_path, stage_env = prepare_stage_repo(
         stage_id,
         stage,
@@ -3774,40 +4437,40 @@ def validate_workflow_target_selectors(
                 f"selectors={selectors}"
             )
 
-def build_adhoc_cfg(
+def build_sub_workflow_cfg(
     ctl_cfg_root: Path,
     action: str,
     *,
     source: str,
     ref: str,
-    cfg_set_name: str,
+    cfg_file_set_name: str,
     sub_workflow: str,
     execution_identity_key: str | None,
 ) -> tuple[dict, dict]:
-    """Build a one-target (workflow_cfg, inventory_cfg) for an ad-hoc run.
+    """Build a one-target cfg for a synthetic repo-local sub_workflow run.
 
     The synthetic target is composed directly from CLI args and need not exist
     in targets/<action>/.
     """
     stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
-    cfg_sets = collect_resource(ctl_cfg_root, "cfg_sets")
-    cfg_sets_path = ctl_cfg_root
-    cfg_set = cfg_sets.get(cfg_set_name)
-    if not isinstance(cfg_set, dict):
-        raise RuntimeError(f"❌ adhoc cfg_set {cfg_set_name!r} not found under {cfg_sets_path}")
+    cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
+    cfg_file_sets_path = ctl_cfg_root
+    cfg_file_set = cfg_file_sets.get(cfg_file_set_name)
+    if not isinstance(cfg_file_set, dict):
+        raise RuntimeError(f"❌ sub_workflow cfg_file_set {cfg_file_set_name!r} not found under {cfg_file_sets_path}")
     resolved = {
         "source": source,
         "ref": ref,
         "sub_workflow": sub_workflow,
-        "cfg_root": cfg_set.get("cfg_root", "/"),
-        "cfg_files": resolve_cfg_set_files(cfg_set_name, cfg_sets, cfg_sets_path),
+        "cfg_root": cfg_file_set.get("cfg_root", "/"),
+        "cfg_files": resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
     }
     if execution_identity_key:
         resolved["execution_identity_key"] = execution_identity_key
-    name = "adhoc"
+    name = "sub_workflow"
     inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
     workflow_cfg = {
-        "meta": {"name": f"adhoc/{source}/{sub_workflow}", "action": action},
+        "meta": {"name": f"sub_workflow/{source}/{sub_workflow}", "action": action},
         "stages": [name],
     }
     return workflow_cfg, inventory_cfg
@@ -3816,13 +4479,13 @@ def build_adhoc_cfg(
 def run_pipeline(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
-    ctl_env: str,
+    ctl_context: str,
     plt_env: str,
     ctl_runtime_selectors: dict[str, str],
     plt_runtime_selectors: dict[str, str],
     ctl_ref_policy: str,
     inventory_name: str,
-    workflow_name: str,
+    workflow_name: str | None,
     run_id: str,
     main_tag: str,
     plt_overlays: list[str],
@@ -3837,14 +4500,12 @@ def run_pipeline(
     log_file: Path,
     profile_only_aws_profile: str | None,
     target_name: str | None = None,
-    adhoc: dict | None = None,
+    sub_workflow_run: dict | None = None,
 ) -> None:
     """
-    Run the full pipeline with given cfg roots.
+    Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
 
-    Baseline shapes: a `--workflow` (ordered), a single `--target` (one catalog
-    target), or an ad-hoc synthetic target (`adhoc` dict). The caller passes stage
-    repo settings and pre-created run/log directories.
+    The caller passes stage repo settings and pre-created run/log directories.
     """
     # Validation
     runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
@@ -3852,24 +4513,24 @@ def run_pipeline(
     validate_destroy_allowed(inventory_name, plt_cfg_root, plt_runtime_selectors)
 
     # Load workflow + inventory (validate before creating dirs).
-    if adhoc:
-        workflow_cfg, inventory_cfg = build_adhoc_cfg(
+    if sub_workflow_run:
+        workflow_cfg, inventory_cfg = build_sub_workflow_cfg(
             ctl_cfg_root,
             inventory_name,
-            source=adhoc["source"],
-            ref=adhoc["ref"],
-            cfg_set_name=adhoc["cfg_set"],
-            sub_workflow=adhoc["sub_workflow"],
-            execution_identity_key=adhoc.get("execution_identity_key"),
+            source=sub_workflow_run["source"],
+            ref=sub_workflow_run["ref"],
+            cfg_file_set_name=sub_workflow_run["cfg_file_set"],
+            sub_workflow=sub_workflow_run["sub_workflow"],
+            execution_identity_key=sub_workflow_run.get("execution_identity_key"),
         )
     elif target_name:
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
         workflow_cfg = {
-            "meta": {"name": f"{ctl_env}/{inventory_name}/{target_name}", "action": inventory_name},
+            "meta": {"name": f"{ctl_context}/{inventory_name}/{target_name}", "action": inventory_name},
             "stages": [target_name],
         }
     else:
-        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_env, inventory_name, workflow_name, runtime_selector_maps)
+        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_context, inventory_name, workflow_name, runtime_selector_maps)
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
         workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
@@ -3880,7 +4541,7 @@ def run_pipeline(
             workflow_name=workflow_name,
             ctl_variants=ctl_variants,
         )
-    if not adhoc:
+    if not sub_workflow_run:
         validate_workflow_target_selectors(workflow_cfg, inventory_cfg, runtime_selector_maps)
 
     refs = load_refs_cfg(ctl_cfg_root)
@@ -3890,7 +4551,7 @@ def run_pipeline(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_env={ctl_env}, plt_env={plt_env}")
+    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}, plt_env={plt_env}")
 
     # Prepare pipeline config
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
@@ -3899,7 +4560,7 @@ def run_pipeline(
         inventory_cfg,
         plt_merged_dir,
         artifacts_dir,
-        ctl_env,
+        ctl_context,
         plt_env,
         plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
@@ -3909,12 +4570,24 @@ def run_pipeline(
         refs=refs,
     )
 
+    if sub_workflow_run:
+        target_keys = sub_workflow_run.get("affected_target_keys") or []
+        if inventory_name in MUTATING_ACTIONS and not target_keys:
+            raise RuntimeError("❌ mutating sub_workflow runs require affected_target_keys")
+    else:
+        target_keys = target_keys_from_active_stages(active_stages)
+    record_run_target_keys(run_dir, target_keys)
+    run_metadata = load_run_metadata(run_dir)
+    ctl_results_root_value = run_metadata.get("ctl_results_root")
+    if isinstance(ctl_results_root_value, str) and ctl_results_root_value:
+        mark_removed_definitions_outdated(Path(ctl_results_root_value), ctl_cfg_root)
+
     # Validate stages have commits and resolvable AWS access before execution.
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
     plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_env)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
@@ -3931,7 +4604,7 @@ def run_pipeline(
     write_target_stage_flow_artifact(
         ctl_cfg_root,
         artifacts_dir,
-        ctl_env=ctl_env,
+        ctl_context=ctl_context,
         plt_env=plt_env,
         plt_runtime_selectors=plt_runtime_selectors,
         runtime_selector_maps=runtime_selector_maps,
