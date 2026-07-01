@@ -4,6 +4,7 @@ import argparse
 import collections
 import fcntl
 import functools
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -74,6 +75,7 @@ CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
 CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
 RUN_METADATA_FILENAME = "RUN.yaml"
 RUNTIME_CONTEXT_FILENAME = "runtime_context.yaml"
+PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
 _UUID7_LAST_TIMESTAMP_MS = -1
@@ -3305,7 +3307,7 @@ def force_unlock_ctl_results_lock(ctl_results_root: Path, lock_id: str, maintena
 
 
 SCOPE_META_FILENAME = "__meta__.yaml"
-SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME}
+SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME, PLT_GUARDRAILS_FILENAME}
 
 def selector_expected_values(expected, *, label: str) -> list[str]:
     if isinstance(expected, str) and expected:
@@ -3476,6 +3478,235 @@ def write_runtime_context_artifact(artifacts_dir: Path, runtime_context: dict[st
     path = artifacts_dir / RUNTIME_CONTEXT_FILENAME
     write_yaml_file(path, runtime_context)
     return path
+
+
+
+GUARD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def guard_value_text(value, *, label: str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        text = str(value)
+        if text:
+            return text
+    raise RuntimeError(f"❌ guarded var {label} must resolve to a non-empty scalar value")
+
+
+def guard_effective_value(value, runtime_context: dict[str, object], *, label: str):
+    if isinstance(value, str) and "${" in value:
+        return resolve_runtime_scalar(value, runtime_context_env_values(runtime_context), label=label)
+    return value
+
+
+def guard_value_hash(value, *, label: str) -> str:
+    return hashlib.sha256(guard_value_text(value, label=label).encode("utf-8")).hexdigest()
+
+
+def validate_guard_hash(raw_hash, *, label: str) -> str:
+    if not isinstance(raw_hash, str) or not GUARD_HASH_RE.fullmatch(raw_hash):
+        raise RuntimeError(f"❌ {label} must be a lowercase sha256 hex string")
+    return raw_hash
+
+
+def merge_guarded_vars(dst: dict[str, str], raw_guarded_vars, *, origin: Path) -> None:
+    if raw_guarded_vars is None:
+        return
+    if not isinstance(raw_guarded_vars, dict):
+        raise RuntimeError(f"❌ guarded_vars must be a mapping: {origin}")
+    for var_name, raw_hash in raw_guarded_vars.items():
+        if not isinstance(var_name, str) or not var_name.strip():
+            raise RuntimeError(f"❌ guarded_vars keys must be non-empty strings: {origin}")
+        if var_name in dst:
+            raise RuntimeError(f"❌ duplicate guarded var {var_name!r}: {origin}")
+        dst[var_name] = validate_guard_hash(raw_hash, label=f"guarded_vars.{var_name}")
+
+
+def load_guarded_vars_file(path: Path, *, allow_missing: bool = False) -> dict[str, str]:
+    if not path.is_file():
+        if allow_missing:
+            return {}
+        raise RuntimeError(f"❌ guardrails file not found: {path}")
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ {path.name} must contain a mapping: {path}")
+    unknown = set(data) - {"guarded_vars"}
+    if unknown:
+        raise RuntimeError(f"❌ {path.name} has unsupported keys {sorted(unknown)}: {path}")
+    guarded: dict[str, str] = {}
+    merge_guarded_vars(guarded, data.get("guarded_vars"), origin=path)
+    return guarded
+
+
+def load_ctl_guarded_vars(ctl_cfg_root: Path) -> dict[str, str]:
+    guarded: dict[str, str] = {}
+    for path, section in collect_top_level_sections(ctl_cfg_root, "guardrails"):
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ guardrails must be a mapping: {path}")
+        unknown = set(section) - {"guarded_vars"}
+        if unknown:
+            raise RuntimeError(f"❌ guardrails has unsupported keys {sorted(unknown)}: {path}")
+        merge_guarded_vars(guarded, section.get("guarded_vars"), origin=path)
+    return guarded
+
+
+def load_plt_guarded_vars(plt_cfg_root: Path) -> dict[str, str]:
+    return load_guarded_vars_file(plt_cfg_root / PLT_GUARDRAILS_FILENAME, allow_missing=True)
+
+
+def verify_guarded_value(
+    owner: str,
+    var_name: str,
+    value,
+    expected_hash: str,
+    runtime_context: dict[str, object],
+    *,
+    label: str,
+) -> None:
+    effective_value = guard_effective_value(value, runtime_context, label=label)
+    actual_hash = guard_value_hash(effective_value, label=f"{owner}.{var_name}")
+    if actual_hash != expected_hash:
+        raise RuntimeError(
+            f"❌ guarded {owner} var {var_name!r} changed: expected sha256 {expected_hash}, got {actual_hash}"
+        )
+
+
+def verify_ctl_guardrails(ctl_cfg_root: Path, runtime_context: dict[str, object]) -> None:
+    guarded = load_ctl_guarded_vars(ctl_cfg_root)
+    if not guarded:
+        return
+    for var_name, expected_hash in guarded.items():
+        if var_name not in runtime_context:
+            raise RuntimeError(f"❌ ctl guarded var {var_name!r} is not available in runtime_context")
+        verify_guarded_value(
+            "ctl",
+            var_name,
+            runtime_context[var_name],
+            expected_hash,
+            runtime_context,
+            label=f"ctl.{var_name}",
+        )
+    logging.info("Ctl guardrails verified: %s", sorted(guarded))
+
+
+def load_merged_cfg_top_level_values(plt_merged_dir: Path, var_name: str) -> list[tuple[Path, object]]:
+    values: list[tuple[Path, object]] = []
+    for path in sorted(plt_merged_dir.rglob("*.yaml")):
+        if path.name in SCOPE_META_SKIP_FILENAMES:
+            continue
+        data = load_yaml(path) or {}
+        if not isinstance(data, dict) or var_name not in data:
+            continue
+        values.append((path, data[var_name]))
+    return values
+
+
+def verify_plt_guarded_vars(
+    guarded: dict[str, str],
+    search_dir: Path,
+    runtime_context: dict[str, object],
+    *,
+    label: str,
+    require_present: bool,
+) -> list[str]:
+    verified: list[str] = []
+    for var_name, expected_hash in guarded.items():
+        values = load_merged_cfg_top_level_values(search_dir, var_name)
+        if not values:
+            if require_present:
+                raise RuntimeError(f"❌ {label} guarded var {var_name!r} was not found in {search_dir}")
+            logging.info("Skipping absent %s guarded var %s", label, var_name)
+            continue
+        first_path, first_value = values[0]
+        first_effective = guard_effective_value(first_value, runtime_context, label=f"{label}.{var_name} at {first_path}")
+        first_text = guard_value_text(first_effective, label=f"{label}.{var_name} at {first_path}")
+        for path, value in values[1:]:
+            effective_value = guard_effective_value(value, runtime_context, label=f"{label}.{var_name} at {path}")
+            value_text = guard_value_text(effective_value, label=f"{label}.{var_name} at {path}")
+            if value_text != first_text:
+                raise RuntimeError(
+                    f"❌ {label} guarded var {var_name!r} has multiple active values: "
+                    f"{first_path}={first_text!r}, {path}={value_text!r}"
+                )
+        verify_guarded_value(
+            "plt",
+            var_name,
+            first_value,
+            expected_hash,
+            runtime_context,
+            label=f"{label}.{var_name}",
+        )
+        verified.append(var_name)
+    return verified
+
+
+def active_plt_scope_guardrails(
+    plt_cfg_root: Path,
+    plt_runtime_selectors: dict[str, str],
+) -> list[dict]:
+    scopes: list[dict] = []
+    if not discover_cfg_meta_paths(plt_cfg_root):
+        return scopes
+    for scope in discover_active_cfg_scopes(plt_cfg_root, plt_runtime_selectors=plt_runtime_selectors):
+        guardrails_path = scope["scope_root"] / PLT_GUARDRAILS_FILENAME
+        guarded = load_guarded_vars_file(guardrails_path, allow_missing=True)
+        if not guarded:
+            continue
+        scopes.append({**scope, "guardrails_path": guardrails_path, "guarded_vars": guarded})
+    return scopes
+
+
+def verify_plt_guardrails(
+    plt_cfg_root: Path,
+    plt_merged_dir: Path,
+    plt_runtime_selectors: dict[str, str],
+    runtime_context: dict[str, object],
+) -> None:
+    root_guarded = load_plt_guarded_vars(plt_cfg_root)
+    root_verified = verify_plt_guarded_vars(
+        root_guarded,
+        plt_merged_dir,
+        runtime_context,
+        label="plt root",
+        require_present=False,
+    )
+    if root_verified:
+        logging.info("Plt root guardrails verified: %s", sorted(root_verified))
+
+    for scope in active_plt_scope_guardrails(plt_cfg_root, plt_runtime_selectors):
+        target_rel = scope["target_path"].lstrip("/")
+        target_dir = (plt_merged_dir / target_rel).resolve()
+        try:
+            target_dir.relative_to(plt_merged_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"Scope guardrails target_path escapes merged cfg dir: {scope['target_path']}") from exc
+        if not target_dir.is_dir():
+            raise RuntimeError(
+                f"❌ active scope guardrails target dir not found for {scope['guardrails_path']}: {target_dir}"
+            )
+        label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
+        verified = verify_plt_guarded_vars(
+            scope["guarded_vars"],
+            target_dir,
+            runtime_context,
+            label=label,
+            require_present=True,
+        )
+        if verified:
+            logging.info("Plt scope guardrails verified for %s: %s", scope["scope_path"], sorted(verified))
+
+
+def verify_guardrails(
+    ctl_cfg_root: Path,
+    plt_cfg_root: Path,
+    plt_merged_dir: Path,
+    runtime_context: dict[str, object],
+    plt_runtime_selectors: dict[str, str],
+) -> None:
+    verify_ctl_guardrails(ctl_cfg_root, runtime_context)
+    verify_plt_guardrails(plt_cfg_root, plt_merged_dir, plt_runtime_selectors, runtime_context)
+
 
 
 def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = False) -> str:
@@ -3689,6 +3920,8 @@ def validate_overlay_data_tree(overlay_root: Path, *, meta_path: Path) -> None:
             raise RuntimeError(
                 f"Overlay data must not contain nested {SCOPE_META_FILENAME}: {path}"
             )
+        if path.name == PLT_GUARDRAILS_FILENAME:
+            raise RuntimeError(f"Overlay data must not contain {PLT_GUARDRAILS_FILENAME}: {path}")
 
 
 def load_overlay_candidate(
@@ -3798,7 +4031,7 @@ def apply_selected_overlays_to_cfg_root(
             source_dirs=[str(overlay["root"])],
             dest_dir=str(effective_cfg_root),
             clear_dest=False,
-            skip_filenames={SCOPE_META_FILENAME},
+            skip_filenames=SCOPE_META_SKIP_FILENAMES,
         )
 
 def merge_plt_cfg_dirs(
@@ -4510,6 +4743,7 @@ def run_maintenance(
         refs=refs,
     )
     record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
+    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_merged_dir, runtime_context, plt_runtime_selectors)
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
@@ -4750,6 +4984,7 @@ def run_pipeline(
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
+    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_merged_dir, runtime_context, plt_runtime_selectors)
 
     if sub_workflow_run:
         target_keys = sub_workflow_run.get("affected_target_keys") or []
