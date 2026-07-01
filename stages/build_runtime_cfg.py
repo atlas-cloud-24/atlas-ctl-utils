@@ -13,6 +13,7 @@ import yaml
 VAR_NAME_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 PLACEHOLDER_RE = re.compile(rf"\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}")
 EXACT_PLACEHOLDER_RE = re.compile(rf"^\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}$")
+RUNTIME_CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 OMIT = object()
 
 
@@ -46,6 +47,19 @@ def load_yaml_mapping(path: Path) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError(f"cfg file must contain a mapping: {path}")
     return data
+
+
+
+def load_runtime_context(path: Path) -> dict[str, object]:
+    data = load_yaml_mapping(path)
+    runtime_context: dict[str, object] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"runtime context key {key!r} is not a valid env var name")
+        if not isinstance(value, (str, int, float, bool)):
+            raise RuntimeError(f"runtime context key {key!r} must be scalar, got {type(value).__name__}")
+        runtime_context[key] = value
+    return runtime_context
 
 
 def merge_values(base, overlay):
@@ -289,9 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfg-files", required=True, type=parse_cfg_files)
     parser.add_argument("--values-json-out", required=True)
     parser.add_argument("--stage-env-out", required=True)
-    parser.add_argument("--env-type", required=True)
-    parser.add_argument("--main-tag", required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--runtime-context-file", required=True)
     return parser
 
 
@@ -306,13 +318,12 @@ def main() -> int:
     values_json_out = None if values_json_out_arg == "-" else Path(values_json_out_arg).resolve()
     stage_env_out = None if stage_env_out_arg == "-" else Path(stage_env_out_arg).resolve()
 
-    env_ctx = {
-        "env_type": args.env_type,
-        "main_tag": args.main_tag,
-        "run_id": args.run_id,
-    }
+    runtime_context_file = Path(args.runtime_context_file).resolve()
+    env_ctx = load_runtime_context(runtime_context_file)
 
     stage_values, merged_files = build_stage_values(origin_cfg_dir, cfg_files, env_ctx)
+    stage_env_values = dict(env_ctx)
+    stage_env_values.update(stage_values)
 
     if values_json_out is not None:
         values_json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -321,9 +332,11 @@ def main() -> int:
                 {
                     "_meta": {
                         "origin_cfg_dir": str(origin_cfg_dir),
+                        "runtime_context_file": str(runtime_context_file),
+                        "runtime_context_keys": sorted(env_ctx),
                         "merged_files": merged_files,
                     },
-                    "values": stage_values,
+                    "values": stage_env_values,
                 },
                 indent=2,
                 sort_keys=True,
@@ -333,7 +346,7 @@ def main() -> int:
 
     if stage_env_out is not None:
         stage_env_out.parent.mkdir(parents=True, exist_ok=True)
-        write_stage_env(stage_env_out, stage_values, values_json_out)
+        write_stage_env(stage_env_out, stage_env_values, values_json_out)
         stage_env_out.chmod(0o755)
     return 0
 

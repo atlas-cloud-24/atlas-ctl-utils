@@ -24,7 +24,6 @@ import yaml
 from utils.git_meta import write_git_meta_to_file
 
 REQUIRED_TOOLING_REFS = ("ctl-utils", "plt-utils")
-LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
 TOOLING_ENV_PREFIXES = {
     "ctl-utils": "ATLAS_CTL_UTILS",
     "plt-utils": "ATLAS_PLT_UTILS",
@@ -72,6 +71,8 @@ SERVICE_ID = "atlas-ctl-orchestrator-local"
 CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
 CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
 RUN_METADATA_FILENAME = "RUN.yaml"
+RUNTIME_CONTEXT_FILENAME = "runtime_context.yaml"
+CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
 _UUID7_LAST_TIMESTAMP_MS = -1
 _UUID7_COUNTER = 0
@@ -217,44 +218,94 @@ def require_selector(selectors: dict[str, str], key: str, *, label: str) -> str:
     return value
 
 
+def load_cfg_root_meta(cfg_root: Path) -> dict:
+    path = cfg_root / CFG_ROOT_META_FILENAME
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ {CFG_ROOT_META_FILENAME} must contain a mapping: {path}")
+    return data
 
 
-def selector_registry_candidates(cfg_root: Path, owner: str) -> list[Path]:
-    if owner == "ctl":
-        return [cfg_root / "selectors.yaml"]
-    if owner == "plt":
-        return [cfg_root / "selectors.yaml", cfg_root / "_common" / "all" / "selectors.yaml"]
-    raise RuntimeError(f"❌ unknown selector registry owner {owner!r}")
+def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, object]]:
+    sections: list[tuple[Path, object]] = []
+    for yf in sorted(cfg_root.rglob("*.yaml")):
+        data = load_yaml(yf) or {}
+        if not isinstance(data, dict):
+            continue
+        if key in data:
+            sections.append((yf, data[key]))
+    return sections
 
 
 def load_selector_registry(cfg_root: Path, owner: str) -> dict:
-    """Load the selector value registry owned by ctl or plt cfg."""
-    registry_path = next((path for path in selector_registry_candidates(cfg_root, owner) if path.is_file()), None)
-    if registry_path is None:
-        return {}
+    """Load selector vocabulary owned by ctl or plt cfg.
 
-    data = load_yaml(registry_path) or {}
-    registry = data.get("selectors") or {}
-    if not isinstance(registry, dict):
-        raise RuntimeError(f"❌ selectors registry must be a mapping: {registry_path}")
+    Ctl selector values can carry policy metadata, so ctl discovers top-level
+    selectors.<selector>.<value> mappings by scanning ctl cfg files. Plt selector
+    vocabulary is cfg-root/global metadata stored in __cfg__.yaml as
+    selector_registry.<selector> lists and normalized to the same internal mapping
+    shape for callers.
+    """
+    if owner == "ctl":
+        registry: dict = {}
+        for registry_path, section in collect_top_level_sections(cfg_root, "selectors"):
+            if not isinstance(section, dict):
+                raise RuntimeError(f"❌ selectors must be a mapping: {registry_path}")
+            for selector_key, values in section.items():
+                if selector_key in registry:
+                    raise RuntimeError(f"❌ duplicate selector registry {selector_key!r}: {registry_path}")
+                registry[selector_key] = values
 
-    for selector_key, values in registry.items():
-        if not isinstance(selector_key, str) or not selector_key.strip():
-            raise RuntimeError(f"❌ selector registry keys must be non-empty strings: {registry_path}")
-        if not isinstance(values, dict) or not values:
-            raise RuntimeError(
-                f"❌ selector registry {owner}.{selector_key} must map allowed values to policy mappings: {registry_path}"
-            )
-        for selector_value, policy in values.items():
-            if not isinstance(selector_value, str) or not selector_value.strip():
+        for selector_key, values in registry.items():
+            if not isinstance(selector_key, str) or not selector_key.strip():
+                raise RuntimeError(f"❌ selector registry keys must be non-empty strings: {cfg_root}")
+            if not isinstance(values, dict) or not values:
                 raise RuntimeError(
-                    f"❌ selector registry {owner}.{selector_key} values must be non-empty strings: {registry_path}"
+                    f"❌ selector registry {selector_key} must map allowed values to policy mappings: {cfg_root}"
                 )
-            if policy is not None and not isinstance(policy, dict):
+            for selector_value, policy in values.items():
+                if not isinstance(selector_value, str) or not selector_value.strip():
+                    raise RuntimeError(
+                        f"❌ selector registry {selector_key} values must be non-empty strings: {cfg_root}"
+                    )
+                if policy is not None and not isinstance(policy, dict):
+                    raise RuntimeError(
+                        f"❌ selector registry {selector_key}.{selector_value} policy must be a mapping: {cfg_root}"
+                    )
+        return registry
+
+    if owner == "plt":
+        meta_path = cfg_root / CFG_ROOT_META_FILENAME
+        meta = load_cfg_root_meta(cfg_root)
+        registry = meta.get("selector_registry") or {}
+        if not isinstance(registry, dict):
+            raise RuntimeError(f"❌ selector_registry must be a mapping: {meta_path}")
+
+        normalized: dict[str, dict[str, dict]] = {}
+        for selector_key, values in registry.items():
+            if not isinstance(selector_key, str) or not selector_key.strip():
+                raise RuntimeError(f"❌ selector_registry keys must be non-empty strings: {meta_path}")
+            if not isinstance(values, list) or not values:
                 raise RuntimeError(
-                    f"❌ selector registry {owner}.{selector_key}.{selector_value} policy must be a mapping: {registry_path}"
+                    f"❌ selector_registry.{selector_key} must be a non-empty list of allowed values: {meta_path}"
                 )
-    return registry
+            normalized_values: dict[str, dict] = {}
+            for selector_value in values:
+                if not isinstance(selector_value, str) or not selector_value.strip():
+                    raise RuntimeError(
+                        f"❌ selector_registry.{selector_key} values must be non-empty strings: {meta_path}"
+                    )
+                if selector_value in normalized_values:
+                    raise RuntimeError(
+                        f"❌ duplicate selector_registry.{selector_key} value {selector_value!r}: {meta_path}"
+                    )
+                normalized_values[selector_value] = {}
+            normalized[selector_key] = normalized_values
+        return normalized
+
+    raise RuntimeError(f"❌ unknown selector registry owner {owner!r}")
 
 
 def selector_policy(registry: dict, selector_key: str, selector_value: str, *, owner: str) -> dict:
@@ -310,14 +361,14 @@ def ref_policy_requires_commits(ref_policy: str) -> bool:
 
 
 def load_selector_bindings(ctl_cfg_root: Path) -> list[dict]:
-    path = ctl_cfg_root / "selector_bindings.yaml"
-    if not path.is_file():
-        return []
-    data = load_yaml(path) or {}
-    bindings = data.get("selector_bindings") or []
-    if not isinstance(bindings, list):
-        raise RuntimeError(f"❌ selector_bindings must be a list: {path}")
-    for idx, binding in enumerate(bindings, start=1):
+    binding_entries: list[tuple[dict, Path]] = []
+    for path, section in collect_top_level_sections(ctl_cfg_root, "selector_bindings"):
+        if not isinstance(section, list):
+            raise RuntimeError(f"❌ selector_bindings must be a list: {path}")
+        binding_entries.extend((binding, path) for binding in section)
+
+    bindings: list[dict] = []
+    for idx, (binding, path) in enumerate(binding_entries, start=1):
         if not isinstance(binding, dict):
             raise RuntimeError(f"❌ selector binding #{idx} must be a mapping: {path}")
         when = binding.get("when") or {}
@@ -329,6 +380,7 @@ def load_selector_bindings(ctl_cfg_root: Path) -> list[dict]:
             raise RuntimeError(f"❌ selector binding #{idx} require_selectors must be a list of non-empty strings: {path}")
         if not isinstance(allowed_values, dict):
             raise RuntimeError(f"❌ selector binding #{idx} allowed_values must be a mapping: {path}")
+        bindings.append(binding)
     return bindings
 
 
@@ -358,6 +410,7 @@ def validate_runtime_selector_state(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
     *,
+    action: str,
     ctl_runtime_selectors: dict[str, str],
     plt_runtime_selectors: dict[str, str],
 ) -> None:
@@ -365,28 +418,12 @@ def validate_runtime_selector_state(
     plt_registry = load_selector_registry(plt_cfg_root, "plt")
     validate_runtime_selectors_against_registry(ctl_runtime_selectors, ctl_registry, owner="ctl")
     validate_runtime_selectors_against_registry(plt_runtime_selectors, plt_registry, owner="plt")
+    # `action` is the operation verb, not a declared selector; it is exposed to bindings
+    # only so consumer cfg can gate actions (e.g. no destroy in prod) generically.
     validate_selector_bindings(
         ctl_cfg_root,
-        {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors},
+        {"ctl": {**ctl_runtime_selectors, "action": action}, "plt": plt_runtime_selectors},
     )
-
-
-def validate_destroy_allowed(
-    action: str,
-    plt_cfg_root: Path,
-    plt_runtime_selectors: dict[str, str],
-) -> None:
-    if action != "destroy":
-        return
-    plt_env = plt_runtime_selectors.get("plt_env")
-    if not plt_env:
-        return
-    registry = load_selector_registry(plt_cfg_root, "plt")
-    policy = selector_policy(registry, "plt_env", plt_env, owner="plt")
-    if policy.get("allow_destroy") is not True:
-        raise RuntimeError(
-            f"❌ destroy is not allowed for plt_env={plt_env!r}; set selectors.plt_env.{plt_env}.allow_destroy=true to allow it"
-        )
 
 def normalize_ctl_results_root(value: str) -> Path:
     """Normalize the operator-provided ctl results root directory."""
@@ -411,7 +448,6 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     args.plt_runtime_selectors = selectors_to_map(args.plt_selector, label="plt")
     args.ctl_runtime_selectors = selectors_to_map(args.ctl_selector, label="ctl")
     args.ctl_context = require_selector(args.ctl_runtime_selectors, "ctl_context", label="ctl")
-    args.plt_env = args.plt_runtime_selectors.get("plt_env", "")
     args.ctl_results_root = normalize_ctl_results_root(args.ctl_results_root)
     args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
     args.run_id = generate_uuid7()
@@ -536,9 +572,9 @@ def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
 
 def validate_workflow_args(args: argparse.Namespace) -> None:
     """Validate args for a declared workflow run."""
-    if not args.workflow:
+    if not getattr(args, "workflow", None):
         raise RuntimeError("❌ workflow runner requires --workflow")
-    if args.target:
+    if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
     if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
         raise RuntimeError("❌ workflow runner does not accept sub-workflow synthetic target args")
@@ -546,9 +582,9 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
 
 def validate_target_args(args: argparse.Namespace) -> None:
     """Validate args for a declared single-target run."""
-    if not args.target:
+    if not getattr(args, "target", None):
         raise RuntimeError("❌ target runner requires --target")
-    if args.workflow:
+    if getattr(args, "workflow", None):
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
@@ -562,19 +598,19 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
     if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
         raise RuntimeError("❌ maintenance runner does not accept sub-workflow synthetic target args")
-    if not args.maintenance_action:
+    if not getattr(args, "maintenance_action", None):
         raise RuntimeError("❌ --maintenance-action is required for maintenance")
-    if args.maintenance_action == "force-unlock" and not args.lock_id:
+    if args.maintenance_action == "force-unlock" and not getattr(args, "lock_id", None):
         raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
     if args.maintenance_action == "force-unlock" and ctl_results_lock_matches(args.ctl_results_root, args.lock_id):
         return
-    if not args.target:
+    if not getattr(args, "target", None):
         raise RuntimeError("❌ --target is required for maintenance")
 
 
 def validate_sub_workflow_args(args: argparse.Namespace) -> None:
     """Validate args for a synthetic repo-local sub_workflow run."""
-    if args.workflow or args.target:
+    if getattr(args, "workflow", None) or getattr(args, "target", None):
         raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for sub_workflow runs")
@@ -589,7 +625,7 @@ def validate_sub_workflow_args(args: argparse.Namespace) -> None:
     affected_target_keys = getattr(args, "affected_target_keys", None) or []
     if affected_target_keys:
         args.affected_target_keys = normalize_target_keys(affected_target_keys, label="--affected-target-key")
-    if args.action in MUTATING_ACTIONS and not args.affected_target_keys:
+    if args.action in MUTATING_ACTIONS and not getattr(args, "affected_target_keys", None):
         raise RuntimeError("❌ mutating sub_workflow runs require at least one --affected-target-key")
 
 
@@ -853,8 +889,7 @@ def build_active_stages(
     repo_key: str = "repo_url",
     require_branch_or_commit: bool = True,
     refs: dict | None = None,
-    plt_env: str = "",
-    plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object] | None = None,
     require_commit_refs: bool = False,
 ) -> dict:
     inventory_stage_sources = inventory_cfg.get("stage_sources", {})
@@ -867,7 +902,7 @@ def build_active_stages(
 
     refs = refs or {}
     scoped_refs = refs.get("scoped") or {}
-    ref_context_values = plt_runtime_selectors or ({"plt_env": plt_env} if plt_env else {})
+    ref_context_values = runtime_context or {}
     active = {}
 
     def normalize_cfg_root(raw_value, *, stage_target: str) -> str:
@@ -1183,11 +1218,11 @@ def load_refs_cfg(ctl_cfg_root: Path) -> dict:
     return merged
 
 
-def resolve_ref_context(target_ref: str, plt_runtime_selectors: dict[str, str]) -> str:
-    """Resolve selector placeholders in a target ref into a refs.scoped context key."""
+def resolve_ref_context(target_ref: str, context: dict[str, object]) -> str:
+    """Resolve placeholders in a target ref into a refs.scoped context key."""
     return resolve_runtime_scalar(
         target_ref,
-        plt_runtime_selectors,
+        context,
         label="target ref_key",
     )
 
@@ -1496,9 +1531,7 @@ def resolve_stage_aws_access(
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
-    main_tag: str,
-    plt_env: str,
-    plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str] | None = None,
     allow_profile_only: bool = False,
@@ -1539,10 +1572,7 @@ def resolve_stage_aws_access(
     raw_account_key = identity_cfg.get("account_key")
     raw_access_context_key = identity_cfg.get("access_context_key")
 
-    context = dict(plt_runtime_selectors or {})
-    if plt_env and "plt_env" not in context:
-        context["plt_env"] = plt_env
-    context["main_tag"] = main_tag
+    context = dict(runtime_context)
     account_key = resolve_runtime_scalar(
         raw_account_key,
         context,
@@ -1725,9 +1755,7 @@ def validate_active_stage_aws_access(
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
-    main_tag: str,
-    plt_env: str,
-    plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object],
     implementation_key: str,
     allow_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
@@ -1745,9 +1773,7 @@ def validate_active_stage_aws_access(
             execution_identities,
             aws_access_contexts,
             plt_aws_catalogs,
-            main_tag=main_tag,
-            plt_env=plt_env,
-            plt_runtime_selectors=plt_runtime_selectors,
+            runtime_context=runtime_context,
             implementation_key=implementation_key,
             allow_profile_only=allow_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
@@ -1790,9 +1816,7 @@ def configure_stage_aws_env(
     aws_access_contexts: dict,
     plt_aws_catalogs: dict[str, dict],
     *,
-    main_tag: str,
-    plt_env: str,
-    plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str],
     allow_profile_only: bool = False,
@@ -1810,9 +1834,7 @@ def configure_stage_aws_env(
         execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
-        main_tag=main_tag,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
         allow_profile_only=allow_profile_only,
@@ -1917,13 +1939,87 @@ def merge_config_dirs(
     return merged_files
 
 
-def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add arguments common to local runner entrypoints."""
+def _add_workflow_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--main-tag",
-        required=True,
-        help="Main tag passed to stage runners",
+        "--ctl-variants",
+        required=False,
+        default=[],
+        dest="ctl_variants",
+        type=parse_ctl_variants_arg,
+        help="Optional comma-separated ctl variant paths under variants/",
     )
+    parser.add_argument(
+        "--workflow",
+        required=True,
+        help="declared ctl workflow name",
+    )
+
+
+def _add_target_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--target",
+        required=True,
+        help="declared target name",
+    )
+
+
+def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--maintenance-action",
+        required=True,
+        choices=list(MAINTENANCE_ACTIONS),
+        help="maintenance action",
+    )
+    parser.add_argument(
+        "--lock-id",
+        help="ctl run ID or Terraform state lock ID to force-unlock",
+    )
+    parser.add_argument(
+        "--target",
+        help="declared target to operate on; required for Terraform lock force-unlock",
+    )
+
+
+def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="source repo for a synthetic target",
+    )
+    parser.add_argument(
+        "--ref",
+        required=True,
+        help="ref context (a key in refs.scoped, e.g. env.${env_type} or org) for a synthetic target",
+    )
+    parser.add_argument(
+        "--cfg-file-set",
+        required=True,
+        dest="cfg_file_set",
+        help="cfg_file_set for a synthetic target",
+    )
+    parser.add_argument(
+        "--sub-workflow",
+        required=True,
+        dest="sub_workflow",
+        help="repo-local sub_workflow to run",
+    )
+    parser.add_argument(
+        "--execution-identity-key",
+        dest="execution_identity_key",
+        default=None,
+        help="execution identity key for a synthetic target",
+    )
+    parser.add_argument(
+        "--affected-target-key",
+        dest="affected_target_keys",
+        action="append",
+        default=[],
+        help="affected declared target key; repeatable and required for mutating synthetic runs",
+    )
+
+
+def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
+    """Add shared and runner-specific arguments for local runner entrypoints."""
     parser.add_argument(
         "--ctl-results-root",
         required=True,
@@ -1943,14 +2039,6 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Optional comma-separated plt overlay names",
     )
     parser.add_argument(
-        "--ctl-variants",
-        required=False,
-        default=[],
-        dest="ctl_variants",
-        type=parse_ctl_variants_arg,
-        help="Optional comma-separated ctl variant paths under variants/",
-    )
-    parser.add_argument(
         "--ctl-selector",
         required=True,
         action="append",
@@ -1965,61 +2053,23 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Lifecycle action (provision|plan|destroy|readonly)",
     )
     parser.add_argument(
-        "--workflow",
-        help="declared ctl workflow name (workflow runs)",
-    )
-    parser.add_argument(
-        "--target",
-        help="declared target name (target runs), or target to operate on (maintenance)",
-    )
-    parser.add_argument(
-        "--maintenance-action",
-        choices=list(MAINTENANCE_ACTIONS),
-        help="maintenance action (maintenance runs)",
-    )
-    parser.add_argument(
-        "--lock-id",
-        help="ctl run ID or Terraform state lock ID to force-unlock (required for force-unlock)",
-    )
-    parser.add_argument(
         "--plt-selector",
         action="append",
         default=[],
         type=parse_selector_arg,
         help="Plt selector in key=value form; repeatable",
     )
-    parser.add_argument(
-        "--source",
-        help="sub_workflow: source repo for a synthetic target",
-    )
-    parser.add_argument(
-        "--ref",
-        help="sub_workflow: ref context (a key in refs.scoped, e.g. env.${plt_env} or org) for a synthetic target",
-    )
-    parser.add_argument(
-        "--cfg-file-set",
-        dest="cfg_file_set",
-        help="sub_workflow: cfg_file_set for a synthetic target",
-    )
-    parser.add_argument(
-        "--sub-workflow",
-        dest="sub_workflow",
-        help="sub_workflow: repo-local sub_workflow to run",
-    )
-    parser.add_argument(
-        "--execution-identity-key",
-        dest="execution_identity_key",
-        default=None,
-        help="sub_workflow: execution identity key for a synthetic target",
-    )
-    parser.add_argument(
-        "--affected-target-key",
-        dest="affected_target_keys",
-        action="append",
-        default=[],
-        help="sub_workflow: affected declared target key; repeatable and required for mutating synthetic runs",
-    )
 
+    if run_type == "workflow":
+        _add_workflow_args(parser)
+    elif run_type == "target":
+        _add_target_args(parser)
+    elif run_type == "maintenance":
+        _add_maintenance_args(parser)
+    elif run_type == "sub_workflow":
+        _add_sub_workflow_args(parser)
+    else:
+        raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
 
 def setup_logging() -> logging.handlers.MemoryHandler:
     """Setup logging with memory handler to capture early logs."""
@@ -2118,7 +2168,6 @@ def validate_ctl_variant_meta(
     *,
     variant_label: str,
     ctl_context: str,
-    plt_env: str,
     plt_overlays: list[str],
 ) -> None:
     """Validate ctl variant metadata against selected plt overlays."""
@@ -2130,11 +2179,6 @@ def validate_ctl_variant_meta(
         if ctl_context not in allowed_envs:
             raise RuntimeError(
                 f"❌ ctl variant '{variant_label}' is not allowed for ctl context '{ctl_context}'; "
-                f"allowed_envs={allowed_envs}"
-            )
-        if plt_env not in allowed_envs:
-            raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' is not allowed for plt env '{plt_env}'; "
                 f"allowed_envs={allowed_envs}"
             )
 
@@ -2253,15 +2297,8 @@ def apply_ctl_variant_workflow_patch(
 
 
 def load_variants_cfg(ctl_cfg_root: Path) -> dict:
-    """Load variants.yaml (action-keyed placements); {} if absent."""
-    path = ctl_cfg_root / "variants.yaml"
-    if not path.is_file():
-        return {}
-    data = load_yaml(path) or {}
-    variants = data.get("variants", {})
-    if not isinstance(variants, dict):
-        raise RuntimeError(f"❌ 'variants' must be a mapping: {path}")
-    return variants
+    """Load action-keyed variant placements discovered by content key."""
+    return collect_resource(ctl_cfg_root, "variants", entry_depth=2)
 
 
 def _selectors_subset(child: dict | None, parent: dict | None):
@@ -2289,7 +2326,7 @@ def apply_ctl_variants_to_workflow_cfg(
     workflow_name: str,
     ctl_variants: list[str],
 ) -> dict:
-    """Apply selected variants.yaml placements to a loaded workflow cfg.
+    """Apply selected variant placements to a loaded workflow cfg.
 
     A variant is `variants.<action>.<name> = {target_key, workflow_key, after_target_key|before_target_key, [selectors]}`.
     For each selected variant whose `workflow_key` matches the running one: validate its target
@@ -2308,7 +2345,7 @@ def apply_ctl_variants_to_workflow_cfg(
         v = variants.get(name)
         if v is None:
             raise RuntimeError(
-                f"❌ variant {name!r} not found under action {inventory_name!r} in variants.yaml"
+                f"❌ variant {name!r} not found under action {inventory_name!r} in variant config"
             )
         if not isinstance(v, dict):
             raise RuntimeError(f"❌ variant {name!r} must be a mapping")
@@ -2510,21 +2547,12 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
 
 
 def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
-    """Load local tooling repo paths from local_repos.yaml for local_dev runs."""
-    tooling_path = ctl_cfg_root / LOCAL_TOOLING_CFG_NAME
-    if not tooling_path.is_file():
-        logging.info(f"No local tooling file found: {tooling_path}")
+    """Load local tooling repo paths discovered by content key for local_dev runs."""
+    raw_tooling_cfg = collect_resource(ctl_cfg_root, "tooling")
+    tooling_path = ctl_cfg_root
+    if not raw_tooling_cfg:
+        logging.info("No local tooling config found")
         return {}
-
-    tooling_cfg_root = load_yaml(tooling_path) or {}
-    if not isinstance(tooling_cfg_root, dict):
-        raise RuntimeError(f"❌ local tooling file must contain a mapping: {tooling_path}")
-
-    raw_tooling_cfg = tooling_cfg_root.get("tooling") or {}
-    if not isinstance(raw_tooling_cfg, dict):
-        raise RuntimeError(
-            f"❌ local tooling file must contain a 'tooling' mapping: {tooling_path}"
-        )
 
     tooling_refs = {}
     for tooling_name, tooling_entry in raw_tooling_cfg.items():
@@ -2563,7 +2591,7 @@ def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
 
         tooling_refs[tooling_name] = {"repo_path": str(repo_path_obj)}
 
-    logging.info(f"Using local tooling file: {tooling_path}")
+    logging.info("Using local tooling config discovered by content key")
     return tooling_refs
 
 
@@ -2615,21 +2643,22 @@ def ref_context_to_result_path(ref_context: str) -> str:
 def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
     """Resolve the stable ctl result name for the selected runner mode."""
     if run_type == "workflow":
-        if args.target:
+        if getattr(args, "target", None):
             raise RuntimeError("❌ workflow runner does not accept --target")
-        raw_name = args.workflow
+        raw_name = getattr(args, "workflow", None)
     elif run_type == "target":
-        if args.workflow:
+        if getattr(args, "workflow", None):
             raise RuntimeError("❌ target runner does not accept --workflow")
-        raw_name = args.target
+        raw_name = getattr(args, "target", None)
     elif run_type == "sub_workflow":
-        if args.workflow or args.target:
+        if getattr(args, "workflow", None) or getattr(args, "target", None):
             raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
-        ref_context = resolve_ref_context(args.ref, args.plt_runtime_selectors) if args.ref else "sub_workflow"
-        raw_name = f"{ref_context_to_result_path(ref_context)}/{args.source or 'unknown'}/{args.sub_workflow or 'unknown'}"
+        ref = getattr(args, "ref", None)
+        ref_context = resolve_ref_context(ref, args.plt_runtime_selectors) if ref else "sub_workflow"
+        raw_name = f"{ref_context_to_result_path(ref_context)}/{getattr(args, 'source', None) or 'unknown'}/{getattr(args, 'sub_workflow', None) or 'unknown'}"
     elif run_type == "maintenance":
-        maintenance_target = args.target or args.lock_id or "unknown"
-        raw_name = f"{args.maintenance_action or 'maintenance'}/{maintenance_target}"
+        maintenance_target = getattr(args, "target", None) or getattr(args, "lock_id", None) or "unknown"
+        raw_name = f"{getattr(args, 'maintenance_action', None) or 'maintenance'}/{maintenance_target}"
     else:
         raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
 
@@ -3416,6 +3445,109 @@ def selector_matches(
             return False
     return True
 
+RUNTIME_CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _runtime_context_scalar(value, *, label: str):
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    raise RuntimeError(f"❌ {label} must resolve to a scalar string/number/bool value")
+
+
+def runtime_context_env_values(runtime_context: dict[str, object]) -> dict[str, str]:
+    env_values: dict[str, str] = {}
+    for key, value in runtime_context.items():
+        if not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"❌ runtime context key {key!r} is not a valid env var name")
+        if isinstance(value, bool):
+            env_values[key] = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            env_values[key] = str(value)
+        else:
+            raise RuntimeError(f"❌ runtime context key {key!r} must be scalar, got {type(value).__name__}")
+    return env_values
+
+
+SELECTOR_REF_RE = re.compile(
+    r"^\$\{selectors\.([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\}$"
+)
+
+
+def load_runtime_context(ctl_cfg_root: Path) -> dict[str, dict[str, str]]:
+    """Read runtime-context declarations discovered by content key. Each value is
+    a literal scalar or a whole-value ${selectors.<owner>.<key>} reference (the
+    only place selectors may be referenced as an interpolation value)."""
+    entries: dict[str, object] = {}
+    origins: dict[str, Path] = {}
+    for path, section in collect_top_level_sections(ctl_cfg_root, "runtime_context"):
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ runtime_context must be a mapping: {path}")
+        for runtime_key, raw in section.items():
+            if runtime_key in entries:
+                raise RuntimeError(
+                    f"❌ duplicate runtime_context key {runtime_key!r}: {path} (also defined in {origins[runtime_key]})"
+                )
+            entries[runtime_key] = raw
+            origins[runtime_key] = path
+
+    normalized: dict[str, dict[str, str]] = {}
+    for runtime_key, raw in entries.items():
+        path = origins[runtime_key]
+        if not isinstance(runtime_key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(runtime_key):
+            raise RuntimeError(f"❌ runtime_context key must be a valid env var name: {runtime_key!r}")
+        if not isinstance(raw, (str, int, float, bool)):
+            raise RuntimeError(
+                f"❌ runtime_context.{runtime_key} must be a scalar literal or a "
+                f"${{selectors.<owner>.<key>}} reference: {path}"
+            )
+        text = str(raw)
+        match = SELECTOR_REF_RE.match(text)
+        if match:
+            normalized[runtime_key] = {"selector": match.group(1)}
+        elif "${" in text:
+            raise RuntimeError(
+                f"❌ runtime_context.{runtime_key}: only a whole-value "
+                f"${{selectors.<owner>.<key>}} reference is allowed, got {text!r}: {path}"
+            )
+        else:
+            normalized[runtime_key] = {"value": raw}
+    return normalized
+
+
+def build_runtime_context(
+    ctl_cfg_root: Path,
+    selector_maps: dict[str, dict[str, str]],
+    *,
+    base_values: dict[str, object],
+) -> dict[str, object]:
+    runtime_context: dict[str, object] = {}
+    for key, value in base_values.items():
+        if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"❌ runtime context base key must be a valid env var name: {key!r}")
+        runtime_context[key] = _runtime_context_scalar(value, label=f"runtime context base key {key}")
+
+    for runtime_key, decl in load_runtime_context(ctl_cfg_root).items():
+        if "value" in decl:
+            runtime_context[runtime_key] = _runtime_context_scalar(
+                decl["value"], label=f"runtime_context.{runtime_key}"
+            )
+            continue
+        found, value, _, _ = selector_value_from_maps(decl["selector"], selector_maps)
+        if not found:
+            continue
+        runtime_context[runtime_key] = _runtime_context_scalar(
+            value,
+            label=f"runtime_context.{runtime_key}",
+        )
+    return runtime_context
+
+
+def write_runtime_context_artifact(artifacts_dir: Path, runtime_context: dict[str, object]) -> Path:
+    path = artifacts_dir / RUNTIME_CONTEXT_FILENAME
+    write_yaml_file(path, runtime_context)
+    return path
+
+
 def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = False) -> str:
     """Normalize a cfg-root absolute path used by plt metadata."""
     if not isinstance(raw_value, str) or not raw_value.strip():
@@ -3743,7 +3875,6 @@ def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
     ctl_context: str,
-    plt_env: str,
     plt_overlays: list[str] | None = None,
     plt_runtime_selectors: dict[str, str] | None = None,
     *,
@@ -3762,7 +3893,7 @@ def merge_plt_cfg_dirs(
         merged_files = {}
 
     selected_overlays = plt_overlays or []
-    runtime_selectors = plt_runtime_selectors or ({"plt_env": plt_env} if plt_env else {})
+    runtime_selectors = plt_runtime_selectors or {}
     composition_files = set(SCOPE_META_SKIP_FILENAMES)
 
     def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> None:
@@ -3820,9 +3951,9 @@ def prepare_pipeline_cfg(
     plt_merged_dir: Path,
     artifacts_dir: Path,
     ctl_context: str,
-    plt_env: str,
     plt_overlays: list[str],
     plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object] | None = None,
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
     require_commit_refs: bool = False,
@@ -3841,7 +3972,6 @@ def prepare_pipeline_cfg(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
         ctl_context=ctl_context,
-        plt_env=plt_env,
         plt_overlays=plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
         source_log_roots=source_log_roots,
@@ -3855,8 +3985,7 @@ def prepare_pipeline_cfg(
         repo_key=stage_repo_key,
         require_branch_or_commit=require_stage_ref,
         refs=refs,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         require_commit_refs=require_commit_refs,
     )
 
@@ -3904,8 +4033,7 @@ def write_target_stage_flow_artifact(
     artifacts_dir: Path,
     *,
     ctl_context: str,
-    plt_env: str,
-    plt_runtime_selectors: dict[str, str],
+    runtime_context: dict[str, object],
     runtime_selector_maps: dict[str, dict[str, str]],
     inventory_name: str,
     workflow_name: str | None,
@@ -3946,8 +4074,7 @@ def write_target_stage_flow_artifact(
             repo_key=stage_repo_key,
             require_branch_or_commit=require_stage_ref,
             refs=refs,
-            plt_env=plt_env,
-            plt_runtime_selectors=plt_runtime_selectors,
+            runtime_context=runtime_context,
             require_commit_refs=require_commit_refs,
         )
     except Exception as exc:
@@ -4063,9 +4190,7 @@ def prepare_stage_repo(
     aws_access_contexts: dict | None = None,
     plt_aws_catalogs: dict[str, dict] | None = None,
     aws_account_registry: dict[str, str] | None = None,
-    main_tag: str | None = None,
-    plt_env: str | None = None,
-    plt_runtime_selectors: dict[str, str] | None = None,
+    runtime_context: dict[str, object] | None = None,
     aws_implementation_key: str | None = None,
     allow_aws_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
@@ -4102,8 +4227,7 @@ def prepare_stage_repo(
             execution_identities is None
             or plt_aws_catalogs is None
             or aws_account_registry is None
-            or main_tag is None
-            or plt_env is None
+            or runtime_context is None
             or aws_implementation_key is None
         ):
             raise RuntimeError("❌ incomplete AWS access context for stage preparation")
@@ -4114,9 +4238,7 @@ def prepare_stage_repo(
             execution_identities,
             aws_access_contexts,
             plt_aws_catalogs,
-            main_tag=main_tag,
-            plt_env=plt_env,
-            plt_runtime_selectors=plt_runtime_selectors,
+            runtime_context=runtime_context,
             implementation_key=aws_implementation_key,
             account_registry=aws_account_registry,
             allow_profile_only=allow_aws_profile_only,
@@ -4179,11 +4301,10 @@ def run_stages(
     active_stages: dict,
     run_dir: Path,
     plt_distributed_dir_path: Path,
+    runtime_context_path: Path,
     inventory_name: str,
-    plt_env: str,
-    plt_runtime_selectors: dict[str, str],
+    runtime_context: dict[str, object],
     run_id: str,
-    main_tag: str,
     tooling_refs: dict,
     use_local_tooling_cfg: bool,
     execution_identities: dict,
@@ -4209,9 +4330,7 @@ def run_stages(
             aws_access_contexts=aws_access_contexts,
             plt_aws_catalogs=plt_aws_catalogs,
             aws_account_registry=aws_account_registry,
-            main_tag=main_tag,
-            plt_env=plt_env,
-            plt_runtime_selectors=plt_runtime_selectors,
+            runtime_context=runtime_context,
             aws_implementation_key=aws_implementation_key,
             allow_aws_profile_only=allow_aws_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
@@ -4220,14 +4339,10 @@ def run_stages(
         stage_runner_path = "./atlas_ctl_adapter/runners/local_dev.py" if use_local_tooling_cfg else "./atlas_ctl_adapter/runners/local.py"
         stage_run_cmd = [
             stage_runner_path,
-            "--main-tag", main_tag,
             "--action", inventory_name,
-            "--env-type", plt_env,
             "--workflow", stage["workflow"],
             "--origin-cfg", f"{plt_distributed_dir_path}/{stage_id}",
-            "--ephemeral", "false",
-            "--skip-cfg-merge",
-            "--run-id", run_id,
+            "--runtime-context-file", str(runtime_context_path),
         ]
         stage_cfg_dir = run_dir / "cfg" / "plt" / "per_stage" / stage_id
         os.makedirs(stage_cfg_dir, exist_ok=True)
@@ -4256,7 +4371,6 @@ def run_maintenance(
     plt_cfg_root: Path,
     ctl_results_root: Path,
     ctl_context: str,
-    plt_env: str,
     ctl_runtime_selectors: dict[str, str],
     plt_runtime_selectors: dict[str, str],
     ctl_ref_policy: str,
@@ -4265,7 +4379,6 @@ def run_maintenance(
     stage_target: str,
     lock_id: str,
     run_id: str,
-    main_tag: str,
     plt_overlays: list[str],
     stage_repo_key: str,
     require_stage_ref: bool,
@@ -4283,8 +4396,13 @@ def run_maintenance(
         return
 
     runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
+    runtime_context = build_runtime_context(
+        ctl_cfg_root,
+        runtime_selector_maps,
+        base_values={"run_id": run_id},
+    )
+    runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
-    validate_destroy_allowed(inventory_name, plt_cfg_root, plt_runtime_selectors)
 
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
     refs = load_refs_cfg(ctl_cfg_root)
@@ -4294,7 +4412,7 @@ def run_maintenance(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}, plt_env={plt_env}")
+    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}")
 
     workflow_cfg = {
         "meta": {
@@ -4317,9 +4435,9 @@ def run_maintenance(
         plt_merged_dir,
         artifacts_dir,
         ctl_context,
-        plt_env,
         plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
         require_commit_refs=require_commit_refs,
@@ -4337,9 +4455,7 @@ def run_maintenance(
         execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
-        main_tag=main_tag,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
@@ -4369,9 +4485,7 @@ def run_maintenance(
         aws_access_contexts=aws_access_contexts,
         plt_aws_catalogs=plt_aws_catalogs,
         aws_account_registry=aws_account_registry,
-        main_tag=main_tag,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         aws_implementation_key=aws_implementation_key,
         allow_aws_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
@@ -4394,9 +4508,10 @@ def run_maintenance(
     stage_env["MAINTENANCE_STAGE_CFG_DIR"] = str(stage_cfg_dir)
     stage_env["TFSTATE_KEY_VAR"] = tfstate_key_var
     stage_env["LOCK_ID"] = lock_id
-    stage_env["env_type"] = plt_env
-    stage_env["main_tag"] = main_tag
-    stage_env["run_id"] = run_id
+    runtime_context_repo_path = repo_path / RUNTIME_CONTEXT_FILENAME
+    shutil.copy2(runtime_context_path, runtime_context_repo_path)
+    stage_env["ATLAS_RUNTIME_CONTEXT_FILE"] = RUNTIME_CONTEXT_FILENAME
+    stage_env.update(runtime_context_env_values(runtime_context))
 
     maintenance_cmd = [
         "bash",
@@ -4480,14 +4595,12 @@ def run_pipeline(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
     ctl_context: str,
-    plt_env: str,
     ctl_runtime_selectors: dict[str, str],
     plt_runtime_selectors: dict[str, str],
     ctl_ref_policy: str,
     inventory_name: str,
     workflow_name: str | None,
     run_id: str,
-    main_tag: str,
     plt_overlays: list[str],
     ctl_variants: list[str],
     stage_repo_key: str,
@@ -4509,8 +4622,13 @@ def run_pipeline(
     """
     # Validation
     runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
+    runtime_context = build_runtime_context(
+        ctl_cfg_root,
+        runtime_selector_maps,
+        base_values={"run_id": run_id},
+    )
+    runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
-    validate_destroy_allowed(inventory_name, plt_cfg_root, plt_runtime_selectors)
 
     # Load workflow + inventory (validate before creating dirs).
     if sub_workflow_run:
@@ -4551,7 +4669,7 @@ def run_pipeline(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}, plt_env={plt_env}")
+    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}")
 
     # Prepare pipeline config
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
@@ -4561,9 +4679,9 @@ def run_pipeline(
         plt_merged_dir,
         artifacts_dir,
         ctl_context,
-        plt_env,
         plt_overlays,
         plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
         require_commit_refs=require_commit_refs,
@@ -4593,9 +4711,7 @@ def run_pipeline(
         execution_identities,
         aws_access_contexts,
         plt_aws_catalogs,
-        main_tag=main_tag,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
@@ -4605,8 +4721,7 @@ def run_pipeline(
         ctl_cfg_root,
         artifacts_dir,
         ctl_context=ctl_context,
-        plt_env=plt_env,
-        plt_runtime_selectors=plt_runtime_selectors,
+        runtime_context=runtime_context,
         runtime_selector_maps=runtime_selector_maps,
         inventory_name=inventory_name,
         workflow_name=workflow_name,
@@ -4628,9 +4743,8 @@ def run_pipeline(
 
     # Run stages
     run_stages(
-        active_stages, run_dir, plt_distributed_dir_path,
-        inventory_name, plt_env, plt_runtime_selectors, run_id,
-        main_tag=main_tag,
+        active_stages, run_dir, plt_distributed_dir_path, runtime_context_path,
+        inventory_name, runtime_context, run_id,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
         execution_identities=execution_identities,

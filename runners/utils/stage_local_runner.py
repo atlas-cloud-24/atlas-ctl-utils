@@ -1,26 +1,49 @@
 #!/usr/bin/env python3
 import argparse
-import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-from utils.common import (
-    load_yaml,
-    merge_plt_cfg_dirs,
-    parse_overlays_arg,
-    str2bool,
-    validate_uuid7,
-)
+from utils.common import load_yaml
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 ADAPTER_DIR = "atlas_ctl_adapter"
+RUNTIME_CONTEXT_FILENAME = "runtime_context.yaml"
+RUNTIME_CONTEXT_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _runtime_context_env_value(value, *, key: str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    raise RuntimeError(f"runtime context key {key!r} must be scalar, got {type(value).__name__}")
+
+
+def load_runtime_context(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"runtime context file not found: {path}")
+    data = load_yaml(path) or {}
+    runtime_context: dict[str, object] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not RUNTIME_CONTEXT_ENV_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"runtime context key {key!r} is not a valid env var name")
+        runtime_context[key] = value
+        _runtime_context_env_value(value, key=key)
+    return runtime_context
+
+
+def runtime_context_to_env(runtime_context: dict[str, object]) -> dict[str, str]:
+    return {
+        key: _runtime_context_env_value(value, key=key)
+        for key, value in runtime_context.items()
+    }
 
 
 def _build_active_stages(action_manifest, active_ids, repo_root: Path):
@@ -90,93 +113,35 @@ def get_stages_from_workflow(manifest_file: Path, workflows_file: Path, action: 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--main-tag", required=True)
     parser.add_argument("--action", required=True)
-    parser.add_argument("--env-type", required=True)
-    parser.add_argument(
-        "--overlays",
-        required=False,
-        default=[],
-        dest="overlays",
-        type=parse_overlays_arg,
-        help="Optional comma-separated plt overlay names.",
-    )
     parser.add_argument("--workflow", required=True)
-    parser.add_argument(
-        "--cfg-root",
-        default="/env",
-        help="Scoped cfg root to use when merging origin cfg locally. Use /env, /org, /deployments, or /.",
-    )
     parser.add_argument("--origin-cfg", required=True)
-    parser.add_argument("--ephemeral", required=True, type=str2bool)
-    parser.add_argument(
-        "--skip-cfg-merge",
-        action="store_true",
-        help="Use cfg that was already merged by an upstream step.",
-    )
-    parser.add_argument("--run-id", required=True, type=validate_uuid7)
+    parser.add_argument("--runtime-context-file", required=True)
     return parser
-
-
-def _normalize_cfg_root(raw_value: str) -> str:
-    value = raw_value if raw_value is not None else "/env"
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError("cfg-root must be a non-empty string")
-
-    value = value.strip()
-    if "\\" in value:
-        raise RuntimeError(f"cfg-root must use forward slashes: {value}")
-    if not value.startswith("/"):
-        raise RuntimeError(f"cfg-root must start with /: {value}")
-
-    parts = [part for part in value.split("/") if part]
-    if any(part in (".", "..") for part in parts):
-        raise RuntimeError(f"cfg-root must not contain . or ..: {value}")
-
-    return "/" + "/".join(parts) if parts else "/"
-
-
-def _resolve_cfg_root(merged_root: Path, cfg_root: str) -> Path:
-    normalized = _normalize_cfg_root(cfg_root)
-    rel = normalized.lstrip("/")
-    scoped = (merged_root / rel).resolve() if rel else merged_root.resolve()
-    try:
-        scoped.relative_to(merged_root.resolve())
-    except ValueError as exc:
-        raise RuntimeError(f"cfg-root escapes merged cfg: {normalized}") from exc
-    if not scoped.is_dir():
-        raise RuntimeError(f"cfg-root not found in merged cfg: {normalized} ({scoped})")
-    return scoped
-
-
-@contextlib.contextmanager
-def _prepare_merged(origin_cfg: str, env_type: str, overlays: list[str] | None, skip_cfg_merge: bool, cfg_root: str):
-    if skip_cfg_merge:
-        yield origin_cfg
-        return
-
-    with tempfile.TemporaryDirectory() as tmp_cfg_dir:
-        merged_root = Path(tmp_cfg_dir)
-        merge_plt_cfg_dirs(
-            plt_cfg_root=Path(origin_cfg),
-            plt_merged_dir=merged_root,
-            ctl_context=env_type,
-            plt_env=env_type,
-            plt_overlays=overlays,
-        )
-        yield str(_resolve_cfg_root(merged_root, cfg_root))
 
 
 def run_local_runner(stage_runner_script: str) -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if args.env_type == "prod" and args.ephemeral:
-        raise RuntimeError("❌ For env-type 'prod', only --ephemeral=false is allowed")
-
     repo_root = Path(
         subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
     )
+
+    runtime_context_file = Path(args.runtime_context_file).expanduser().resolve()
+    runtime_context = load_runtime_context(runtime_context_file)
+    runtime_env = runtime_context_to_env(runtime_context)
+    run_id = runtime_env.get("run_id", "unknown")
+
+    adapter_runtime_context_file = repo_root / RUNTIME_CONTEXT_FILENAME
+    copied_runtime_context = False
+    if runtime_context_file != adapter_runtime_context_file.resolve():
+        shutil.copy2(runtime_context_file, adapter_runtime_context_file)
+        copied_runtime_context = True
+
+    origin_cfg_path = Path(args.origin_cfg).expanduser().resolve()
+    if not origin_cfg_path.is_dir():
+        raise RuntimeError(f"origin cfg dir not found: {origin_cfg_path}")
 
     manifest_file = repo_root / ADAPTER_DIR / "manifest.yaml"
     if not manifest_file.is_file():
@@ -192,50 +157,38 @@ def run_local_runner(stage_runner_script: str) -> None:
     )
 
     run_manifest = {
-        "run_id": args.run_id,
+        "run_id": run_id,
         "branch": None,
         "commit": None,
         "action": args.action,
-        "env_type": args.env_type,
-        "overlays": args.overlays,
         "workflow": args.workflow,
         "active_stages": active_stage_ids,
-        "origin_cfg": args.origin_cfg,
-        "cfg_root": args.cfg_root,
+        "origin_cfg": str(origin_cfg_path),
+        "runtime_context_file": str(runtime_context_file),
+        "runtime_context_keys": sorted(runtime_context),
     }
     logging.info(json.dumps(run_manifest, indent=4))
 
-    with _prepare_merged(args.origin_cfg, args.env_type, args.overlays, args.skip_cfg_merge, args.cfg_root) as source_for_resolve:
-        merged_dir = "merged"
-        if os.path.exists(merged_dir):
-            shutil.rmtree(merged_dir)
-        os.makedirs(merged_dir)
-        subprocess.run(
-            ["cp", "-aL", source_for_resolve + "/.", merged_dir],
-            check=True,
-        )
+    try:
+        for stage in active_stages:
+            stage_id = stage.get("id")
+            stage_path = stage.get("path")
+            logging.info(f"===================== {stage_id} =====================")
+            env = os.environ.copy()
+            env.update(runtime_env)
+            env["ATLAS_RUNTIME_CONTEXT_FILE"] = RUNTIME_CONTEXT_FILENAME
+            env["cfg_files"] = json.dumps(stage.get("cfg_files"))
+            env["STAGE_WRITE_VALUES_JSON"] = "true" if stage.get("runtime", {}).get("values_json", True) else "false"
+            env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
+            env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
+            subprocess.run(
+                args=[f"./{stage_path}/run/{stage_runner_script}"],
+                check=True,
+                env=env,
+            )
+    finally:
+        if copied_runtime_context and adapter_runtime_context_file.is_file():
+            adapter_runtime_context_file.unlink()
 
-        try:
-            for stage in active_stages:
-                stage_id = stage.get("id")
-                stage_path = stage.get("path")
-                logging.info(f"===================== {stage_id} =====================")
-                env = os.environ.copy()
-                env["main_tag"] = args.main_tag
-                env["env_type"] = args.env_type
-                env["run_id"] = args.run_id
-                env["cfg_files"] = json.dumps(stage.get("cfg_files"))
-                env["STAGE_WRITE_VALUES_JSON"] = "true" if stage.get("runtime", {}).get("values_json", True) else "false"
-                env["STAGE_WRITE_ENV_SH"] = "true" if stage.get("runtime", {}).get("env_sh", True) else "false"
-                env["origin_cfg_base_dir_path"] = merged_dir
-                subprocess.run(
-                    args=[f"./{stage_path}/run/{stage_runner_script}"],
-                    check=True,
-                    env=env,
-                )
-        finally:
-            if os.path.exists(merged_dir):
-                shutil.rmtree(merged_dir)
-
-    logging.info(f"✅ All stages completed, run_id: {args.run_id}")
-    print(f"export run_id={args.run_id}")
+    logging.info(f"✅ All stages completed, run_id: {run_id}")
+    print(f"export run_id={run_id}")

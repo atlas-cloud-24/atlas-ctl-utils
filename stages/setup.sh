@@ -73,9 +73,13 @@ stage_env_out="-"
 
 if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]; then
   mkdir -p runtime
-  : "${env_type:?must be set}"
-  : "${main_tag:?must be set}"
-  : "${run_id:?must be set}"
+  : "${ATLAS_RUNTIME_CONTEXT_FILE:?must be set}"
+  runtime_context_file="$ATLAS_RUNTIME_CONTEXT_FILE"
+
+  if [[ ! -f "$runtime_context_file" ]]; then
+    echo "❌ runtime context file not found: $runtime_context_file"
+    exit 1
+  fi
 
   if [[ "$stage_write_values_json" == "true" ]]; then
     values_json_out="runtime/values.json"
@@ -89,9 +93,7 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     --cfg-files "$cfg_files" \
     --values-json-out "$values_json_out" \
     --stage-env-out "$stage_env_out" \
-    --env-type "$env_type" \
-    --main-tag "$main_tag" \
-    --run-id "$run_id"
+    --runtime-context-file "$runtime_context_file"
 
   echo "✅ cfg artifacts generated:"
   if [[ "$stage_write_values_json" == "true" ]]; then

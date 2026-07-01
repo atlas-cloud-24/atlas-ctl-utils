@@ -30,7 +30,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 }
             },
             "env_deploy": {
-                "local": {"profile_key": "${plt_env}_deploy"}
+                "local": {"profile_key": "${env_type}_deploy"}
             },
         }
         self.identities = {
@@ -41,7 +41,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             },
             "env_deploy": {
                 "provider": "aws",
-                "account_key": "${plt_env}",
+                "account_key": "${env_type}",
                 "access_context_key": "env_deploy",
             },
             "prod_deploy": {
@@ -77,8 +77,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
 
@@ -97,8 +96,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
 
@@ -125,8 +123,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     self.identities,
                     self.levels,
                     self.catalogs,
-                    main_tag="oxygen",
-                    plt_env="dev",
+                    runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                     implementation_key="local",
                 )
 
@@ -144,8 +141,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
         self.assertEqual(resolved["profile_name"], "oxygen-org-admin")
@@ -159,8 +155,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
 
@@ -175,8 +170,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="ci",
             )
 
@@ -184,7 +178,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unavailable runtime value"):
             common.resolve_runtime_scalar(
                 "${unknown}_deploy",
-                {"main_tag": "oxygen", "plt_env": "dev"},
+                {"main_tag": "oxygen", "env_type": "dev"},
                 label="test",
             )
 
@@ -192,13 +186,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_account_registry_rejects_conflicting_profile_ids(self):
         levels = {
             **self.levels,
-            "env_readonly": {"local": {"profile_key": "${plt_env}_readonly"}},
+            "env_readonly": {"local": {"profile_key": "${env_type}_readonly"}},
         }
         identities = {
             **self.identities,
             "env_readonly": {
                 "provider": "aws",
-                "account_key": "${plt_env}",
+                "account_key": "${env_type}",
                 "access_context_key": "env_readonly",
             },
         }
@@ -235,8 +229,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     identities,
                     levels,
                     catalogs,
-                    main_tag="oxygen",
-                    plt_env="dev",
+                    runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                     implementation_key="local",
                 )
 
@@ -256,8 +249,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.levels,
             self.catalogs,
-            main_tag="oxygen",
-            plt_env="dev",
+            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             account_registry={},
         )
@@ -274,8 +266,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.levels,
             self.catalogs,
-            main_tag="oxygen",
-            plt_env="dev",
+            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
         )
@@ -288,8 +279,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.levels,
             self.catalogs,
-            main_tag="oxygen",
-            plt_env="dev",
+            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
             profile_only_aws_profile="legacy-dev-profile",
@@ -308,8 +298,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.levels,
             self.catalogs,
-            main_tag="oxygen",
-            plt_env="dev",
+            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             account_registry={},
             allow_profile_only=True,
@@ -331,8 +320,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
@@ -346,8 +334,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
@@ -361,8 +348,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.levels,
                 self.catalogs,
-                main_tag="oxygen",
-                plt_env="dev",
+                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
             )
@@ -374,8 +360,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.levels,
             self.catalogs,
-            main_tag="oxygen",
-            plt_env="dev",
+            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
             profile_only_aws_profile="legacy-dev-profile",

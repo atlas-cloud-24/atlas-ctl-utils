@@ -85,9 +85,7 @@ run_local_stage() {
     -v "$PWD:/mnt/source:ro" \
     -v "$(realpath "$origin_cfg_base_dir_path"):/mnt/origin_cfg:ro" \
     -v "$HOME/.aws:/root/.aws:ro" \
-    -e run_id \
-    -e env_type \
-    -e main_tag \
+    -e ATLAS_RUNTIME_CONTEXT_FILE \
     -e stage_dir="$stage_dir" \
     -e cfg_files \
     -e STAGE_WRITE_VALUES_JSON \
@@ -114,7 +112,7 @@ run_local_stage() {
       cp -a /mnt/origin_cfg "$GITHUB_WORKSPACE"/origin_cfg
       cd "$GITHUB_WORKSPACE"
 
-      if [ "${ATLAS_AWS_ASSERT_ACCESS:-false}" = "true" ]; then
+      if [ "${ATLAS_AWS_ASSERT_ACCESS}" = "true" ]; then
         python3 ./atlas_ctl_adapter/stages/_common/assert_aws_access.py
       fi
 
