@@ -75,6 +75,11 @@ CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
 CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
 RUN_METADATA_FILENAME = "RUN.yaml"
 RUNTIME_CONTEXT_FILENAME = "runtime_context.yaml"
+
+# Context keys the engine injects fresh per run. They are withheld from
+# render-time interpolation (kept verbatim in rendered/) and resolve at the
+# per-stage resolved/ step, keeping rendered/ deterministic on the engine side.
+ENGINE_VOLATILE_CONTEXT_KEYS = ("run_id",)
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
@@ -2614,7 +2619,9 @@ def setup_run_dirs(
     ctl_stage_runtime_dir = materialize_ctl_stage_runtime(run_dir)
     logging.info(f"Using ctl stage runtime: {ctl_stage_runtime_dir}")
 
-    artifacts_dir = run_dir / "artifacts"
+    # artifacts/ splits into general/ (run-level metadata + logs) and
+    # stages/<stage>/ (per-stage outputs, created when stages run).
+    artifacts_dir = run_dir / "artifacts" / "general"
     os.makedirs(artifacts_dir, exist_ok=True)
 
     cfg_dir = run_dir / "cfg"
@@ -4282,19 +4289,41 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
     )
 
 
-def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_merged_dir: Path, run_dir: Path) -> Path:
-    """Run cfg distribution script and return destination cfg dir path."""
-    plt_distributed_dir_path = run_dir / "cfg" / "plt" / "distributed"
+def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, runtime_context_path: Path) -> Path:
+    """Render merged/ into rendered/ (whole-scope, engine-volatile keys kept verbatim)."""
+    plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
+    render_script = materialize_ctl_stage_runtime(run_dir) / "render_cfg.py"
+    run_and_log(
+        [
+            "python3",
+            str(render_script),
+            "--merged-dir", str(plt_merged_dir),
+            "--rendered-dir", str(plt_rendered_dir),
+            "--runtime-context-file", str(runtime_context_path),
+            "--volatile-keys", json.dumps(list(ENGINE_VOLATILE_CONTEXT_KEYS)),
+        ],
+    )
+    return plt_rendered_dir
+
+
+def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_merged_dir: Path, run_dir: Path, runtime_context_path: Path) -> Path:
+    """Render merged cfg, then distribute stage input views from the rendered tree.
+
+    Single derivation chain: rendered/ derives from merged/; each
+    stages/<stage>/input/ view is selected from rendered/ only.
+    """
+    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, runtime_context_path)
+    plt_stages_dir_path = run_dir / "cfg" / "plt" / "stages"
     env = os.environ.copy()
     env["pipeline_run_cfg_path"] = str(pipeline_run_cfg_path)
-    env["plt_merged_dir_path"] = str(plt_merged_dir)
-    env["plt_distributed_dir_path"] = str(plt_distributed_dir_path)
+    env["plt_rendered_dir_path"] = str(plt_rendered_dir)
+    env["plt_stages_dir_path"] = str(plt_stages_dir_path)
     logging.info(f"Running: {os.getcwd()}/stages/prepare/cfg/run/local.sh")
     run_and_log(
         [f"{os.getcwd()}/stages/prepare/cfg/run/local.sh"],
         env=env,
     )
-    return plt_distributed_dir_path
+    return plt_stages_dir_path
 
 
 
@@ -4564,7 +4593,7 @@ def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]
 def run_stages(
     active_stages: dict,
     run_dir: Path,
-    plt_distributed_dir_path: Path,
+    plt_stages_dir_path: Path,
     runtime_context_path: Path,
     inventory_name: str,
     runtime_context: dict[str, object],
@@ -4603,11 +4632,13 @@ def run_stages(
         workflow_name = stage.get("workflow")
         if not isinstance(workflow_name, str) or not workflow_name:
             raise RuntimeError(f"❌ stage {stage_id!r} must define a non-empty repo-local workflow")
-        origin_cfg_path = plt_distributed_dir_path / stage_id
+        origin_cfg_path = plt_stages_dir_path / stage_id / "input"
         if not origin_cfg_path.is_dir():
-            raise RuntimeError(f"❌ distributed cfg dir not found for stage {stage_id!r}: {origin_cfg_path}")
-        stage_cfg_dir = run_dir / "cfg" / "plt" / "per_stage" / stage_id
+            raise RuntimeError(f"❌ stage input cfg dir not found for stage {stage_id!r}: {origin_cfg_path}")
+        stage_cfg_dir = plt_stages_dir_path / stage_id / "resolved"
         os.makedirs(stage_cfg_dir, exist_ok=True)
+        stage_artifacts_dir = run_dir / "artifacts" / "stages" / stage_id
+        os.makedirs(stage_artifacts_dir, exist_ok=True)
 
         copied_runtime_context = ensure_repo_runtime_context(repo_path, runtime_context_path)
         try:
@@ -4646,6 +4677,7 @@ def run_stages(
                 )
                 repo_stage_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
                 repo_stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
+                repo_stage_env["STAGE_ARTIFACTS_DIR"] = str(stage_artifacts_dir)
 
                 logging.info(" ".join(stage_run_cmd))
                 run_and_log(
@@ -4759,10 +4791,11 @@ def run_maintenance(
         profile_only_aws_profile=profile_only_aws_profile,
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
-    plt_distributed_dir_path = run_cfg_distribution(
+    plt_stages_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path,
         plt_merged_dir,
         run_dir,
+        runtime_context_path,
     )
 
     os.chdir(run_dir)
@@ -4793,9 +4826,9 @@ def run_maintenance(
         env=stage_env,
     )
 
-    stage_cfg_dir = plt_distributed_dir_path / stage_id
+    stage_cfg_dir = plt_stages_dir_path / stage_id / "input"
     if not stage_cfg_dir.is_dir():
-        raise RuntimeError(f"❌ distributed cfg dir not found for stage '{stage_id}': {stage_cfg_dir}")
+        raise RuntimeError(f"❌ stage input cfg dir not found for stage '{stage_id}': {stage_cfg_dir}")
 
     if maintenance_action != "force-unlock":
         raise RuntimeError(f"❌ Unsupported maintenance action: {maintenance_action}")
@@ -5032,14 +5065,14 @@ def run_pipeline(
     # Write git metas
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
 
-    # Run cfg distribution
-    plt_distributed_dir_path = run_cfg_distribution(
-        pipeline_run_cfg_path, plt_merged_dir, run_dir
+    # Render cfg + distribute stage input views
+    plt_stages_dir_path = run_cfg_distribution(
+        pipeline_run_cfg_path, plt_merged_dir, run_dir, runtime_context_path
     )
 
     # Run stages
     run_stages(
-        active_stages, run_dir, plt_distributed_dir_path, runtime_context_path,
+        active_stages, run_dir, plt_stages_dir_path, runtime_context_path,
         inventory_name, runtime_context, run_id,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,

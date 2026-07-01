@@ -82,6 +82,13 @@ run_local_stage() {
       -e STAGE_CFG_DIR=/mnt/stage_cfg
     )
   fi
+  if [[ -n "${STAGE_ARTIFACTS_DIR:-}" ]]; then
+    mkdir -p "${STAGE_ARTIFACTS_DIR}"
+    stage_cfg_mount_args+=(
+      -v "${STAGE_ARTIFACTS_DIR}:/mnt/stage_artifacts"
+      -e STAGE_ARTIFACTS_DIR=/mnt/stage_artifacts
+    )
+  fi
 
   docker build \
     -f "$dockerfile_path" \

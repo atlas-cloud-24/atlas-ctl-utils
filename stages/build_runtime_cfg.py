@@ -116,12 +116,14 @@ def lookup_cfg_collection(root: dict, collection: str, path: tuple[str, ...]):
     return current
 
 
-def resolve_cfg_entry_refs(root: dict):
+def resolve_cfg_entry_refs(root: dict, lookup_root: dict | None = None):
+    ref_lookup_root = root if lookup_root is None else lookup_root
+
     def resolve_value(value, path: tuple[str, ...]):
         if isinstance(value, str):
             if value.startswith(CFG_ENTRY_REF_PREFIX):
                 collection, key = parse_cfg_entry_ref(value, path)
-                collection_value = lookup_cfg_collection(root, collection, path)
+                collection_value = lookup_cfg_collection(ref_lookup_root, collection, path)
                 if key not in collection_value:
                     raise RuntimeError(
                         f"cfg entry reference at {format_cfg_path(path)} points to missing item "
@@ -194,9 +196,12 @@ def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
 
 
 class Resolver:
-    def __init__(self, raw: dict, env_ctx: dict[str, str]):
+    def __init__(self, raw: dict, env_ctx: dict[str, str], keep_unresolved: frozenset[str] = frozenset()):
         self.raw = raw
         self.env_ctx = env_ctx
+        # Names whose placeholders stay verbatim when unresolved (render mode:
+        # engine-volatile context keys resolve later, at the per-stage step).
+        self.keep_unresolved = keep_unresolved
         self.cache: dict[str, object] = {}
         self.resolving: set[str] = set()
 
@@ -268,6 +273,8 @@ class Resolver:
             var_name = exact_match.group(1)
             default_raw = exact_match.group(2)
             looked_up = self.lookup(var_name)
+            if looked_up is OMIT and var_name in self.keep_unresolved:
+                return value
             if looked_up is OMIT and default_raw is not None:
                 return self.parse_default(default_raw)
             if looked_up is OMIT:
@@ -278,6 +285,8 @@ class Resolver:
             var_name = match.group(1)
             default_raw = match.group(2)
             looked_up = self.lookup(var_name)
+            if looked_up is OMIT and var_name in self.keep_unresolved:
+                return match.group(0)
             if looked_up is OMIT:
                 if default_raw is not None:
                     looked_up = self.parse_default(default_raw)

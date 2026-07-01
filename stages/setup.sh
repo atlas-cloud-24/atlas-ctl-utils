@@ -116,13 +116,14 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
   fi
 
   if [[ -n "${STAGE_CFG_DIR:-}" ]]; then
-    mkdir -p "${STAGE_CFG_DIR}/runtime"
-    rm -f "${STAGE_CFG_DIR}/runtime/values.json" "${STAGE_CFG_DIR}/runtime/env.sh"
+    # STAGE_CFG_DIR is the stage's resolved/ layer: flat final consumables.
+    mkdir -p "${STAGE_CFG_DIR}"
+    rm -f "${STAGE_CFG_DIR}/values.json" "${STAGE_CFG_DIR}/env.sh"
     if [[ "$stage_write_values_json" == "true" ]]; then
-      cp runtime/values.json "${STAGE_CFG_DIR}/runtime/values.json"
+      cp runtime/values.json "${STAGE_CFG_DIR}/values.json"
     fi
     if [[ "$stage_write_env_sh" == "true" ]]; then
-      cp runtime/env.sh "${STAGE_CFG_DIR}/runtime/env.sh"
+      cp runtime/env.sh "${STAGE_CFG_DIR}/env.sh"
     fi
     chmod -R a+rwX "${STAGE_CFG_DIR}"
   fi
