@@ -22,6 +22,7 @@ assert_spec.loader.exec_module(assert_aws_access)
 
 class AwsAccessResolutionTests(unittest.TestCase):
     def setUp(self):
+        # aws_access_contexts: direct ctl-owned profile_name + expect (no plt org catalog)
         self.levels = {
             "org_admin": {
                 "local": {
@@ -29,8 +30,17 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     "expect": {"permission_set_name": "AdministratorAccess"},
                 }
             },
-            "env_deploy": {
-                "local": {"profile_key": "${env_type}_deploy"}
+            "non_prod_deploy": {
+                "local": {
+                    "profile_name": "${main_tag}-${env_type}-deploy",
+                    "expect": {"permission_set_name": "NonProdDeploy"},
+                }
+            },
+            "non_prod_readonly": {
+                "local": {
+                    "profile_name": "${main_tag}-${env_type}-readonly",
+                    "expect": {"permission_set_name": "ReadOnlyAccess"},
+                }
             },
         }
         self.identities = {
@@ -42,29 +52,17 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "env_deploy": {
                 "provider": "aws",
                 "account_key": "${env_type}",
-                "access_context_key": "env_deploy",
+                "access_context_key": "non_prod_deploy",
             },
-            "prod_deploy": {
+            "env_readonly": {
                 "provider": "aws",
-                "account_key": "prod",
-                "access_context_key": "env_deploy",
-            },
-        }
-        self.catalogs = {
-            "profiles": {
-                "dev_deploy": {
-                    "profile_name": "${main_tag}-dev-deploy",
-                    "account_key": "dev",
-                    "permission_set_key": "non_prod_deploy",
-                }
-            },
-            "permission_sets": {
-                "non_prod_deploy": {"name": "NonProdDeployAccess"}
+                "account_key": "${env_type}",
+                "access_context_key": "non_prod_readonly",
             },
         }
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_profile_key_derives_account_profile_and_permission_set(self):
+    def test_profile_name_resolves_account_profile_and_permission_set(self):
         with mock.patch.object(
             common,
             "resolve_configured_profile_account_id",
@@ -76,33 +74,18 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
 
         self.assertEqual(resolved["account_key"], "dev")
         self.assertEqual(resolved["profile_name"], "oxygen-dev-deploy")
-        self.assertEqual(resolved["permission_set_name"], "NonProdDeployAccess")
+        self.assertEqual(resolved["permission_set_name"], "NonProdDeploy")
         self.assertEqual(resolved["expected_account_id"], "111111111111")
-
-    @mock.patch.dict(os.environ, {}, clear=True)
-    def test_profile_catalog_account_must_match_target(self):
-        with self.assertRaisesRegex(RuntimeError, "execution identity .* requires 'prod'"):
-            common.resolve_stage_aws_access(
-                {
-                    "execution_identity_key": "prod_deploy",
-                },
-                self.identities,
-                self.levels,
-                self.catalogs,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
-                implementation_key="local",
-            )
 
     @mock.patch.dict(
         os.environ,
-        {"ATLAS_AWS_PROFILE_ENV_DEPLOY": "custom-dev-deploy"},
+        {"ATLAS_AWS_PROFILE_NON_PROD_DEPLOY": "custom-dev-deploy"},
         clear=True,
     )
     def test_profile_override_cannot_change_account(self):
@@ -122,7 +105,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     },
                     self.identities,
                     self.levels,
-                    self.catalogs,
                     runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                     implementation_key="local",
                 )
@@ -140,7 +122,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
@@ -154,11 +135,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 {"execution_identity_key": "missing"},
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
             )
-
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_missing_runner_implementation_fails(self):
@@ -169,7 +148,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="ci",
             )
@@ -184,32 +162,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_account_registry_rejects_conflicting_profile_ids(self):
-        levels = {
-            **self.levels,
-            "env_readonly": {"local": {"profile_key": "${env_type}_readonly"}},
-        }
-        identities = {
-            **self.identities,
-            "env_readonly": {
-                "provider": "aws",
-                "account_key": "${env_type}",
-                "access_context_key": "env_readonly",
-            },
-        }
-        catalogs = {
-            "profiles": {
-                **self.catalogs["profiles"],
-                "dev_readonly": {
-                    "profile_name": "${main_tag}-dev-readonly",
-                    "account_key": "dev",
-                    "permission_set_key": "read_only_access",
-                },
-            },
-            "permission_sets": {
-                **self.catalogs["permission_sets"],
-                "read_only_access": {"name": "ReadOnlyAccess"},
-            },
-        }
         account_ids = {
             "oxygen-dev-deploy": "111111111111",
             "oxygen-dev-readonly": "222222222222",
@@ -226,9 +178,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Conflicting AWS account IDs"):
                 common.validate_active_stage_aws_access(
                     stages,
-                    identities,
-                    levels,
-                    catalogs,
+                    self.identities,
+                    self.levels,
                     runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                     implementation_key="local",
                 )
@@ -248,7 +199,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stage_env,
             self.identities,
             self.levels,
-            self.catalogs,
             runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             account_registry={},
@@ -265,7 +215,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
             {},
             self.identities,
             self.levels,
-            self.catalogs,
             runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
@@ -278,7 +227,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
             {},
             self.identities,
             self.levels,
-            self.catalogs,
             runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
@@ -297,7 +245,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stage_env,
             self.identities,
             self.levels,
-            self.catalogs,
             runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             account_registry={},
@@ -319,7 +266,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
@@ -333,7 +279,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
@@ -347,7 +292,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                self.catalogs,
                 runtime_context={"main_tag": "oxygen", "env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
@@ -359,7 +303,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stages,
             self.identities,
             self.levels,
-            self.catalogs,
             runtime_context={"main_tag": "oxygen", "env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,

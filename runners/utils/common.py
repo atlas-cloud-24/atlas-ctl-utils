@@ -1364,13 +1364,13 @@ def _validate_aws_access_implementation(
         )
 
     credential_keys = [
-        key for key in ("profile_key", "profile_name", "iam_role_key")
+        key for key in ("profile_name", "iam_role_key")
         if key in implementation_cfg
     ]
     if len(credential_keys) != 1:
         raise RuntimeError(
             f"❌ AWS access context {access_context_key!r}.{implementation_key} must define exactly one of "
-            f"profile_key, profile_name, or iam_role_key: {path}"
+            f"profile_name or iam_role_key: {path}"
         )
     credential_key = credential_keys[0]
     _require_non_empty_string(
@@ -1379,9 +1379,9 @@ def _validate_aws_access_implementation(
         path,
     )
 
-    if implementation_key == "local" and credential_key not in ("profile_key", "profile_name"):
+    if implementation_key == "local" and credential_key != "profile_name":
         raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.local must use profile_key or profile_name: {path}"
+            f"❌ AWS access context {access_context_key!r}.local must use profile_name: {path}"
         )
     if implementation_key == "ci" and credential_key != "iam_role_key":
         raise RuntimeError(
@@ -1441,42 +1441,6 @@ def _require_non_empty_string(value, label: str, path: Path | None = None) -> st
     return value.strip()
 
 
-def load_plt_aws_catalogs(plt_merged_dir: Path) -> dict[str, dict]:
-    """Load profile and permission-set catalogs using normal plt cfg merge semantics."""
-    profiles: dict = {}
-    permission_sets: dict = {}
-
-    for cfg_file in sorted(plt_merged_dir.rglob("*.yaml")):
-        data = load_yaml(cfg_file) or {}
-        if not isinstance(data, dict):
-            continue
-
-        profile_entries = data.get("org_profiles_cfg")
-        if profile_entries is not None:
-            if not isinstance(profile_entries, dict):
-                raise RuntimeError(f"❌ org_profiles_cfg must be a mapping: {cfg_file}")
-            profiles = merge_cfg_values(profiles, profile_entries)
-
-        org_cfg = data.get("org") or {}
-        if org_cfg and not isinstance(org_cfg, dict):
-            raise RuntimeError(f"❌ org must be a mapping: {cfg_file}")
-        identity_center_cfg = org_cfg.get("identity_center") or {}
-        if identity_center_cfg and not isinstance(identity_center_cfg, dict):
-            raise RuntimeError(f"❌ org.identity_center must be a mapping: {cfg_file}")
-        permission_entries = identity_center_cfg.get("permission_sets_cfg")
-        if permission_entries is not None:
-            if not isinstance(permission_entries, dict):
-                raise RuntimeError(
-                    f"❌ org.identity_center.permission_sets_cfg must be a mapping: {cfg_file}"
-                )
-            permission_sets = merge_cfg_values(permission_sets, permission_entries)
-
-    return {
-        "profiles": profiles,
-        "permission_sets": permission_sets,
-    }
-
-
 def aws_access_override_env_name(access_context_key: str) -> str:
     suffix = re.sub(r"[^A-Za-z0-9]", "_", access_context_key).upper()
     return f"ATLAS_AWS_PROFILE_{suffix}"
@@ -1529,7 +1493,6 @@ def resolve_stage_aws_access(
     stage: dict,
     execution_identities: dict,
     aws_access_contexts: dict,
-    plt_aws_catalogs: dict[str, dict],
     *,
     runtime_context: dict[str, object],
     implementation_key: str,
@@ -1603,50 +1566,7 @@ def resolve_stage_aws_access(
         "implementation_key": implementation_key,
     }
 
-    if "profile_key" in implementation_cfg:
-        profile_key = resolve_runtime_scalar(
-            implementation_cfg["profile_key"],
-            context,
-            label=f"aws_access_contexts.{access_context_key}.{implementation_key}.profile_key",
-        )
-        profile_cfg = plt_aws_catalogs.get("profiles", {}).get(profile_key)
-        if not isinstance(profile_cfg, dict):
-            raise RuntimeError(f"❌ org_profiles_cfg has no profile key {profile_key!r}")
-
-        profile_account_key = resolve_runtime_scalar(
-            profile_cfg.get("account_key"),
-            context,
-            label=f"org_profiles_cfg.{profile_key}.account_key",
-        )
-        if profile_account_key != account_key:
-            raise RuntimeError(
-                f"❌ AWS account mismatch in cfg: execution identity {identity_key!r} requires "
-                f"{account_key!r}, but profile {profile_key!r} references {profile_account_key!r}"
-            )
-
-        canonical_profile_name = resolve_runtime_scalar(
-            profile_cfg.get("profile_name"),
-            context,
-            label=f"org_profiles_cfg.{profile_key}.profile_name",
-        )
-        permission_set_key = resolve_runtime_scalar(
-            profile_cfg.get("permission_set_key"),
-            context,
-            label=f"org_profiles_cfg.{profile_key}.permission_set_key",
-        )
-        permission_set_cfg = plt_aws_catalogs.get("permission_sets", {}).get(permission_set_key)
-        if not isinstance(permission_set_cfg, dict):
-            raise RuntimeError(
-                f"❌ org.identity_center.permission_sets_cfg has no key {permission_set_key!r}"
-            )
-        resolved["permission_set_name"] = resolve_runtime_scalar(
-            permission_set_cfg.get("name"),
-            context,
-            label=f"permission_sets_cfg.{permission_set_key}.name",
-        )
-        resolved["credential_provider_kind"] = "identity_center_profile"
-        resolved["profile_key"] = profile_key
-    elif "profile_name" in implementation_cfg:
+    if "profile_name" in implementation_cfg:
         canonical_profile_name = resolve_runtime_scalar(
             implementation_cfg["profile_name"],
             context,
@@ -1753,7 +1673,6 @@ def validate_active_stage_aws_access(
     active_stages: dict,
     execution_identities: dict,
     aws_access_contexts: dict,
-    plt_aws_catalogs: dict[str, dict],
     *,
     runtime_context: dict[str, object],
     implementation_key: str,
@@ -1772,7 +1691,6 @@ def validate_active_stage_aws_access(
             stage,
             execution_identities,
             aws_access_contexts,
-            plt_aws_catalogs,
             runtime_context=runtime_context,
             implementation_key=implementation_key,
             allow_profile_only=allow_profile_only,
@@ -1814,7 +1732,6 @@ def configure_stage_aws_env(
     stage_env: dict[str, str],
     execution_identities: dict,
     aws_access_contexts: dict,
-    plt_aws_catalogs: dict[str, dict],
     *,
     runtime_context: dict[str, object],
     implementation_key: str,
@@ -1833,7 +1750,6 @@ def configure_stage_aws_env(
         stage,
         execution_identities,
         aws_access_contexts,
-        plt_aws_catalogs,
         runtime_context=runtime_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
@@ -1989,7 +1905,7 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ref",
         required=True,
-        help="ref context (a key in refs.scoped, e.g. env.${env_type} or org) for a synthetic target",
+        help="ref context (a key in refs.scoped, e.g. env/${env_type} or org) for a synthetic target",
     )
     parser.add_argument(
         "--cfg-file-set",
@@ -2301,6 +2217,12 @@ def load_variants_cfg(ctl_cfg_root: Path) -> dict:
     return collect_resource(ctl_cfg_root, "variants", entry_depth=2)
 
 
+def variant_source_action(action: str) -> str:
+    """Which action's variants apply. `plan` previews `provision`, so a plan run
+    resolves variants against `provision` rather than a separate `plan` block."""
+    return "provision" if action == "plan" else action
+
+
 def _selectors_subset(child: dict | None, parent: dict | None):
     """(ok, reason) — True if child selectors are a subset of parent's, per dimension."""
     if not child:
@@ -2337,7 +2259,8 @@ def apply_ctl_variants_to_workflow_cfg(
     if not ctl_variants:
         return workflow_cfg
 
-    variants = load_variants_cfg(ctl_cfg_root).get(inventory_name, {})
+    variant_action = variant_source_action(inventory_name)
+    variants = load_variants_cfg(ctl_cfg_root).get(variant_action, {})
     targets = inventory_cfg.get("stage_targets", {})
     stages = list(workflow_cfg.get("stages") or [])
 
@@ -2345,7 +2268,7 @@ def apply_ctl_variants_to_workflow_cfg(
         v = variants.get(name)
         if v is None:
             raise RuntimeError(
-                f"❌ variant {name!r} not found under action {inventory_name!r} in variant config"
+                f"❌ variant {name!r} not found under action {variant_action!r} in variant config"
             )
         if not isinstance(v, dict):
             raise RuntimeError(f"❌ variant {name!r} must be a mapping")
@@ -4188,7 +4111,6 @@ def prepare_stage_repo(
     tooling_env: dict[str, str],
     execution_identities: dict | None = None,
     aws_access_contexts: dict | None = None,
-    plt_aws_catalogs: dict[str, dict] | None = None,
     aws_account_registry: dict[str, str] | None = None,
     runtime_context: dict[str, object] | None = None,
     aws_implementation_key: str | None = None,
@@ -4225,7 +4147,6 @@ def prepare_stage_repo(
     if aws_access_contexts is not None:
         if (
             execution_identities is None
-            or plt_aws_catalogs is None
             or aws_account_registry is None
             or runtime_context is None
             or aws_implementation_key is None
@@ -4237,7 +4158,6 @@ def prepare_stage_repo(
             stage_env,
             execution_identities,
             aws_access_contexts,
-            plt_aws_catalogs,
             runtime_context=runtime_context,
             implementation_key=aws_implementation_key,
             account_registry=aws_account_registry,
@@ -4309,7 +4229,6 @@ def run_stages(
     use_local_tooling_cfg: bool,
     execution_identities: dict,
     aws_access_contexts: dict,
-    plt_aws_catalogs: dict[str, dict],
     aws_account_registry: dict[str, str],
     aws_implementation_key: str,
     allow_aws_profile_only: bool,
@@ -4328,7 +4247,6 @@ def run_stages(
             tooling_env,
             execution_identities=execution_identities,
             aws_access_contexts=aws_access_contexts,
-            plt_aws_catalogs=plt_aws_catalogs,
             aws_account_registry=aws_account_registry,
             runtime_context=runtime_context,
             aws_implementation_key=aws_implementation_key,
@@ -4448,13 +4366,11 @@ def run_maintenance(
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
     allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
         aws_access_contexts,
-        plt_aws_catalogs,
         runtime_context=runtime_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
@@ -4483,7 +4399,6 @@ def run_maintenance(
         tooling_env,
         execution_identities=execution_identities,
         aws_access_contexts=aws_access_contexts,
-        plt_aws_catalogs=plt_aws_catalogs,
         aws_account_registry=aws_account_registry,
         runtime_context=runtime_context,
         aws_implementation_key=aws_implementation_key,
@@ -4704,13 +4619,11 @@ def run_pipeline(
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    plt_aws_catalogs = load_plt_aws_catalogs(plt_merged_dir)
     allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
         aws_access_contexts,
-        plt_aws_catalogs,
         runtime_context=runtime_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
@@ -4749,7 +4662,6 @@ def run_pipeline(
         use_local_tooling_cfg=use_local_tooling_cfg,
         execution_identities=execution_identities,
         aws_access_contexts=aws_access_contexts,
-        plt_aws_catalogs=plt_aws_catalogs,
         aws_account_registry=aws_account_registry,
         aws_implementation_key=aws_implementation_key,
         allow_aws_profile_only=allow_aws_profile_only,
