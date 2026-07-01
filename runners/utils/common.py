@@ -4,6 +4,7 @@ import argparse
 import collections
 import fcntl
 import functools
+import json
 import logging
 import logging.handlers
 import os
@@ -24,6 +25,7 @@ import yaml
 from utils.git_meta import write_git_meta_to_file
 
 REQUIRED_TOOLING_REFS = ("ctl-utils", "plt-utils")
+ADAPTER_DIR = "atlas_ctl_adapter"
 TOOLING_ENV_PREFIXES = {
     "ctl-utils": "ATLAS_CTL_UTILS",
     "plt-utils": "ATLAS_PLT_UTILS",
@@ -4104,6 +4106,32 @@ def materialize_stage_modules(stage_id: str, stage: dict, repo_path: Path) -> No
             )
 
 
+def ctl_utils_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def source_ctl_stage_runtime_dir() -> Path:
+    runtime_dir = ctl_utils_root() / "stages"
+    if not runtime_dir.is_dir():
+        raise RuntimeError(f"❌ ctl stage runtime source dir not found: {runtime_dir}")
+    return runtime_dir
+
+
+def materialize_ctl_stage_runtime(run_dir: Path) -> Path:
+    """Copy the selected ctl-owned stage runtime into this run's runtime area."""
+    runtime_dir = run_dir / "runtime" / "ctl_stage"
+    if runtime_dir.is_dir():
+        return runtime_dir
+    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        source_ctl_stage_runtime_dir(),
+        runtime_dir,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    return runtime_dir
+
+
 def prepare_stage_repo(
     stage_id: str,
     stage: dict,
@@ -4117,7 +4145,7 @@ def prepare_stage_repo(
     allow_aws_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
-    """Clone/copy a stage repo, materialize child modules, and run its setup script."""
+    """Clone/copy a stage repo, materialize child modules, and prepare its execution env."""
     repo_path = run_dir / "stages_source" / stage_id
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
@@ -4141,9 +4169,9 @@ def prepare_stage_repo(
 
     materialize_stage_modules(stage_id, stage, repo_path)
 
-    stage_setup_cmd = ["./atlas_ctl_adapter/setup.sh"]
     stage_env = os.environ.copy()
     stage_env.update(tooling_env)
+    stage_env["ATLAS_CTL_STAGE_RUNTIME_DIR"] = str(materialize_ctl_stage_runtime(run_dir))
     if aws_access_contexts is not None:
         if (
             execution_identities is None
@@ -4164,13 +4192,91 @@ def prepare_stage_repo(
             allow_profile_only=allow_aws_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
         )
-    logging.info(" ".join(stage_setup_cmd))
-    run_and_log(
-        stage_setup_cmd,
-        cwd=repo_path,
-        env=stage_env,
-    )
     return repo_path, stage_env
+
+
+def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo_root: Path) -> list[dict]:
+    active: list[dict] = []
+    for stage_id in active_ids:
+        entry = action_manifest.get(stage_id)
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Stage {stage_id!r} not declared in manifest")
+        stage_path = entry.get("path")
+        if not isinstance(stage_path, str) or not stage_path:
+            raise RuntimeError(f"Stage {stage_id!r} manifest entry must define a non-empty path")
+
+        stage_meta_path = repo_root / stage_path / "stage.yaml"
+        if not stage_meta_path.is_file():
+            raise RuntimeError(f"Stage metadata not found: {stage_meta_path}")
+        stage_meta = load_yaml(stage_meta_path) or {}
+        runtime_cfg = stage_meta.get("runtime") or {}
+        if not isinstance(runtime_cfg, dict):
+            raise RuntimeError(f"Stage metadata runtime must be a mapping: {stage_meta_path}")
+        values_json = runtime_cfg.get("values_json", True)
+        env_sh = runtime_cfg.get("env_sh", True)
+        if not isinstance(values_json, bool) or not isinstance(env_sh, bool):
+            raise RuntimeError(f"Stage metadata runtime flags must be booleans: {stage_meta_path}")
+        cfg_files = stage_meta.get("cfg_files", [])
+        if cfg_files is None:
+            cfg_files = []
+        if not isinstance(cfg_files, list):
+            raise RuntimeError(f"Stage metadata cfg_files must be a list: {stage_meta_path}")
+
+        active.append(
+            {
+                "id": stage_id,
+                "path": stage_path,
+                "cfg_files": cfg_files,
+                "runtime": {
+                    "values_json": values_json,
+                    "env_sh": env_sh,
+                },
+                "env_vars": {
+                    "inventory": {},
+                    "stage": stage_meta.get("env_vars", {}),
+                },
+            }
+        )
+    return active
+
+
+def get_repo_local_stages(repo_path: Path, action: str, workflow_name: str) -> tuple[list[str], list[dict]]:
+    manifest_file = repo_path / ADAPTER_DIR / "manifest.yaml"
+    if not manifest_file.is_file():
+        raise RuntimeError(f"❌ manifest file not found: {manifest_file}")
+    workflows_file = repo_path / ADAPTER_DIR / "workflows.yaml"
+    if not workflows_file.is_file():
+        raise RuntimeError(f"❌ workflows file not found: {workflows_file}")
+
+    manifest = (load_yaml(manifest_file) or {}).get("manifest", {})
+    workflows = (load_yaml(workflows_file) or {}).get("workflows", {})
+
+    action_manifest = manifest.get(action)
+    if not isinstance(action_manifest, dict) or not action_manifest:
+        raise RuntimeError(f"manifest {manifest_file} declares no stages for action {action!r}")
+
+    action_workflows = workflows.get(action)
+    if not isinstance(action_workflows, dict) or workflow_name not in action_workflows:
+        raise RuntimeError(f"workflow {action}/{workflow_name} not found in {workflows_file}")
+    workflow = action_workflows[workflow_name]
+    if not isinstance(workflow, dict) or "stages" not in workflow:
+        raise RuntimeError(f"workflow {action}/{workflow_name} must define stages")
+
+    active_ids: list[str] = []
+    for stage_id in workflow.get("stages", []):
+        if stage_id not in action_manifest:
+            raise RuntimeError(f"Stage {stage_id!r} not declared in manifest for action {action!r}")
+        active_ids.append(stage_id)
+
+    return active_ids, _repo_local_active_stages(action_manifest, active_ids, repo_path)
+
+
+def ensure_repo_runtime_context(repo_path: Path, runtime_context_path: Path) -> bool:
+    repo_runtime_context_path = repo_path / RUNTIME_CONTEXT_FILENAME
+    if runtime_context_path.resolve() == repo_runtime_context_path.resolve():
+        return False
+    shutil.copy2(runtime_context_path, repo_runtime_context_path)
+    return True
 
 
 def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]:
@@ -4237,6 +4343,8 @@ def run_stages(
     """Clone and run all active stages."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
+    stage_runner_script = "local_dev.sh" if use_local_tooling_cfg else "local.sh"
+    runtime_env = runtime_context_env_values(runtime_context)
     mutation_marked = False
     for stage_id, stage in active_stages.items():
         log_stage_banner(f"[{inventory_name}] [{stage_id}]")
@@ -4254,28 +4362,63 @@ def run_stages(
             profile_only_aws_profile=profile_only_aws_profile,
         )
 
-        stage_runner_path = "./atlas_ctl_adapter/runners/local_dev.py" if use_local_tooling_cfg else "./atlas_ctl_adapter/runners/local.py"
-        stage_run_cmd = [
-            stage_runner_path,
-            "--action", inventory_name,
-            "--workflow", stage["workflow"],
-            "--origin-cfg", f"{plt_distributed_dir_path}/{stage_id}",
-            "--runtime-context-file", str(runtime_context_path),
-        ]
+        workflow_name = stage.get("workflow")
+        if not isinstance(workflow_name, str) or not workflow_name:
+            raise RuntimeError(f"❌ stage {stage_id!r} must define a non-empty repo-local workflow")
+        origin_cfg_path = plt_distributed_dir_path / stage_id
+        if not origin_cfg_path.is_dir():
+            raise RuntimeError(f"❌ distributed cfg dir not found for stage {stage_id!r}: {origin_cfg_path}")
         stage_cfg_dir = run_dir / "cfg" / "plt" / "per_stage" / stage_id
         os.makedirs(stage_cfg_dir, exist_ok=True)
-        stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
 
-        if inventory_name in MUTATING_ACTIONS and not mutation_marked:
-            mark_mutation_started(run_dir, stage_id)
-            mutation_marked = True
+        copied_runtime_context = ensure_repo_runtime_context(repo_path, runtime_context_path)
+        try:
+            repo_stage_ids, repo_stages = get_repo_local_stages(repo_path, inventory_name, workflow_name)
+            run_manifest = {
+                "run_id": run_id,
+                "branch": stage.get("branch"),
+                "commit": stage.get("commit"),
+                "action": inventory_name,
+                "workflow": workflow_name,
+                "active_stages": repo_stage_ids,
+                "origin_cfg": str(origin_cfg_path),
+                "runtime_context_file": str(runtime_context_path),
+                "runtime_context_keys": sorted(runtime_context),
+            }
+            logging.info(json.dumps(run_manifest, indent=4))
 
-        logging.info(" ".join(stage_run_cmd))
-        run_and_log(
-            stage_run_cmd,
-            cwd=repo_path,
-            env=stage_env,
-        )
+            if inventory_name in MUTATING_ACTIONS and not mutation_marked:
+                mark_mutation_started(run_dir, stage_id)
+                mutation_marked = True
+
+            for repo_stage in repo_stages:
+                repo_stage_id = repo_stage["id"]
+                repo_stage_path = repo_stage["path"]
+                log_stage_banner(f"[{inventory_name}] [{stage_id}] [{repo_stage_id}]", ch="-")
+                stage_run_cmd = [f"./{repo_stage_path}/run/{stage_runner_script}"]
+                repo_stage_env = dict(stage_env)
+                repo_stage_env.update(runtime_env)
+                repo_stage_env["ATLAS_RUNTIME_CONTEXT_FILE"] = RUNTIME_CONTEXT_FILENAME
+                repo_stage_env["cfg_files"] = json.dumps(repo_stage.get("cfg_files"))
+                repo_stage_env["STAGE_WRITE_VALUES_JSON"] = (
+                    "true" if repo_stage.get("runtime", {}).get("values_json", True) else "false"
+                )
+                repo_stage_env["STAGE_WRITE_ENV_SH"] = (
+                    "true" if repo_stage.get("runtime", {}).get("env_sh", True) else "false"
+                )
+                repo_stage_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
+                repo_stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
+
+                logging.info(" ".join(stage_run_cmd))
+                run_and_log(
+                    stage_run_cmd,
+                    cwd=repo_path,
+                    env=repo_stage_env,
+                )
+        finally:
+            repo_runtime_context_path = repo_path / RUNTIME_CONTEXT_FILENAME
+            if copied_runtime_context and repo_runtime_context_path.is_file():
+                repo_runtime_context_path.unlink()
 
 
 def print_run_summary(run_id: str, log_file: Path) -> None:
@@ -4406,7 +4549,7 @@ def run_maintenance(
         profile_only_aws_profile=profile_only_aws_profile,
     )
     run_and_log(
-        ["python3", "./atlas_ctl_adapter/stages/_common/assert_aws_access.py"],
+        ["python3", str(materialize_ctl_stage_runtime(run_dir) / "assert_aws_access.py")],
         cwd=repo_path,
         env=stage_env,
     )
@@ -4433,7 +4576,7 @@ def run_maintenance(
         "-lc",
         """
 set -euo pipefail
-source ./atlas_ctl_adapter/stages/_common/prepare_stage_runtime.sh
+source "$ATLAS_CTL_STAGE_RUNTIME_DIR/prepare_stage_runtime.sh"
 prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
 ./bin/tf.sh infra init "$TFSTATE_KEY_VAR"
 ./bin/tf.sh infra force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"

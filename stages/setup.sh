@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+: "${ATLAS_CTL_STAGE_RUNTIME_DIR:?must be set}"
+if [[ ! -d "$ATLAS_CTL_STAGE_RUNTIME_DIR" ]]; then
+  echo "❌ ATLAS_CTL_STAGE_RUNTIME_DIR not found: $ATLAS_CTL_STAGE_RUNTIME_DIR"
+  exit 1
+fi
+
 materialize_repo_ref() {
     local repo_path="${1:-}"
     local repo_url="${2:-}"
@@ -88,7 +94,7 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     stage_env_out="runtime/env.sh"
   fi
 
-  python3 ./atlas_ctl_adapter/stages/_common/build_runtime_cfg.py \
+  python3 "$ATLAS_CTL_STAGE_RUNTIME_DIR/build_runtime_cfg.py" \
     --origin-cfg-dir origin_cfg \
     --cfg-files "$cfg_files" \
     --values-json-out "$values_json_out" \

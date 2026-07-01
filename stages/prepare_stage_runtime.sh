@@ -10,5 +10,5 @@ prepare_stage_runtime() {
     cp -aL "$stage_cfg_dir"/. origin_cfg/
     export cfg_files="$cfg_files_json"
 
-    source ./atlas_ctl_adapter/stages/_common/setup.sh
+    source "${ATLAS_CTL_STAGE_RUNTIME_DIR:?must be set}/setup.sh"
 }
