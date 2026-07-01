@@ -14,6 +14,9 @@ VAR_NAME_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 PLACEHOLDER_RE = re.compile(rf"\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}")
 EXACT_PLACEHOLDER_RE = re.compile(rf"^\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}$")
 RUNTIME_CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CFG_ENTRY_REF_PREFIX = "cfg-entry-ref:"
+CFG_ENTRY_REF_KEY = "cfg_entry_ref"
+CFG_ENTRY_REF_COLLECTION_RE = re.compile(rf"^{VAR_NAME_RE}$")
 OMIT = object()
 
 
@@ -72,6 +75,79 @@ def merge_values(base, overlay):
                 merged[key] = value
         return merged
     return deepcopy(overlay)
+
+
+
+def format_cfg_path(path: tuple[str, ...]) -> str:
+    return ".".join(path) if path else "<root>"
+
+
+def parse_cfg_entry_ref(value: str, path: tuple[str, ...]) -> tuple[str, str]:
+    body = value[len(CFG_ENTRY_REF_PREFIX):]
+    if ":" not in body:
+        raise RuntimeError(
+            f"cfg entry reference at {format_cfg_path(path)} must use "
+            f"{CFG_ENTRY_REF_PREFIX}<collection>:<key>"
+        )
+    collection, key = body.rsplit(":", 1)
+    if not collection:
+        raise RuntimeError(f"cfg entry reference at {format_cfg_path(path)} has an empty collection path")
+    if not key or key != key.strip():
+        raise RuntimeError(f"cfg entry reference at {format_cfg_path(path)} has an empty or padded item key")
+    if not CFG_ENTRY_REF_COLLECTION_RE.fullmatch(collection):
+        raise RuntimeError(
+            f"cfg entry reference at {format_cfg_path(path)} has invalid collection path {collection!r}"
+        )
+    return collection, key
+
+
+def lookup_cfg_collection(root: dict, collection: str, path: tuple[str, ...]):
+    current = root
+    for part in collection.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise RuntimeError(
+                f"cfg entry reference at {format_cfg_path(path)} points to missing collection {collection!r}"
+            )
+        current = current[part]
+    if not isinstance(current, dict):
+        raise RuntimeError(
+            f"cfg entry reference at {format_cfg_path(path)} points to non-mapping collection {collection!r}"
+        )
+    return current
+
+
+def resolve_cfg_entry_refs(root: dict):
+    def resolve_value(value, path: tuple[str, ...]):
+        if isinstance(value, str):
+            if value.startswith(CFG_ENTRY_REF_PREFIX):
+                collection, key = parse_cfg_entry_ref(value, path)
+                collection_value = lookup_cfg_collection(root, collection, path)
+                if key not in collection_value:
+                    raise RuntimeError(
+                        f"cfg entry reference at {format_cfg_path(path)} points to missing item "
+                        f"{key!r} in collection {collection!r}"
+                    )
+                return {
+                    CFG_ENTRY_REF_KEY: {
+                        "collection": collection,
+                        "key": key,
+                    }
+                }
+            if CFG_ENTRY_REF_PREFIX in value:
+                raise RuntimeError(
+                    f"cfg entry reference at {format_cfg_path(path)} must be a whole scalar, not part of a string"
+                )
+            return value
+
+        if isinstance(value, list):
+            return [resolve_value(item, (*path, str(index))) for index, item in enumerate(value)]
+
+        if isinstance(value, dict):
+            return {key: resolve_value(item, (*path, str(key))) for key, item in value.items()}
+
+        return value
+
+    return resolve_value(root, ())
 
 
 def resolve_cfg_path(origin_cfg_dir: Path, key: str) -> Path:
@@ -262,6 +338,7 @@ def build_stage_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict
             continue
         resolved[key] = value
 
+    resolved = resolve_cfg_entry_refs(resolved)
     return resolved, merged_files
 
 

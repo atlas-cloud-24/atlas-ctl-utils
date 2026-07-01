@@ -2607,6 +2607,11 @@ def setup_run_dirs(
     logging.info(f"Using ctl_result_dir: {ctl_result_dir}")
     logging.info(f"Using run_dir: {run_dir}")
 
+    # Materialize the pinned ctl stage runtime once, up front — it is a run-scoped
+    # (workspace-scoped) precondition, not a per-stage step. Idempotent thereafter.
+    ctl_stage_runtime_dir = materialize_ctl_stage_runtime(run_dir)
+    logging.info(f"Using ctl stage runtime: {ctl_stage_runtime_dir}")
+
     artifacts_dir = run_dir / "artifacts"
     os.makedirs(artifacts_dir, exist_ok=True)
 
