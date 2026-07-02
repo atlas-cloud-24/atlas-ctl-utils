@@ -1985,6 +1985,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         type=parse_selector_arg,
         help="Plt selector in key=value form; repeatable",
     )
+    parser.add_argument(
+        "--skip-ctl-results-sync",
+        action="store_true",
+        help="Skip ctl results sync to the remote bucket; honored only when the "
+        "ctl_context results_sync policy is 'optional' (error under 'required')",
+    )
 
     if run_type == "workflow":
         _add_workflow_args(parser)
@@ -2843,6 +2849,7 @@ def mark_mutation_started(run_dir: Path, stage_id: str) -> None:
         write_current_status(run_dir, status)
         if status.get("status") == "in_progress":
             rewrite_in_progress_slot_if_present(run_dir, status)
+    ctl_results_push(f"mutation started ({stage_id})")
 
 
 def tail_log_lines(log_path: str | None, limit: int = 40) -> list[str]:
@@ -2885,12 +2892,14 @@ def print_failure_summary(payload: dict) -> None:
 
 
 def mark_run_succeeded(run_dir: Path) -> None:
-    payload = build_status_payload(run_dir, "ok")
+    payload = build_status_payload(run_dir, "ok", {"results_sync": ctl_results_sync_summary()})
     write_current_status(run_dir, payload)
     write_state_slot(run_dir, "committed", payload)
     remove_state_slot(run_dir, "in_progress")
     remove_state_slot(run_dir, "failed")
     mark_outdated_for_run(run_dir, include_current_result=False)
+    ctl_results_push("run succeeded")
+    ctl_results_remove_slots(run_dir, ("in_progress", "failed"))
 
 
 def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
@@ -2906,12 +2915,15 @@ def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
             },
             "log_path": metadata.get("log_path"),
             "tail_lines": extracted["tail_lines"],
+            "results_sync": ctl_results_sync_summary(),
         },
     )
     write_current_status(run_dir, payload)
     write_state_slot(run_dir, "failed", payload)
     remove_state_slot(run_dir, "in_progress")
     mark_outdated_for_run(run_dir, include_current_result=True)
+    ctl_results_push("run failed")
+    ctl_results_remove_slots(run_dir, ("in_progress",))
     print_failure_summary(payload)
 
 
@@ -4368,6 +4380,262 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
     )
 
 
+# ---------------------------------------------------------------------------
+# Ctl results sync (Phase 14): mirror the local ctl-results tree to a per-tier
+# S3 bucket. Local-first mechanics, remote system of record after final push.
+# ---------------------------------------------------------------------------
+
+CTL_RESULTS_SYNC_POLICIES = ("required", "optional", "disabled")
+
+
+def load_ctl_results_cfg(ctl_cfg_root: Path) -> dict | None:
+    """Load the optional ctl_results resource: backends -> {tier: {bucket_name, execution_identity_key}}."""
+    merged: dict = {}
+    for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_results"):
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ ctl_results must be a mapping: {path}")
+        unknown = set(section) - {"backends"}
+        if unknown:
+            raise RuntimeError(f"❌ ctl_results has unsupported keys {sorted(unknown)}: {path}")
+        backends = section.get("backends") or {}
+        if not isinstance(backends, dict):
+            raise RuntimeError(f"❌ ctl_results.backends must be a mapping: {path}")
+        for tier, backend in backends.items():
+            if tier not in ("env", "deployments"):
+                raise RuntimeError(f"❌ ctl_results backend tier must be env or deployments: {tier!r} in {path}")
+            if tier in merged:
+                raise RuntimeError(f"❌ duplicate ctl_results backend tier {tier!r}: {path}")
+            if not isinstance(backend, dict):
+                raise RuntimeError(f"❌ ctl_results.backends.{tier} must be a mapping: {path}")
+            unknown = set(backend) - {"bucket_name", "execution_identity_key"}
+            if unknown:
+                raise RuntimeError(f"❌ ctl_results.backends.{tier} has unsupported keys {sorted(unknown)}: {path}")
+            for field in ("bucket_name", "execution_identity_key"):
+                if not isinstance(backend.get(field), str) or not backend[field].strip():
+                    raise RuntimeError(f"❌ ctl_results.backends.{tier}.{field} must be a non-empty string: {path}")
+            merged[tier] = {"bucket_name": backend["bucket_name"].strip(),
+                            "execution_identity_key": backend["execution_identity_key"].strip()}
+    return merged or None
+
+
+def ctl_results_sync_policy(ctl_cfg_root: Path, ctl_context: str) -> str:
+    """Read the results_sync policy from the ctl_context entry; absent = disabled."""
+    context_cfg = ctl_selector_policy(ctl_cfg_root, ctl_context)
+    policy = context_cfg.get("results_sync", "disabled")
+    if policy not in CTL_RESULTS_SYNC_POLICIES:
+        raise RuntimeError(
+            f"❌ ctl_context {ctl_context!r} results_sync must be one of {CTL_RESULTS_SYNC_POLICIES}: {policy!r}"
+        )
+    return policy
+
+
+def resolve_ctl_results_backend(
+    ctl_results_cfg: dict,
+    plt_runtime_selectors: dict[str, str],
+    runtime_context: dict[str, object],
+) -> dict[str, str]:
+    """Pick the backend tier for this run and resolve its bucket name."""
+    tier = "env" if "env_type" in plt_runtime_selectors else "deployments"
+    backend = ctl_results_cfg.get(tier)
+    if backend is None:
+        raise RuntimeError(f"❌ ctl_results has no backend for tier {tier!r}")
+    bucket_name = resolve_runtime_scalar(
+        backend["bucket_name"],
+        runtime_context_env_values(runtime_context),
+        label=f"ctl_results.backends.{tier}.bucket_name",
+    )
+    return {
+        "tier": tier,
+        "bucket_name": str(bucket_name),
+        "execution_identity_key": backend["execution_identity_key"],
+    }
+
+
+class CtlResultsSyncer:
+    """Incremental mirror of the local ctl-results tree to the tier bucket.
+
+    Forward sync is add/update only — never deletes remote objects (the local
+    root is ephemeral; remote cleanup is bucket lifecycle rules only).
+    """
+
+    STATE_LAYER_INCLUDES = ("*/RUN.yaml", "*/STATUS.yaml", "*/MANIFEST.yaml")
+
+    def __init__(self, results_root: Path, bucket_name: str, aws_profile: str, *, required: bool):
+        self.results_root = Path(results_root).resolve()
+        self.bucket_name = bucket_name
+        self.aws_profile = aws_profile
+        self.required = required
+        self.state = "pending"
+        self.detail: str | None = None
+
+    def _aws_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["AWS_PROFILE"] = self.aws_profile
+        return env
+
+    def _run_aws(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["aws", *args],
+            env=self._aws_env(),
+            capture_output=True,
+            text=True,
+        )
+
+    def bucket_exists(self) -> bool:
+        result = self._run_aws(["s3api", "head-bucket", "--bucket", self.bucket_name])
+        return result.returncode == 0
+
+    def _fail(self, action: str, detail: str) -> None:
+        self.state = "failed"
+        self.detail = f"{action}: {detail}"
+        message = f"ctl results sync {action} failed for s3://{self.bucket_name}: {detail}"
+        if self.required:
+            raise RuntimeError(f"❌ {message}")
+        logging.warning("%s (results_sync policy is not required; continuing)", message)
+
+    def pull_state_layer(self) -> None:
+        """Reverse sync: hydrate slots + RUN/STATUS/MANIFEST from the bucket (small files only)."""
+        args = ["s3", "sync", f"s3://{self.bucket_name}", str(self.results_root), "--exclude", "*"]
+        for pattern in self.STATE_LAYER_INCLUDES:
+            args += ["--include", pattern]
+        result = self._run_aws(args)
+        if result.returncode != 0:
+            self._fail("state pull", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
+        else:
+            logging.info("Ctl results state layer pulled from s3://%s", self.bucket_name)
+
+    def push(self, reason: str) -> None:
+        """Forward incremental mirror of the whole local results tree (never deletes)."""
+        result = self._run_aws(["s3", "sync", str(self.results_root), f"s3://{self.bucket_name}", "--no-progress"])
+        if result.returncode != 0:
+            self._fail(f"push ({reason})", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
+        else:
+            self.state = "synced"
+            self.detail = reason
+            logging.info("Ctl results synced to s3://%s (%s)", self.bucket_name, reason)
+
+    def remove_prefix(self, rel_prefix: str) -> None:
+        """Explicit slot-transition removal of one remote prefix.
+
+        Distinct from the mirror (which never deletes): state slots are
+        pointers, and a slot removed locally must not linger remotely.
+        """
+        result = self._run_aws(
+            ["s3", "rm", f"s3://{self.bucket_name}/{rel_prefix.strip('/')}", "--recursive"]
+        )
+        if result.returncode != 0:
+            self._fail(f"slot removal ({rel_prefix})", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
+
+    def summary(self) -> dict[str, str]:
+        payload = {"mode": "enabled", "bucket": self.bucket_name, "state": self.state}
+        if self.detail:
+            payload["detail"] = self.detail
+        return payload
+
+
+_CTL_RESULTS_SYNCER: CtlResultsSyncer | None = None
+_CTL_RESULTS_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
+
+
+def configure_ctl_results_sync(
+    ctl_cfg_root: Path,
+    ctl_context: str,
+    plt_runtime_selectors: dict[str, str],
+    runtime_context: dict[str, object],
+    run_dir: Path,
+    *,
+    skip_ctl_results_sync: bool,
+    execution_identities: dict | None = None,
+    aws_access_contexts: dict | None = None,
+    aws_implementation_key: str = "local",
+) -> dict[str, str] | None:
+    """Resolve backend + policy, hydrate state, and arm the global syncer.
+
+    Returns the resolved backend (for runtime-context injection) or None when
+    the consumer defines no ctl_results resource. Policy semantics: `required`
+    rejects --skip-ctl-results-sync; `optional` honors it; `disabled` never syncs.
+    """
+    global _CTL_RESULTS_SYNCER, _CTL_RESULTS_SYNC_NOTE
+    _CTL_RESULTS_SYNCER = None
+    _CTL_RESULTS_SYNC_NOTE = {"mode": "disabled"}
+
+    ctl_results_cfg = load_ctl_results_cfg(ctl_cfg_root)
+    if ctl_results_cfg is None:
+        if skip_ctl_results_sync:
+            logging.info("--skip-ctl-results-sync has no effect: no ctl_results resource defined")
+        return None
+
+    backend = resolve_ctl_results_backend(ctl_results_cfg, plt_runtime_selectors, runtime_context)
+
+    policy = ctl_results_sync_policy(ctl_cfg_root, ctl_context)
+    if policy == "required" and skip_ctl_results_sync:
+        raise RuntimeError("❌ --skip-ctl-results-sync is not allowed: ctl_context results_sync policy is 'required'")
+    if policy == "disabled" or (policy == "optional" and skip_ctl_results_sync):
+        _CTL_RESULTS_SYNC_NOTE = {"mode": "skipped", "reason": "policy" if policy == "disabled" else "flag"}
+        return backend
+
+    identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
+    contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
+    resolved = resolve_stage_aws_access(
+        {"execution_identity_key": backend["execution_identity_key"]},
+        identities,
+        contexts,
+        runtime_context=runtime_context,
+        implementation_key=aws_implementation_key,
+    )
+    if not resolved or not resolved.get("profile_name"):
+        raise RuntimeError(
+            f"❌ ctl results writer identity {backend['execution_identity_key']!r} did not resolve to an AWS profile"
+        )
+
+    results_root_value = load_run_metadata(run_dir).get("ctl_results_root")
+    if not isinstance(results_root_value, str) or not results_root_value:
+        raise RuntimeError("❌ run metadata is missing ctl_results_root; cannot sync results")
+
+    syncer = CtlResultsSyncer(
+        Path(results_root_value),
+        backend["bucket_name"],
+        resolved["profile_name"],
+        required=(policy == "required"),
+    )
+    if not syncer.bucket_exists():
+        note = {"mode": "skipped", "reason": "bucket_missing", "bucket": backend["bucket_name"]}
+        if policy == "required":
+            logging.warning(
+                "ctl results bucket s3://%s not found; results stay local (bootstrap tier?)",
+                backend["bucket_name"],
+            )
+        _CTL_RESULTS_SYNC_NOTE = note
+        return backend
+
+    syncer.pull_state_layer()
+    _CTL_RESULTS_SYNCER = syncer
+    _CTL_RESULTS_SYNC_NOTE = syncer.summary()
+    syncer.push("run started")
+    return backend
+
+
+def ctl_results_push(reason: str) -> None:
+    if _CTL_RESULTS_SYNCER is not None:
+        _CTL_RESULTS_SYNCER.push(reason)
+
+
+def ctl_results_remove_slots(run_dir: Path, states: tuple[str, ...]) -> None:
+    """Remove stale remote state-slot prefixes after a local slot transition."""
+    if _CTL_RESULTS_SYNCER is None:
+        return
+    result_dir = ctl_result_dir_from_run_dir(run_dir)
+    rel_result = result_dir.resolve().relative_to(_CTL_RESULTS_SYNCER.results_root).as_posix()
+    for state in states:
+        _CTL_RESULTS_SYNCER.remove_prefix(f"{rel_result}/{state}")
+
+
+def ctl_results_sync_summary() -> dict[str, str]:
+    if _CTL_RESULTS_SYNCER is not None:
+        return _CTL_RESULTS_SYNCER.summary()
+    return dict(_CTL_RESULTS_SYNC_NOTE)
+
+
 def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, runtime_context_path: Path) -> Path:
     """Render merged/ into rendered/ (whole-scope, engine-volatile keys kept verbatim)."""
     plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
@@ -4764,6 +5032,7 @@ def run_stages(
                     cwd=repo_path,
                     env=repo_stage_env,
                 )
+            ctl_results_push(f"stage {stage_id} completed")
         finally:
             repo_runtime_context_path = repo_path / RUNTIME_CONTEXT_FILENAME
             if copied_runtime_context and repo_runtime_context_path.is_file():
@@ -4799,6 +5068,7 @@ def run_maintenance(
     plt_merged_dir: Path,
     log_file: Path,
     profile_only_aws_profile: str | None,
+    skip_ctl_results_sync: bool = False,
 ) -> None:
     """Run a maintenance action against a single stage target."""
     if maintenance_action == "force-unlock" and force_unlock_ctl_results_lock(ctl_results_root, lock_id, run_dir):
@@ -4811,6 +5081,17 @@ def run_maintenance(
         runtime_selector_maps,
         base_values={"run_id": run_id},
     )
+    ctl_results_backend = configure_ctl_results_sync(
+        ctl_cfg_root,
+        ctl_context,
+        plt_runtime_selectors,
+        runtime_context,
+        run_dir,
+        skip_ctl_results_sync=skip_ctl_results_sync,
+        aws_implementation_key=aws_implementation_key,
+    )
+    if ctl_results_backend is not None:
+        runtime_context["ctl_results_s3_bucket_name"] = ctl_results_backend["bucket_name"]
     runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
@@ -5023,6 +5304,7 @@ def run_pipeline(
     profile_only_aws_profile: str | None,
     target_name: str | None = None,
     sub_workflow_run: dict | None = None,
+    skip_ctl_results_sync: bool = False,
 ) -> None:
     """
     Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
@@ -5036,6 +5318,20 @@ def run_pipeline(
         runtime_selector_maps,
         base_values={"run_id": run_id},
     )
+    # Ctl results backend: resolve + arm sync (pulls remote state layer), and
+    # inject the ctl-owned bucket name into plt processing (ctl→plt injection)
+    # so bucket-creating bootstrap stages consume it as a TF input.
+    ctl_results_backend = configure_ctl_results_sync(
+        ctl_cfg_root,
+        ctl_context,
+        plt_runtime_selectors,
+        runtime_context,
+        run_dir,
+        skip_ctl_results_sync=skip_ctl_results_sync,
+        aws_implementation_key=aws_implementation_key,
+    )
+    if ctl_results_backend is not None:
+        runtime_context["ctl_results_s3_bucket_name"] = ctl_results_backend["bucket_name"]
     runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
@@ -5151,6 +5447,8 @@ def run_pipeline(
     plt_stages_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path, plt_rendered_dir, run_dir
     )
+    # Prepared snapshot: cfg layers + run-level metadata are immutable from here.
+    ctl_results_push("preparation complete")
 
     # Run stages
     run_stages(
