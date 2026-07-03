@@ -18,11 +18,11 @@ run_local_stage() {
     exit 1
   fi
 
-  : "${ATLAS_CTL_STAGE_RUNTIME_DIR:?must be set}"
-  local ctl_stage_runtime_dir_host
-  ctl_stage_runtime_dir_host="$(realpath "$ATLAS_CTL_STAGE_RUNTIME_DIR")"
-  if [[ ! -d "$ctl_stage_runtime_dir_host" ]]; then
-    echo "❌ ATLAS_CTL_STAGE_RUNTIME_DIR not found: $ctl_stage_runtime_dir_host"
+  : "${ATLAS_STAGE_UTILS_DIR:?must be set}"
+  local stage_utils_dir_host
+  stage_utils_dir_host="$(realpath "$ATLAS_STAGE_UTILS_DIR")"
+  if [[ ! -d "$stage_utils_dir_host/ctl" ]]; then
+    echo "❌ ATLAS_STAGE_UTILS_DIR/ctl not found: $stage_utils_dir_host/ctl"
     exit 1
   fi
 
@@ -99,10 +99,10 @@ run_local_stage() {
     --entrypoint sh \
     -v "$PWD:/mnt/source:ro" \
     -v "$(realpath "$origin_cfg_base_dir_path"):/mnt/origin_cfg:ro" \
-    -v "$ctl_stage_runtime_dir_host:/mnt/ctl_runtime:ro" \
+    -v "$stage_utils_dir_host:/mnt/stage_utils:ro" \
     -v "$HOME/.aws:/root/.aws:ro" \
-    -e ATLAS_RUNTIME_CONTEXT_FILE \
-    -e ATLAS_CTL_STAGE_RUNTIME_DIR=/mnt/ctl_runtime \
+    -e ATLAS_EXECUTION_CONTEXT_FILE \
+    -e ATLAS_STAGE_UTILS_DIR=/mnt/stage_utils \
     -e stage_dir="$stage_dir" \
     -e cfg_files \
     -e STAGE_WRITE_VALUES_JSON \
@@ -130,7 +130,7 @@ run_local_stage() {
       cd "$GITHUB_WORKSPACE"
 
       if [ "${ATLAS_AWS_ASSERT_ACCESS}" = "true" ]; then
-        python3 "$ATLAS_CTL_STAGE_RUNTIME_DIR/assert_aws_access.py"
+        python3 "${ATLAS_STAGE_UTILS_DIR}/ctl/assert_aws_access.py"
       fi
 
       exec "./${stage_dir}/src/stage.sh"

@@ -25,7 +25,7 @@ def make_plt_tree(root: Path, *, baseline_hash: str | None, declared: bool = Tru
         )
     write(
         plt / "env" / "dev" / common.SCOPE_META_FILENAME,
-        "type: scope\ntarget_path: /env\nidentity_selectors:\n  env_type: dev\nimports: []\n",
+        "type: scope\ntarget_path: /env\nscope_identity:\n  env_type: dev\nimports: []\n",
     )
     if baseline_hash is not None:
         write(
@@ -44,7 +44,7 @@ class CtlGuardrailTests(unittest.TestCase):
             expected = common.guard_value_hash("oxygen", label="test")
             write(root / "not-a-special-name.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
 
-            common.verify_ctl_guardrails(root, {"main_tag": "oxygen"})
+            common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
 
     def test_ctl_guardrails_reject_changed_value(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,7 +53,7 @@ class CtlGuardrailTests(unittest.TestCase):
             write(root / "guardrails.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
 
             with self.assertRaisesRegex(RuntimeError, "guarded ctl var .*main_tag.* changed"):
-                common.verify_ctl_guardrails(root, {"main_tag": "argon"})
+                common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "argon"})
 
 
 class PltGuardrailTests(unittest.TestCase):
@@ -163,12 +163,12 @@ class PltGuardrailTests(unittest.TestCase):
             write(plt / "_common" / "all" / "notes.md", "not cfg\n")
             write(
                 plt / "env" / "dev" / common.SCOPE_META_FILENAME,
-                "type: scope\ntarget_path: /env\nidentity_selectors:\n  env_type: dev\n"
+                "type: scope\ntarget_path: /env\nscope_identity:\n  env_type: dev\n"
                 "imports:\n  - /_common/all\n",
             )
 
             with self.assertRaisesRegex(RuntimeError, "at least one yaml cfg file"):
-                common.discover_active_cfg_scopes(plt, plt_runtime_selectors={"env_type": "dev"})
+                common.discover_active_cfg_scopes(plt, scope_params={"env_type": "dev"})
 
     def test_scope_meta_rejects_legacy_selectors_field(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,8 +178,8 @@ class PltGuardrailTests(unittest.TestCase):
                 "type: scope\ntarget_path: /env\nselectors:\n  env_type: dev\nimports: []\n",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "identity_selectors"):
-                common.discover_active_cfg_scopes(plt, plt_runtime_selectors={"env_type": "dev"})
+            with self.assertRaisesRegex(RuntimeError, "scope_identity"):
+                common.discover_active_cfg_scopes(plt, scope_params={"env_type": "dev"})
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ATLAS_CTL_STAGE_RUNTIME_DIR:?must be set}"
-if [[ ! -d "$ATLAS_CTL_STAGE_RUNTIME_DIR" ]]; then
-  echo "❌ ATLAS_CTL_STAGE_RUNTIME_DIR not found: $ATLAS_CTL_STAGE_RUNTIME_DIR"
+: "${ATLAS_STAGE_UTILS_DIR:?must be set}"
+if [[ ! -d "$ATLAS_STAGE_UTILS_DIR" ]]; then
+  echo "❌ ATLAS_STAGE_UTILS_DIR not found: $ATLAS_STAGE_UTILS_DIR"
   exit 1
 fi
 
@@ -79,11 +79,11 @@ stage_env_out="-"
 
 if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]; then
   mkdir -p runtime
-  : "${ATLAS_RUNTIME_CONTEXT_FILE:?must be set}"
-  runtime_context_file="$ATLAS_RUNTIME_CONTEXT_FILE"
+  : "${ATLAS_EXECUTION_CONTEXT_FILE:?must be set}"
+  execution_context_file="$ATLAS_EXECUTION_CONTEXT_FILE"
 
-  if [[ ! -f "$runtime_context_file" ]]; then
-    echo "❌ runtime context file not found: $runtime_context_file"
+  if [[ ! -f "$execution_context_file" ]]; then
+    echo "❌ execution context file not found: $execution_context_file"
     exit 1
   fi
 
@@ -94,12 +94,12 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     stage_env_out="runtime/env.sh"
   fi
 
-  python3 "$ATLAS_CTL_STAGE_RUNTIME_DIR/build_runtime_cfg.py" \
+  python3 "${ATLAS_STAGE_UTILS_DIR}/ctl/build_runtime_cfg.py" \
     --origin-cfg-dir origin_cfg \
     --cfg-files "$cfg_files" \
     --values-json-out "$values_json_out" \
     --stage-env-out "$stage_env_out" \
-    --runtime-context-file "$runtime_context_file"
+    --execution-context-file "$execution_context_file"
 
   echo "✅ cfg artifacts generated:"
   if [[ "$stage_write_values_json" == "true" ]]; then

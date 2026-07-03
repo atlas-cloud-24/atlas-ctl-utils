@@ -14,7 +14,7 @@ from utils import common  # noqa: E402
 
 assert_spec = importlib.util.spec_from_file_location(
     "assert_aws_access",
-    REPO_ROOT / "stages" / "assert_aws_access.py",
+    REPO_ROOT / "stage_utils" / "assert_aws_access.py",
 )
 assert_aws_access = importlib.util.module_from_spec(assert_spec)
 assert_spec.loader.exec_module(assert_aws_access)
@@ -26,19 +26,19 @@ class AwsAccessResolutionTests(unittest.TestCase):
         self.levels = {
             "org_admin": {
                 "local": {
-                    "profile_name": "${main_tag}-org-admin",
+                    "profile_name": "${execution_context.params.main_tag}-org-admin",
                     "expect": {"permission_set_name": "AdministratorAccess"},
                 }
             },
             "non_prod_deploy": {
                 "local": {
-                    "profile_name": "${main_tag}-${env_type}-deploy",
+                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env_type}-deploy",
                     "expect": {"permission_set_name": "NonProdDeploy"},
                 }
             },
             "non_prod_readonly": {
                 "local": {
-                    "profile_name": "${main_tag}-${env_type}-readonly",
+                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env_type}-readonly",
                     "expect": {"permission_set_name": "ReadOnlyAccess"},
                 }
             },
@@ -51,12 +51,12 @@ class AwsAccessResolutionTests(unittest.TestCase):
             },
             "env_deploy": {
                 "provider": "aws",
-                "account_key": "${env_type}",
+                "account_key": "${execution_context.params.env_type}",
                 "access_context_key": "non_prod_deploy",
             },
             "env_readonly": {
                 "provider": "aws",
-                "account_key": "${env_type}",
+                "account_key": "${execution_context.params.env_type}",
                 "access_context_key": "non_prod_readonly",
             },
         }
@@ -74,7 +74,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
             )
 
@@ -105,7 +105,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     },
                     self.identities,
                     self.levels,
-                    runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                    execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                     implementation_key="local",
                 )
 
@@ -122,7 +122,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
             )
         self.assertEqual(resolved["profile_name"], "oxygen-org-admin")
@@ -135,7 +135,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 {"execution_identity_key": "missing"},
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
             )
 
@@ -148,15 +148,15 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 },
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="ci",
             )
 
     def test_unknown_runtime_placeholder_fails(self):
-        with self.assertRaisesRegex(RuntimeError, "unavailable runtime value"):
+        with self.assertRaisesRegex(RuntimeError, "not found in execution context"):
             common.resolve_runtime_scalar(
                 "${unknown}_deploy",
-                {"main_tag": "oxygen", "env_type": "dev"},
+                {"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 label="test",
             )
 
@@ -180,7 +180,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     stages,
                     self.identities,
                     self.levels,
-                    runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                    execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                     implementation_key="local",
                 )
 
@@ -199,7 +199,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stage_env,
             self.identities,
             self.levels,
-            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+            execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             implementation_key="local",
             account_registry={},
         )
@@ -215,7 +215,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             {},
             self.identities,
             self.levels,
-            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+            execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
         )
@@ -227,7 +227,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             {},
             self.identities,
             self.levels,
-            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+            execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
             profile_only_aws_profile="legacy-dev-profile",
@@ -245,7 +245,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stage_env,
             self.identities,
             self.levels,
-            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+            execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             implementation_key="local",
             account_registry={},
             allow_profile_only=True,
@@ -266,7 +266,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
@@ -279,7 +279,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
@@ -292,7 +292,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 stages,
                 self.identities,
                 self.levels,
-                runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+                execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
                 allow_profile_only=True,
             )
@@ -303,7 +303,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             stages,
             self.identities,
             self.levels,
-            runtime_context={"main_tag": "oxygen", "env_type": "dev"},
+            execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             implementation_key="local",
             allow_profile_only=True,
             profile_only_aws_profile="legacy-dev-profile",

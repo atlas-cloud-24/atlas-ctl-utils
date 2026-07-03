@@ -74,12 +74,12 @@ SERVICE_ID = "atlas-ctl-orchestrator-local"
 CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
 CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
 RUN_METADATA_FILENAME = "RUN.yaml"
-RUNTIME_CONTEXT_FILENAME = "runtime_context.yaml"
+EXECUTION_CONTEXT_FILENAME = "execution_context.yaml"
 
 # Context keys the engine injects fresh per run. They are withheld from
 # render-time interpolation (kept verbatim in rendered/) and resolve at the
 # per-stage resolved/ step, keeping rendered/ deterministic on the engine side.
-ENGINE_VOLATILE_CONTEXT_KEYS = ("run_id",)
+ENGINE_VOLATILE_CONTEXT_KEYS = ()  # empty hook: no per-run volatile context facts today
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 PLT_GUARDRAILS_DIRNAME = "__guardrails__"
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
@@ -249,120 +249,43 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
     return sections
 
 
-def load_selector_registry(cfg_root: Path, owner: str) -> dict:
-    """Load selector vocabulary owned by ctl or plt cfg.
-
-    Ctl selector values can carry policy metadata, so ctl discovers top-level
-    selectors.<selector>.<value> mappings by scanning ctl cfg files. Plt selector
-    vocabulary is cfg-root/global metadata stored in __cfg__.yaml as
-    selector_registry.<selector> lists and normalized to the same internal mapping
-    shape for callers.
-    """
-    if owner == "ctl":
-        registry: dict = {}
-        for registry_path, section in collect_top_level_sections(cfg_root, "selectors"):
-            if not isinstance(section, dict):
-                raise RuntimeError(f"❌ selectors must be a mapping: {registry_path}")
-            for selector_key, values in section.items():
-                if selector_key in registry:
-                    raise RuntimeError(f"❌ duplicate selector registry {selector_key!r}: {registry_path}")
-                registry[selector_key] = values
-
-        for selector_key, values in registry.items():
-            if not isinstance(selector_key, str) or not selector_key.strip():
-                raise RuntimeError(f"❌ selector registry keys must be non-empty strings: {cfg_root}")
-            if not isinstance(values, dict) or not values:
-                raise RuntimeError(
-                    f"❌ selector registry {selector_key} must map allowed values to policy mappings: {cfg_root}"
-                )
-            for selector_value, policy in values.items():
-                if not isinstance(selector_value, str) or not selector_value.strip():
-                    raise RuntimeError(
-                        f"❌ selector registry {selector_key} values must be non-empty strings: {cfg_root}"
-                    )
-                if policy is not None and not isinstance(policy, dict):
-                    raise RuntimeError(
-                        f"❌ selector registry {selector_key}.{selector_value} policy must be a mapping: {cfg_root}"
-                    )
-        return registry
-
-    if owner == "plt":
-        meta_path = cfg_root / CFG_ROOT_META_FILENAME
-        meta = load_cfg_root_meta(cfg_root)
-        registry = meta.get("selector_registry") or {}
-        if not isinstance(registry, dict):
-            raise RuntimeError(f"❌ selector_registry must be a mapping: {meta_path}")
-
-        normalized: dict[str, dict[str, dict]] = {}
-        for selector_key, values in registry.items():
-            if not isinstance(selector_key, str) or not selector_key.strip():
-                raise RuntimeError(f"❌ selector_registry keys must be non-empty strings: {meta_path}")
-            if not isinstance(values, list) or not values:
-                raise RuntimeError(
-                    f"❌ selector_registry.{selector_key} must be a non-empty list of allowed values: {meta_path}"
-                )
-            normalized_values: dict[str, dict] = {}
-            for selector_value in values:
-                if not isinstance(selector_value, str) or not selector_value.strip():
-                    raise RuntimeError(
-                        f"❌ selector_registry.{selector_key} values must be non-empty strings: {meta_path}"
-                    )
-                if selector_value in normalized_values:
-                    raise RuntimeError(
-                        f"❌ duplicate selector_registry.{selector_key} value {selector_value!r}: {meta_path}"
-                    )
-                normalized_values[selector_value] = {}
-            normalized[selector_key] = normalized_values
-        return normalized
-
-    raise RuntimeError(f"❌ unknown selector registry owner {owner!r}")
+def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
+    """Load the ctl profile catalog (content key: ctl_profiles) — named policy
+    bundles governing ctl behavior (ref_policy, allow_aws_profile_only,
+    results_sync, ...)."""
+    profiles: dict[str, dict] = {}
+    for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
+        if not isinstance(section, dict):
+            raise RuntimeError(f"❌ ctl_profiles must be a mapping: {path}")
+        for profile_name, policy in section.items():
+            if profile_name in profiles:
+                raise RuntimeError(f"❌ duplicate ctl profile {profile_name!r}: {path}")
+            if not isinstance(profile_name, str) or not profile_name.strip():
+                raise RuntimeError(f"❌ ctl profile names must be non-empty strings: {path}")
+            if policy is not None and not isinstance(policy, dict):
+                raise RuntimeError(f"❌ ctl profile {profile_name!r} policy must be a mapping: {path}")
+            profiles[profile_name] = policy or {}
+    return profiles
 
 
-def selector_policy(registry: dict, selector_key: str, selector_value: str, *, owner: str) -> dict:
-    values = registry.get(selector_key)
-    if not isinstance(values, dict) or selector_value not in values:
-        raise RuntimeError(f"❌ unknown {owner} selector value {selector_key}={selector_value!r}")
-    policy = values.get(selector_value) or {}
-    if not isinstance(policy, dict):
-        raise RuntimeError(f"❌ {owner} selector policy for {selector_key}={selector_value!r} must be a mapping")
-    return policy
+def ctl_profile_policy(ctl_cfg_root: Path, ctl_profile: str) -> dict:
+    profiles = load_ctl_profiles(ctl_cfg_root)
+    if ctl_profile not in profiles:
+        known = ", ".join(sorted(profiles)) or "none"
+        raise RuntimeError(f"❌ unknown ctl profile {ctl_profile!r}; known profiles: {known}")
+    return profiles[ctl_profile]
 
 
-def validate_runtime_selectors_against_registry(
-    runtime_selectors: dict[str, str],
-    registry: dict,
-    *,
-    owner: str,
-) -> None:
-    for selector_key, selector_value in runtime_selectors.items():
-        values = registry.get(selector_key)
-        if not isinstance(values, dict):
-            known = ", ".join(sorted(registry)) or "none"
-            raise RuntimeError(
-                f"❌ unknown {owner} selector {selector_key!r}; known {owner} selectors: {known}"
-            )
-        if selector_value not in values:
-            allowed = ", ".join(sorted(values)) or "none"
-            raise RuntimeError(
-                f"❌ invalid {owner} selector {selector_key}={selector_value!r}; allowed values: {allowed}"
-            )
-
-
-def ctl_selector_policy(ctl_cfg_root: Path, ctl_context: str) -> dict:
-    registry = load_selector_registry(ctl_cfg_root, "ctl")
-    return selector_policy(registry, "ctl_context", ctl_context, owner="ctl")
-
-
-def ctl_ref_policy(ctl_cfg_root: Path, ctl_context: str) -> str:
-    policy = ctl_selector_policy(ctl_cfg_root, ctl_context)
+def ctl_ref_policy(ctl_cfg_root: Path, ctl_profile: str) -> str:
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     ref_policy = policy.get("ref_policy")
     if not isinstance(ref_policy, str) or not ref_policy.strip():
-        raise RuntimeError(f"❌ ctl selector ctl_context={ctl_context!r} must define non-empty ref_policy")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} must define non-empty ref_policy")
     return ref_policy.strip()
 
 
-def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_context: str) -> bool:
-    policy = ctl_selector_policy(ctl_cfg_root, ctl_context)
+def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     return policy.get("allow_aws_profile_only") is True
 
 
@@ -394,46 +317,27 @@ def load_selector_bindings(ctl_cfg_root: Path) -> list[dict]:
     return bindings
 
 
-def validate_selector_bindings(ctl_cfg_root: Path, selector_maps: dict[str, dict[str, str]]) -> None:
+def validate_selector_bindings(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
     for idx, binding in enumerate(load_selector_bindings(ctl_cfg_root), start=1):
         when = binding.get("when") or {}
-        if not selector_matches(when, selector_maps, label=f"selector_bindings[{idx}].when"):
+        if not selector_matches(when, execution_context, label=f"selector_bindings[{idx}].when"):
             continue
 
-        for selector_ref in binding.get("require_selectors") or []:
-            found, _, _, _ = selector_value_from_maps(selector_ref, selector_maps)
-            if not found:
+        for ref in binding.get("require_selectors") or []:
+            validate_execution_context_ref(ref, label=f"selector_bindings[{idx}].require_selectors")
+            if ref not in execution_context:
                 raise RuntimeError(
-                    f"❌ selector binding #{idx} requires selector {selector_ref!r} when {when} matches"
+                    f"❌ selector binding #{idx} requires {ref!r} when {when} matches; "
+                    f"{execution_context_miss_message(execution_context, ref)}"
                 )
 
-        for selector_ref, expected in (binding.get("allowed_values") or {}).items():
-            allowed = selector_expected_values(expected, label=f"selector_bindings[{idx}].allowed_values.{selector_ref}")
-            found, actual, _, _ = selector_value_from_maps(selector_ref, selector_maps)
-            if found and actual not in allowed:
+        for ref, expected in (binding.get("allowed_values") or {}).items():
+            validate_execution_context_ref(ref, label=f"selector_bindings[{idx}].allowed_values")
+            allowed = selector_expected_values(expected, label=f"selector_bindings[{idx}].allowed_values.{ref}")
+            if ref in execution_context and str(execution_context[ref]) not in allowed:
                 raise RuntimeError(
-                    f"❌ selector binding #{idx} allows {selector_ref} only in {allowed}, got {actual!r}"
+                    f"❌ selector binding #{idx} allows {ref} only in {allowed}, got {execution_context[ref]!r}"
                 )
-
-
-def validate_runtime_selector_state(
-    ctl_cfg_root: Path,
-    plt_cfg_root: Path,
-    *,
-    action: str,
-    ctl_runtime_selectors: dict[str, str],
-    plt_runtime_selectors: dict[str, str],
-) -> None:
-    ctl_registry = load_selector_registry(ctl_cfg_root, "ctl")
-    plt_registry = load_selector_registry(plt_cfg_root, "plt")
-    validate_runtime_selectors_against_registry(ctl_runtime_selectors, ctl_registry, owner="ctl")
-    validate_runtime_selectors_against_registry(plt_runtime_selectors, plt_registry, owner="plt")
-    # `action` is the operation verb, not a declared selector; it is exposed to bindings
-    # only so consumer cfg can gate actions (e.g. no destroy in prod) generically.
-    validate_selector_bindings(
-        ctl_cfg_root,
-        {"ctl": {**ctl_runtime_selectors, "action": action}, "plt": plt_runtime_selectors},
-    )
 
 def normalize_ctl_results_root(value: str) -> Path:
     """Normalize the operator-provided ctl results root directory."""
@@ -454,10 +358,8 @@ def normalize_optional_aws_profile(value: str | None) -> str | None:
 
 
 def finalize_common_args(args: argparse.Namespace) -> None:
-    """Normalize split selector CLI into runtime maps and common selector values."""
-    args.plt_runtime_selectors = selectors_to_map(args.plt_selector, label="plt")
-    args.ctl_runtime_selectors = selectors_to_map(args.ctl_selector, label="ctl")
-    args.ctl_context = require_selector(args.ctl_runtime_selectors, "ctl_context", label="ctl")
+    """Normalize execution-params CLI args into a map and common values."""
+    args.execution_params = selectors_to_map(args.execution_param, label="execution param")
     args.ctl_results_root = normalize_ctl_results_root(args.ctl_results_root)
     args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
     args.run_id = generate_uuid7()
@@ -899,7 +801,7 @@ def build_active_stages(
     repo_key: str = "repo_url",
     require_branch_or_commit: bool = True,
     refs: dict | None = None,
-    runtime_context: dict[str, object] | None = None,
+    execution_context: dict[str, object] | None = None,
     require_commit_refs: bool = False,
 ) -> dict:
     inventory_stage_sources = inventory_cfg.get("stage_sources", {})
@@ -912,7 +814,7 @@ def build_active_stages(
 
     refs = refs or {}
     scoped_refs = refs.get("scoped") or {}
-    ref_context_values = runtime_context or {}
+    ref_context_values = execution_context or {}
     active = {}
 
     def normalize_cfg_root(raw_value, *, stage_target: str) -> str:
@@ -1277,19 +1179,22 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
     return sel
 
 
-def resolve_runtime_scalar(value, context: dict[str, str], *, label: str) -> str:
-    """Resolve ${name} placeholders from explicit runner context."""
+def resolve_runtime_scalar(value, context: dict[str, object], *, label: str) -> str:
+    """Resolve ${execution_context.<ns>.<key>} placeholders from the flat
+    execution context (dotted keys)."""
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"❌ {label} must be a non-empty string")
 
-    token_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+    token_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
         resolved = context.get(key)
-        if not isinstance(resolved, str) or not resolved:
-            raise RuntimeError(f"❌ {label} references unavailable runtime value {key!r}")
-        return resolved
+        if resolved is None or str(resolved) == "":
+            raise RuntimeError(
+                f"❌ {label}: {execution_context_miss_message(context, key)}"
+            )
+        return str(resolved)
 
     resolved = token_re.sub(replace, value.strip())
     if "${" in resolved:
@@ -1504,7 +1409,7 @@ def resolve_stage_aws_access(
     execution_identities: dict,
     aws_access_contexts: dict,
     *,
-    runtime_context: dict[str, object],
+    execution_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str] | None = None,
     allow_profile_only: bool = False,
@@ -1545,7 +1450,7 @@ def resolve_stage_aws_access(
     raw_account_key = identity_cfg.get("account_key")
     raw_access_context_key = identity_cfg.get("access_context_key")
 
-    context = dict(runtime_context)
+    context = dict(execution_context)
     account_key = resolve_runtime_scalar(
         raw_account_key,
         context,
@@ -1684,7 +1589,7 @@ def validate_active_stage_aws_access(
     execution_identities: dict,
     aws_access_contexts: dict,
     *,
-    runtime_context: dict[str, object],
+    execution_context: dict[str, object],
     implementation_key: str,
     allow_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
@@ -1701,7 +1606,7 @@ def validate_active_stage_aws_access(
             stage,
             execution_identities,
             aws_access_contexts,
-            runtime_context=runtime_context,
+            execution_context=execution_context,
             implementation_key=implementation_key,
             allow_profile_only=allow_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
@@ -1743,7 +1648,7 @@ def configure_stage_aws_env(
     execution_identities: dict,
     aws_access_contexts: dict,
     *,
-    runtime_context: dict[str, object],
+    execution_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str],
     allow_profile_only: bool = False,
@@ -1760,7 +1665,7 @@ def configure_stage_aws_env(
         stage,
         execution_identities,
         aws_access_contexts,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
         allow_profile_only=allow_profile_only,
@@ -1965,12 +1870,9 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Optional comma-separated plt overlay names",
     )
     parser.add_argument(
-        "--ctl-selector",
+        "--ctl-profile",
         required=True,
-        action="append",
-        default=[],
-        type=parse_selector_arg,
-        help="Ctl selector in key=value form; repeatable",
+        help="Ctl profile name (named policy bundle from the ctl_profiles catalog)",
     )
     parser.add_argument(
         "--action",
@@ -1979,17 +1881,18 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Lifecycle action (provision|plan|destroy|readonly)",
     )
     parser.add_argument(
-        "--plt-selector",
+        "--execution-params",
+        dest="execution_param",
         action="append",
         default=[],
         type=parse_selector_arg,
-        help="Plt selector in key=value form; repeatable",
+        help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
     )
     parser.add_argument(
         "--skip-ctl-results-sync",
         action="store_true",
         help="Skip ctl results sync to the remote bucket; honored only when the "
-        "ctl_context results_sync policy is 'optional' (error under 'required')",
+        "ctl_profile results_sync policy is 'optional' (error under 'required')",
     )
 
     if run_type == "workflow":
@@ -2014,16 +1917,16 @@ def setup_logging() -> logging.handlers.MemoryHandler:
 
 def load_workflow_cfg(
     ctl_cfg_root: Path,
-    ctl_context: str,
+    ctl_profile: str,
     inventory_name: str,
     workflow_name: str,
-    runtime_selector_maps: dict[str, dict[str, str]],
+    execution_context: dict[str, object],
 ) -> dict:
     """Load a content-key workflow: `workflows.<action>.<name>` (imports + selectors).
 
     Expands `import_workflow_keys` (ordered, recursive) then the workflow's own `target_keys`; applies
     `selectors` (intersected through imports) through the generic selector matcher.
-    The workflow name is an opaque key (slashes are cosmetic). `ctl_context` is retained
+    The workflow name is an opaque key (slashes are cosmetic). `ctl_profile` is retained
     for the generated workflow metadata.
     """
     workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
@@ -2038,12 +1941,12 @@ def load_workflow_cfg(
     effective_selectors = workflow_effective_selectors(action_workflows, workflow_name)
     if not selector_matches(
         effective_selectors,
-        runtime_selector_maps,
+        execution_context,
         label=f"workflow {inventory_name}/{workflow_name}",
     ):
         raise RuntimeError(
             f"❌ workflow {inventory_name}/{workflow_name} is not available for "
-            f"runtime selectors {runtime_selector_maps} (selectors {effective_selectors})"
+            f"runtime selectors {execution_context} (selectors {effective_selectors})"
         )
 
     stages = expand_workflow_imports(action_workflows, workflow_name)
@@ -2099,7 +2002,7 @@ def validate_ctl_variant_meta(
     meta: dict,
     *,
     variant_label: str,
-    ctl_context: str,
+    ctl_profile: str,
     plt_overlays: list[str],
 ) -> None:
     """Validate ctl variant metadata against selected plt overlays."""
@@ -2108,9 +2011,9 @@ def validate_ctl_variant_meta(
 
     allowed_envs = _load_meta_string_list(meta, "allowed_envs", "ctl variant", variant_label)
     if allowed_envs:
-        if ctl_context not in allowed_envs:
+        if ctl_profile not in allowed_envs:
             raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' is not allowed for ctl context '{ctl_context}'; "
+                f"❌ ctl variant '{variant_label}' is not allowed for ctl context '{ctl_profile}'; "
                 f"allowed_envs={allowed_envs}"
             )
 
@@ -2259,7 +2162,7 @@ def apply_ctl_variants_to_workflow_cfg(
     workflow_cfg: dict,
     inventory_cfg: dict,
     *,
-    runtime_selector_maps: dict[str, dict[str, str]],
+    execution_context: dict[str, object],
     inventory_name: str,
     workflow_name: str,
     ctl_variants: list[str],
@@ -2309,17 +2212,17 @@ def apply_ctl_variants_to_workflow_cfg(
 
         if not selector_matches(
             target.get("selectors"),
-            runtime_selector_maps,
+            execution_context,
             label=f"target {target_name}",
         ):
-            logging.info("Variant '%s' target is not available for selectors %s — skipped", name, runtime_selector_maps)
+            logging.info("Variant '%s' target is not available for selectors %s — skipped", name, execution_context)
             continue
         if not selector_matches(
             v.get("selectors"),
-            runtime_selector_maps,
+            execution_context,
             label=f"variant {name}",
         ):
-            logging.info("Variant '%s' placement gated off for selectors %s — skipped", name, runtime_selector_maps)
+            logging.info("Variant '%s' placement gated off for selectors %s — skipped", name, execution_context)
             continue
 
         before, after = v.get("before_target_key"), v.get("after_target_key")
@@ -2593,7 +2496,7 @@ def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
         if getattr(args, "workflow", None) or getattr(args, "target", None):
             raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
         ref = getattr(args, "ref", None)
-        ref_context = resolve_ref_context(ref, args.plt_runtime_selectors) if ref else "sub_workflow"
+        ref_context = resolve_ref_context(ref, args.execution_params) if ref else "sub_workflow"
         raw_name = f"{ref_context_to_result_path(ref_context)}/{getattr(args, 'source', None) or 'unknown'}/{getattr(args, 'sub_workflow', None) or 'unknown'}"
     elif run_type == "maintenance":
         maintenance_target = getattr(args, "target", None) or getattr(args, "lock_id", None) or "unknown"
@@ -2623,8 +2526,8 @@ def setup_run_dirs(
 
     # Materialize the pinned ctl stage runtime once, up front — it is a run-scoped
     # (workspace-scoped) precondition, not a per-stage step. Idempotent thereafter.
-    ctl_stage_runtime_dir = materialize_ctl_stage_runtime(run_dir)
-    logging.info(f"Using ctl stage runtime: {ctl_stage_runtime_dir}")
+    stage_utils_dir = materialize_stage_utils(run_dir)
+    logging.info(f"Using ctl stage runtime: {stage_utils_dir}")
 
     # artifacts/ splits into general/ (run-level metadata + logs) and
     # stages/<stage>/ (per-stage outputs, created when stages run).
@@ -3337,166 +3240,181 @@ def selector_expected_values(expected, *, label: str) -> list[str]:
     raise RuntimeError(f"❌ {label} must be a non-empty string or list of non-empty strings")
 
 
-def split_selector_ref(selector_ref: str, selector_maps: dict[str, dict[str, str]]) -> tuple[str | None, str]:
-    if not isinstance(selector_ref, str) or not selector_ref.strip():
-        raise RuntimeError("❌ selector reference must be a non-empty string")
-    value = selector_ref.strip()
-    if "." in value:
-        owner, key = value.split(".", 1)
-        if not owner or not key:
-            raise RuntimeError(f"❌ selector reference must use owner.key format: {selector_ref!r}")
-        if owner not in selector_maps:
-            known = ", ".join(sorted(selector_maps)) or "none"
-            raise RuntimeError(f"❌ unknown selector owner {owner!r}; known owners: {known}")
-        return owner, key
-    return None, value
+EXECUTION_CONTEXT_ROOT = "execution_context"
+EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params")
+EXECUTION_CONTEXT_REF_RE = re.compile(
+    rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})\.[A-Za-z_][A-Za-z0-9_]*$"
+)
 
 
-def selector_value_from_maps(
-    selector_ref: str,
-    selector_maps: dict[str, dict[str, str]],
-) -> tuple[bool, str | None, str | None, str]:
-    owner, key = split_selector_ref(selector_ref, selector_maps)
-    if owner is not None:
-        runtime_selectors = selector_maps[owner]
-        return key in runtime_selectors, runtime_selectors.get(key), owner, key
-
-    matches = [
-        candidate_owner
-        for candidate_owner, runtime_selectors in selector_maps.items()
-        if key in runtime_selectors
-    ]
-    if len(matches) > 1:
+def validate_execution_context_ref(ref: str, *, label: str) -> str:
+    """Selector/binding/interpolation references into the execution context are
+    always fully-qualified paths starting at the root key."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise RuntimeError(f"❌ {label}: execution-context reference must be a non-empty string")
+    value = ref.strip()
+    if not EXECUTION_CONTEXT_REF_RE.fullmatch(value):
         raise RuntimeError(
-            f"❌ selector {selector_ref!r} is ambiguous across owners {matches}; use owner.key"
+            f"❌ {label}: reference {value!r} must be a fully-qualified execution-context path "
+            f"({EXECUTION_CONTEXT_ROOT}.<{'|'.join(EXECUTION_CONTEXT_NAMESPACES)}>.<key>)"
         )
-    if not matches:
-        return False, None, None, key
-    matched_owner = matches[0]
-    return True, selector_maps[matched_owner][key], matched_owner, key
+    return value
+
+
+def execution_context_miss_message(execution_context: dict[str, object], ref: str) -> str:
+    available = ", ".join(sorted(execution_context)) or "none"
+    return f"{ref!r} not found in execution context; available: {available}"
 
 
 def selector_matches(
     selectors: dict | None,
-    selector_maps: dict[str, dict[str, str]],
+    execution_context: dict[str, object],
     *,
     label: str,
 ) -> bool:
-    """Return whether selector constraints match runtime selector maps."""
+    """Return whether selector constraints match the execution context.
+
+    Uniform surface: any fully-qualified execution-context path is usable; a
+    missing key means no match (the gated entry is simply inactive), never an
+    error here. The miss is logged with the available keys so a typo'd
+    execution input is self-evident.
+    """
     if not selectors:
         return True
     if not isinstance(selectors, dict):
         raise RuntimeError(f"❌ selectors must be a mapping: {label}")
 
-    for selector_ref, expected in selectors.items():
-        allowed_values = selector_expected_values(expected, label=f"{label}.{selector_ref}")
-        found, actual, _, _ = selector_value_from_maps(selector_ref, selector_maps)
-        if not found:
+    for ref, expected in selectors.items():
+        validate_execution_context_ref(ref, label=label)
+        allowed_values = selector_expected_values(expected, label=f"{label}.{ref}")
+        if ref not in execution_context:
+            logging.info("Selector %s: %s", label, execution_context_miss_message(execution_context, ref))
             return False
-        if actual not in allowed_values:
+        if str(execution_context[ref]) not in allowed_values:
             return False
     return True
 
-RUNTIME_CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def scope_identity_matches(constraints: dict | None, scope_identity: dict[str, object], *, label: str) -> bool:
+    """Match bare-key constraints against a scope's identity.
+
+    Scope identity is scope *mechanism* metadata, deliberately outside the
+    execution-context reference grammar (bare keys, not qualified paths).
+    """
+    if not constraints:
+        return True
+    if not isinstance(constraints, dict):
+        raise RuntimeError(f"❌ scope identity constraints must be a mapping: {label}")
+    for key, expected in constraints.items():
+        allowed_values = selector_expected_values(expected, label=f"{label}.{key}")
+        if key not in scope_identity or str(scope_identity[key]) not in allowed_values:
+            return False
+    return True
+
+CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+EXECUTION_PARAMS_KEY = "execution_params"
+EXECUTION_CONTEXT_PARAM_REF_RE = re.compile(
+    rf"^\$\{{({EXECUTION_CONTEXT_ROOT}\.(?:ctl|params)\.[A-Za-z_][A-Za-z0-9_]*)\}}$"
+)
 
 
-def _runtime_context_scalar(value, *, label: str):
+def _context_scalar(value, *, label: str):
     if isinstance(value, (str, int, float, bool)):
         return value
     raise RuntimeError(f"❌ {label} must resolve to a scalar string/number/bool value")
 
 
-def runtime_context_env_values(runtime_context: dict[str, object]) -> dict[str, str]:
-    env_values: dict[str, str] = {}
-    for key, value in runtime_context.items():
-        if not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
-            raise RuntimeError(f"❌ runtime context key {key!r} is not a valid env var name")
-        if isinstance(value, bool):
-            env_values[key] = "true" if value else "false"
-        elif isinstance(value, (str, int, float)):
-            env_values[key] = str(value)
-        else:
-            raise RuntimeError(f"❌ runtime context key {key!r} must be scalar, got {type(value).__name__}")
-    return env_values
-
-
-SELECTOR_REF_RE = re.compile(
-    r"^\$\{selectors\.([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\}$"
-)
-
-
-def load_runtime_context(ctl_cfg_root: Path) -> dict[str, dict[str, str]]:
-    """Read runtime-context declarations discovered by content key. Each value is
-    a literal scalar or a whole-value ${selectors.<owner>.<key>} reference (the
-    only place selectors may be referenced as an interpolation value)."""
+def load_execution_params(ctl_cfg_root: Path) -> dict[str, object]:
+    """Read consumer param declarations discovered by the `execution_params`
+    content key. Each value is a literal scalar or a whole-value fully-qualified
+    reference into ctl/params (resolved against CLI params + promoted args)."""
     entries: dict[str, object] = {}
     origins: dict[str, Path] = {}
-    for path, section in collect_top_level_sections(ctl_cfg_root, "runtime_context"):
+    for path, section in collect_top_level_sections(ctl_cfg_root, EXECUTION_PARAMS_KEY):
         if not isinstance(section, dict):
-            raise RuntimeError(f"❌ runtime_context must be a mapping: {path}")
-        for runtime_key, raw in section.items():
-            if runtime_key in entries:
+            raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY} must be a mapping: {path}")
+        for key, raw in section.items():
+            if key in entries:
                 raise RuntimeError(
-                    f"❌ duplicate runtime_context key {runtime_key!r}: {path} (also defined in {origins[runtime_key]})"
+                    f"❌ duplicate {EXECUTION_PARAMS_KEY}.{key}: {path} (also defined in {origins[key]})"
                 )
-            entries[runtime_key] = raw
-            origins[runtime_key] = path
-
-    normalized: dict[str, dict[str, str]] = {}
-    for runtime_key, raw in entries.items():
-        path = origins[runtime_key]
-        if not isinstance(runtime_key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(runtime_key):
-            raise RuntimeError(f"❌ runtime_context key must be a valid env var name: {runtime_key!r}")
-        if not isinstance(raw, (str, int, float, bool)):
-            raise RuntimeError(
-                f"❌ runtime_context.{runtime_key} must be a scalar literal or a "
-                f"${{selectors.<owner>.<key>}} reference: {path}"
-            )
-        text = str(raw)
-        match = SELECTOR_REF_RE.match(text)
-        if match:
-            normalized[runtime_key] = {"selector": match.group(1)}
-        elif "${" in text:
-            raise RuntimeError(
-                f"❌ runtime_context.{runtime_key}: only a whole-value "
-                f"${{selectors.<owner>.<key>}} reference is allowed, got {text!r}: {path}"
-            )
-        else:
-            normalized[runtime_key] = {"value": raw}
-    return normalized
+            if not isinstance(key, str) or not CONTEXT_KEY_RE.fullmatch(key):
+                raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY} key must be a valid identifier: {key!r}")
+            entries[key] = raw
+            origins[key] = path
+    return entries
 
 
-def build_runtime_context(
+def build_execution_context(
     ctl_cfg_root: Path,
-    selector_maps: dict[str, dict[str, str]],
     *,
-    base_values: dict[str, object],
+    action: str | None,
+    ctl_profile: str | None,
+    execution_params: dict[str, str],
 ) -> dict[str, object]:
-    runtime_context: dict[str, object] = {}
-    for key, value in base_values.items():
-        if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
-            raise RuntimeError(f"❌ runtime context base key must be a valid env var name: {key!r}")
-        runtime_context[key] = _runtime_context_scalar(value, label=f"runtime context base key {key}")
+    """Build the flat dotted execution context: the closed, namespaced facts of
+    this execution. Two namespaces — `ctl` (promoted engine args) and `params`
+    (consumer values, merged from --execution-params CLI + the execution_params
+    cfg block). Keys look like 'execution_context.params.env_type'."""
+    context: dict[str, object] = {}
 
-    for runtime_key, decl in load_runtime_context(ctl_cfg_root).items():
-        if "value" in decl:
-            runtime_context[runtime_key] = _runtime_context_scalar(
-                decl["value"], label=f"runtime_context.{runtime_key}"
+    def put(namespace: str, key: str, value, *, label: str) -> None:
+        if not CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
+        context[f"{EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = _context_scalar(value, label=label)
+
+    if action is not None:
+        put("ctl", "action", action, label="promoted --action")
+    if ctl_profile is not None:
+        put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
+
+    # CLI params first, so cfg params may reference them.
+    for key, value in execution_params.items():
+        put("params", key, value, label=f"--execution-params {key}")
+
+    for key, raw in load_execution_params(ctl_cfg_root).items():
+        label = f"{EXECUTION_PARAMS_KEY}.{key}"
+        ref_key = f"{EXECUTION_CONTEXT_ROOT}.params.{key}"
+        if ref_key in context:
+            raise RuntimeError(
+                f"❌ {label} collides with a --execution-params CLI value; define it in one place"
             )
-            continue
-        found, value, _, _ = selector_value_from_maps(decl["selector"], selector_maps)
-        if not found:
-            continue
-        runtime_context[runtime_key] = _runtime_context_scalar(
-            value,
-            label=f"runtime_context.{runtime_key}",
-        )
-    return runtime_context
+        if isinstance(raw, str):
+            match = EXECUTION_CONTEXT_PARAM_REF_RE.match(raw.strip())
+            if match:
+                ref = match.group(1)
+                if ref not in context:
+                    continue
+                put("params", key, context[ref], label=label)
+                continue
+            if "${" in raw:
+                raise RuntimeError(
+                    f"❌ {label}: only a literal or a whole-value "
+                    f"${{{EXECUTION_CONTEXT_ROOT}.<ctl|params>.<key>}} reference is allowed, got {raw!r}"
+                )
+        put("params", key, raw, label=label)
+    return context
 
 
-def write_runtime_context_artifact(artifacts_dir: Path, runtime_context: dict[str, object]) -> Path:
-    path = artifacts_dir / RUNTIME_CONTEXT_FILENAME
-    write_yaml_file(path, runtime_context)
+def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Nested {execution_context: {ctl: {...}, params: {...}}} view."""
+    nested: dict[str, dict[str, object]] = {ns: {} for ns in EXECUTION_CONTEXT_NAMESPACES}
+    for ref, value in execution_context.items():
+        _, namespace, key = ref.split(".", 2)
+        nested[namespace][key] = value
+    return {EXECUTION_CONTEXT_ROOT: nested}
+
+
+def scope_params_from_context(execution_context: dict[str, object]) -> dict[str, str]:
+    """Bare param map used for scope-identity activation (scope mechanism)."""
+    prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
+    return {ref[len(prefix):]: str(value) for ref, value in execution_context.items() if ref.startswith(prefix)}
+
+
+def write_execution_context_artifact(run_dir: Path, execution_context: dict[str, object]) -> Path:
+    path = run_dir / "execution" / EXECUTION_CONTEXT_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_yaml_file(path, execution_context_nested(execution_context))
     return path
 
 
@@ -3630,9 +3548,9 @@ def load_scope_guard_hashes(path: Path, *, allow_missing: bool = False) -> dict[
 def guard_declaration_matches_scope(declaration: dict, scope: dict) -> bool:
     if declaration["match_target_path"] != scope["target_path"]:
         return False
-    return selector_matches(
+    return scope_identity_matches(
         declaration["selectors"],
-        {"plt": scope.get("identity_selectors") or {}},
+        scope.get("scope_identity") or {},
         label=f"guard declaration {declaration['path']!r}",
     )
 
@@ -3664,17 +3582,20 @@ def verify_guarded_value(
         )
 
 
-def verify_ctl_guardrails(ctl_cfg_root: Path, runtime_context: dict[str, object]) -> None:
+def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
     guarded = load_ctl_guarded_vars(ctl_cfg_root)
     if not guarded:
         return
     for var_name, expected_hash in guarded.items():
-        if var_name not in runtime_context:
-            raise RuntimeError(f"❌ ctl guarded var {var_name!r} is not available in runtime_context")
+        ref = f"{EXECUTION_CONTEXT_ROOT}.params.{var_name}"
+        if ref not in execution_context:
+            raise RuntimeError(
+                f"❌ ctl guarded var {var_name!r}: {execution_context_miss_message(execution_context, ref)}"
+            )
         verify_guarded_value(
             "ctl",
             var_name,
-            runtime_context[var_name],
+            execution_context[ref],
             expected_hash,
             label=f"ctl.{var_name}",
         )
@@ -3732,7 +3653,7 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
 def verify_plt_guardrails(
     plt_cfg_root: Path,
     plt_rendered_dir: Path,
-    plt_runtime_selectors: dict[str, str],
+    scope_params: dict[str, str],
 ) -> None:
     """Verify declared plt guards against the rendered cfg of every active scope.
 
@@ -3746,7 +3667,7 @@ def verify_plt_guardrails(
     if not discover_cfg_meta_paths(plt_cfg_root):
         raise RuntimeError(f"❌ plt guard declarations exist but no cfg scopes found under: {plt_cfg_root}")
 
-    for scope in discover_active_cfg_scopes(plt_cfg_root, plt_runtime_selectors=plt_runtime_selectors):
+    for scope in discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
         matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
         baseline_path = scope["scope_root"] / PLT_GUARDRAILS_FILENAME
         baseline = load_scope_guard_hashes(baseline_path, allow_missing=True)
@@ -3784,11 +3705,11 @@ def verify_guardrails(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
     plt_rendered_dir: Path,
-    runtime_context: dict[str, object],
-    plt_runtime_selectors: dict[str, str],
+    execution_context: dict[str, object],
+    scope_params: dict[str, str],
 ) -> None:
-    verify_ctl_guardrails(ctl_cfg_root, runtime_context)
-    verify_plt_guardrails(plt_cfg_root, plt_rendered_dir, plt_runtime_selectors)
+    verify_ctl_guardrails(ctl_cfg_root, execution_context)
+    verify_plt_guardrails(plt_cfg_root, plt_rendered_dir, scope_params)
 
 
 
@@ -3877,7 +3798,7 @@ def load_scope_candidate(
     plt_cfg_root: Path,
     meta_path: Path,
     meta_cfg: dict,
-    runtime_selectors: dict[str, str],
+    scope_params: dict[str, str],
 ) -> dict | None:
     """Load one scope __meta__.yaml and return an active merge scope, or None."""
     cfg_root = plt_cfg_root.resolve()
@@ -3890,22 +3811,26 @@ def load_scope_candidate(
     scope_rel = scope_root.relative_to(cfg_root).as_posix()
     scope_path = "/" + scope_rel if scope_rel != "." else "/"
 
-    if "selectors" in meta_cfg:
-        raise RuntimeError(
-            f"scope {SCOPE_META_FILENAME} must use identity_selectors (renamed from selectors): {meta_path}"
-        )
-    identity_selectors = meta_cfg.get("identity_selectors") or {}
-    if not isinstance(identity_selectors, dict):
-        raise RuntimeError(f"identity_selectors must be a mapping: {meta_path}")
-    for key, value in identity_selectors.items():
+    for legacy in ("selectors", "identity_selectors"):
+        if legacy in meta_cfg:
+            raise RuntimeError(
+                f"scope {SCOPE_META_FILENAME} must use scope_identity (renamed from {legacy}): {meta_path}"
+            )
+    scope_identity = meta_cfg.get("scope_identity") or {}
+    if not isinstance(scope_identity, dict):
+        raise RuntimeError(f"scope_identity must be a mapping: {meta_path}")
+    for key, value in scope_identity.items():
         if not isinstance(value, (str, int, bool)):
             raise RuntimeError(
-                f"identity_selectors.{key} must be a single scalar (identity dimensions are AND-only, "
+                f"scope_identity.{key} must be a single scalar (identity dimensions are AND-only, "
                 f"lists are not allowed): {meta_path}"
             )
-    if not selector_matches(identity_selectors, {"plt": runtime_selectors}, label=str(meta_path)):
-        logging.info("Skipping inactive cfg scope %s for selectors %s", meta_path, runtime_selectors)
-        return None
+    # A scope is active when every identity dimension equals the corresponding
+    # plt execution input (bare keys — scope mechanism, not the reference grammar).
+    for key, value in scope_identity.items():
+        if key not in scope_params or str(scope_params[key]) != str(value):
+            logging.info("Skipping inactive cfg scope %s for params %s", meta_path, scope_params)
+            return None
 
     if "target_path" not in meta_cfg:
         raise RuntimeError(f"target_path is required in scope {SCOPE_META_FILENAME}: {meta_path}")
@@ -3950,7 +3875,7 @@ def load_scope_candidate(
         "scope_root": scope_root,
         "scope_path": scope_path,
         "target_path": target_path,
-        "identity_selectors": identity_selectors,
+        "scope_identity": scope_identity,
         "source_dirs": source_dirs,
     }
 
@@ -3958,11 +3883,11 @@ def load_scope_candidate(
 def discover_active_cfg_scopes(
     plt_cfg_root: Path,
     *,
-    plt_runtime_selectors: dict[str, str],
+    scope_params: dict[str, str],
 ) -> list[dict]:
     """Discover active cfg merge scopes from type: scope metadata."""
     cfg_root = plt_cfg_root.resolve()
-    runtime_selectors = plt_runtime_selectors
+    runtime_selectors = scope_params
     active_scopes: list[dict] = []
     target_paths: dict[str, Path] = {}
 
@@ -4026,7 +3951,7 @@ def load_overlay_candidate(
     plt_cfg_root: Path,
     meta_path: Path,
     meta_cfg: dict,
-    runtime_selectors: dict[str, str],
+    execution_context: dict[str, object],
 ) -> dict:
     """Load one overlay metadata file."""
     cfg_root = plt_cfg_root.resolve()
@@ -4041,7 +3966,7 @@ def load_overlay_candidate(
         label=f"overlay name in {meta_path}",
     )
     selectors = meta_cfg.get("selectors") or {}
-    matches = selector_matches(selectors, {"plt": runtime_selectors}, label=str(meta_path))
+    matches = selector_matches(selectors, execution_context, label=str(meta_path))
     validate_overlay_data_tree(overlay_root, meta_path=meta_path)
 
     return {
@@ -4056,11 +3981,11 @@ def load_overlay_candidate(
 def discover_overlay_candidates(
     plt_cfg_root: Path,
     *,
-    plt_runtime_selectors: dict[str, str],
+    execution_context: dict[str, object],
 ) -> dict[str, dict]:
     """Discover all type: overlay metadata entries by unique overlay name."""
     cfg_root = plt_cfg_root.resolve()
-    runtime_selectors = plt_runtime_selectors
+    runtime_selectors = scope_params
     candidates: dict[str, dict] = {}
 
     for meta_path in discover_cfg_meta_paths(cfg_root):
@@ -4068,7 +3993,7 @@ def discover_overlay_candidates(
         if meta_cfg["type"] == "scope":
             continue
 
-        overlay = load_overlay_candidate(cfg_root, meta_path, meta_cfg, runtime_selectors)
+        overlay = load_overlay_candidate(cfg_root, meta_path, meta_cfg, execution_context)
         previous = candidates.get(overlay["name"])
         if previous is not None:
             raise RuntimeError(
@@ -4100,7 +4025,7 @@ def apply_selected_overlays_to_cfg_root(
     effective_cfg_root: Path,
     plt_overlays: list[str],
     *,
-    plt_runtime_selectors: dict[str, str],
+    execution_context: dict[str, object],
 ) -> None:
     """Apply selected overlay data to a temporary cfg root before scope merge."""
     if not plt_overlays:
@@ -4110,7 +4035,7 @@ def apply_selected_overlays_to_cfg_root(
     if duplicates:
         raise RuntimeError(f"plt overlays must be unique; duplicates: {', '.join(sorted(duplicates))}")
 
-    candidates = discover_overlay_candidates(plt_cfg_root, plt_runtime_selectors=plt_runtime_selectors)
+    candidates = discover_overlay_candidates(plt_cfg_root, execution_context=execution_context)
     for overlay_name in plt_overlays:
         overlay = candidates.get(overlay_name)
         if overlay is None:
@@ -4120,7 +4045,7 @@ def apply_selected_overlays_to_cfg_root(
             )
         if not overlay["matches"]:
             raise RuntimeError(
-                f"plt overlay {overlay_name!r} is not allowed for plt selectors {plt_runtime_selectors}; "
+                f"plt overlay {overlay_name!r} is not allowed for this execution context; "
                 f"selectors={overlay['selectors']}"
             )
 
@@ -4135,15 +4060,20 @@ def apply_selected_overlays_to_cfg_root(
 def merge_plt_cfg_dirs(
     plt_cfg_root: Path,
     plt_merged_dir: Path,
-    ctl_context: str,
+    ctl_profile: str,
     plt_overlays: list[str] | None = None,
-    plt_runtime_selectors: dict[str, str] | None = None,
+    scope_params: dict[str, str] | None = None,
     *,
+    execution_context: dict[str, object] | None = None,
     source_log_roots: tuple[Path, ...] | None = None,
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
-    """Build scoped merged cfg trees from typed __meta__.yaml metadata."""
+    """Build scoped merged cfg trees from typed __meta__.yaml metadata.
+
+    Scope activation matches scope_identity against plt execution inputs
+    (bare keys); overlay gating matches overlay selectors against the full
+    execution context (fully-qualified refs), so overlays require it."""
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
     os.makedirs(plt_merged_dir, exist_ok=True)
@@ -4154,11 +4084,11 @@ def merge_plt_cfg_dirs(
         merged_files = {}
 
     selected_overlays = plt_overlays or []
-    runtime_selectors = plt_runtime_selectors or {}
+    runtime_selectors = scope_params or {}
     composition_files = set(SCOPE_META_SKIP_FILENAMES)
 
     def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> None:
-        active_scopes = discover_active_cfg_scopes(effective_cfg_root, plt_runtime_selectors=runtime_selectors)
+        active_scopes = discover_active_cfg_scopes(effective_cfg_root, scope_params=runtime_selectors)
 
         for scope in active_scopes:
             target_path = scope["target_path"]
@@ -4188,11 +4118,13 @@ def merge_plt_cfg_dirs(
         with tempfile.TemporaryDirectory(prefix="atlas-plt-cfg-") as tmp_dir:
             effective_cfg_root = Path(tmp_dir) / "source"
             copy_cfg_root_without_overlay_catalog(plt_cfg_root, effective_cfg_root)
+            if execution_context is None:
+                raise RuntimeError("❌ plt overlays require the execution context for selector gating")
             apply_selected_overlays_to_cfg_root(
                 plt_cfg_root,
                 effective_cfg_root,
                 selected_overlays,
-                plt_runtime_selectors=runtime_selectors,
+                execution_context=execution_context,
             )
             effective_source_log_roots = source_log_roots or (
                 effective_cfg_root.resolve(),
@@ -4211,10 +4143,10 @@ def prepare_pipeline_cfg(
     inventory_cfg: dict,
     plt_merged_dir: Path,
     artifacts_dir: Path,
-    ctl_context: str,
+    ctl_profile: str,
     plt_overlays: list[str],
-    plt_runtime_selectors: dict[str, str] | None = None,
-    runtime_context: dict[str, object] | None = None,
+    scope_params: dict[str, str] | None = None,
+    execution_context: dict[str, object] | None = None,
     stage_repo_key: str = "repo_url",
     require_stage_ref: bool = True,
     require_commit_refs: bool = False,
@@ -4232,9 +4164,10 @@ def prepare_pipeline_cfg(
     merged_files = merge_plt_cfg_dirs(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
-        ctl_context=ctl_context,
+        ctl_profile=ctl_profile,
         plt_overlays=plt_overlays,
-        plt_runtime_selectors=plt_runtime_selectors,
+        scope_params=scope_params,
+        execution_context=execution_context,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
     )
@@ -4246,7 +4179,7 @@ def prepare_pipeline_cfg(
         repo_key=stage_repo_key,
         require_branch_or_commit=require_stage_ref,
         refs=refs,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         require_commit_refs=require_commit_refs,
     )
 
@@ -4293,9 +4226,8 @@ def write_target_stage_flow_artifact(
     ctl_cfg_root: Path,
     artifacts_dir: Path,
     *,
-    ctl_context: str,
-    runtime_context: dict[str, object],
-    runtime_selector_maps: dict[str, dict[str, str]],
+    ctl_profile: str,
+    execution_context: dict[str, object],
     inventory_name: str,
     workflow_name: str | None,
     ctl_variants: list[str],
@@ -4313,29 +4245,29 @@ def write_target_stage_flow_artifact(
     try:
         target_workflow_cfg = load_workflow_cfg(
             ctl_cfg_root,
-            ctl_context,
+            ctl_profile,
             target_inventory_name,
             workflow_name,
-            runtime_selector_maps,
+            execution_context,
         )
         target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name)
         target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             target_workflow_cfg,
             target_inventory_cfg,
-            runtime_selector_maps=runtime_selector_maps,
+            execution_context=execution_context,
             inventory_name=target_inventory_name,
             workflow_name=workflow_name,
             ctl_variants=ctl_variants,
         )
-        validate_workflow_target_selectors(target_workflow_cfg, target_inventory_cfg, runtime_selector_maps)
+        validate_workflow_target_selectors(target_workflow_cfg, target_inventory_cfg, execution_context)
         target_active_stages = build_active_stages(
             target_workflow_cfg,
             target_inventory_cfg,
             repo_key=stage_repo_key,
             require_branch_or_commit=require_stage_ref,
             refs=refs,
-            runtime_context=runtime_context,
+            execution_context=execution_context,
             require_commit_refs=require_commit_refs,
         )
     except Exception as exc:
@@ -4418,30 +4350,30 @@ def load_ctl_results_cfg(ctl_cfg_root: Path) -> dict | None:
     return merged or None
 
 
-def ctl_results_sync_policy(ctl_cfg_root: Path, ctl_context: str) -> str:
-    """Read the results_sync policy from the ctl_context entry; absent = disabled."""
-    context_cfg = ctl_selector_policy(ctl_cfg_root, ctl_context)
-    policy = context_cfg.get("results_sync", "disabled")
+def ctl_results_sync_policy(ctl_cfg_root: Path, ctl_profile: str) -> str:
+    """Read the results_sync policy from the ctl profile; absent = disabled."""
+    profile_cfg = ctl_profile_policy(ctl_cfg_root, ctl_profile)
+    policy = profile_cfg.get("results_sync", "disabled")
     if policy not in CTL_RESULTS_SYNC_POLICIES:
         raise RuntimeError(
-            f"❌ ctl_context {ctl_context!r} results_sync must be one of {CTL_RESULTS_SYNC_POLICIES}: {policy!r}"
+            f"❌ ctl profile {ctl_profile!r} results_sync must be one of {CTL_RESULTS_SYNC_POLICIES}: {policy!r}"
         )
     return policy
 
 
 def resolve_ctl_results_backend(
     ctl_results_cfg: dict,
-    plt_runtime_selectors: dict[str, str],
-    runtime_context: dict[str, object],
+    scope_params: dict[str, str],
+    execution_context: dict[str, object],
 ) -> dict[str, str]:
     """Pick the backend tier for this run and resolve its bucket name."""
-    tier = "env" if "env_type" in plt_runtime_selectors else "deployments"
+    tier = "env" if "env_type" in scope_params else "deployments"
     backend = ctl_results_cfg.get(tier)
     if backend is None:
         raise RuntimeError(f"❌ ctl_results has no backend for tier {tier!r}")
     bucket_name = resolve_runtime_scalar(
         backend["bucket_name"],
-        runtime_context_env_values(runtime_context),
+        execution_context,
         label=f"ctl_results.backends.{tier}.bucket_name",
     )
     return {
@@ -4539,9 +4471,9 @@ _CTL_RESULTS_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
 
 def configure_ctl_results_sync(
     ctl_cfg_root: Path,
-    ctl_context: str,
-    plt_runtime_selectors: dict[str, str],
-    runtime_context: dict[str, object],
+    ctl_profile: str,
+    scope_params: dict[str, str],
+    execution_context: dict[str, object],
     run_dir: Path,
     *,
     skip_ctl_results_sync: bool,
@@ -4565,11 +4497,11 @@ def configure_ctl_results_sync(
             logging.info("--skip-ctl-results-sync has no effect: no ctl_results resource defined")
         return None
 
-    backend = resolve_ctl_results_backend(ctl_results_cfg, plt_runtime_selectors, runtime_context)
+    backend = resolve_ctl_results_backend(ctl_results_cfg, scope_params, execution_context)
 
-    policy = ctl_results_sync_policy(ctl_cfg_root, ctl_context)
+    policy = ctl_results_sync_policy(ctl_cfg_root, ctl_profile)
     if policy == "required" and skip_ctl_results_sync:
-        raise RuntimeError("❌ --skip-ctl-results-sync is not allowed: ctl_context results_sync policy is 'required'")
+        raise RuntimeError("❌ --skip-ctl-results-sync is not allowed: ctl_profile results_sync policy is 'required'")
     if policy == "disabled" or (policy == "optional" and skip_ctl_results_sync):
         _CTL_RESULTS_SYNC_NOTE = {"mode": "skipped", "reason": "policy" if policy == "disabled" else "flag"}
         return backend
@@ -4580,7 +4512,7 @@ def configure_ctl_results_sync(
         {"execution_identity_key": backend["execution_identity_key"]},
         identities,
         contexts,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         implementation_key=aws_implementation_key,
     )
     if not resolved or not resolved.get("profile_name"):
@@ -4636,40 +4568,150 @@ def ctl_results_sync_summary() -> dict[str, str]:
     return dict(_CTL_RESULTS_SYNC_NOTE)
 
 
-def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, runtime_context_path: Path) -> Path:
-    """Render merged/ into rendered/ (whole-scope, engine-volatile keys kept verbatim)."""
+def _stage_utils_module(name: str):
+    """Import a stage_utils/ctl python module by file path (shared primitives:
+    Resolver, merge_values, cfg-entry refs). The module stays self-contained in
+    stage_utils because it also executes inside stage containers."""
+    import importlib.util
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, source_stage_utils_dir() / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict, volatile: frozenset[str]) -> None:
+    """Render one scope: merge all scope YAML for lookups, interpolate with
+    volatile keys kept verbatim, normalize cfg-entry refs whole-scope, write
+    back per-file YAML, copy non-YAML verbatim. Engine logic (folded from the
+    former stage-side render_cfg.py)."""
+    brc = _stage_utils_module("build_runtime_cfg")
+    yaml_files = sorted(p for p in scope_dir.rglob("*.yaml") if p.is_file())
+    scope_merged: dict = {}
+    for path in yaml_files:
+        doc = brc.load_yaml_mapping(path)
+        if EXECUTION_CONTEXT_ROOT in doc:
+            raise RuntimeError(
+                f"❌ plt payload must not define reserved top-level key "
+                f"{EXECUTION_CONTEXT_ROOT!r}: {path}"
+            )
+        scope_merged = brc.merge_values(scope_merged, doc)
+
+    resolver = brc.Resolver(scope_merged, env_ctx, keep_unresolved=volatile)
+    scope_resolved: dict = {}
+    for key in scope_merged:
+        value = resolver.lookup(key)
+        if value is brc.OMIT:
+            continue
+        scope_resolved[key] = value
+    scope_resolved = brc.resolve_cfg_entry_refs(scope_resolved)
+
+    for path in sorted(p for p in scope_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(scope_dir)
+        dest = dest_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix != ".yaml":
+            shutil.copy2(path, dest)
+            continue
+        doc = brc.load_yaml_mapping(path)
+        rendered = resolver.resolve_value(doc)
+        rendered = brc.resolve_cfg_entry_refs(rendered, lookup_root=scope_resolved)
+        dest.write_text(
+            yaml.safe_dump(rendered, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+
+
+def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[str, object]) -> Path:
+    """Render merged/ into rendered/ (whole-scope, engine-volatile keys kept
+    verbatim). In-process engine step — no subprocess, no stage costume."""
     plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
-    render_script = materialize_ctl_stage_runtime(run_dir) / "render_cfg.py"
-    run_and_log(
-        [
-            "python3",
-            str(render_script),
-            "--merged-dir", str(plt_merged_dir),
-            "--rendered-dir", str(plt_rendered_dir),
-            "--runtime-context-file", str(runtime_context_path),
-            "--volatile-keys", json.dumps(list(ENGINE_VOLATILE_CONTEXT_KEYS)),
-        ],
-    )
+    if plt_rendered_dir.exists():
+        shutil.rmtree(plt_rendered_dir)
+    plt_rendered_dir.mkdir(parents=True)
+    env_ctx = {k: v for k, v in execution_context.items() if k not in ENGINE_VOLATILE_CONTEXT_KEYS}
+    volatile = frozenset(ENGINE_VOLATILE_CONTEXT_KEYS)
+    for entry in sorted(plt_merged_dir.iterdir()):
+        if entry.is_dir():
+            render_scope_tree(entry, plt_rendered_dir / entry.name, env_ctx, volatile)
+        else:
+            shutil.copy2(entry, plt_rendered_dir / entry.name)
+    logging.info("Rendered plt cfg: %s", plt_rendered_dir)
     return plt_rendered_dir
 
 
 def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_rendered_dir: Path, run_dir: Path) -> Path:
-    """Distribute stage input views from the rendered tree.
+    """Distribute stage input views from the rendered tree (in-process engine
+    step — folded from the former dockerized prepare/cfg stage).
 
-    Single derivation chain: rendered/ derives from merged/ (render_plt_cfg,
-    run before guardrail verification); each stages/<stage>/input/ view is
-    selected from rendered/ only.
+    Single derivation chain: rendered/ derives from merged/; each
+    stages/<stage>/input/ view is selected from rendered/ only.
     """
     plt_stages_dir_path = run_dir / "cfg" / "plt" / "stages"
-    env = os.environ.copy()
-    env["pipeline_run_cfg_path"] = str(pipeline_run_cfg_path)
-    env["plt_rendered_dir_path"] = str(plt_rendered_dir)
-    env["plt_stages_dir_path"] = str(plt_stages_dir_path)
-    logging.info(f"Running: {os.getcwd()}/stages/prepare/cfg/run/local.sh")
-    run_and_log(
-        [f"{os.getcwd()}/stages/prepare/cfg/run/local.sh"],
-        env=env,
-    )
+    cfg = load_yaml(pipeline_run_cfg_path) or {}
+    stages = cfg.get("stages") or {}
+    if not isinstance(stages, dict):
+        raise RuntimeError("pipeline_run_cfg.yaml stages must be a mapping")
+    plt_stages_dir_path.mkdir(parents=True, exist_ok=True)
+
+    for stage_name, stage_cfg in stages.items():
+        if not isinstance(stage_cfg, dict):
+            raise RuntimeError(f"Stage {stage_name!r} config must be a mapping")
+        cfg_files = stage_cfg.get("cfg_files") or []
+        if not cfg_files:
+            continue
+        if not isinstance(cfg_files, list):
+            raise RuntimeError(f"Stage {stage_name!r} cfg_files must be a list")
+
+        cfg_root = normalize_cfg_absolute_path(
+            stage_cfg.get("cfg_root", "/"), label=f"stage {stage_name!r} cfg_root", allow_root=False
+        )
+        if len([part for part in cfg_root.split("/") if part]) != 1:
+            raise RuntimeError(
+                f"Stage {stage_name!r} cfg_root must be exactly one top-level scope "
+                f"(a single path segment), not {cfg_root!r} — a stage may not span scopes"
+            )
+        scope_root = cfg_abs_path_to_dir(plt_rendered_dir, cfg_root, label=f"stage {stage_name!r} cfg_root")
+        if not scope_root.is_dir():
+            logging.info("[WARN] cfg root %r not found for stage %r: %s", cfg_root, stage_name, scope_root)
+            continue
+
+        stage_input_dir = plt_stages_dir_path / stage_name / "input"
+        stage_input_dir.mkdir(parents=True, exist_ok=True)
+
+        for pattern in cfg_files:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise RuntimeError(f"Stage {stage_name!r} cfg_files entries must be non-empty strings")
+            pattern_norm = pattern.strip().lstrip("/")
+            if pattern_norm == "*":
+                sources = [p for p in scope_root.iterdir()]
+            elif pattern_norm.endswith("/*"):
+                src_dir = cfg_abs_path_to_dir(scope_root, "/" + pattern_norm[:-2], label=f"stage {stage_name!r} cfg_files pattern")
+                if not src_dir.is_dir():
+                    logging.info("[WARN] cfg dir %r not found under %s", pattern_norm, cfg_root)
+                    continue
+                sources = [p for p in src_dir.iterdir()]
+            else:
+                sources = [cfg_abs_path_to_dir(scope_root, "/" + pattern_norm, label=f"stage {stage_name!r} cfg_files entry")]
+
+            for src in sources:
+                if not src.exists():
+                    logging.info("[WARN] cfg entry does not exist under %s: %s", cfg_root, src)
+                    continue
+                rel = src.relative_to(scope_root)
+                dst = stage_input_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    shutil.copytree(dst if False else src, dst)
+                else:
+                    shutil.copy2(src, dst)
+
+    logging.info("Prepared stage input cfg views under %s", plt_stages_dir_path)
     return plt_stages_dir_path
 
 
@@ -4724,26 +4766,30 @@ def ctl_utils_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def source_ctl_stage_runtime_dir() -> Path:
-    runtime_dir = ctl_utils_root() / "stages"
-    if not runtime_dir.is_dir():
-        raise RuntimeError(f"❌ ctl stage runtime source dir not found: {runtime_dir}")
-    return runtime_dir
+def source_stage_utils_dir() -> Path:
+    utils_dir = ctl_utils_root() / "stage_utils"
+    if not utils_dir.is_dir():
+        raise RuntimeError(f"❌ stage utils source dir not found: {utils_dir}")
+    return utils_dir
 
 
-def materialize_ctl_stage_runtime(run_dir: Path) -> Path:
-    """Copy the selected ctl-owned stage runtime into this run's runtime area."""
-    runtime_dir = run_dir / "runtime" / "ctl_stage"
-    if runtime_dir.is_dir():
-        return runtime_dir
-    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+def materialize_stage_utils(run_dir: Path) -> Path:
+    """Copy the ctl-owned stage support scripts into this run's stage_utils area.
+
+    Rule: stage_utils/ctl holds only files consumed by stages (host wrappers,
+    in-container setup, the per-stage resolver, access assert, dockerfiles).
+    """
+    utils_dir = run_dir / "stage_utils" / "ctl"
+    if utils_dir.is_dir():
+        return utils_dir
+    utils_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(
-        source_ctl_stage_runtime_dir(),
-        runtime_dir,
+        source_stage_utils_dir(),
+        utils_dir,
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    return runtime_dir
+    return utils_dir
 
 
 def prepare_stage_repo(
@@ -4754,7 +4800,7 @@ def prepare_stage_repo(
     execution_identities: dict | None = None,
     aws_access_contexts: dict | None = None,
     aws_account_registry: dict[str, str] | None = None,
-    runtime_context: dict[str, object] | None = None,
+    execution_context: dict[str, object] | None = None,
     aws_implementation_key: str | None = None,
     allow_aws_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
@@ -4785,12 +4831,12 @@ def prepare_stage_repo(
 
     stage_env = os.environ.copy()
     stage_env.update(tooling_env)
-    stage_env["ATLAS_CTL_STAGE_RUNTIME_DIR"] = str(materialize_ctl_stage_runtime(run_dir))
+    stage_env["ATLAS_STAGE_UTILS_DIR"] = str(materialize_stage_utils(run_dir).parent)
     if aws_access_contexts is not None:
         if (
             execution_identities is None
             or aws_account_registry is None
-            or runtime_context is None
+            or execution_context is None
             or aws_implementation_key is None
         ):
             raise RuntimeError("❌ incomplete AWS access context for stage preparation")
@@ -4800,7 +4846,7 @@ def prepare_stage_repo(
             stage_env,
             execution_identities,
             aws_access_contexts,
-            runtime_context=runtime_context,
+            execution_context=execution_context,
             implementation_key=aws_implementation_key,
             account_registry=aws_account_registry,
             allow_profile_only=allow_aws_profile_only,
@@ -4885,11 +4931,11 @@ def get_repo_local_stages(repo_path: Path, action: str, workflow_name: str) -> t
     return active_ids, _repo_local_active_stages(action_manifest, active_ids, repo_path)
 
 
-def ensure_repo_runtime_context(repo_path: Path, runtime_context_path: Path) -> bool:
-    repo_runtime_context_path = repo_path / RUNTIME_CONTEXT_FILENAME
-    if runtime_context_path.resolve() == repo_runtime_context_path.resolve():
+def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path) -> bool:
+    repo_execution_context_path = repo_path / EXECUTION_CONTEXT_FILENAME
+    if execution_context_path.resolve() == repo_execution_context_path.resolve():
         return False
-    shutil.copy2(runtime_context_path, repo_runtime_context_path)
+    shutil.copy2(execution_context_path, repo_execution_context_path)
     return True
 
 
@@ -4941,9 +4987,9 @@ def run_stages(
     active_stages: dict,
     run_dir: Path,
     plt_stages_dir_path: Path,
-    runtime_context_path: Path,
+    execution_context_path: Path,
     inventory_name: str,
-    runtime_context: dict[str, object],
+    execution_context: dict[str, object],
     run_id: str,
     tooling_refs: dict,
     use_local_tooling_cfg: bool,
@@ -4953,12 +4999,12 @@ def run_stages(
     aws_implementation_key: str,
     allow_aws_profile_only: bool,
     profile_only_aws_profile: str | None,
+    ctl_results_bucket_name: str | None = None,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
     stage_runner_script = "local_dev.sh" if use_local_tooling_cfg else "local.sh"
-    runtime_env = runtime_context_env_values(runtime_context)
     mutation_marked = False
     for stage_id, stage in active_stages.items():
         log_stage_banner(f"[{inventory_name}] [{stage_id}]")
@@ -4970,7 +5016,7 @@ def run_stages(
             execution_identities=execution_identities,
             aws_access_contexts=aws_access_contexts,
             aws_account_registry=aws_account_registry,
-            runtime_context=runtime_context,
+            execution_context=execution_context,
             aws_implementation_key=aws_implementation_key,
             allow_aws_profile_only=allow_aws_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
@@ -4987,7 +5033,7 @@ def run_stages(
         stage_artifacts_dir = run_dir / "artifacts" / "stages" / stage_id
         os.makedirs(stage_artifacts_dir, exist_ok=True)
 
-        copied_runtime_context = ensure_repo_runtime_context(repo_path, runtime_context_path)
+        copied_execution_context = ensure_repo_execution_context(repo_path, execution_context_path)
         try:
             repo_stage_ids, repo_stages = get_repo_local_stages(repo_path, inventory_name, workflow_name)
             run_manifest = {
@@ -4998,8 +5044,8 @@ def run_stages(
                 "workflow": workflow_name,
                 "active_stages": repo_stage_ids,
                 "origin_cfg": str(origin_cfg_path),
-                "runtime_context_file": str(runtime_context_path),
-                "runtime_context_keys": sorted(runtime_context),
+                "execution_context_file": str(execution_context_path),
+                "execution_context_keys": sorted(execution_context),
             }
             logging.info(json.dumps(run_manifest, indent=4))
 
@@ -5013,8 +5059,10 @@ def run_stages(
                 log_stage_banner(f"[{inventory_name}] [{stage_id}] [{repo_stage_id}]", ch="-")
                 stage_run_cmd = [f"./{repo_stage_path}/run/{stage_runner_script}"]
                 repo_stage_env = dict(stage_env)
-                repo_stage_env.update(runtime_env)
-                repo_stage_env["ATLAS_RUNTIME_CONTEXT_FILE"] = RUNTIME_CONTEXT_FILENAME
+                repo_stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
+                if ctl_results_bucket_name:
+                    # Resolved mechanism value: stage env delivery, never context.
+                    repo_stage_env["ctl_results_s3_bucket_name"] = ctl_results_bucket_name
                 repo_stage_env["cfg_files"] = json.dumps(repo_stage.get("cfg_files"))
                 repo_stage_env["STAGE_WRITE_VALUES_JSON"] = (
                     "true" if repo_stage.get("runtime", {}).get("values_json", True) else "false"
@@ -5034,9 +5082,9 @@ def run_stages(
                 )
             ctl_results_push(f"stage {stage_id} completed")
         finally:
-            repo_runtime_context_path = repo_path / RUNTIME_CONTEXT_FILENAME
-            if copied_runtime_context and repo_runtime_context_path.is_file():
-                repo_runtime_context_path.unlink()
+            repo_execution_context_path = repo_path / EXECUTION_CONTEXT_FILENAME
+            if copied_execution_context and repo_execution_context_path.is_file():
+                repo_execution_context_path.unlink()
 
 
 def print_run_summary(run_id: str, log_file: Path) -> None:
@@ -5049,9 +5097,8 @@ def run_maintenance(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
     ctl_results_root: Path,
-    ctl_context: str,
-    ctl_runtime_selectors: dict[str, str],
-    plt_runtime_selectors: dict[str, str],
+    ctl_profile: str,
+    execution_params: dict[str, str],
     ctl_ref_policy: str,
     inventory_name: str,
     maintenance_action: str,
@@ -5075,24 +5122,25 @@ def run_maintenance(
         print_run_summary(run_id, log_file)
         return
 
-    runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
-    runtime_context = build_runtime_context(
+    execution_context = build_execution_context(
         ctl_cfg_root,
-        runtime_selector_maps,
-        base_values={"run_id": run_id},
+        action=inventory_name,
+        ctl_profile=ctl_profile,
+        execution_params=execution_params,
     )
+    scope_params = scope_params_from_context(execution_context)
+    validate_selector_bindings(ctl_cfg_root, execution_context)
     ctl_results_backend = configure_ctl_results_sync(
         ctl_cfg_root,
-        ctl_context,
-        plt_runtime_selectors,
-        runtime_context,
+        ctl_profile,
+        scope_params,
+        execution_context,
         run_dir,
         skip_ctl_results_sync=skip_ctl_results_sync,
         aws_implementation_key=aws_implementation_key,
     )
-    if ctl_results_backend is not None:
-        runtime_context["ctl_results_s3_bucket_name"] = ctl_results_backend["bucket_name"]
-    runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
+    ctl_results_bucket_name = ctl_results_backend["bucket_name"] if ctl_results_backend else None
+    execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
@@ -5103,11 +5151,11 @@ def run_maintenance(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}")
+    logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
 
     workflow_cfg = {
         "meta": {
-            "name": f"{ctl_context}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
+            "name": f"{ctl_profile}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
             "inventory": inventory_name,
         },
         "stages": [
@@ -5117,7 +5165,7 @@ def run_maintenance(
             }
         ],
     }
-    validate_workflow_target_selectors(workflow_cfg, inventory_cfg, runtime_selector_maps)
+    validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
 
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
         plt_cfg_root,
@@ -5125,28 +5173,28 @@ def run_maintenance(
         inventory_cfg,
         plt_merged_dir,
         artifacts_dir,
-        ctl_context,
+        ctl_profile,
         plt_overlays,
-        plt_runtime_selectors=plt_runtime_selectors,
-        runtime_context=runtime_context,
+        scope_params=scope_params,
+        execution_context=execution_context,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
     record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
-    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, runtime_context_path)
-    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, runtime_context, plt_runtime_selectors)
+    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
+    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params)
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
         aws_access_contexts,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
@@ -5175,13 +5223,13 @@ def run_maintenance(
         execution_identities=execution_identities,
         aws_access_contexts=aws_access_contexts,
         aws_account_registry=aws_account_registry,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         aws_implementation_key=aws_implementation_key,
         allow_aws_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
     )
     run_and_log(
-        ["python3", str(materialize_ctl_stage_runtime(run_dir) / "assert_aws_access.py")],
+        ["python3", str(materialize_stage_utils(run_dir) / "assert_aws_access.py")],
         cwd=repo_path,
         env=stage_env,
     )
@@ -5198,17 +5246,16 @@ def run_maintenance(
     stage_env["MAINTENANCE_STAGE_CFG_DIR"] = str(stage_cfg_dir)
     stage_env["TFSTATE_KEY_VAR"] = tfstate_key_var
     stage_env["LOCK_ID"] = lock_id
-    runtime_context_repo_path = repo_path / RUNTIME_CONTEXT_FILENAME
-    shutil.copy2(runtime_context_path, runtime_context_repo_path)
-    stage_env["ATLAS_RUNTIME_CONTEXT_FILE"] = RUNTIME_CONTEXT_FILENAME
-    stage_env.update(runtime_context_env_values(runtime_context))
+    execution_context_repo_path = repo_path / EXECUTION_CONTEXT_FILENAME
+    shutil.copy2(execution_context_path, execution_context_repo_path)
+    stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
 
     maintenance_cmd = [
         "bash",
         "-lc",
         """
 set -euo pipefail
-source "$ATLAS_CTL_STAGE_RUNTIME_DIR/prepare_stage_runtime.sh"
+source "$ATLAS_STAGE_UTILS_DIR/ctl/prepare_stage_runtime.sh"
 prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
 ./bin/tf.sh infra init "$TFSTATE_KEY_VAR"
 ./bin/tf.sh infra force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
@@ -5227,7 +5274,7 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
 def validate_workflow_target_selectors(
     workflow_cfg: dict,
     inventory_cfg: dict,
-    runtime_selector_maps: dict[str, dict[str, str]],
+    execution_context: dict[str, object],
 ) -> None:
     targets = inventory_cfg.get("stage_targets", {})
     for entry in workflow_cfg.get("stages", []):
@@ -5236,9 +5283,9 @@ def validate_workflow_target_selectors(
         if target_cfg is None:
             continue
         selectors = target_cfg.get("selectors")
-        if not selector_matches(selectors, runtime_selector_maps, label=f"target {target_name}"):
+        if not selector_matches(selectors, execution_context, label=f"target {target_name}"):
             raise RuntimeError(
-                f"❌ target {target_name!r} is not available for runtime selectors {runtime_selector_maps}; "
+                f"❌ target {target_name!r} is not available for runtime selectors {execution_context}; "
                 f"selectors={selectors}"
             )
 
@@ -5284,9 +5331,8 @@ def build_sub_workflow_cfg(
 def run_pipeline(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
-    ctl_context: str,
-    ctl_runtime_selectors: dict[str, str],
-    plt_runtime_selectors: dict[str, str],
+    ctl_profile: str,
+    execution_params: dict[str, str],
     ctl_ref_policy: str,
     inventory_name: str,
     workflow_name: str | None,
@@ -5311,28 +5357,29 @@ def run_pipeline(
 
     The caller passes stage repo settings and pre-created run/log directories.
     """
-    # Validation
-    runtime_selector_maps = {"ctl": ctl_runtime_selectors, "plt": plt_runtime_selectors}
-    runtime_context = build_runtime_context(
+    # Build the execution context (flat dotted namespaces) and validate bindings.
+    execution_context = build_execution_context(
         ctl_cfg_root,
-        runtime_selector_maps,
-        base_values={"run_id": run_id},
+        action=inventory_name,
+        ctl_profile=ctl_profile,
+        execution_params=execution_params,
     )
-    # Ctl results backend: resolve + arm sync (pulls remote state layer), and
-    # inject the ctl-owned bucket name into plt processing (ctl→plt injection)
-    # so bucket-creating bootstrap stages consume it as a TF input.
+    scope_params = scope_params_from_context(execution_context)
+    validate_selector_bindings(ctl_cfg_root, execution_context)
+    # Ctl results backend: resolve + arm sync (pulls remote state layer). The
+    # bucket name is a resolved mechanism value: delivered to stages as an env
+    # var (never promoted into the execution context).
     ctl_results_backend = configure_ctl_results_sync(
         ctl_cfg_root,
-        ctl_context,
-        plt_runtime_selectors,
-        runtime_context,
+        ctl_profile,
+        scope_params,
+        execution_context,
         run_dir,
         skip_ctl_results_sync=skip_ctl_results_sync,
         aws_implementation_key=aws_implementation_key,
     )
-    if ctl_results_backend is not None:
-        runtime_context["ctl_results_s3_bucket_name"] = ctl_results_backend["bucket_name"]
-    runtime_context_path = write_runtime_context_artifact(artifacts_dir, runtime_context)
+    ctl_results_bucket_name = ctl_results_backend["bucket_name"] if ctl_results_backend else None
+    execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
     # Load workflow + inventory (validate before creating dirs).
@@ -5349,23 +5396,23 @@ def run_pipeline(
     elif target_name:
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
         workflow_cfg = {
-            "meta": {"name": f"{ctl_context}/{inventory_name}/{target_name}", "action": inventory_name},
+            "meta": {"name": f"{ctl_profile}/{inventory_name}/{target_name}", "action": inventory_name},
             "stages": [target_name],
         }
     else:
-        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_context, inventory_name, workflow_name, runtime_selector_maps)
+        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_profile, inventory_name, workflow_name, execution_context)
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
         workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             workflow_cfg,
             inventory_cfg,
-            runtime_selector_maps=runtime_selector_maps,
+            execution_context=execution_context,
             inventory_name=inventory_name,
             workflow_name=workflow_name,
             ctl_variants=ctl_variants,
         )
     if not sub_workflow_run:
-        validate_workflow_target_selectors(workflow_cfg, inventory_cfg, runtime_selector_maps)
+        validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
 
     refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
@@ -5374,7 +5421,7 @@ def run_pipeline(
         tooling_refs = refs.get("global") or {}
         validate_tooling_refs_have_commits(tooling_refs, ctl_ref_policy)
 
-    logging.info(f"Selector policy validation passed: ctl_context={ctl_context}")
+    logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
 
     # Prepare pipeline config
     active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
@@ -5383,10 +5430,10 @@ def run_pipeline(
         inventory_cfg,
         plt_merged_dir,
         artifacts_dir,
-        ctl_context,
+        ctl_profile,
         plt_overlays,
-        plt_runtime_selectors=plt_runtime_selectors,
-        runtime_context=runtime_context,
+        scope_params=scope_params,
+        execution_context=execution_context,
         stage_repo_key=stage_repo_key,
         require_stage_ref=require_stage_ref,
         require_commit_refs=require_commit_refs,
@@ -5394,8 +5441,8 @@ def run_pipeline(
     )
     # Single derivation chain: render the merged tree, then verify guards
     # against rendered values, then distribute stage input views from it.
-    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, runtime_context_path)
-    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, runtime_context, plt_runtime_selectors)
+    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
+    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params)
 
     if sub_workflow_run:
         target_keys = sub_workflow_run.get("affected_target_keys") or []
@@ -5413,12 +5460,12 @@ def run_pipeline(
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_context)
+    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
         execution_identities,
         aws_access_contexts,
-        runtime_context=runtime_context,
+        execution_context=execution_context,
         implementation_key=aws_implementation_key,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
@@ -5427,9 +5474,8 @@ def run_pipeline(
     write_target_stage_flow_artifact(
         ctl_cfg_root,
         artifacts_dir,
-        ctl_context=ctl_context,
-        runtime_context=runtime_context,
-        runtime_selector_maps=runtime_selector_maps,
+        ctl_profile=ctl_profile,
+        execution_context=execution_context,
         inventory_name=inventory_name,
         workflow_name=workflow_name,
         ctl_variants=ctl_variants,
@@ -5452,8 +5498,8 @@ def run_pipeline(
 
     # Run stages
     run_stages(
-        active_stages, run_dir, plt_stages_dir_path, runtime_context_path,
-        inventory_name, runtime_context, run_id,
+        active_stages, run_dir, plt_stages_dir_path, execution_context_path,
+        inventory_name, execution_context, run_id,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
         execution_identities=execution_identities,
@@ -5462,6 +5508,7 @@ def run_pipeline(
         aws_implementation_key=aws_implementation_key,
         allow_aws_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
+        ctl_results_bucket_name=ctl_results_bucket_name,
     )
 
     print_run_summary(run_id, log_file)

@@ -17,7 +17,7 @@ def load_module(name: str, path: Path):
 
 build_runtime_cfg = load_module(
     "build_runtime_cfg",
-    CTL_UTILS_ROOT / "stages" / "build_runtime_cfg.py",
+    CTL_UTILS_ROOT / "stage_utils" / "build_runtime_cfg.py",
 )
 
 

@@ -19,10 +19,10 @@ CTL_RESULTS_YAML = """\
 ctl_results:
   backends:
     env:
-      bucket_name: ${main_tag}-${env_type}-ctl-results
+      bucket_name: ${execution_context.params.main_tag}-${execution_context.params.env_type}-ctl-results
       execution_identity_key: ctl_results_env_writer
     deployments:
-      bucket_name: ${main_tag}-deployments-ctl-results
+      bucket_name: ${execution_context.params.main_tag}-deployments-ctl-results
       execution_identity_key: ctl_results_deployments_writer
 """
 
@@ -57,7 +57,7 @@ class CtlResultsCfgTests(unittest.TestCase):
             backend = common.resolve_ctl_results_backend(
                 cfg,
                 {"env_type": "dev"},
-                {"main_tag": "oxygen", "env_type": "dev"},
+                {"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
             )
             self.assertEqual(backend["tier"], "env")
             self.assertEqual(backend["bucket_name"], "oxygen-dev-ctl-results")
@@ -69,7 +69,7 @@ class CtlResultsCfgTests(unittest.TestCase):
             write(root / "ctl_results.yaml", CTL_RESULTS_YAML)
             cfg = common.load_ctl_results_cfg(root)
 
-            backend = common.resolve_ctl_results_backend(cfg, {}, {"main_tag": "oxygen"})
+            backend = common.resolve_ctl_results_backend(cfg, {}, {"execution_context.params.main_tag": "oxygen"})
             self.assertEqual(backend["tier"], "deployments")
             self.assertEqual(backend["bucket_name"], "oxygen-deployments-ctl-results")
 
@@ -78,8 +78,8 @@ class CtlResultsPolicyTests(unittest.TestCase):
     def _ctl_root(self, tmp: str, results_sync_line: str) -> Path:
         root = Path(tmp)
         write(
-            root / "selectors.yaml",
-            "selectors:\n  ctl_context:\n    test_ctx:\n      ref_policy: commit_required\n" + results_sync_line,
+            root / "ctl_profiles.yaml",
+            "ctl_profiles:\n  test_ctx:\n    ref_policy: commit_required\n" + results_sync_line,
         )
         return root
 
@@ -90,12 +90,12 @@ class CtlResultsPolicyTests(unittest.TestCase):
 
     def test_policy_reads_context_value(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._ctl_root(tmp, "      results_sync: required\n")
+            root = self._ctl_root(tmp, "    results_sync: required\n")
             self.assertEqual(common.ctl_results_sync_policy(root, "test_ctx"), "required")
 
     def test_policy_rejects_unknown_value(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._ctl_root(tmp, "      results_sync: sometimes\n")
+            root = self._ctl_root(tmp, "    results_sync: sometimes\n")
             with self.assertRaisesRegex(RuntimeError, "results_sync must be one of"):
                 common.ctl_results_sync_policy(root, "test_ctx")
 

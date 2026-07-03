@@ -53,16 +53,26 @@ def load_yaml_mapping(path: Path) -> dict:
 
 
 
-def load_runtime_context(path: Path) -> dict[str, object]:
+EXECUTION_CONTEXT_ROOT = "execution_context"
+
+
+def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
+    """Load the nested execution_context file; return (flat dotted map, nested)."""
     data = load_yaml_mapping(path)
-    runtime_context: dict[str, object] = {}
-    for key, value in data.items():
-        if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
-            raise RuntimeError(f"runtime context key {key!r} is not a valid env var name")
-        if not isinstance(value, (str, int, float, bool)):
-            raise RuntimeError(f"runtime context key {key!r} must be scalar, got {type(value).__name__}")
-        runtime_context[key] = value
-    return runtime_context
+    nested = data.get(EXECUTION_CONTEXT_ROOT)
+    if not isinstance(nested, dict):
+        raise RuntimeError(f"execution context file must contain a top-level {EXECUTION_CONTEXT_ROOT} mapping: {path}")
+    flat: dict[str, object] = {}
+    for namespace, entries in nested.items():
+        if not isinstance(entries, dict):
+            raise RuntimeError(f"{EXECUTION_CONTEXT_ROOT}.{namespace} must be a mapping: {path}")
+        for key, value in entries.items():
+            if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
+                raise RuntimeError(f"execution context key {key!r} is not a valid identifier")
+            if not isinstance(value, (str, int, float, bool)):
+                raise RuntimeError(f"execution context key {key!r} must be scalar, got {type(value).__name__}")
+            flat[f"{EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = value
+    return flat, nested
 
 
 def merge_values(base, overlay):
@@ -336,7 +346,12 @@ def build_stage_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict
     merged: dict = {}
     merged_files: list[str] = []
     for cfg_file in iter_cfg_files(origin_cfg_dir, cfg_files):
-        merged = merge_values(merged, load_yaml_mapping(cfg_file))
+        doc = load_yaml_mapping(cfg_file)
+        if EXECUTION_CONTEXT_ROOT in doc:
+            raise RuntimeError(
+                f"plt payload must not define reserved top-level key {EXECUTION_CONTEXT_ROOT!r}: {cfg_file}"
+            )
+        merged = merge_values(merged, doc)
         merged_files.append(str(cfg_file))
 
     resolver = Resolver(merged, env_ctx)
@@ -389,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cfg-files", required=True, type=parse_cfg_files)
     parser.add_argument("--values-json-out", required=True)
     parser.add_argument("--stage-env-out", required=True)
-    parser.add_argument("--runtime-context-file", required=True)
+    parser.add_argument("--execution-context-file", required=True)
     return parser
 
 
@@ -404,12 +419,14 @@ def main() -> int:
     values_json_out = None if values_json_out_arg == "-" else Path(values_json_out_arg).resolve()
     stage_env_out = None if stage_env_out_arg == "-" else Path(stage_env_out_arg).resolve()
 
-    runtime_context_file = Path(args.runtime_context_file).resolve()
-    env_ctx = load_runtime_context(runtime_context_file)
+    execution_context_file = Path(args.execution_context_file).resolve()
+    env_ctx, execution_context_nested = load_execution_context(execution_context_file)
 
     stage_values, merged_files = build_stage_values(origin_cfg_dir, cfg_files, env_ctx)
-    stage_env_values = dict(env_ctx)
-    stage_env_values.update(stage_values)
+    # Nested merge + aliases: the whole context under ONE reserved key; the
+    # engine never invents flat leaves (flat names exist only via payload aliases).
+    stage_env_values = dict(stage_values)
+    stage_env_values[EXECUTION_CONTEXT_ROOT] = execution_context_nested
 
     if values_json_out is not None:
         values_json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -418,8 +435,8 @@ def main() -> int:
                 {
                     "_meta": {
                         "origin_cfg_dir": str(origin_cfg_dir),
-                        "runtime_context_file": str(runtime_context_file),
-                        "runtime_context_keys": sorted(env_ctx),
+                        "execution_context_file": str(execution_context_file),
+                        "execution_context_keys": sorted(env_ctx),
                         "merged_files": merged_files,
                     },
                     "values": stage_env_values,
