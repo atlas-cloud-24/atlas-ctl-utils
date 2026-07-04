@@ -110,10 +110,6 @@ def run_plt(args: argparse.Namespace) -> int:
     ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve() if args.ctl_cfg_root else None
     execution_context = build_context(args, ctl_cfg_root)
     scope_params = dict(args.execution_param)
-    # Engine-resolved ctl-results params (per-tier bucket-name aliases) so
-    # scopes that reference them render, matching the pipeline's context.
-    if ctl_cfg_root is not None:
-        common.inject_ctl_results_params(execution_context, ctl_cfg_root)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="atlas-regenerate-guardrails-"))
     try:
@@ -176,15 +172,13 @@ def run_ctl(args: argparse.Namespace) -> int:
         raise RuntimeError("no ctl guarded vars declared; pass --var to add one")
 
     execution_context = build_context(args, ctl_cfg_root)
-    # Engine-resolved mechanism params (e.g. the invariant deployments results
-    # bucket name) so their guarded refs are available to hash.
-    common.inject_ctl_results_params(execution_context, ctl_cfg_root)
     hashes: dict[str, str] = dict(existing)
     for ref in refs:
         ref = common.validate_ctl_guard_ref(ref, label="--var")
-        if ref not in execution_context:
-            raise RuntimeError(f"ctl guarded var {ref!r} is not available in the execution context")
-        hashes[ref] = common.guard_value_hash(execution_context[ref], label=ref)
+        # Context refs read the built context; ctl_state_buckets.* refs resolve
+        # from the registry — same resolution the run-time verify uses.
+        value = common.resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
+        hashes[ref] = common.guard_value_hash(value, label=ref)
 
     path = ctl_cfg_root / "guardrails.yaml"
     path.write_text(

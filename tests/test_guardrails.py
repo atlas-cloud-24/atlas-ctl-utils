@@ -73,6 +73,35 @@ class CtlGuardrailTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "per-run switches and can never be guarded"):
                 common.verify_ctl_guardrails(root, {"execution_context.ctl.action": "provision"})
 
+    def test_ctl_guardrails_resolve_registry_refs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(
+                root / "ctl_state.yaml",
+                "ctl_state_buckets:\n  deployments:\n"
+                "    bucket_name: ${execution_context.params.main_tag}-deployments-ctl-state\n"
+                "    bucket_region: us-east-1\n",
+            )
+            expected = common.guard_value_hash("oxygen-deployments-ctl-state", label="test")
+            write(
+                root / "guardrails.yaml",
+                f"guardrails:\n  guarded_vars:\n    ctl_state_buckets.deployments.bucket_name: {expected}\n",
+            )
+
+            common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
+
+    def test_ctl_guardrails_reject_registry_ref_with_bad_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = common.guard_value_hash("x", label="test")
+            write(
+                root / "guardrails.yaml",
+                f"guardrails:\n  guarded_vars:\n    ctl_state_buckets.deployments.execution_identity_key: {expected}\n",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "must be ctl_state_buckets"):
+                common.verify_ctl_guardrails(root, {})
+
     def test_ctl_guardrails_reject_bare_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

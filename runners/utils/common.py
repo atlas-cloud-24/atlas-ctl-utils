@@ -248,7 +248,7 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
     bundles governing ctl behavior (ref_policy, allow_aws_profile_only,
-    results_sync, ...)."""
+    allow_skip_ctl_state_bucket_sync, ...)."""
     profiles: dict[str, dict] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
         if not isinstance(section, dict):
@@ -335,13 +335,13 @@ def validate_selector_bindings(ctl_cfg_root: Path, execution_context: dict[str, 
                     f"❌ selector binding #{idx} allows {ref} only in {allowed}, got {execution_context[ref]!r}"
                 )
 
-def normalize_ctl_results_root(value: str) -> Path:
-    """Normalize the operator-provided ctl results root directory."""
+def normalize_ctl_state_local_root(value: str) -> Path:
+    """Normalize the operator-provided local ctl-state root directory."""
     if not isinstance(value, str) or not value.strip():
-        raise RuntimeError("❌ --ctl-results-root must be a non-empty directory path")
+        raise RuntimeError("❌ --ctl-state-local-root must be a non-empty directory path")
     root = Path(value.strip()).expanduser().resolve()
     if root.exists() and not root.is_dir():
-        raise RuntimeError(f"❌ --ctl-results-root exists but is not a directory: {root}")
+        raise RuntimeError(f"❌ --ctl-state-local-root exists but is not a directory: {root}")
     return root
 
 
@@ -356,7 +356,7 @@ def normalize_optional_aws_profile(value: str | None) -> str | None:
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
     args.execution_params = selectors_to_map(args.execution_param, label="execution param")
-    args.ctl_results_root = normalize_ctl_results_root(args.ctl_results_root)
+    args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
     args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
     args.run_id = generate_uuid7()
 
@@ -484,7 +484,7 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ workflow runner requires --workflow")
     if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
         raise RuntimeError("❌ workflow runner does not accept sub-workflow synthetic target args")
 
 
@@ -496,7 +496,7 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
         raise RuntimeError("❌ target runner does not accept sub-workflow synthetic target args")
 
 
@@ -504,13 +504,13 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
     """Validate args for a maintenance run."""
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
         raise RuntimeError("❌ maintenance runner does not accept sub-workflow synthetic target args")
     if not getattr(args, "maintenance_action", None):
         raise RuntimeError("❌ --maintenance-action is required for maintenance")
     if args.maintenance_action == "force-unlock" and not getattr(args, "lock_id", None):
         raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
-    if args.maintenance_action == "force-unlock" and ctl_results_lock_matches(args.ctl_results_root, args.lock_id):
+    if args.maintenance_action == "force-unlock" and ctl_state_lock_matches(args.ctl_state_local_root, args.lock_id):
         return
     if not getattr(args, "target", None):
         raise RuntimeError("❌ --target is required for maintenance")
@@ -940,6 +940,14 @@ def build_active_stages(
             if not isinstance(execution_identity_key, str) or not execution_identity_key.strip():
                 raise RuntimeError(f"Stage {stage_id!r} execution_identity_key must be a non-empty string")
             active_stage["execution_identity_key"] = execution_identity_key.strip()
+
+        # State domain: which ctl-state bucket this target's results/lock live in.
+        # Absent (commented in dev cfg) = no domain for this run → sync skippable.
+        ctl_state_bucket_key = target_cfg.get("ctl_state_bucket_key")
+        if ctl_state_bucket_key is not None:
+            if not isinstance(ctl_state_bucket_key, str) or not ctl_state_bucket_key.strip():
+                raise RuntimeError(f"Stage {stage_id!r} ctl_state_bucket_key must be a non-empty string")
+            active_stage["ctl_state_bucket_key"] = ctl_state_bucket_key.strip()
 
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
@@ -1837,6 +1845,13 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
         help="execution identity key for a synthetic target",
     )
     parser.add_argument(
+        "--ctl-state-bucket-key",
+        dest="ctl_state_bucket_key",
+        default=None,
+        help="state domain for a synthetic target (ctl_state_buckets key); "
+        "omit = no domain (sync skippable via the skip triad)",
+    )
+    parser.add_argument(
         "--affected-target-key",
         dest="affected_target_keys",
         action="append",
@@ -1848,9 +1863,9 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
 def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     """Add shared and runner-specific arguments for local runner entrypoints."""
     parser.add_argument(
-        "--ctl-results-root",
+        "--ctl-state-local-root",
         required=True,
-        help="Directory where ctl results are stored; runner appends <action>/<run_type>/<name>",
+        help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
     )
     parser.add_argument(
         "--aws-profile",
@@ -1885,10 +1900,11 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
     )
     parser.add_argument(
-        "--skip-ctl-results-sync",
+        "--skip-ctl-state-bucket-sync",
         action="store_true",
-        help="Skip ctl results sync to the remote bucket; honored only when the "
-        "ctl_profile results_sync policy is 'optional' (error under 'required')",
+        help="Run without ctl-state bucket sync; honored only when the ctl profile "
+        "sets allow_skip_ctl_state_bucket_sync: true AND no active target declares "
+        "a ctl_state_bucket_key (a declared state domain always syncs)",
     )
 
     if run_type == "workflow":
@@ -2364,6 +2380,15 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         }
         if execution_identity_key is not None:
             resolved["execution_identity_key"] = execution_identity_key.strip()
+        ctl_state_bucket_key = target_def.get("ctl_state_bucket_key")
+        if ctl_state_bucket_key is not None:
+            if not isinstance(ctl_state_bucket_key, str) or not ctl_state_bucket_key.strip():
+                raise RuntimeError(
+                    f"❌ target {target_name!r} ctl_state_bucket_key must be a non-empty string"
+                )
+            resolved["ctl_state_bucket_key"] = ctl_state_bucket_key.strip()
+        if target_def.get("provisions_ctl_state_bucket") is True:
+            resolved["provisions_ctl_state_bucket"] = True
         if "selectors" in target_def:
             resolved["selectors"] = target_def["selectors"]
         if "required_plt_overlay_keys" in target_def:
@@ -2508,16 +2533,16 @@ def setup_run_dirs(
     action: str,
     run_type: str,
     result_name: str,
-    ctl_results_root: Path,
+    ctl_state_local_root: Path,
     memory_handler: logging.handlers.MemoryHandler,
 ) -> tuple[Path, Path, Path, Path]:
     """Create run directories under the stable ctl result key and setup file logging."""
     result_name = normalize_result_name(result_name, label="ctl result name")
-    ctl_result_dir = Path(ctl_results_root) / action / run_type / result_name
-    runs_dir = ctl_result_dir / "runs"
+    ctl_state_dir = Path(ctl_state_local_root) / action / run_type / result_name
+    runs_dir = ctl_state_dir / "runs"
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Using ctl_result_dir: {ctl_result_dir}")
+    logging.info(f"Using ctl_state_dir: {ctl_state_dir}")
     logging.info(f"Using run_dir: {run_dir}")
 
     # Materialize the pinned ctl stage runtime once, up front — it is a run-scoped
@@ -2563,8 +2588,8 @@ def setup_run_dirs(
             "run_type": run_type,
             "result_name": result_name,
             "result_key": f"{action}/{run_type}/{result_name}",
-            "ctl_results_root": str(Path(ctl_results_root)),
-            "ctl_result_dir": str(ctl_result_dir),
+            "ctl_state_local_root": str(Path(ctl_state_local_root)),
+            "ctl_state_dir": str(ctl_state_dir),
             "run_dir": str(run_dir),
             "log_path": str(log_file),
             "target_keys": [],
@@ -2582,7 +2607,7 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def ctl_result_dir_from_run_dir(run_dir: Path) -> Path:
+def ctl_state_dir_from_run_dir(run_dir: Path) -> Path:
     if run_dir.parent.name != "runs":
         raise RuntimeError(f"run_dir must be under a runs/ directory: {run_dir}")
     return run_dir.parent.parent
@@ -2677,13 +2702,13 @@ def write_current_status(run_dir: Path, payload: dict) -> None:
 
 
 def remove_state_slot(run_dir: Path, state: str) -> None:
-    slot_dir = ctl_result_dir_from_run_dir(run_dir) / state
+    slot_dir = ctl_state_dir_from_run_dir(run_dir) / state
     if slot_dir.exists():
         shutil.rmtree(slot_dir)
 
 
 def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
-    slot_dir = ctl_result_dir_from_run_dir(run_dir) / state
+    slot_dir = ctl_state_dir_from_run_dir(run_dir) / state
     slot_payload = dict(payload)
     slot_payload["state_slot"] = state
     slot_payload["run_path"] = f"runs/{run_dir.name}"
@@ -2701,7 +2726,7 @@ def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
 
 
 def rewrite_in_progress_slot_if_present(run_dir: Path, payload: dict) -> None:
-    slot_dir = ctl_result_dir_from_run_dir(run_dir) / "in_progress"
+    slot_dir = ctl_state_dir_from_run_dir(run_dir) / "in_progress"
     if slot_dir.exists():
         write_state_slot(run_dir, "in_progress", payload)
 
@@ -2718,7 +2743,7 @@ def record_run_target_keys(run_dir: Path, target_keys: list[str]) -> None:
     status = load_current_status(run_dir)
     if status:
         status.update({"target_keys": normalized, "updated_at": utc_timestamp()})
-        for key in ("action", "run_type", "result_name", "result_key", "ctl_results_root", "ctl_result_dir", "run_dir", "log_path"):
+        for key in ("action", "run_type", "result_name", "result_key", "ctl_state_local_root", "ctl_state_dir", "run_dir", "log_path"):
             if key in metadata:
                 status[key] = metadata[key]
         write_current_status(run_dir, status)
@@ -2748,7 +2773,7 @@ def mark_mutation_started(run_dir: Path, stage_id: str) -> None:
         write_current_status(run_dir, status)
         if status.get("status") == "in_progress":
             rewrite_in_progress_slot_if_present(run_dir, status)
-    ctl_results_push(f"mutation started ({stage_id})")
+    ctl_state_push(f"mutation started ({stage_id})")
 
 
 def tail_log_lines(log_path: str | None, limit: int = 40) -> list[str]:
@@ -2791,14 +2816,14 @@ def print_failure_summary(payload: dict) -> None:
 
 
 def mark_run_succeeded(run_dir: Path) -> None:
-    payload = build_status_payload(run_dir, "ok", {"results_sync": ctl_results_sync_summary()})
+    payload = build_status_payload(run_dir, "ok", {"ctl_state_sync": ctl_state_sync_summary()})
     write_current_status(run_dir, payload)
     write_state_slot(run_dir, "committed", payload)
     remove_state_slot(run_dir, "in_progress")
     remove_state_slot(run_dir, "failed")
     mark_outdated_for_run(run_dir, include_current_result=False)
-    ctl_results_push("run succeeded")
-    ctl_results_remove_slots(run_dir, ("in_progress", "failed"))
+    ctl_state_push("run succeeded")
+    ctl_state_remove_slots(run_dir, ("in_progress", "failed"))
 
 
 def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
@@ -2814,21 +2839,21 @@ def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
             },
             "log_path": metadata.get("log_path"),
             "tail_lines": extracted["tail_lines"],
-            "results_sync": ctl_results_sync_summary(),
+            "ctl_state_sync": ctl_state_sync_summary(),
         },
     )
     write_current_status(run_dir, payload)
     write_state_slot(run_dir, "failed", payload)
     remove_state_slot(run_dir, "in_progress")
     mark_outdated_for_run(run_dir, include_current_result=True)
-    ctl_results_push("run failed")
-    ctl_results_remove_slots(run_dir, ("in_progress",))
+    ctl_state_push("run failed")
+    ctl_state_remove_slots(run_dir, ("in_progress",))
     print_failure_summary(payload)
 
 
-def parse_result_dir(ctl_results_root: Path, result_dir: Path) -> dict | None:
+def parse_result_dir(ctl_state_local_root: Path, result_dir: Path) -> dict | None:
     try:
-        rel = Path(result_dir).resolve().relative_to(Path(ctl_results_root).resolve())
+        rel = Path(result_dir).resolve().relative_to(Path(ctl_state_local_root).resolve())
     except ValueError:
         return None
     parts = rel.parts
@@ -2846,8 +2871,8 @@ def parse_result_dir(ctl_results_root: Path, result_dir: Path) -> dict | None:
     }
 
 
-def iter_committed_status_paths(ctl_results_root: Path):
-    root = Path(ctl_results_root)
+def iter_committed_status_paths(ctl_state_local_root: Path):
+    root = Path(ctl_state_local_root)
     if not root.is_dir():
         return
     yield from sorted(root.rglob("committed/STATUS.yaml"))
@@ -2860,9 +2885,9 @@ def load_status_mapping(path: Path) -> dict:
     return data
 
 
-def status_result_info(ctl_results_root: Path, status_path: Path, status: dict) -> dict | None:
+def status_result_info(ctl_state_local_root: Path, status_path: Path, status: dict) -> dict | None:
     result_dir = status_path.parent.parent
-    parsed = parse_result_dir(ctl_results_root, result_dir)
+    parsed = parse_result_dir(ctl_state_local_root, result_dir)
     if parsed is None:
         return None
     info = dict(parsed)
@@ -2919,9 +2944,9 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
         return
     affected = set(affected_target_keys)
 
-    ctl_results_root = metadata.get("ctl_results_root")
+    ctl_state_local_root = metadata.get("ctl_state_local_root")
     current_result_key = metadata.get("result_key")
-    if not isinstance(ctl_results_root, str) or not ctl_results_root:
+    if not isinstance(ctl_state_local_root, str) or not ctl_state_local_root:
         return
 
     caused_by = {
@@ -2933,9 +2958,9 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
         "target_keys": affected_target_keys,
     }
 
-    for status_path in iter_committed_status_paths(Path(ctl_results_root)):
+    for status_path in iter_committed_status_paths(Path(ctl_state_local_root)):
         status = load_status_mapping(status_path)
-        info = status_result_info(Path(ctl_results_root), status_path, status)
+        info = status_result_info(Path(ctl_state_local_root), status_path, status)
         if info is None:
             continue
         if info.get("action") == "readonly":
@@ -2953,7 +2978,7 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
         )
 
 
-def mark_removed_definitions_outdated(ctl_results_root: Path, ctl_cfg_root: Path) -> None:
+def mark_removed_definitions_outdated(ctl_state_local_root: Path, ctl_cfg_root: Path) -> None:
     try:
         workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
     except Exception as exc:
@@ -2965,9 +2990,9 @@ def mark_removed_definitions_outdated(ctl_results_root: Path, ctl_cfg_root: Path
         logging.warning("Skipping definition_removed scan: failed to load targets: %s", exc)
         targets = {}
 
-    for status_path in iter_committed_status_paths(Path(ctl_results_root)):
+    for status_path in iter_committed_status_paths(Path(ctl_state_local_root)):
         status = load_status_mapping(status_path)
-        info = status_result_info(Path(ctl_results_root), status_path, status)
+        info = status_result_info(Path(ctl_state_local_root), status_path, status)
         if info is None:
             continue
         run_type = info.get("run_type")
@@ -2994,35 +3019,35 @@ def mark_removed_definitions_outdated(ctl_results_root: Path, ctl_cfg_root: Path
         )
 
 
-def ctl_results_lock_path(ctl_results_root: Path) -> Path:
-    return Path(ctl_results_root) / CTL_RESULTS_LOCK_FILENAME
+def ctl_state_lock_path(ctl_state_local_root: Path) -> Path:
+    return Path(ctl_state_local_root) / CTL_RESULTS_LOCK_FILENAME
 
 
-def ctl_results_lock_metadata_path(ctl_results_root: Path) -> Path:
-    return Path(ctl_results_root) / CTL_RESULTS_LOCK_META_FILENAME
+def ctl_state_lock_metadata_path(ctl_state_local_root: Path) -> Path:
+    return Path(ctl_state_local_root) / CTL_RESULTS_LOCK_META_FILENAME
 
 
-def load_ctl_results_lock_metadata(ctl_results_root: Path) -> dict:
-    path = ctl_results_lock_metadata_path(ctl_results_root)
+def load_ctl_state_lock_metadata(ctl_state_local_root: Path) -> dict:
+    path = ctl_state_lock_metadata_path(ctl_state_local_root)
     if not path.is_file():
         return {}
     data = load_yaml(path) or {}
     if not isinstance(data, dict):
-        raise RuntimeError(f"❌ ctl results lock metadata must be a mapping: {path}")
+        raise RuntimeError(f"❌ ctl-state lock metadata must be a mapping: {path}")
     return data
 
 
-def ctl_results_lock_matches(ctl_results_root: Path, lock_id: str | None) -> bool:
+def ctl_state_lock_matches(ctl_state_local_root: Path, lock_id: str | None) -> bool:
     if not lock_id:
         return False
-    metadata = load_ctl_results_lock_metadata(ctl_results_root)
+    metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
     return metadata.get("run_id") == lock_id
 
 
-def format_ctl_results_lock_error(ctl_results_root: Path, metadata: dict, *, reason: str) -> str:
+def format_ctl_state_lock_error(ctl_state_local_root: Path, metadata: dict, *, reason: str) -> str:
     lock_id = metadata.get("run_id") or "unknown"
     details = [
-        f"❌ ctl results root is locked: {ctl_results_root}",
+        f"❌ ctl-state local root is locked: {ctl_state_local_root}",
         f"reason: {reason}",
         f"lock_id/run_id: {lock_id}",
     ]
@@ -3035,39 +3060,39 @@ def format_ctl_results_lock_error(ctl_results_root: Path, metadata: dict, *, rea
 
 
 class CtlResultsLock:
-    """Local ctl results root lock backed by flock plus explicit metadata."""
+    """Local ctl-state root lock backed by flock plus explicit metadata."""
 
-    def __init__(self, ctl_results_root: Path):
-        self.ctl_results_root = Path(ctl_results_root)
-        self.lock_path = ctl_results_lock_path(self.ctl_results_root)
-        self.metadata_path = ctl_results_lock_metadata_path(self.ctl_results_root)
+    def __init__(self, ctl_state_local_root: Path):
+        self.ctl_state_local_root = Path(ctl_state_local_root)
+        self.lock_path = ctl_state_lock_path(self.ctl_state_local_root)
+        self.metadata_path = ctl_state_lock_metadata_path(self.ctl_state_local_root)
         self._file = None
         self.run_id: str | None = None
 
     def acquire(self, *, allow_stale_metadata: bool = False) -> "CtlResultsLock":
-        self.ctl_results_root.mkdir(parents=True, exist_ok=True)
+        self.ctl_state_local_root.mkdir(parents=True, exist_ok=True)
         self._file = self.lock_path.open("a+", encoding="utf-8")
         try:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+            metadata = load_ctl_state_lock_metadata(self.ctl_state_local_root)
             self._file.close()
             self._file = None
             raise RuntimeError(
-                format_ctl_results_lock_error(
-                    self.ctl_results_root,
+                format_ctl_state_lock_error(
+                    self.ctl_state_local_root,
                     metadata,
                     reason="another ctl process still holds the OS lock",
                 )
             ) from exc
 
         if not allow_stale_metadata:
-            metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+            metadata = load_ctl_state_lock_metadata(self.ctl_state_local_root)
             if metadata:
                 self.release(clear_metadata=False)
                 raise RuntimeError(
-                    format_ctl_results_lock_error(
-                        self.ctl_results_root,
+                    format_ctl_state_lock_error(
+                        self.ctl_state_local_root,
                         metadata,
                         reason="stale ctl lock metadata exists",
                     )
@@ -3091,7 +3116,7 @@ class CtlResultsLock:
         remove_lock_file = clear_metadata
         try:
             if clear_metadata and self.metadata_path.exists():
-                metadata = load_ctl_results_lock_metadata(self.ctl_results_root)
+                metadata = load_ctl_state_lock_metadata(self.ctl_state_local_root)
                 if not self.run_id or metadata.get("run_id") == self.run_id:
                     self.metadata_path.unlink()
                 else:
@@ -3114,24 +3139,24 @@ class CtlResultsLock:
             self._file = None
 
 
-def acquire_ctl_results_lock(ctl_results_root: Path) -> CtlResultsLock:
-    return CtlResultsLock(ctl_results_root).acquire()
+def acquire_ctl_state_lock(ctl_state_local_root: Path) -> CtlResultsLock:
+    return CtlResultsLock(ctl_state_local_root).acquire()
 
 
-def release_ctl_results_lock(lock: CtlResultsLock | None) -> None:
+def release_ctl_state_lock(lock: CtlResultsLock | None) -> None:
     if lock is not None:
         lock.release()
 
 
-def should_bypass_ctl_results_lock(args: argparse.Namespace, run_type: str) -> bool:
+def should_bypass_ctl_state_lock(args: argparse.Namespace, run_type: str) -> bool:
     return (
         run_type == "maintenance"
         and getattr(args, "maintenance_action", None) == "force-unlock"
-        and ctl_results_lock_matches(args.ctl_results_root, getattr(args, "lock_id", None))
+        and ctl_state_lock_matches(args.ctl_state_local_root, getattr(args, "lock_id", None))
     )
 
 
-def write_ctl_results_lock_metadata(
+def write_ctl_state_lock_metadata(
     lock: CtlResultsLock,
     *,
     run_id: str,
@@ -3170,7 +3195,7 @@ def mark_run_force_unlocked(run_dir: Path, metadata: dict, maintenance_run_dir: 
             "failure_reason": "force_unlocked",
             "error": {
                 "type": "ForceUnlocked",
-                "summary": "ctl results lock was cleared by maintenance force-unlock",
+                "summary": "ctl-state lock was cleared by maintenance force-unlock",
             },
             "force_unlocked": {
                 "at": utc_timestamp(),
@@ -3188,34 +3213,34 @@ def mark_run_force_unlocked(run_dir: Path, metadata: dict, maintenance_run_dir: 
     mark_outdated_for_run(run_dir, include_current_result=True, force=force_outdated)
 
 
-def force_unlock_ctl_results_lock(ctl_results_root: Path, lock_id: str, maintenance_run_dir: Path) -> bool:
-    metadata = load_ctl_results_lock_metadata(ctl_results_root)
+def force_unlock_ctl_state_lock(ctl_state_local_root: Path, lock_id: str, maintenance_run_dir: Path) -> bool:
+    metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
     if not metadata:
         return False
 
     active_run_id = metadata.get("run_id")
     if active_run_id != lock_id:
         raise RuntimeError(
-            f"❌ ctl results lock id mismatch: active lock_id/run_id is {active_run_id!r}, got {lock_id!r}"
+            f"❌ ctl-state lock id mismatch: active lock_id/run_id is {active_run_id!r}, got {lock_id!r}"
         )
 
-    lock = CtlResultsLock(ctl_results_root).acquire(allow_stale_metadata=True)
+    lock = CtlResultsLock(ctl_state_local_root).acquire(allow_stale_metadata=True)
     try:
-        metadata = load_ctl_results_lock_metadata(ctl_results_root)
+        metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
         if metadata.get("run_id") != lock_id:
             raise RuntimeError(
-                f"❌ ctl results lock changed while force-unlock was starting: expected {lock_id!r}, got {metadata.get('run_id')!r}"
+                f"❌ ctl-state lock changed while force-unlock was starting: expected {lock_id!r}, got {metadata.get('run_id')!r}"
             )
 
         raw_run_dir = metadata.get("run_dir")
         if not isinstance(raw_run_dir, str) or not raw_run_dir:
-            raise RuntimeError("❌ ctl results lock metadata is missing run_dir")
+            raise RuntimeError("❌ ctl-state lock metadata is missing run_dir")
         run_dir = Path(raw_run_dir).expanduser().resolve()
-        root = Path(ctl_results_root).resolve()
+        root = Path(ctl_state_local_root).resolve()
         try:
             run_dir.relative_to(root)
         except ValueError as exc:
-            raise RuntimeError(f"❌ ctl results lock run_dir is outside ctl_results_root: {run_dir}") from exc
+            raise RuntimeError(f"❌ ctl-state lock run_dir is outside ctl_state_local_root: {run_dir}") from exc
 
         mark_run_force_unlocked(run_dir, metadata, maintenance_run_dir)
         logging.warning("Ctl results lock force-unlocked for run_id=%s", lock_id)
@@ -3390,26 +3415,6 @@ def build_execution_context(
                 )
         put("params", key, raw, label=label)
     return context
-
-
-def add_resolved_execution_param(
-    execution_context: dict[str, object], key: str, value, *, label: str
-) -> None:
-    """Promote an engine-resolved mechanism value into the params namespace.
-
-    Params have three sources: --execution-params CLI, the execution_params cfg
-    block, and engine-resolved mechanism values (this path, e.g. the ctl-results
-    bucket name). Collides — hard error — if the consumer already declared the
-    same key, so a mechanism-owned value can never be silently shadowed."""
-    if not CONTEXT_KEY_RE.fullmatch(key):
-        raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
-    ref_key = f"{EXECUTION_CONTEXT_ROOT}.params.{key}"
-    if ref_key in execution_context:
-        raise RuntimeError(
-            f"❌ {label}: param {key!r} is engine-resolved and must not also be "
-            f"declared in execution_params or --execution-params"
-        )
-    execution_context[ref_key] = _context_scalar(value, label=label)
 
 
 def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -3598,13 +3603,31 @@ def verify_guarded_value(
         )
 
 
-def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
-    """A ctl guarded var is keyed by a fully-qualified execution-context ref.
+CTL_STATE_BUCKETS_GUARD_PREFIX = "ctl_state_buckets."
+CTL_STATE_BUCKETS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
 
-    `execution_context.ctl.*` is forbidden: action/profile are per-run switches,
-    so hashing them can never be correct. Only `params` (consumer-declared or
-    engine-resolved values) is guardable."""
-    value = validate_execution_context_ref(ref, label=label)
+
+def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
+    """A ctl guarded var is keyed by one of two fully-qualified ref forms:
+
+    - an execution-context ref (`execution_context.params.<key>`) —
+      `execution_context.ctl.*` is forbidden: action/profile are per-run
+      switches, so hashing them can never be correct;
+    - a ctl-state registry ref (`ctl_state_buckets.<domain>.<bucket_name|bucket_region>`)
+      — resolved from the registry (env-invariant values only, e.g. the
+      deployments bucket)."""
+    if not isinstance(ref, str) or not ref.strip():
+        raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
+    value = ref.strip()
+    if value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+        parts = value.split(".")
+        if len(parts) != 3 or parts[2] not in CTL_STATE_BUCKETS_GUARDABLE_FIELDS:
+            raise RuntimeError(
+                f"❌ {label}: {value!r} must be ctl_state_buckets.<domain>."
+                f"<{'|'.join(CTL_STATE_BUCKETS_GUARDABLE_FIELDS)}>"
+            )
+        return value
+    value = validate_execution_context_ref(value, label=label)
     _, namespace, _ = value.split(".", 2)
     if namespace == "ctl":
         raise RuntimeError(
@@ -3614,20 +3637,37 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
     return value
 
 
+def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
+    """Resolve a validated ctl guard ref to its current value.
+
+    Registry refs resolve from ctl_state_buckets (interpolating the execution
+    context, e.g. main_tag); context refs read the execution context directly."""
+    if ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+        _, domain, field = ref.split(".")
+        buckets = load_ctl_state_buckets_cfg(ctl_cfg_root) or {}
+        entry = buckets.get(domain)
+        if entry is None:
+            known = ", ".join(sorted(buckets)) or "none"
+            raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown domain {domain!r}; known: {known}")
+        return str(resolve_runtime_scalar(entry[field], execution_context, label=ref))
+    if ref not in execution_context:
+        raise RuntimeError(
+            f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
+        )
+    return execution_context[ref]
+
+
 def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
     guarded = load_ctl_guarded_vars(ctl_cfg_root)
     if not guarded:
         return
     for ref, expected_hash in guarded.items():
         validate_ctl_guard_ref(ref)
-        if ref not in execution_context:
-            raise RuntimeError(
-                f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
-            )
+        value = resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
         verify_guarded_value(
             "ctl",
             ref,
-            execution_context[ref],
+            value,
             expected_hash,
             label=ref,
         )
@@ -3681,16 +3721,35 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
     return target_dir
 
 
+def required_target_paths_for_stages(active_stages: dict) -> set[str] | None:
+    """Target paths this run's stages consume, from their cfg_roots.
+
+    Scopes are independent units: a run merges/renders/guard-verifies only the
+    scopes serving its stages' cfg_roots. Returns None when any stage consumes
+    the root ("/") — the deliberate escape hatch meaning every scope."""
+    paths: set[str] = set()
+    for stage in active_stages.values():
+        cfg_root = str(stage.get("cfg_root") or "/")
+        segments = [part for part in cfg_root.split("/") if part]
+        if not segments:
+            return None
+        paths.add(f"/{segments[0]}")
+    return paths
+
+
 def verify_plt_guardrails(
     plt_cfg_root: Path,
     plt_rendered_dir: Path,
     scope_params: dict[str, str],
+    required_target_paths: set[str] | None = None,
 ) -> None:
     """Verify declared plt guards against the rendered cfg of every active scope.
 
     Coverage: each declaration matching an active scope must have a baseline
     hash in that scope's local guardrails file, and every baseline hash must
-    correspond to a matching declaration.
+    correspond to a matching declaration. With `required_target_paths` set,
+    only the scopes this run merged/rendered are verified (scopes are
+    independent; the full tree is checked by the validate-all action).
     """
     declarations = load_plt_guard_declarations(plt_cfg_root)
     if not declarations:
@@ -3699,6 +3758,8 @@ def verify_plt_guardrails(
         raise RuntimeError(f"❌ plt guard declarations exist but no cfg scopes found under: {plt_cfg_root}")
 
     for scope in discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
+        if required_target_paths is not None and scope["target_path"] not in required_target_paths:
+            continue
         matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
         baseline_path = scope["scope_root"] / PLT_GUARDRAILS_FILENAME
         baseline = load_scope_guard_hashes(baseline_path, allow_missing=True)
@@ -3738,9 +3799,10 @@ def verify_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
+    required_target_paths: set[str] | None = None,
 ) -> None:
     verify_ctl_guardrails(ctl_cfg_root, execution_context)
-    verify_plt_guardrails(plt_cfg_root, plt_rendered_dir, scope_params)
+    verify_plt_guardrails(plt_cfg_root, plt_rendered_dir, scope_params, required_target_paths)
 
 
 
@@ -4098,12 +4160,16 @@ def merge_plt_cfg_dirs(
     source_log_roots: tuple[Path, ...] | None = None,
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
+    required_target_paths: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Build scoped merged cfg trees from typed __meta__.yaml metadata.
 
     Scope activation matches scope_identity against plt execution inputs
     (bare keys); overlay gating matches overlay selectors against the full
-    execution context (fully-qualified refs), so overlays require it."""
+    execution context (fully-qualified refs), so overlays require it.
+    With `required_target_paths` set, only the scopes serving those target
+    paths merge (selective merge: a run composes only the cfg its stages
+    consume); None = every active scope."""
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
     os.makedirs(plt_merged_dir, exist_ok=True)
@@ -4122,6 +4188,13 @@ def merge_plt_cfg_dirs(
 
         for scope in active_scopes:
             target_path = scope["target_path"]
+            if required_target_paths is not None and target_path not in required_target_paths:
+                logging.info(
+                    "Skipping cfg scope %s -> %s (not consumed by this run's stages)",
+                    scope["scope_path"],
+                    target_path,
+                )
+                continue
             target_rel = target_path.lstrip("/")
             target_dest = (plt_merged_dir / target_rel).resolve()
             try:
@@ -4191,6 +4264,18 @@ def prepare_pipeline_cfg(
     source_log_roots = (plt_cfg_root.resolve(),)
     dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
 
+    # Resolve active stages first (needs no plt cfg), so the merge composes only
+    # the scopes this run's stages consume (selective merge by cfg_root).
+    active_stages = build_active_stages(
+        workflow_cfg,
+        inventory_cfg,
+        repo_key=stage_repo_key,
+        require_branch_or_commit=require_stage_ref,
+        refs=refs,
+        execution_context=execution_context,
+        require_commit_refs=require_commit_refs,
+    )
+
     merged_files = merge_plt_cfg_dirs(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
@@ -4200,17 +4285,7 @@ def prepare_pipeline_cfg(
         execution_context=execution_context,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
-    )
-
-    # get active stages
-    active_stages = build_active_stages(
-        workflow_cfg,
-        inventory_cfg,
-        repo_key=stage_repo_key,
-        require_branch_or_commit=require_stage_ref,
-        refs=refs,
-        execution_context=execution_context,
-        require_commit_refs=require_commit_refs,
+        required_target_paths=required_target_paths_for_stages(active_stages),
     )
 
     write_stage_flow_artifact(
@@ -4388,95 +4463,64 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
 
 
 # ---------------------------------------------------------------------------
-# Ctl results sync (Phase 14): mirror the local ctl-results tree to a per-tier
+# Ctl-state sync: mirror the local ctl-state tree to the domain bucket.
 # S3 bucket. Local-first mechanics, remote system of record after final push.
 # ---------------------------------------------------------------------------
 
-CTL_RESULTS_SYNC_POLICIES = ("required", "optional", "disabled")
+def load_ctl_state_buckets_cfg(ctl_cfg_root: Path) -> dict | None:
+    """Load the optional ctl_state_buckets registry: {domain: {bucket_name, bucket_region, [execution_identity_key]}}.
 
-
-def load_ctl_results_cfg(ctl_cfg_root: Path) -> dict | None:
-    """Load the optional ctl_results resource: backends -> {tier: {bucket_name, execution_identity_key}}."""
+    Keyed by the state domain (the value of a target's ctl_state_bucket_key).
+    bucket_name + bucket_region are ctl-owned and required; execution_identity_key
+    (the s3 writer) is optional — when omitted the writer falls back to the run's
+    --aws-profile (only under a profile that allows profile-only, e.g. local dev)."""
     merged: dict = {}
-    for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_results"):
+    for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_state_buckets"):
         if not isinstance(section, dict):
-            raise RuntimeError(f"❌ ctl_results must be a mapping: {path}")
-        unknown = set(section) - {"backends"}
-        if unknown:
-            raise RuntimeError(f"❌ ctl_results has unsupported keys {sorted(unknown)}: {path}")
-        backends = section.get("backends") or {}
-        if not isinstance(backends, dict):
-            raise RuntimeError(f"❌ ctl_results.backends must be a mapping: {path}")
-        for tier, backend in backends.items():
-            if tier not in ("env", "deployments"):
-                raise RuntimeError(f"❌ ctl_results backend tier must be env or deployments: {tier!r} in {path}")
-            if tier in merged:
-                raise RuntimeError(f"❌ duplicate ctl_results backend tier {tier!r}: {path}")
-            if not isinstance(backend, dict):
-                raise RuntimeError(f"❌ ctl_results.backends.{tier} must be a mapping: {path}")
-            unknown = set(backend) - {"bucket_name", "execution_identity_key"}
+            raise RuntimeError(f"❌ ctl_state_buckets must be a mapping: {path}")
+        for domain, entry in section.items():
+            if domain not in ("env", "deployments"):
+                raise RuntimeError(f"❌ ctl_state_buckets domain must be env or deployments: {domain!r} in {path}")
+            if domain in merged:
+                raise RuntimeError(f"❌ duplicate ctl_state_buckets domain {domain!r}: {path}")
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"❌ ctl_state_buckets.{domain} must be a mapping: {path}")
+            unknown = set(entry) - {"bucket_name", "bucket_region", "execution_identity_key"}
             if unknown:
-                raise RuntimeError(f"❌ ctl_results.backends.{tier} has unsupported keys {sorted(unknown)}: {path}")
-            if not isinstance(backend.get("bucket_name"), str) or not backend["bucket_name"].strip():
-                raise RuntimeError(f"❌ ctl_results.backends.{tier}.bucket_name must be a non-empty string: {path}")
-            entry = {"bucket_name": backend["bucket_name"].strip()}
-            # execution_identity_key is optional: when omitted, the writer falls
-            # back to the run's --aws-profile (only under a profile that allows
-            # profile-only, e.g. local dev).
-            identity_key = backend.get("execution_identity_key")
+                raise RuntimeError(f"❌ ctl_state_buckets.{domain} has unsupported keys {sorted(unknown)}: {path}")
+            for field in ("bucket_name", "bucket_region"):
+                if not isinstance(entry.get(field), str) or not entry[field].strip():
+                    raise RuntimeError(f"❌ ctl_state_buckets.{domain}.{field} must be a non-empty string: {path}")
+            resolved = {"bucket_name": entry["bucket_name"].strip(), "bucket_region": entry["bucket_region"].strip()}
+            identity_key = entry.get("execution_identity_key")
             if identity_key is not None:
                 if not isinstance(identity_key, str) or not identity_key.strip():
                     raise RuntimeError(
-                        f"❌ ctl_results.backends.{tier}.execution_identity_key must be a non-empty string: {path}"
+                        f"❌ ctl_state_buckets.{domain}.execution_identity_key must be a non-empty string: {path}"
                     )
-                entry["execution_identity_key"] = identity_key.strip()
-            merged[tier] = entry
+                resolved["execution_identity_key"] = identity_key.strip()
+            merged[domain] = resolved
     return merged or None
 
 
-def ctl_results_sync_policy(ctl_cfg_root: Path, ctl_profile: str) -> str:
-    """Read the results_sync policy from the ctl profile; absent = disabled."""
-    profile_cfg = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    policy = profile_cfg.get("results_sync", "disabled")
-    if policy not in CTL_RESULTS_SYNC_POLICIES:
+def ctl_allows_skip_ctl_state_bucket_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    """Profile policy bool: may a run skip the ctl-state bucket sync?
+
+    Absent = false (strict). This only *permits* the per-run
+    --skip-ctl-state-bucket-sync decision; skipping additionally requires that no
+    active target declares a ctl_state_bucket_key (the sync-skip triad, mirroring
+    the profile-only identity fallback)."""
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
+    value = policy.get("allow_skip_ctl_state_bucket_sync", False)
+    if not isinstance(value, bool):
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} results_sync must be one of {CTL_RESULTS_SYNC_POLICIES}: {policy!r}"
+            f"❌ ctl profile {ctl_profile!r} allow_skip_ctl_state_bucket_sync must be a bool: {value!r}"
         )
-    return policy
+    return value
 
 
-def resolve_ctl_results_backend(
-    ctl_results_cfg: dict,
-    scope_params: dict[str, str],
-    execution_context: dict[str, object],
-) -> dict[str, str]:
-    """Pick the backend tier for this run and resolve its bucket name."""
-    tier = "env" if "env_type" in scope_params else "deployments"
-    backend = ctl_results_cfg.get(tier)
-    if backend is None:
-        raise RuntimeError(f"❌ ctl_results has no backend for tier {tier!r}")
-    bucket_name = resolve_runtime_scalar(
-        backend["bucket_name"],
-        execution_context,
-        label=f"ctl_results.backends.{tier}.bucket_name",
-    )
-    resolved_backend = {"tier": tier, "bucket_name": str(bucket_name)}
-    # execution_identity_key is optional. When present it may be env-dispatched
-    # (e.g. ctl_results_${env_type}_writer) so the env tier picks a prod- or
-    # non-prod-scoped writer per run; when absent the writer uses --aws-profile.
-    if "execution_identity_key" in backend:
-        resolved_backend["execution_identity_key"] = str(
-            resolve_runtime_scalar(
-                backend["execution_identity_key"],
-                execution_context,
-                label=f"ctl_results.backends.{tier}.execution_identity_key",
-            )
-        )
-    return resolved_backend
-
-
-class CtlResultsSyncer:
-    """Incremental mirror of the local ctl-results tree to the tier bucket.
+class CtlStateSyncer:
+    """Incremental mirror of the local ctl-state tree to the domain bucket.
 
     Forward sync is add/update only — never deletes remote objects (the local
     root is ephemeral; remote cleanup is bucket lifecycle rules only).
@@ -4484,9 +4528,10 @@ class CtlResultsSyncer:
 
     STATE_LAYER_INCLUDES = ("*/RUN.yaml", "*/STATUS.yaml", "*/MANIFEST.yaml")
 
-    def __init__(self, results_root: Path, bucket_name: str, aws_profile: str, *, required: bool):
+    def __init__(self, results_root: Path, bucket_name: str, bucket_region: str, aws_profile: str, *, required: bool):
         self.results_root = Path(results_root).resolve()
         self.bucket_name = bucket_name
+        self.bucket_region = bucket_region
         self.aws_profile = aws_profile
         self.required = required
         self.state = "pending"
@@ -4499,8 +4544,9 @@ class CtlResultsSyncer:
         return env
 
     def _run_aws(self, args: list[str]) -> subprocess.CompletedProcess:
+        # Region is explicit (ctl-owned registry), never the profile default.
         return subprocess.run(
-            ["aws", *args],
+            ["aws", "--region", self.bucket_region, *args],
             env=self._aws_env(),
             capture_output=True,
             text=True,
@@ -4513,10 +4559,10 @@ class CtlResultsSyncer:
     def _fail(self, action: str, detail: str) -> None:
         self.state = "failed"
         self.detail = f"{action}: {detail}"
-        message = f"ctl results sync {action} failed for s3://{self.bucket_name}: {detail}"
+        message = f"ctl-state sync {action} failed for s3://{self.bucket_name}: {detail}"
         if self.required:
             raise RuntimeError(f"❌ {message}")
-        logging.warning("%s (results_sync policy is not required; continuing)", message)
+        logging.warning("%s (sync not strict; continuing)", message)
 
     def ensure_ready(self, reason: str) -> bool:
         """Confirm the bucket exists, re-checked at every sync point (not once at
@@ -4531,7 +4577,7 @@ class CtlResultsSyncer:
             self.detail = f"{reason}: bucket s3://{self.bucket_name} not present yet"
             if self.required:
                 logging.warning(
-                    "ctl results bucket s3://%s not present at %r; results stay local (bootstrap tier?)",
+                    "ctl-state bucket s3://%s not present at %r; results stay local (bootstrap run?)",
                     self.bucket_name,
                     reason,
                 )
@@ -4561,7 +4607,7 @@ class CtlResultsSyncer:
         else:
             self.state = "synced"
             self.detail = reason
-            logging.info("Ctl results synced to s3://%s (%s)", self.bucket_name, reason)
+            logging.info("Ctl-state synced to s3://%s (%s)", self.bucket_name, reason)
 
     def remove_prefix(self, rel_prefix: str) -> None:
         """Explicit slot-transition removal of one remote prefix.
@@ -4584,60 +4630,92 @@ class CtlResultsSyncer:
         return payload
 
 
-_CTL_RESULTS_SYNCER: CtlResultsSyncer | None = None
-_CTL_RESULTS_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
+_CTL_STATE_SYNCER: CtlStateSyncer | None = None
+_CTL_STATE_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
 
 
-def configure_ctl_results_sync(
+def configure_ctl_state_sync(
     ctl_cfg_root: Path,
     ctl_profile: str,
-    scope_params: dict[str, str],
+    domain: str | None,
     execution_context: dict[str, object],
     run_dir: Path,
     *,
-    skip_ctl_results_sync: bool,
-    results_sync_bootstrap: bool = False,
+    skip_ctl_state_bucket_sync: bool,
+    provisions_ctl_state_bucket: bool = False,
     profile_only_aws_profile: str | None = None,
     execution_identities: dict | None = None,
     aws_access_contexts: dict | None = None,
     aws_implementation_key: str = "local",
 ) -> dict[str, str] | None:
-    """Resolve backend + policy and arm the global syncer (existence is
-    re-checked lazily at each sync point, so a bucket-creating run mirrors
-    itself at finalization).
+    """Resolve the run's ctl-state bucket (by domain) and arm the global syncer.
 
-    Returns the resolved backend or None when the consumer defines no
-    ctl_results resource. Policy semantics: `disabled` never syncs (the flag is
-    a no-op). `required` and `optional` both keep sync **on** for the run and
-    treat a missing bucket as a hard error (unless `results_sync_bootstrap`
-    marks this as the run that creates it) — the only difference is the escape
-    hatch: `required` rejects `--skip-ctl-results-sync`, `optional` honors it.
+    Routes by the run's single state `domain` (from resolve_run_domain): the
+    bucket name+region come straight from the ctl_state_buckets registry — no
+    execution-context involvement. Existence is re-checked at each sync point, so
+    a bucket-creating run mirrors itself at finalization.
+
+    Skip semantics — a three-condition triad, mirroring the profile-only identity
+    fallback: sync is skipped only when the profile allows it
+    (allow_skip_ctl_state_bucket_sync: true), no active target declares a
+    ctl_state_bucket_key (domain is None), AND --skip-ctl-state-bucket-sync is
+    passed. A declared domain always syncs (the arg is rejected); a missing
+    domain never syncs silently (the skip must be explicit).
     """
-    global _CTL_RESULTS_SYNCER, _CTL_RESULTS_SYNC_NOTE
-    _CTL_RESULTS_SYNCER = None
-    _CTL_RESULTS_SYNC_NOTE = {"mode": "disabled"}
+    global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE
+    _CTL_STATE_SYNCER = None
+    _CTL_STATE_SYNC_NOTE = {"mode": "disabled"}
 
-    ctl_results_cfg = load_ctl_results_cfg(ctl_cfg_root)
-    if ctl_results_cfg is None:
-        if skip_ctl_results_sync:
-            logging.info("--skip-ctl-results-sync has no effect: no ctl_results resource defined")
+    buckets = load_ctl_state_buckets_cfg(ctl_cfg_root)
+    if buckets is None and domain is None:
+        # Consumer has no ctl-state feature at all: nothing to sync or skip.
+        if skip_ctl_state_bucket_sync:
+            logging.info("--skip-ctl-state-bucket-sync has no effect: no ctl_state_buckets registry defined")
+        return None
+    if domain is not None and buckets is None:
+        raise RuntimeError(
+            f"❌ targets declare ctl_state_bucket_key {domain!r} but no ctl_state_buckets registry is defined"
+        )
+
+    allow_skip = ctl_allows_skip_ctl_state_bucket_sync(ctl_cfg_root, ctl_profile)
+    if skip_ctl_state_bucket_sync and not allow_skip:
+        raise RuntimeError(
+            "❌ --skip-ctl-state-bucket-sync is not allowed: ctl profile sets "
+            "allow_skip_ctl_state_bucket_sync: false"
+        )
+
+    if domain is None:
+        # No active target declares a state domain (keys commented, dev cfg).
+        if not skip_ctl_state_bucket_sync:
+            raise RuntimeError(
+                "❌ no active target declares ctl_state_bucket_key; pass "
+                "--skip-ctl-state-bucket-sync to run without ctl-state sync "
+                "(or restore the keys)"
+            )
+        _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "no_domain"}
         return None
 
-    backend = resolve_ctl_results_backend(ctl_results_cfg, scope_params, execution_context)
+    if skip_ctl_state_bucket_sync:
+        raise RuntimeError(
+            f"❌ --skip-ctl-state-bucket-sync is not allowed: active targets declare "
+            f"ctl_state_bucket_key {domain!r} — a declared state domain always syncs"
+        )
 
-    policy = ctl_results_sync_policy(ctl_cfg_root, ctl_profile)
-    if policy == "required" and skip_ctl_results_sync:
-        raise RuntimeError("❌ --skip-ctl-results-sync is not allowed: ctl_profile results_sync policy is 'required'")
-    if policy == "disabled" or (policy == "optional" and skip_ctl_results_sync):
-        _CTL_RESULTS_SYNC_NOTE = {"mode": "skipped", "reason": "policy" if policy == "disabled" else "flag"}
-        return backend
+    entry = buckets[domain]  # domain existence validated by resolve_run_domain
+    bucket_name = str(
+        resolve_runtime_scalar(
+            entry["bucket_name"], execution_context, label=f"ctl_state_buckets.{domain}.bucket_name"
+        )
+    )
+    bucket_region = entry["bucket_region"]
+    result = {"domain": domain, "bucket_name": bucket_name, "bucket_region": bucket_region}
 
-    # Resolve the writer's AWS profile. A backend declares an
+    # Resolve the writer's AWS profile. The registry entry declares an
     # execution_identity_key or omits it — mirroring stages: a declared identity
     # is resolved (and --aws-profile never overrides it); an omitted one falls
     # back to the run's --aws-profile, but only under a profile that permits
     # profile-only access (e.g. local dev).
-    identity_key = backend.get("execution_identity_key")
+    identity_key = entry.get("execution_identity_key")
     if identity_key:
         identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
         contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
@@ -4650,112 +4728,63 @@ def configure_ctl_results_sync(
         )
         if not resolved or not resolved.get("profile_name"):
             raise RuntimeError(
-                f"❌ ctl results writer identity {identity_key!r} did not resolve to an AWS profile"
+                f"❌ ctl-state writer identity {identity_key!r} did not resolve to an AWS profile"
             )
         writer_profile = resolved["profile_name"]
     elif ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile) and profile_only_aws_profile:
         writer_profile = profile_only_aws_profile.strip()
     else:
         raise RuntimeError(
-            f"❌ ctl_results backend for tier {backend['tier']!r} declares no execution_identity_key; "
+            f"❌ ctl_state_buckets.{domain} declares no execution_identity_key; "
             f"provide --aws-profile under a profile that allows profile-only access, "
             f"or add an execution_identity_key"
         )
 
-    results_root_value = load_run_metadata(run_dir).get("ctl_results_root")
+    results_root_value = load_run_metadata(run_dir).get("ctl_state_local_root")
     if not isinstance(results_root_value, str) or not results_root_value:
-        raise RuntimeError("❌ run metadata is missing ctl_results_root; cannot sync results")
+        raise RuntimeError("❌ run metadata is missing ctl_state_local_root; cannot sync ctl-state")
 
-    # Reaching here means sync is ON for this run: `required`, or `optional`
-    # without --skip. Both must sync (optional = required with --skip as the
-    # escape hatch), so the syncer is strict and a missing bucket is a hard error
-    # unless this is the run that provisions it (results_sync_bootstrap).
-    # Existence is re-checked at every sync point, so a bootstrap run mirrors
-    # itself once the bucket exists.
-    syncer = CtlResultsSyncer(
+    # A declared domain always syncs: the syncer is strict and a missing bucket is
+    # a hard error unless this run provisions it. Existence is re-checked at every
+    # sync point, so a bootstrap run mirrors itself once the bucket exists.
+    syncer = CtlStateSyncer(
         Path(results_root_value),
-        backend["bucket_name"],
+        bucket_name,
+        bucket_region,
         writer_profile,
         required=True,
     )
-    _CTL_RESULTS_SYNCER = syncer
+    _CTL_STATE_SYNCER = syncer
     bucket_ready = syncer.ensure_ready("run started")
-    if not bucket_ready and not results_sync_bootstrap:
-        hint = "" if policy == "required" else " (or pass --skip-ctl-results-sync to run without results sync)"
+    if not bucket_ready and not provisions_ctl_state_bucket:
         raise RuntimeError(
-            f"❌ ctl results bucket s3://{backend['bucket_name']} not found and results_sync is on "
-            f"(policy {policy!r}); provision it via the ctl-results bootstrap target first{hint}"
+            f"❌ ctl-state bucket s3://{bucket_name} ({bucket_region}) not found; "
+            f"provision it via the ctl-state bootstrap target first"
         )
     syncer.push("run started")
-    _CTL_RESULTS_SYNC_NOTE = syncer.summary()
-    return backend
+    _CTL_STATE_SYNC_NOTE = syncer.summary()
+    return result
 
 
-def inject_ctl_results_params(execution_context: dict[str, object], ctl_cfg_root: Path) -> None:
-    """Promote per-tier ctl-results bucket names into the params namespace.
-
-    One param per tier, each engine-resolved from its ctl_results.yaml formula,
-    so a scope aliases only its own tier and cross-tier contamination is
-    impossible (the deployments scope is always active, so it must never read an
-    env-tier value):
-      - ctl_results_env_bucket_name: the env tier name (varies by env; resolved
-        only when env_type is in the context, i.e. an env run). Guarded per env
-        scope in plt.
-      - ctl_results_deployments_bucket_name: the deployments tier name, which
-        depends only on main_tag so it is invariant across every run. This is
-        the stable handle the ctl guardrails hash.
-    Skipped entirely when the consumer defines no ctl_results resource."""
-    ctl_results_cfg = load_ctl_results_cfg(ctl_cfg_root)
-    if not ctl_results_cfg:
-        return
-    env_backend = ctl_results_cfg.get("env")
-    env_type_present = f"{EXECUTION_CONTEXT_ROOT}.params.env_type" in execution_context
-    if env_backend and env_type_present:
-        env_bucket = resolve_runtime_scalar(
-            env_backend["bucket_name"],
-            execution_context,
-            label="ctl_results.backends.env.bucket_name",
-        )
-        add_resolved_execution_param(
-            execution_context,
-            "ctl_results_env_bucket_name",
-            str(env_bucket),
-            label="ctl_results env backend",
-        )
-    deployments_backend = ctl_results_cfg.get("deployments")
-    if deployments_backend:
-        deployments_bucket = resolve_runtime_scalar(
-            deployments_backend["bucket_name"],
-            execution_context,
-            label="ctl_results.backends.deployments.bucket_name",
-        )
-        add_resolved_execution_param(
-            execution_context,
-            "ctl_results_deployments_bucket_name",
-            str(deployments_bucket),
-            label="ctl_results deployments backend",
-        )
+def ctl_state_push(reason: str) -> None:
+    if _CTL_STATE_SYNCER is not None:
+        _CTL_STATE_SYNCER.push(reason)
 
 
-def ctl_results_push(reason: str) -> None:
-    if _CTL_RESULTS_SYNCER is not None:
-        _CTL_RESULTS_SYNCER.push(reason)
-
-
-def ctl_results_remove_slots(run_dir: Path, states: tuple[str, ...]) -> None:
+def ctl_state_remove_slots(run_dir: Path, states: tuple[str, ...]) -> None:
     """Remove stale remote state-slot prefixes after a local slot transition."""
-    if _CTL_RESULTS_SYNCER is None:
+    if _CTL_STATE_SYNCER is None:
         return
-    result_dir = ctl_result_dir_from_run_dir(run_dir)
-    rel_result = result_dir.resolve().relative_to(_CTL_RESULTS_SYNCER.results_root).as_posix()
+    result_dir = ctl_state_dir_from_run_dir(run_dir)
+    rel_result = result_dir.resolve().relative_to(_CTL_STATE_SYNCER.results_root).as_posix()
     for state in states:
-        _CTL_RESULTS_SYNCER.remove_prefix(f"{rel_result}/{state}")
+        _CTL_STATE_SYNCER.remove_prefix(f"{rel_result}/{state}")
 
 
-def ctl_results_sync_summary() -> dict[str, str]:
-    if _CTL_RESULTS_SYNCER is not None:
-        return _CTL_RESULTS_SYNCER.summary()
-    return dict(_CTL_RESULTS_SYNC_NOTE)
+def ctl_state_sync_summary() -> dict[str, str]:
+    if _CTL_STATE_SYNCER is not None:
+        return _CTL_STATE_SYNCER.summary()
+    return dict(_CTL_STATE_SYNC_NOTE)
 
 
 def _stage_utils_module(name: str):
@@ -5265,7 +5294,7 @@ def run_stages(
                     cwd=repo_path,
                     env=repo_stage_env,
                 )
-            ctl_results_push(f"stage {stage_id} completed")
+            ctl_state_push(f"stage {stage_id} completed")
         finally:
             repo_execution_context_path = repo_path / EXECUTION_CONTEXT_FILENAME
             if copied_execution_context and repo_execution_context_path.is_file():
@@ -5281,7 +5310,7 @@ def print_run_summary(run_id: str, log_file: Path) -> None:
 def run_maintenance(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
-    ctl_results_root: Path,
+    ctl_state_local_root: Path,
     ctl_profile: str,
     execution_params: dict[str, str],
     ctl_ref_policy: str,
@@ -5300,10 +5329,10 @@ def run_maintenance(
     plt_merged_dir: Path,
     log_file: Path,
     profile_only_aws_profile: str | None,
-    skip_ctl_results_sync: bool = False,
+    skip_ctl_state_bucket_sync: bool = False,
 ) -> None:
     """Run a maintenance action against a single stage target."""
-    if maintenance_action == "force-unlock" and force_unlock_ctl_results_lock(ctl_results_root, lock_id, run_dir):
+    if maintenance_action == "force-unlock" and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir):
         print_run_summary(run_id, log_file)
         return
 
@@ -5315,21 +5344,25 @@ def run_maintenance(
     )
     scope_params = scope_params_from_context(execution_context)
     validate_selector_bindings(ctl_cfg_root, execution_context)
-    configure_ctl_results_sync(
+    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+    ctl_state_domain = resolve_run_domain(
+        {"stages": [{"target": stage_target}]},
+        inventory_cfg,
+        load_ctl_state_buckets_cfg(ctl_cfg_root),
+    )
+    configure_ctl_state_sync(
         ctl_cfg_root,
         ctl_profile,
-        scope_params,
+        ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_results_sync=skip_ctl_results_sync,
+        skip_ctl_state_bucket_sync=skip_ctl_state_bucket_sync,
         profile_only_aws_profile=profile_only_aws_profile,
         aws_implementation_key=aws_implementation_key,
     )
-    inject_ctl_results_params(execution_context, ctl_cfg_root)
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
-    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
     refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
         tooling_refs = load_local_tooling_cfg(ctl_cfg_root)
@@ -5370,7 +5403,10 @@ def run_maintenance(
     )
     record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
-    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params)
+    verify_guardrails(
+        ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params,
+        required_target_paths=required_target_paths_for_stages(active_stages),
+    )
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
@@ -5457,16 +5493,54 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
     print_run_summary(run_id, log_file)
 
 
-def run_requests_results_bootstrap(workflow_cfg: dict, inventory_cfg: dict) -> bool:
-    """Whether any target in this run is the ctl-results bucket-creating target
-    (declares results_sync_bootstrap: true). Such a run may legitimately start
+def resolve_run_domain(
+    workflow_cfg: dict,
+    inventory_cfg: dict,
+    ctl_state_buckets_cfg: dict | None,
+) -> str | None:
+    """Resolve the run's single ctl-state domain from its active targets.
+
+    One state domain per run: all active targets that declare a
+    `ctl_state_bucket_key` must declare the *same* one — that is the run's domain
+    (and it must exist in the ctl_state_buckets registry). Targets that omit it
+    (commented in dev cfg) are the skip hatch. A run whose active targets declare
+    *different* domains is a hard error (a run is one state/lock/outdate boundary).
+    Returns the domain key, or None when no active target declares one."""
+    targets = inventory_cfg.get("stage_targets", {})
+    seen: dict[str, str] = {}  # domain -> first target that declared it
+    for entry in workflow_cfg.get("stages", []):
+        target_name = entry if isinstance(entry, str) else entry.get("target")
+        domain = (targets.get(target_name) or {}).get("ctl_state_bucket_key")
+        if domain is None:
+            continue
+        seen.setdefault(domain, target_name)
+    if not seen:
+        return None
+    if len(seen) > 1:
+        detail = ", ".join(f"{d} ({t})" for d, t in sorted(seen.items()))
+        raise RuntimeError(
+            f"❌ run spans multiple ctl-state domains [{detail}]; a run is one state "
+            f"domain — split it into separate single-domain runs"
+        )
+    domain = next(iter(seen))
+    if ctl_state_buckets_cfg is not None and domain not in ctl_state_buckets_cfg:
+        known = ", ".join(sorted(ctl_state_buckets_cfg)) or "none"
+        raise RuntimeError(
+            f"❌ ctl_state_bucket_key {domain!r} has no ctl_state_buckets entry; known domains: {known}"
+        )
+    return domain
+
+
+def run_provisions_ctl_state_bucket(workflow_cfg: dict, inventory_cfg: dict) -> bool:
+    """Whether any target in this run is the ctl-state bucket-creating target
+    (declares provisions_ctl_state_bucket: true). Such a run may legitimately start
     before its results bucket exists; every other run must find it already there
     under a `required` sync policy."""
     targets = inventory_cfg.get("stage_targets", {})
     for entry in workflow_cfg.get("stages", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
         target_cfg = targets.get(target_name) or {}
-        if target_cfg.get("results_sync_bootstrap") is True:
+        if target_cfg.get("provisions_ctl_state_bucket") is True:
             return True
     return False
 
@@ -5498,11 +5572,13 @@ def build_sub_workflow_cfg(
     cfg_file_set_name: str,
     sub_workflow: str,
     execution_identity_key: str | None,
+    ctl_state_bucket_key: str | None = None,
 ) -> tuple[dict, dict]:
     """Build a one-target cfg for a synthetic repo-local sub_workflow run.
 
     The synthetic target is composed directly from CLI args and need not exist
-    in targets/<action>/.
+    in targets/<action>/. --ctl-state-bucket-key supplies the state domain the
+    declared targets carry in cfg; omitted = no domain (skip triad applies).
     """
     stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
     cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
@@ -5519,6 +5595,8 @@ def build_sub_workflow_cfg(
     }
     if execution_identity_key:
         resolved["execution_identity_key"] = execution_identity_key
+    if ctl_state_bucket_key:
+        resolved["ctl_state_bucket_key"] = ctl_state_bucket_key
     name = "sub_workflow"
     inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
     workflow_cfg = {
@@ -5550,7 +5628,7 @@ def run_pipeline(
     profile_only_aws_profile: str | None,
     target_name: str | None = None,
     sub_workflow_run: dict | None = None,
-    skip_ctl_results_sync: bool = False,
+    skip_ctl_state_bucket_sync: bool = False,
 ) -> None:
     """
     Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
@@ -5578,6 +5656,7 @@ def run_pipeline(
             cfg_file_set_name=sub_workflow_run["cfg_file_set"],
             sub_workflow=sub_workflow_run["sub_workflow"],
             execution_identity_key=sub_workflow_run.get("execution_identity_key"),
+            ctl_state_bucket_key=sub_workflow_run.get("ctl_state_bucket_key"),
         )
     elif target_name:
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
@@ -5600,23 +5679,24 @@ def run_pipeline(
     if not sub_workflow_run:
         validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
 
-    # Ctl results backend: resolve + arm sync (pulls remote state layer). Done
-    # after the target is known so a missing bucket is tolerated only for the
-    # ctl-results bootstrap target; other required runs must find it present.
-    # The resolved bucket names are then promoted into the params namespace so
-    # plt cfg can alias them and ctl guardrails can hash them.
-    configure_ctl_results_sync(
+    # Ctl-state sync: resolve the run's single state domain from its active
+    # targets (one-domain-per-run; hard error if they disagree), then arm the
+    # syncer for that domain's bucket. Done after the target is known so a missing
+    # bucket is tolerated only for the ctl-state bootstrap target.
+    ctl_state_domain = resolve_run_domain(
+        workflow_cfg, inventory_cfg, load_ctl_state_buckets_cfg(ctl_cfg_root)
+    )
+    configure_ctl_state_sync(
         ctl_cfg_root,
         ctl_profile,
-        scope_params,
+        ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_results_sync=skip_ctl_results_sync,
-        results_sync_bootstrap=run_requests_results_bootstrap(workflow_cfg, inventory_cfg),
+        skip_ctl_state_bucket_sync=skip_ctl_state_bucket_sync,
+        provisions_ctl_state_bucket=run_provisions_ctl_state_bucket(workflow_cfg, inventory_cfg),
         profile_only_aws_profile=profile_only_aws_profile,
         aws_implementation_key=aws_implementation_key,
     )
-    inject_ctl_results_params(execution_context, ctl_cfg_root)
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
 
     refs = load_refs_cfg(ctl_cfg_root)
@@ -5647,7 +5727,10 @@ def run_pipeline(
     # Single derivation chain: render the merged tree, then verify guards
     # against rendered values, then distribute stage input views from it.
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
-    verify_guardrails(ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params)
+    verify_guardrails(
+        ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params,
+        required_target_paths=required_target_paths_for_stages(active_stages),
+    )
 
     if sub_workflow_run:
         target_keys = sub_workflow_run.get("affected_target_keys") or []
@@ -5657,9 +5740,9 @@ def run_pipeline(
         target_keys = target_keys_from_active_stages(active_stages)
     record_run_target_keys(run_dir, target_keys)
     run_metadata = load_run_metadata(run_dir)
-    ctl_results_root_value = run_metadata.get("ctl_results_root")
-    if isinstance(ctl_results_root_value, str) and ctl_results_root_value:
-        mark_removed_definitions_outdated(Path(ctl_results_root_value), ctl_cfg_root)
+    ctl_state_local_root_value = run_metadata.get("ctl_state_local_root")
+    if isinstance(ctl_state_local_root_value, str) and ctl_state_local_root_value:
+        mark_removed_definitions_outdated(Path(ctl_state_local_root_value), ctl_cfg_root)
 
     # Validate stages have commits and resolvable AWS access before execution.
     validate_stages_have_commits(active_stages, ctl_ref_policy)
@@ -5712,7 +5795,7 @@ def run_pipeline(
         pipeline_run_cfg_path, plt_rendered_dir, run_dir
     )
     # Prepared snapshot: cfg layers + run-level metadata are immutable from here.
-    ctl_results_push("preparation complete")
+    ctl_state_push("preparation complete")
 
     # Run stages
     run_stages(
