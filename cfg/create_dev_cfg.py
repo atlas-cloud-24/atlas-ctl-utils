@@ -7,8 +7,8 @@ The source cfg can be either:
 
 The script copies the source cfg into a target directory, rewrites
 `stage_sources.yaml` so each stage source uses `repo_path` instead of `repo_url`,
-removes ineffective `branch` keys from workflow YAMLs, writes local tooling
-repo paths to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
+removes ineffective `branch` keys from workflow YAMLs, writes local `global` repo-path overrides
+to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
 Examples:
     ./cfg/create_dev_cfg.py \
@@ -43,7 +43,7 @@ REF_SPEC_RE = re.compile(r"^(?P<source>.+)@(?P<kind>branch|tag|commit)=(?P<value
 STAGE_LINE_RE = re.compile(r"^  (?P<stage>[^:\n]+):\s*$")
 REPO_URL_LINE_RE = re.compile(r"^    repo_url:\s*.+$")
 WORKFLOW_BRANCH_LINE_RE = re.compile(r"^\s+branch:\s*.+$")
-LOCAL_TOOLING_CFG_NAME = "local_repos.yaml"
+LOCAL_GLOBAL_CFG_NAME = "local_repos.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
             "stage_sources.yaml repo_url values to repo_path using a JSON file "
-            "with stage-source-to-path mappings and optional tooling repo-to-path mappings."
+            "with stage-source-to-path mappings and optional global repo-to-path mappings."
         )
     )
     parser.add_argument(
@@ -176,8 +176,8 @@ def required_repo_entries(paths: list[Path]) -> set[str]:
     return repo_entries
 
 
-def required_tooling(paths: list[Path]) -> set[str]:
-    tooling_names: set[str] = set()
+def required_global_refs(paths: list[Path]) -> set[str]:
+    global_ref_names: set[str] = set()
 
     for path in paths:
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -191,9 +191,9 @@ def required_tooling(paths: list[Path]) -> set[str]:
 
         for tooling_name in global_cfg:
             if isinstance(tooling_name, str):
-                tooling_names.add(tooling_name)
+                global_ref_names.add(tooling_name)
 
-    return tooling_names
+    return global_ref_names
 
 
 def parse_source_ref(source_cfg: str) -> tuple[str, str | None, str | None]:
@@ -380,22 +380,22 @@ def rewrite_workflows(root_dir: Path) -> list[Path]:
     return rewritten_paths
 
 
-def write_local_tooling_file(root_dir: Path, tooling_map: dict[str, str]) -> Path | None:
-    if not tooling_map:
+def write_local_global_file(root_dir: Path, global_ref_map: dict[str, str]) -> Path | None:
+    if not global_ref_map:
         return None
 
-    local_tooling_cfg = {
-        "tooling": {
-            tooling_name: {"repo_path": repo_path}
-            for tooling_name, repo_path in tooling_map.items()
+    local_global_cfg = {
+        "global": {
+            ref_name: {"repo_path": repo_path}
+            for ref_name, repo_path in global_ref_map.items()
         }
     }
-    local_tooling_path = root_dir / LOCAL_TOOLING_CFG_NAME
-    local_tooling_path.write_text(
-        yaml.safe_dump(local_tooling_cfg, sort_keys=False),
+    local_global_path = root_dir / LOCAL_GLOBAL_CFG_NAME
+    local_global_path.write_text(
+        yaml.safe_dump(local_global_cfg, sort_keys=False),
         encoding="utf-8",
     )
-    return local_tooling_path
+    return local_global_path
 
 
 def remove_refs(root_dir: Path) -> list[Path]:
@@ -443,17 +443,17 @@ def main() -> int:
             source_stage_sources = stage_sources_files(source_dir)
             source_refs = refs_files(source_dir)
             required_repo_names = required_repo_entries(source_stage_sources)
-            required_tooling_names = required_tooling(source_refs)
+            required_global_ref_names = required_global_refs(source_refs)
 
             repo_map = {
                 name: path
                 for name, path in path_map.items()
                 if name in required_repo_names
             }
-            tooling_map = {
+            global_ref_map = {
                 name: path
                 for name, path in path_map.items()
-                if name in required_tooling_names
+                if name in required_global_ref_names
             }
 
             missing = sorted(required_repo_names - set(repo_map))
@@ -463,11 +463,11 @@ def main() -> int:
                 )
 
             warn_about_extra_mappings(repo_map, required_repo_names, "repo")
-            warn_about_extra_mappings(tooling_map, required_tooling_names, "tooling")
+            warn_about_extra_mappings(global_ref_map, required_global_ref_names, "global ref")
             copy_source_tree(source_dir, target_dir, args.force)
             rewritten_paths = rewrite_stage_sources(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
-            local_tooling_path = write_local_tooling_file(target_dir, tooling_map)
+            local_global_path = write_local_global_file(target_dir, global_ref_map)
             removed_refs = remove_refs(target_dir)
     except subprocess.CalledProcessError as exc:
         stderr = exc.stderr.strip() if exc.stderr else str(exc)
@@ -483,8 +483,8 @@ def main() -> int:
         print(f"rewrote stage_sources: {path}")
     for path in rewritten_workflows:
         print(f"rewrote workflow: {path}")
-    if local_tooling_path is not None:
-        print(f"wrote local tooling config: {local_tooling_path}")
+    if local_global_path is not None:
+        print(f"wrote local global refs config: {local_global_path}")
     for path in removed_refs:
         print(f"stripped refs from: {path}")
 
