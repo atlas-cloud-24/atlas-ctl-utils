@@ -76,10 +76,6 @@ CTL_RESULTS_LOCK_META_FILENAME = ".ctl.lock.yaml"
 RUN_METADATA_FILENAME = "RUN.yaml"
 EXECUTION_CONTEXT_FILENAME = "execution_context.yaml"
 
-# Context keys the engine injects fresh per run. They are withheld from
-# render-time interpolation (kept verbatim in rendered/) and resolve at the
-# per-stage resolved/ step, keeping rendered/ deterministic on the engine side.
-ENGINE_VOLATILE_CONTEXT_KEYS = ()  # empty hook: no per-run volatile context facts today
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 PLT_GUARDRAILS_DIRNAME = "__guardrails__"
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
@@ -3396,6 +3392,26 @@ def build_execution_context(
     return context
 
 
+def add_resolved_execution_param(
+    execution_context: dict[str, object], key: str, value, *, label: str
+) -> None:
+    """Promote an engine-resolved mechanism value into the params namespace.
+
+    Params have three sources: --execution-params CLI, the execution_params cfg
+    block, and engine-resolved mechanism values (this path, e.g. the ctl-results
+    bucket name). Collides — hard error — if the consumer already declared the
+    same key, so a mechanism-owned value can never be silently shadowed."""
+    if not CONTEXT_KEY_RE.fullmatch(key):
+        raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
+    ref_key = f"{EXECUTION_CONTEXT_ROOT}.params.{key}"
+    if ref_key in execution_context:
+        raise RuntimeError(
+            f"❌ {label}: param {key!r} is engine-resolved and must not also be "
+            f"declared in execution_params or --execution-params"
+        )
+    execution_context[ref_key] = _context_scalar(value, label=label)
+
+
 def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
     """Nested {execution_context: {ctl: {...}, params: {...}}} view."""
     nested: dict[str, dict[str, object]] = {ns: {} for ns in EXECUTION_CONTEXT_NAMESPACES}
@@ -3582,22 +3598,38 @@ def verify_guarded_value(
         )
 
 
+def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
+    """A ctl guarded var is keyed by a fully-qualified execution-context ref.
+
+    `execution_context.ctl.*` is forbidden: action/profile are per-run switches,
+    so hashing them can never be correct. Only `params` (consumer-declared or
+    engine-resolved values) is guardable."""
+    value = validate_execution_context_ref(ref, label=label)
+    _, namespace, _ = value.split(".", 2)
+    if namespace == "ctl":
+        raise RuntimeError(
+            f"❌ {label}: {value!r} guards an {EXECUTION_CONTEXT_ROOT}.ctl.* value; "
+            f"action/profile are per-run switches and can never be guarded"
+        )
+    return value
+
+
 def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
     guarded = load_ctl_guarded_vars(ctl_cfg_root)
     if not guarded:
         return
-    for var_name, expected_hash in guarded.items():
-        ref = f"{EXECUTION_CONTEXT_ROOT}.params.{var_name}"
+    for ref, expected_hash in guarded.items():
+        validate_ctl_guard_ref(ref)
         if ref not in execution_context:
             raise RuntimeError(
-                f"❌ ctl guarded var {var_name!r}: {execution_context_miss_message(execution_context, ref)}"
+                f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
             )
         verify_guarded_value(
             "ctl",
-            var_name,
+            ref,
             execution_context[ref],
             expected_hash,
-            label=f"ctl.{var_name}",
+            label=ref,
         )
     logging.info("Ctl guardrails verified: %s", sorted(guarded))
 
@@ -3618,8 +3650,7 @@ def read_rendered_guard_value(rendered_target_dir: Path, var_name: str, *, label
     """Read one guarded top-level value from a rendered scope target dir.
 
     Requires presence, cross-file agreement, and a fully-resolved value —
-    a leftover ${...} placeholder (volatile key routed into an identity var)
-    is a hard error, never hashed.
+    a leftover ${...} placeholder is a hard error, never hashed.
     """
     values = load_rendered_cfg_top_level_values(rendered_target_dir, var_name)
     if not values:
@@ -3985,7 +4016,6 @@ def discover_overlay_candidates(
 ) -> dict[str, dict]:
     """Discover all type: overlay metadata entries by unique overlay name."""
     cfg_root = plt_cfg_root.resolve()
-    runtime_selectors = scope_params
     candidates: dict[str, dict] = {}
 
     for meta_path in discover_cfg_meta_paths(cfg_root):
@@ -4285,6 +4315,51 @@ def write_target_stage_flow_artifact(
     )
 
 
+def resolve_ctl_structure(value, execution_context: dict[str, object], *, label: str = "ctl cfg"):
+    """Deep-resolve every ${execution_context.<ns>.<key>} placeholder in a ctl
+    cfg structure, leaving all other leaves untouched. Used to snapshot the ctl
+    cfg that drove the run with its vars filled in (e.g. ref_key env/${…} →
+    env/dev)."""
+    if isinstance(value, dict):
+        return {k: resolve_ctl_structure(v, execution_context, label=f"{label}.{k}") for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_ctl_structure(v, execution_context, label=f"{label}[{i}]") for i, v in enumerate(value)]
+    if isinstance(value, str) and "${" in value:
+        return resolve_runtime_scalar(value, execution_context, label=label)
+    return value
+
+
+def write_ctl_cfg_snapshot(
+    run_dir: Path,
+    *,
+    ctl_profile: str,
+    ctl_profile_policy_cfg: dict,
+    inventory_name: str,
+    workflow_cfg: dict,
+    inventory_cfg: dict,
+    active_stages: dict,
+    refs: dict,
+    execution_context: dict[str, object],
+) -> Path:
+    """Write a resolved snapshot of the ctl cfg that drove the run to
+    run_dir/cfg/ctl/, so the run is self-describing next to cfg/plt/. Vars are
+    resolved against the execution context; active_stages is already resolved."""
+    ctl_dir = run_dir / "cfg" / "ctl"
+    if ctl_dir.exists():
+        shutil.rmtree(ctl_dir)
+    ctl_dir.mkdir(parents=True)
+    write_yaml_file(ctl_dir / "profile.yaml", {"ctl_profile": ctl_profile, "policy": ctl_profile_policy_cfg})
+    write_yaml_file(ctl_dir / "workflow.yaml", resolve_ctl_structure(workflow_cfg, execution_context, label="workflow"))
+    write_yaml_file(
+        ctl_dir / "inventory.yaml",
+        resolve_ctl_structure(inventory_cfg, execution_context, label=f"inventory.{inventory_name}"),
+    )
+    write_yaml_file(ctl_dir / "active_stages.yaml", active_stages)
+    write_yaml_file(ctl_dir / "refs.yaml", resolve_ctl_structure(refs, execution_context, label="refs"))
+    logging.info("Wrote resolved ctl cfg snapshot: %s", ctl_dir)
+    return ctl_dir
+
+
 def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path) -> None:
     """Write all git meta files to artifacts directory."""
     # ctl_cfg_git_meta
@@ -4342,11 +4417,20 @@ def load_ctl_results_cfg(ctl_cfg_root: Path) -> dict | None:
             unknown = set(backend) - {"bucket_name", "execution_identity_key"}
             if unknown:
                 raise RuntimeError(f"❌ ctl_results.backends.{tier} has unsupported keys {sorted(unknown)}: {path}")
-            for field in ("bucket_name", "execution_identity_key"):
-                if not isinstance(backend.get(field), str) or not backend[field].strip():
-                    raise RuntimeError(f"❌ ctl_results.backends.{tier}.{field} must be a non-empty string: {path}")
-            merged[tier] = {"bucket_name": backend["bucket_name"].strip(),
-                            "execution_identity_key": backend["execution_identity_key"].strip()}
+            if not isinstance(backend.get("bucket_name"), str) or not backend["bucket_name"].strip():
+                raise RuntimeError(f"❌ ctl_results.backends.{tier}.bucket_name must be a non-empty string: {path}")
+            entry = {"bucket_name": backend["bucket_name"].strip()}
+            # execution_identity_key is optional: when omitted, the writer falls
+            # back to the run's --aws-profile (only under a profile that allows
+            # profile-only, e.g. local dev).
+            identity_key = backend.get("execution_identity_key")
+            if identity_key is not None:
+                if not isinstance(identity_key, str) or not identity_key.strip():
+                    raise RuntimeError(
+                        f"❌ ctl_results.backends.{tier}.execution_identity_key must be a non-empty string: {path}"
+                    )
+                entry["execution_identity_key"] = identity_key.strip()
+            merged[tier] = entry
     return merged or None
 
 
@@ -4376,11 +4460,19 @@ def resolve_ctl_results_backend(
         execution_context,
         label=f"ctl_results.backends.{tier}.bucket_name",
     )
-    return {
-        "tier": tier,
-        "bucket_name": str(bucket_name),
-        "execution_identity_key": backend["execution_identity_key"],
-    }
+    resolved_backend = {"tier": tier, "bucket_name": str(bucket_name)}
+    # execution_identity_key is optional. When present it may be env-dispatched
+    # (e.g. ctl_results_${env_type}_writer) so the env tier picks a prod- or
+    # non-prod-scoped writer per run; when absent the writer uses --aws-profile.
+    if "execution_identity_key" in backend:
+        resolved_backend["execution_identity_key"] = str(
+            resolve_runtime_scalar(
+                backend["execution_identity_key"],
+                execution_context,
+                label=f"ctl_results.backends.{tier}.execution_identity_key",
+            )
+        )
+    return resolved_backend
 
 
 class CtlResultsSyncer:
@@ -4399,6 +4491,7 @@ class CtlResultsSyncer:
         self.required = required
         self.state = "pending"
         self.detail: str | None = None
+        self.ready = False
 
     def _aws_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -4425,6 +4518,28 @@ class CtlResultsSyncer:
             raise RuntimeError(f"❌ {message}")
         logging.warning("%s (results_sync policy is not required; continuing)", message)
 
+    def ensure_ready(self, reason: str) -> bool:
+        """Confirm the bucket exists, re-checked at every sync point (not once at
+        run start). On first confirmation, hydrate the state layer. A run that
+        *creates* its bucket therefore mirrors itself at finalization; only a run
+        whose bucket never appears stays local. Mirrors `terraform init
+        -migrate-state`: create with a local backend, migrate in once it exists."""
+        if self.ready:
+            return True
+        if not self.bucket_exists():
+            self.state = "local"
+            self.detail = f"{reason}: bucket s3://{self.bucket_name} not present yet"
+            if self.required:
+                logging.warning(
+                    "ctl results bucket s3://%s not present at %r; results stay local (bootstrap tier?)",
+                    self.bucket_name,
+                    reason,
+                )
+            return False
+        self.ready = True
+        self.pull_state_layer()
+        return True
+
     def pull_state_layer(self) -> None:
         """Reverse sync: hydrate slots + RUN/STATUS/MANIFEST from the bucket (small files only)."""
         args = ["s3", "sync", f"s3://{self.bucket_name}", str(self.results_root), "--exclude", "*"]
@@ -4438,6 +4553,8 @@ class CtlResultsSyncer:
 
     def push(self, reason: str) -> None:
         """Forward incremental mirror of the whole local results tree (never deletes)."""
+        if not self.ensure_ready(f"push ({reason})"):
+            return
         result = self._run_aws(["s3", "sync", str(self.results_root), f"s3://{self.bucket_name}", "--no-progress"])
         if result.returncode != 0:
             self._fail(f"push ({reason})", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
@@ -4452,6 +4569,8 @@ class CtlResultsSyncer:
         Distinct from the mirror (which never deletes): state slots are
         pointers, and a slot removed locally must not linger remotely.
         """
+        if not self.ensure_ready(f"slot removal ({rel_prefix})"):
+            return
         result = self._run_aws(
             ["s3", "rm", f"s3://{self.bucket_name}/{rel_prefix.strip('/')}", "--recursive"]
         )
@@ -4477,15 +4596,22 @@ def configure_ctl_results_sync(
     run_dir: Path,
     *,
     skip_ctl_results_sync: bool,
+    results_sync_bootstrap: bool = False,
+    profile_only_aws_profile: str | None = None,
     execution_identities: dict | None = None,
     aws_access_contexts: dict | None = None,
     aws_implementation_key: str = "local",
 ) -> dict[str, str] | None:
-    """Resolve backend + policy, hydrate state, and arm the global syncer.
+    """Resolve backend + policy and arm the global syncer (existence is
+    re-checked lazily at each sync point, so a bucket-creating run mirrors
+    itself at finalization).
 
-    Returns the resolved backend (for runtime-context injection) or None when
-    the consumer defines no ctl_results resource. Policy semantics: `required`
-    rejects --skip-ctl-results-sync; `optional` honors it; `disabled` never syncs.
+    Returns the resolved backend or None when the consumer defines no
+    ctl_results resource. Policy semantics: `disabled` never syncs (the flag is
+    a no-op). `required` and `optional` both keep sync **on** for the run and
+    treat a missing bucket as a hard error (unless `results_sync_bootstrap`
+    marks this as the run that creates it) — the only difference is the escape
+    hatch: `required` rejects `--skip-ctl-results-sync`, `optional` honors it.
     """
     global _CTL_RESULTS_SYNCER, _CTL_RESULTS_SYNC_NOTE
     _CTL_RESULTS_SYNCER = None
@@ -4506,45 +4632,109 @@ def configure_ctl_results_sync(
         _CTL_RESULTS_SYNC_NOTE = {"mode": "skipped", "reason": "policy" if policy == "disabled" else "flag"}
         return backend
 
-    identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
-    contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
-    resolved = resolve_stage_aws_access(
-        {"execution_identity_key": backend["execution_identity_key"]},
-        identities,
-        contexts,
-        execution_context=execution_context,
-        implementation_key=aws_implementation_key,
-    )
-    if not resolved or not resolved.get("profile_name"):
+    # Resolve the writer's AWS profile. A backend declares an
+    # execution_identity_key or omits it — mirroring stages: a declared identity
+    # is resolved (and --aws-profile never overrides it); an omitted one falls
+    # back to the run's --aws-profile, but only under a profile that permits
+    # profile-only access (e.g. local dev).
+    identity_key = backend.get("execution_identity_key")
+    if identity_key:
+        identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
+        contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
+        resolved = resolve_stage_aws_access(
+            {"execution_identity_key": identity_key},
+            identities,
+            contexts,
+            execution_context=execution_context,
+            implementation_key=aws_implementation_key,
+        )
+        if not resolved or not resolved.get("profile_name"):
+            raise RuntimeError(
+                f"❌ ctl results writer identity {identity_key!r} did not resolve to an AWS profile"
+            )
+        writer_profile = resolved["profile_name"]
+    elif ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile) and profile_only_aws_profile:
+        writer_profile = profile_only_aws_profile.strip()
+    else:
         raise RuntimeError(
-            f"❌ ctl results writer identity {backend['execution_identity_key']!r} did not resolve to an AWS profile"
+            f"❌ ctl_results backend for tier {backend['tier']!r} declares no execution_identity_key; "
+            f"provide --aws-profile under a profile that allows profile-only access, "
+            f"or add an execution_identity_key"
         )
 
     results_root_value = load_run_metadata(run_dir).get("ctl_results_root")
     if not isinstance(results_root_value, str) or not results_root_value:
         raise RuntimeError("❌ run metadata is missing ctl_results_root; cannot sync results")
 
+    # Reaching here means sync is ON for this run: `required`, or `optional`
+    # without --skip. Both must sync (optional = required with --skip as the
+    # escape hatch), so the syncer is strict and a missing bucket is a hard error
+    # unless this is the run that provisions it (results_sync_bootstrap).
+    # Existence is re-checked at every sync point, so a bootstrap run mirrors
+    # itself once the bucket exists.
     syncer = CtlResultsSyncer(
         Path(results_root_value),
         backend["bucket_name"],
-        resolved["profile_name"],
-        required=(policy == "required"),
+        writer_profile,
+        required=True,
     )
-    if not syncer.bucket_exists():
-        note = {"mode": "skipped", "reason": "bucket_missing", "bucket": backend["bucket_name"]}
-        if policy == "required":
-            logging.warning(
-                "ctl results bucket s3://%s not found; results stay local (bootstrap tier?)",
-                backend["bucket_name"],
-            )
-        _CTL_RESULTS_SYNC_NOTE = note
-        return backend
-
-    syncer.pull_state_layer()
     _CTL_RESULTS_SYNCER = syncer
-    _CTL_RESULTS_SYNC_NOTE = syncer.summary()
+    bucket_ready = syncer.ensure_ready("run started")
+    if not bucket_ready and not results_sync_bootstrap:
+        hint = "" if policy == "required" else " (or pass --skip-ctl-results-sync to run without results sync)"
+        raise RuntimeError(
+            f"❌ ctl results bucket s3://{backend['bucket_name']} not found and results_sync is on "
+            f"(policy {policy!r}); provision it via the ctl-results bootstrap target first{hint}"
+        )
     syncer.push("run started")
+    _CTL_RESULTS_SYNC_NOTE = syncer.summary()
     return backend
+
+
+def inject_ctl_results_params(execution_context: dict[str, object], ctl_cfg_root: Path) -> None:
+    """Promote per-tier ctl-results bucket names into the params namespace.
+
+    One param per tier, each engine-resolved from its ctl_results.yaml formula,
+    so a scope aliases only its own tier and cross-tier contamination is
+    impossible (the deployments scope is always active, so it must never read an
+    env-tier value):
+      - ctl_results_env_bucket_name: the env tier name (varies by env; resolved
+        only when env_type is in the context, i.e. an env run). Guarded per env
+        scope in plt.
+      - ctl_results_deployments_bucket_name: the deployments tier name, which
+        depends only on main_tag so it is invariant across every run. This is
+        the stable handle the ctl guardrails hash.
+    Skipped entirely when the consumer defines no ctl_results resource."""
+    ctl_results_cfg = load_ctl_results_cfg(ctl_cfg_root)
+    if not ctl_results_cfg:
+        return
+    env_backend = ctl_results_cfg.get("env")
+    env_type_present = f"{EXECUTION_CONTEXT_ROOT}.params.env_type" in execution_context
+    if env_backend and env_type_present:
+        env_bucket = resolve_runtime_scalar(
+            env_backend["bucket_name"],
+            execution_context,
+            label="ctl_results.backends.env.bucket_name",
+        )
+        add_resolved_execution_param(
+            execution_context,
+            "ctl_results_env_bucket_name",
+            str(env_bucket),
+            label="ctl_results env backend",
+        )
+    deployments_backend = ctl_results_cfg.get("deployments")
+    if deployments_backend:
+        deployments_bucket = resolve_runtime_scalar(
+            deployments_backend["bucket_name"],
+            execution_context,
+            label="ctl_results.backends.deployments.bucket_name",
+        )
+        add_resolved_execution_param(
+            execution_context,
+            "ctl_results_deployments_bucket_name",
+            str(deployments_bucket),
+            label="ctl_results deployments backend",
+        )
 
 
 def ctl_results_push(reason: str) -> None:
@@ -4583,11 +4773,11 @@ def _stage_utils_module(name: str):
     return module
 
 
-def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict, volatile: frozenset[str]) -> None:
-    """Render one scope: merge all scope YAML for lookups, interpolate with
-    volatile keys kept verbatim, normalize cfg-entry refs whole-scope, write
-    back per-file YAML, copy non-YAML verbatim. Engine logic (folded from the
-    former stage-side render_cfg.py)."""
+def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict) -> None:
+    """Render one scope: merge all scope YAML for lookups, interpolate,
+    normalize cfg-entry refs whole-scope, write back per-file YAML, copy
+    non-YAML verbatim. Engine logic (folded from the former stage-side
+    render_cfg.py)."""
     brc = _stage_utils_module("build_runtime_cfg")
     yaml_files = sorted(p for p in scope_dir.rglob("*.yaml") if p.is_file())
     scope_merged: dict = {}
@@ -4600,7 +4790,7 @@ def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict, volatile: 
             )
         scope_merged = brc.merge_values(scope_merged, doc)
 
-    resolver = brc.Resolver(scope_merged, env_ctx, keep_unresolved=volatile)
+    resolver = brc.Resolver(scope_merged, env_ctx)
     scope_resolved: dict = {}
     for key in scope_merged:
         value = resolver.lookup(key)
@@ -4626,17 +4816,16 @@ def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict, volatile: 
 
 
 def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[str, object]) -> Path:
-    """Render merged/ into rendered/ (whole-scope, engine-volatile keys kept
-    verbatim). In-process engine step — no subprocess, no stage costume."""
+    """Render merged/ into rendered/ (whole-scope). In-process engine step —
+    no subprocess, no stage costume."""
     plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
     if plt_rendered_dir.exists():
         shutil.rmtree(plt_rendered_dir)
     plt_rendered_dir.mkdir(parents=True)
-    env_ctx = {k: v for k, v in execution_context.items() if k not in ENGINE_VOLATILE_CONTEXT_KEYS}
-    volatile = frozenset(ENGINE_VOLATILE_CONTEXT_KEYS)
+    env_ctx = dict(execution_context)
     for entry in sorted(plt_merged_dir.iterdir()):
         if entry.is_dir():
-            render_scope_tree(entry, plt_rendered_dir / entry.name, env_ctx, volatile)
+            render_scope_tree(entry, plt_rendered_dir / entry.name, env_ctx)
         else:
             shutil.copy2(entry, plt_rendered_dir / entry.name)
     logging.info("Rendered plt cfg: %s", plt_rendered_dir)
@@ -4999,7 +5188,6 @@ def run_stages(
     aws_implementation_key: str,
     allow_aws_profile_only: bool,
     profile_only_aws_profile: str | None,
-    ctl_results_bucket_name: str | None = None,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
@@ -5060,9 +5248,6 @@ def run_stages(
                 stage_run_cmd = [f"./{repo_stage_path}/run/{stage_runner_script}"]
                 repo_stage_env = dict(stage_env)
                 repo_stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
-                if ctl_results_bucket_name:
-                    # Resolved mechanism value: stage env delivery, never context.
-                    repo_stage_env["ctl_results_s3_bucket_name"] = ctl_results_bucket_name
                 repo_stage_env["cfg_files"] = json.dumps(repo_stage.get("cfg_files"))
                 repo_stage_env["STAGE_WRITE_VALUES_JSON"] = (
                     "true" if repo_stage.get("runtime", {}).get("values_json", True) else "false"
@@ -5130,16 +5315,17 @@ def run_maintenance(
     )
     scope_params = scope_params_from_context(execution_context)
     validate_selector_bindings(ctl_cfg_root, execution_context)
-    ctl_results_backend = configure_ctl_results_sync(
+    configure_ctl_results_sync(
         ctl_cfg_root,
         ctl_profile,
         scope_params,
         execution_context,
         run_dir,
         skip_ctl_results_sync=skip_ctl_results_sync,
+        profile_only_aws_profile=profile_only_aws_profile,
         aws_implementation_key=aws_implementation_key,
     )
-    ctl_results_bucket_name = ctl_results_backend["bucket_name"] if ctl_results_backend else None
+    inject_ctl_results_params(execution_context, ctl_cfg_root)
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
@@ -5271,6 +5457,20 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
     print_run_summary(run_id, log_file)
 
 
+def run_requests_results_bootstrap(workflow_cfg: dict, inventory_cfg: dict) -> bool:
+    """Whether any target in this run is the ctl-results bucket-creating target
+    (declares results_sync_bootstrap: true). Such a run may legitimately start
+    before its results bucket exists; every other run must find it already there
+    under a `required` sync policy."""
+    targets = inventory_cfg.get("stage_targets", {})
+    for entry in workflow_cfg.get("stages", []):
+        target_name = entry if isinstance(entry, str) else entry.get("target")
+        target_cfg = targets.get(target_name) or {}
+        if target_cfg.get("results_sync_bootstrap") is True:
+            return True
+    return False
+
+
 def validate_workflow_target_selectors(
     workflow_cfg: dict,
     inventory_cfg: dict,
@@ -5366,20 +5566,6 @@ def run_pipeline(
     )
     scope_params = scope_params_from_context(execution_context)
     validate_selector_bindings(ctl_cfg_root, execution_context)
-    # Ctl results backend: resolve + arm sync (pulls remote state layer). The
-    # bucket name is a resolved mechanism value: delivered to stages as an env
-    # var (never promoted into the execution context).
-    ctl_results_backend = configure_ctl_results_sync(
-        ctl_cfg_root,
-        ctl_profile,
-        scope_params,
-        execution_context,
-        run_dir,
-        skip_ctl_results_sync=skip_ctl_results_sync,
-        aws_implementation_key=aws_implementation_key,
-    )
-    ctl_results_bucket_name = ctl_results_backend["bucket_name"] if ctl_results_backend else None
-    execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
     # Load workflow + inventory (validate before creating dirs).
@@ -5413,6 +5599,25 @@ def run_pipeline(
         )
     if not sub_workflow_run:
         validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
+
+    # Ctl results backend: resolve + arm sync (pulls remote state layer). Done
+    # after the target is known so a missing bucket is tolerated only for the
+    # ctl-results bootstrap target; other required runs must find it present.
+    # The resolved bucket names are then promoted into the params namespace so
+    # plt cfg can alias them and ctl guardrails can hash them.
+    configure_ctl_results_sync(
+        ctl_cfg_root,
+        ctl_profile,
+        scope_params,
+        execution_context,
+        run_dir,
+        skip_ctl_results_sync=skip_ctl_results_sync,
+        results_sync_bootstrap=run_requests_results_bootstrap(workflow_cfg, inventory_cfg),
+        profile_only_aws_profile=profile_only_aws_profile,
+        aws_implementation_key=aws_implementation_key,
+    )
+    inject_ctl_results_params(execution_context, ctl_cfg_root)
+    execution_context_path = write_execution_context_artifact(run_dir, execution_context)
 
     refs = load_refs_cfg(ctl_cfg_root)
     if use_local_tooling_cfg:
@@ -5489,6 +5694,19 @@ def run_pipeline(
     # Write git metas
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
 
+    # Resolved ctl cfg snapshot (self-describing run, next to cfg/plt/)
+    write_ctl_cfg_snapshot(
+        run_dir,
+        ctl_profile=ctl_profile,
+        ctl_profile_policy_cfg=ctl_profile_policy(ctl_cfg_root, ctl_profile),
+        inventory_name=inventory_name,
+        workflow_cfg=workflow_cfg,
+        inventory_cfg=inventory_cfg,
+        active_stages=active_stages,
+        refs=refs,
+        execution_context=execution_context,
+    )
+
     # Distribute stage input views from the rendered tree
     plt_stages_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path, plt_rendered_dir, run_dir
@@ -5508,7 +5726,6 @@ def run_pipeline(
         aws_implementation_key=aws_implementation_key,
         allow_aws_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
-        ctl_results_bucket_name=ctl_results_bucket_name,
     )
 
     print_run_summary(run_id, log_file)

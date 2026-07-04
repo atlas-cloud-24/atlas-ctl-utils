@@ -66,7 +66,8 @@ def parse_args() -> argparse.Namespace:
         "--var",
         action="append",
         dest="vars",
-        help="Ctl mode: guarded var name to add/regenerate. Defaults to already-declared vars.",
+        help="Ctl mode: fully-qualified execution-context ref to add/regenerate "
+        "(e.g. execution_context.params.main_tag). Defaults to already-declared vars.",
     )
     parser.add_argument(
         "--keep-artifacts",
@@ -109,6 +110,10 @@ def run_plt(args: argparse.Namespace) -> int:
     ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve() if args.ctl_cfg_root else None
     execution_context = build_context(args, ctl_cfg_root)
     scope_params = dict(args.execution_param)
+    # Engine-resolved ctl-results params (per-tier bucket-name aliases) so
+    # scopes that reference them render, matching the pipeline's context.
+    if ctl_cfg_root is not None:
+        common.inject_ctl_results_params(execution_context, ctl_cfg_root)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="atlas-regenerate-guardrails-"))
     try:
@@ -123,11 +128,9 @@ def run_plt(args: argparse.Namespace) -> int:
             scope_params=scope_params,
         )
         rendered_dir.mkdir(parents=True)
-        env_ctx = {k: v for k, v in execution_context.items() if k not in common.ENGINE_VOLATILE_CONTEXT_KEYS}
-        volatile = frozenset(common.ENGINE_VOLATILE_CONTEXT_KEYS)
         for entry in sorted(merged_dir.iterdir()):
             if entry.is_dir():
-                common.render_scope_tree(entry, rendered_dir / entry.name, env_ctx, volatile)
+                common.render_scope_tree(entry, rendered_dir / entry.name, dict(execution_context))
 
         wrote_any = False
         for scope in common.discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
@@ -168,17 +171,20 @@ def run_ctl(args: argparse.Namespace) -> int:
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
     existing = common.load_ctl_guarded_vars(ctl_cfg_root)
-    var_names = args.vars or sorted(existing)
-    if not var_names:
+    refs = args.vars or sorted(existing)
+    if not refs:
         raise RuntimeError("no ctl guarded vars declared; pass --var to add one")
 
     execution_context = build_context(args, ctl_cfg_root)
+    # Engine-resolved mechanism params (e.g. the invariant deployments results
+    # bucket name) so their guarded refs are available to hash.
+    common.inject_ctl_results_params(execution_context, ctl_cfg_root)
     hashes: dict[str, str] = dict(existing)
-    for var_name in var_names:
-        ref = f"{common.EXECUTION_CONTEXT_ROOT}.params.{var_name}"
+    for ref in refs:
+        ref = common.validate_ctl_guard_ref(ref, label="--var")
         if ref not in execution_context:
-            raise RuntimeError(f"ctl guarded var {var_name!r} is not available: {ref} missing")
-        hashes[var_name] = common.guard_value_hash(execution_context[ref], label=f"ctl.{var_name}")
+            raise RuntimeError(f"ctl guarded var {ref!r} is not available in the execution context")
+        hashes[ref] = common.guard_value_hash(execution_context[ref], label=ref)
 
     path = ctl_cfg_root / "guardrails.yaml"
     path.write_text(

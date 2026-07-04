@@ -42,7 +42,10 @@ class CtlGuardrailTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             expected = common.guard_value_hash("oxygen", label="test")
-            write(root / "not-a-special-name.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
+            write(
+                root / "not-a-special-name.yaml",
+                f"guardrails:\n  guarded_vars:\n    execution_context.params.main_tag: {expected}\n",
+            )
 
             common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
 
@@ -50,10 +53,34 @@ class CtlGuardrailTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             expected = common.guard_value_hash("oxygen", label="test")
-            write(root / "guardrails.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
+            write(
+                root / "guardrails.yaml",
+                f"guardrails:\n  guarded_vars:\n    execution_context.params.main_tag: {expected}\n",
+            )
 
             with self.assertRaisesRegex(RuntimeError, "guarded ctl var .*main_tag.* changed"):
                 common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "argon"})
+
+    def test_ctl_guardrails_reject_ctl_namespace_ref(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = common.guard_value_hash("provision", label="test")
+            write(
+                root / "guardrails.yaml",
+                f"guardrails:\n  guarded_vars:\n    execution_context.ctl.action: {expected}\n",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "per-run switches and can never be guarded"):
+                common.verify_ctl_guardrails(root, {"execution_context.ctl.action": "provision"})
+
+    def test_ctl_guardrails_reject_bare_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected = common.guard_value_hash("oxygen", label="test")
+            write(root / "guardrails.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
+
+            with self.assertRaisesRegex(RuntimeError, "fully-qualified execution-context path"):
+                common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
 
 
 class PltGuardrailTests(unittest.TestCase):

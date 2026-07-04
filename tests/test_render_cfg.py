@@ -19,7 +19,7 @@ def write_tree(root: Path, files: dict[str, str]) -> None:
         path.write_text(content, encoding="utf-8")
 
 
-def render(files: dict[str, str], env_ctx: dict, volatile: set[str]) -> Path:
+def render(files: dict[str, str], env_ctx: dict) -> Path:
     tmp = tempfile.mkdtemp()
     merged = Path(tmp) / "merged"
     write_tree(merged, files)
@@ -27,11 +27,10 @@ def render(files: dict[str, str], env_ctx: dict, volatile: set[str]) -> Path:
     rendered.mkdir()
     for entry in sorted(merged.iterdir()):
         if entry.is_dir():
-            common.render_scope_tree(entry, rendered / entry.name, env_ctx, frozenset(volatile))
+            common.render_scope_tree(entry, rendered / entry.name, env_ctx)
     return rendered
 
 
-VOLATILE = {"execution_context.run.id"}
 CTX = {
     "execution_context.params.main_tag": "oxygen",
     "execution_context.params.env_type": "dev",
@@ -39,7 +38,7 @@ CTX = {
 
 
 class RenderScopeTreeTests(unittest.TestCase):
-    def test_renders_context_keeps_volatile_and_normalizes_refs(self):
+    def test_renders_context_and_normalizes_refs(self):
         rendered = render(
             {
                 "env/computing/asg.yaml": (
@@ -48,7 +47,6 @@ class RenderScopeTreeTests(unittest.TestCase):
                     "    asg_cfg:\n"
                     "      app:\n"
                     "        name: ${execution_context.params.main_tag}-asg\n"
-                    "        run_marker: ${execution_context.run.id}\n"
                     "        launch_template_key: cfg-entry-ref:foundation.computing.launch_templates_cfg:app\n"
                 ),
                 "env/computing/lt.yaml": (
@@ -57,11 +55,9 @@ class RenderScopeTreeTests(unittest.TestCase):
                 "env/notes.md": "not yaml\n",
             },
             CTX,
-            VOLATILE,
         )
         app = yaml.safe_load((rendered / "env/computing/asg.yaml").read_text())["foundation"]["computing"]["asg_cfg"]["app"]
         self.assertEqual(app["name"], "oxygen-asg")
-        self.assertEqual(app["run_marker"], "${execution_context.run.id}")
         self.assertEqual(
             app["launch_template_key"],
             {"cfg_entry_ref": {"collection": "foundation.computing.launch_templates_cfg", "key": "app"}},
@@ -70,11 +66,11 @@ class RenderScopeTreeTests(unittest.TestCase):
 
     def test_reserved_top_level_key_rejected_in_payload(self):
         with self.assertRaisesRegex(RuntimeError, "reserved top-level key"):
-            render({"env/a.yaml": "execution_context:\n  var:\n    main_tag: hacked\n"}, CTX, VOLATILE)
+            render({"env/a.yaml": "execution_context:\n  var:\n    main_tag: hacked\n"}, CTX)
 
     def test_missing_stable_reference_fails_at_render(self):
         with self.assertRaisesRegex(RuntimeError, "missing cfg interpolation reference"):
-            render({"env/a.yaml": "top:\n  value: ${execution_context.params.absent}\n"}, CTX, VOLATILE)
+            render({"env/a.yaml": "top:\n  value: ${execution_context.params.absent}\n"}, CTX)
 
     def test_scopes_render_independently(self):
         rendered = render(
@@ -83,7 +79,6 @@ class RenderScopeTreeTests(unittest.TestCase):
                 "org/b.yaml": "shared:\n  value: org-value\nuses:\n  ref: ${shared.value}\n",
             },
             CTX,
-            VOLATILE,
         )
         self.assertEqual(yaml.safe_load((rendered / "env/a.yaml").read_text())["uses"]["ref"], "env-value")
         self.assertEqual(yaml.safe_load((rendered / "org/b.yaml").read_text())["uses"]["ref"], "org-value")

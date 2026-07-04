@@ -206,12 +206,9 @@ def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
 
 
 class Resolver:
-    def __init__(self, raw: dict, env_ctx: dict[str, str], keep_unresolved: frozenset[str] = frozenset()):
+    def __init__(self, raw: dict, env_ctx: dict[str, str]):
         self.raw = raw
         self.env_ctx = env_ctx
-        # Names whose placeholders stay verbatim when unresolved (render mode:
-        # engine-volatile context keys resolve later, at the per-stage step).
-        self.keep_unresolved = keep_unresolved
         self.cache: dict[str, object] = {}
         self.resolving: set[str] = set()
 
@@ -283,8 +280,6 @@ class Resolver:
             var_name = exact_match.group(1)
             default_raw = exact_match.group(2)
             looked_up = self.lookup(var_name)
-            if looked_up is OMIT and var_name in self.keep_unresolved:
-                return value
             if looked_up is OMIT and default_raw is not None:
                 return self.parse_default(default_raw)
             if looked_up is OMIT:
@@ -295,8 +290,6 @@ class Resolver:
             var_name = match.group(1)
             default_raw = match.group(2)
             looked_up = self.lookup(var_name)
-            if looked_up is OMIT and var_name in self.keep_unresolved:
-                return match.group(0)
             if looked_up is OMIT:
                 if default_raw is not None:
                     looked_up = self.parse_default(default_raw)
