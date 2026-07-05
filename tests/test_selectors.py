@@ -98,18 +98,18 @@ class SelectorMatchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fully-qualified execution-context path"):
             common.selector_matches({"env_type": ["dev"]}, self.CTX, label="t")
 
-    def test_bindings_enforce_allowed_values(self):
+    def test_constraints_enforce_allowed_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write(root / "selector_bindings.yaml",
-                  "selector_bindings:\n"
+            write(root / "execution_context_constraints.yaml",
+                  "execution_context_constraints:\n"
                   "  - when:\n      execution_context.params.env_type: [prod]\n"
                   "    allowed_values:\n      execution_context.ctl.action: [provision, plan, readonly]\n")
             ctx = dict(self.CTX)
             ctx["execution_context.params.env_type"] = "prod"
             ctx["execution_context.ctl.action"] = "destroy"
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_selector_bindings(root, ctx)
+                common.validate_execution_context_constraints(root, ctx)
 
 
 if __name__ == "__main__":

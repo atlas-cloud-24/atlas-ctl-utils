@@ -289,50 +289,50 @@ def ref_policy_requires_commits(ref_policy: str) -> bool:
     return ref_policy == "commit_required"
 
 
-def load_selector_bindings(ctl_cfg_root: Path) -> list[dict]:
-    binding_entries: list[tuple[dict, Path]] = []
-    for path, section in collect_top_level_sections(ctl_cfg_root, "selector_bindings"):
+def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
+    constraint_entries: list[tuple[dict, Path]] = []
+    for path, section in collect_top_level_sections(ctl_cfg_root, "execution_context_constraints"):
         if not isinstance(section, list):
-            raise RuntimeError(f"❌ selector_bindings must be a list: {path}")
-        binding_entries.extend((binding, path) for binding in section)
+            raise RuntimeError(f"❌ execution_context_constraints must be a list: {path}")
+        constraint_entries.extend((constraint, path) for constraint in section)
 
-    bindings: list[dict] = []
-    for idx, (binding, path) in enumerate(binding_entries, start=1):
-        if not isinstance(binding, dict):
-            raise RuntimeError(f"❌ selector binding #{idx} must be a mapping: {path}")
-        when = binding.get("when") or {}
-        require_selectors = binding.get("require_selectors") or []
-        allowed_values = binding.get("allowed_values") or {}
+    constraints: list[dict] = []
+    for idx, (constraint, path) in enumerate(constraint_entries, start=1):
+        if not isinstance(constraint, dict):
+            raise RuntimeError(f"❌ execution context constraint #{idx} must be a mapping: {path}")
+        when = constraint.get("when") or {}
+        require_present = constraint.get("require_present") or []
+        allowed_values = constraint.get("allowed_values") or {}
         if not isinstance(when, dict):
-            raise RuntimeError(f"❌ selector binding #{idx} when must be a mapping: {path}")
-        if not isinstance(require_selectors, list) or not all(isinstance(item, str) and item for item in require_selectors):
-            raise RuntimeError(f"❌ selector binding #{idx} require_selectors must be a list of non-empty strings: {path}")
+            raise RuntimeError(f"❌ execution context constraint #{idx} when must be a mapping: {path}")
+        if not isinstance(require_present, list) or not all(isinstance(item, str) and item for item in require_present):
+            raise RuntimeError(f"❌ execution context constraint #{idx} require_present must be a list of non-empty strings: {path}")
         if not isinstance(allowed_values, dict):
-            raise RuntimeError(f"❌ selector binding #{idx} allowed_values must be a mapping: {path}")
-        bindings.append(binding)
-    return bindings
+            raise RuntimeError(f"❌ execution context constraint #{idx} allowed_values must be a mapping: {path}")
+        constraints.append(constraint)
+    return constraints
 
 
-def validate_selector_bindings(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
-    for idx, binding in enumerate(load_selector_bindings(ctl_cfg_root), start=1):
-        when = binding.get("when") or {}
-        if not selector_matches(when, execution_context, label=f"selector_bindings[{idx}].when"):
+def validate_execution_context_constraints(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
+    for idx, constraint in enumerate(load_execution_context_constraints(ctl_cfg_root), start=1):
+        when = constraint.get("when") or {}
+        if not selector_matches(when, execution_context, label=f"execution_context_constraints[{idx}].when"):
             continue
 
-        for ref in binding.get("require_selectors") or []:
-            validate_execution_context_ref(ref, label=f"selector_bindings[{idx}].require_selectors")
+        for ref in constraint.get("require_present") or []:
+            validate_execution_context_ref(ref, label=f"execution_context_constraints[{idx}].require_present")
             if ref not in execution_context:
                 raise RuntimeError(
-                    f"❌ selector binding #{idx} requires {ref!r} when {when} matches; "
+                    f"❌ execution context constraint #{idx} requires {ref!r} when {when} matches; "
                     f"{execution_context_miss_message(execution_context, ref)}"
                 )
 
-        for ref, expected in (binding.get("allowed_values") or {}).items():
-            validate_execution_context_ref(ref, label=f"selector_bindings[{idx}].allowed_values")
-            allowed = selector_expected_values(expected, label=f"selector_bindings[{idx}].allowed_values.{ref}")
+        for ref, expected in (constraint.get("allowed_values") or {}).items():
+            validate_execution_context_ref(ref, label=f"execution_context_constraints[{idx}].allowed_values")
+            allowed = selector_expected_values(expected, label=f"execution_context_constraints[{idx}].allowed_values.{ref}")
             if ref in execution_context and str(execution_context[ref]) not in allowed:
                 raise RuntimeError(
-                    f"❌ selector binding #{idx} allows {ref} only in {allowed}, got {execution_context[ref]!r}"
+                    f"❌ execution context constraint #{idx} allows {ref} only in {allowed}, got {execution_context[ref]!r}"
                 )
 
 def normalize_ctl_state_local_root(value: str) -> Path:
@@ -3269,7 +3269,7 @@ EXECUTION_CONTEXT_REF_RE = re.compile(
 
 
 def validate_execution_context_ref(ref: str, *, label: str) -> str:
-    """Selector/binding/interpolation references into the execution context are
+    """Selector/constraint/interpolation references into the execution context are
     always fully-qualified paths starting at the root key."""
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: execution-context reference must be a non-empty string")
@@ -3615,7 +3615,7 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
       switches, so hashing them can never be correct;
     - a ctl-state registry ref (`ctl_state_buckets.<domain>.<bucket_name|bucket_region>`)
       — resolved from the registry (env-invariant values only, e.g. the
-      deployments bucket)."""
+      org_state bucket)."""
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
     value = ref.strip()
@@ -4479,8 +4479,10 @@ def load_ctl_state_buckets_cfg(ctl_cfg_root: Path) -> dict | None:
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ ctl_state_buckets must be a mapping: {path}")
         for domain, entry in section.items():
-            if domain not in ("env", "deployments"):
-                raise RuntimeError(f"❌ ctl_state_buckets domain must be env or deployments: {domain!r} in {path}")
+            # Domains are consumer-defined vocabulary (the engine stays cfg-shape
+            # agnostic): any non-empty snake_case key is a valid state domain.
+            if not isinstance(domain, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", domain):
+                raise RuntimeError(f"❌ ctl_state_buckets domain must be a snake_case key: {domain!r} in {path}")
             if domain in merged:
                 raise RuntimeError(f"❌ duplicate ctl_state_buckets domain {domain!r}: {path}")
             if not isinstance(entry, dict):
@@ -5343,7 +5345,7 @@ def run_maintenance(
         execution_params=execution_params,
     )
     scope_params = scope_params_from_context(execution_context)
-    validate_selector_bindings(ctl_cfg_root, execution_context)
+    validate_execution_context_constraints(ctl_cfg_root, execution_context)
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
     ctl_state_domain = resolve_run_domain(
         {"stages": [{"target": stage_target}]},
@@ -5635,7 +5637,7 @@ def run_pipeline(
 
     The caller passes stage repo settings and pre-created run/log directories.
     """
-    # Build the execution context (flat dotted namespaces) and validate bindings.
+    # Build the execution context (flat dotted namespaces) and validate constraints.
     execution_context = build_execution_context(
         ctl_cfg_root,
         action=inventory_name,
@@ -5643,7 +5645,7 @@ def run_pipeline(
         execution_params=execution_params,
     )
     scope_params = scope_params_from_context(execution_context)
-    validate_selector_bindings(ctl_cfg_root, execution_context)
+    validate_execution_context_constraints(ctl_cfg_root, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
     # Load workflow + inventory (validate before creating dirs).

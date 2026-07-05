@@ -42,12 +42,20 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(common.load_ctl_state_buckets_cfg(Path(tmp)))
 
-    def test_rejects_unknown_domain(self):
+    def test_accepts_consumer_defined_domain(self):
+        # domains are consumer vocabulary; the engine accepts any snake_case key
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "ctl_state.yaml", "ctl_state_buckets:\n  org:\n    bucket_name: x\n    bucket_region: y\n")
+            cfg = common.load_ctl_state_buckets_cfg(root)
+            self.assertEqual(set(cfg), {"org"})
 
-            with self.assertRaisesRegex(RuntimeError, "domain must be env or deployments"):
+    def test_rejects_non_snake_domain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root / "ctl_state.yaml", "ctl_state_buckets:\n  Org-State:\n    bucket_name: x\n    bucket_region: y\n")
+
+            with self.assertRaisesRegex(RuntimeError, "must be a snake_case key"):
                 common.load_ctl_state_buckets_cfg(root)
 
     def test_rejects_missing_region(self):

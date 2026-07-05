@@ -7,7 +7,7 @@ The source cfg can be either:
 
 The script copies the source cfg into a target directory, rewrites
 `stage_sources.yaml` so each stage source uses `repo_path` instead of `repo_url`,
-removes ineffective `branch` keys from workflow YAMLs, writes local `global` repo-path overrides
+removes ineffective `branch` keys from workflow YAMLs, writes local `tooling` repo-path overrides
 to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
 Examples:
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
             "stage_sources.yaml repo_url values to repo_path using a JSON file "
-            "with stage-source-to-path mappings and optional global repo-to-path mappings."
+            "with stage-source-to-path mappings and optional tooling repo-to-path mappings."
         )
     )
     parser.add_argument(
@@ -384,8 +384,12 @@ def write_local_global_file(root_dir: Path, global_ref_map: dict[str, str]) -> P
     if not global_ref_map:
         return None
 
+    # Content-key `tooling`: both consumers (the orchestrator local bootstrap and
+    # the engine's load_local_tooling_cfg) discover local tooling repos by scanning
+    # for a top-level `tooling:` section — NOT `global:` (which is a refs.yaml
+    # concept). The strict path reads refs.global; the local-dev path reads tooling.
     local_global_cfg = {
-        "global": {
+        "tooling": {
             ref_name: {"repo_path": repo_path}
             for ref_name, repo_path in global_ref_map.items()
         }
