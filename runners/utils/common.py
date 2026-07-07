@@ -1345,7 +1345,16 @@ def _validate_direct_profile_expect(
         f"AWS access context {access_context_key!r}.{implementation_key}.expect.{principal_keys[0]}",
         path,
     )
-    unknown = sorted(set(expect_cfg) - set(principal_keys))
+    # optional independent account pin (Phase 18 C4): recorded after vending, it
+    # catches a stale/mis-built profile whose own sso_account_id points at the
+    # wrong org — the profile-derived account check alone follows the profile.
+    if "account_id" in expect_cfg:
+        _require_non_empty_string(
+            expect_cfg["account_id"],
+            f"AWS access context {access_context_key!r}.{implementation_key}.expect.account_id",
+            path,
+        )
+    unknown = sorted(set(expect_cfg) - set(principal_keys) - {"account_id"})
     if unknown:
         raise RuntimeError(
             f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect has unknown fields "
@@ -1516,6 +1525,23 @@ def resolve_stage_aws_access(
         )
 
     canonical_account_id = resolve_configured_profile_account_id(canonical_profile_name)
+    pinned_account_id = expect_cfg.get("account_id")
+    if pinned_account_id is not None:
+        pinned_account_id = str(resolve_runtime_scalar(
+            pinned_account_id,
+            context,
+            label=f"aws_access_contexts.{access_context_key}.{implementation_key}.expect.account_id",
+        )).strip()
+        if not re.fullmatch(r"\d{12}", pinned_account_id):
+            raise RuntimeError(
+                f"❌ expect.account_id for {access_context_key!r} must be a 12-digit account id, "
+                f"got {pinned_account_id!r}"
+            )
+        if pinned_account_id != canonical_account_id:
+            raise RuntimeError(
+                f"❌ profile {canonical_profile_name!r} resolves to account {canonical_account_id}, but "
+                f"cfg pins {access_context_key!r} to {pinned_account_id} (stale or wrong-org profile?)"
+            )
     if account_registry is None:
         expected_account_id = canonical_account_id
     else:
@@ -1732,7 +1758,9 @@ def merge_config_dirs(
         merged_files = {}
 
     for source_dir in source_dirs:
-        for root, _, files in os.walk(source_dir):
+        for root, dirs, files in os.walk(source_dir):
+            # scope-local baseline dirs are guard artifacts, never cfg payload
+            dirs[:] = [d for d in dirs if d != PLT_GUARDRAILS_DIRNAME]
             rel_root = os.path.relpath(root, source_dir)
             dest_root = os.path.join(dest_dir, rel_root) if rel_root != "." else dest_dir
 
@@ -3509,12 +3537,32 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
     data = load_yaml(path) or {}
     if not isinstance(data, dict):
         raise RuntimeError(f"❌ {path.name} must contain a mapping: {path}")
-    unknown = set(data) - {"declare"}
+    unknown = set(data) - {"declare", "baseline_axes"}
     if unknown:
         raise RuntimeError(f"❌ root {path.name} has unsupported keys {sorted(unknown)}: {path}")
     raw_declarations = data.get("declare") or []
     if not isinstance(raw_declarations, list):
         raise RuntimeError(f"❌ declare must be a list: {path}")
+
+    # baseline_axes: execution params this file's baselines vary by. A scope
+    # matched by any declaration carrying axes stores one baseline file PER
+    # axis-value combination (<scope>/__guardrails__/<v1>[__<v2>].yaml) instead
+    # of the flat <scope>/__guardrails__.yaml — the per-dir mechanism can't
+    # help when one scope dir serves several param values (e.g. env scopes
+    # across landing zones). Axes are consumer vocabulary: any params ref.
+    raw_axes = data.get("baseline_axes") or []
+    if not isinstance(raw_axes, list) or not all(isinstance(a, str) and a.strip() for a in raw_axes):
+        raise RuntimeError(f"❌ baseline_axes must be a list of non-empty strings: {path}")
+    axes: list[str] = []
+    for axis in raw_axes:
+        axis = validate_execution_context_ref(axis.strip(), label=f"baseline_axes in {path}")
+        if not axis.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
+            raise RuntimeError(
+                f"❌ baseline_axes entries must be params refs ({EXECUTION_CONTEXT_PARAMS_PREFIX}<key>): {axis!r} in {path}"
+            )
+        if axis in axes:
+            raise RuntimeError(f"❌ duplicate baseline axis {axis!r}: {path}")
+        axes.append(axis)
 
     for index, raw in enumerate(raw_declarations):
         label = f"declare[{index}] in {path}"
@@ -3545,6 +3593,7 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
                 "path": var_name,
                 "match_target_path": match_target_path,
                 "selectors": selectors or {},
+                "baseline_axes": tuple(axes),
             }
         )
 
@@ -3564,6 +3613,41 @@ def load_scope_guard_hashes(path: Path, *, allow_missing: bool = False) -> dict[
     hashes: dict[str, str] = {}
     merge_guarded_vars(hashes, data.get("hashes"), origin=path)
     return hashes
+
+
+def scope_guard_baseline_path(scope: dict, matching_declarations: list[dict], scope_params: dict[str, str]) -> Path:
+    """Baseline file for a scope: flat `__guardrails__.yaml`, or one file per
+    axis-value combination under `__guardrails__/` when any matching
+    declaration carries baseline_axes (values read from the run's params)."""
+    axes = sorted({axis for d in matching_declarations for axis in d.get("baseline_axes", ())})
+    scope_root = scope["scope_root"]
+    flat = scope_root / PLT_GUARDRAILS_FILENAME
+    axis_dir = scope_root / PLT_GUARDRAILS_DIRNAME
+    if not axes:
+        if axis_dir.is_dir():
+            raise RuntimeError(
+                f"❌ scope {scope['scope_path']} has a {PLT_GUARDRAILS_DIRNAME}/ dir but no declaration "
+                f"defines baseline_axes; remove the dir or declare the axes"
+            )
+        return flat
+    if flat.is_file():
+        raise RuntimeError(
+            f"❌ scope {scope['scope_path']} has a flat {PLT_GUARDRAILS_FILENAME} but its declarations "
+            f"define baseline_axes {axes}; remove the stale flat baseline"
+        )
+    values: list[str] = []
+    for axis in axes:
+        key = axis[len(EXECUTION_CONTEXT_PARAMS_PREFIX):]
+        value = scope_params.get(key)
+        if not value:
+            raise RuntimeError(
+                f"❌ baseline axis {axis!r} for scope {scope['scope_path']} has no value in this run's "
+                f"params; pass --execution-params {key}=<value>"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", str(value)):
+            raise RuntimeError(f"❌ baseline axis {axis!r} value {value!r} is not filename-safe")
+        values.append(str(value))
+    return axis_dir / ("__".join(values) + ".yaml")
 
 
 def guard_declaration_matches_scope(declaration: dict, scope: dict) -> bool:
@@ -3604,6 +3688,7 @@ def verify_guarded_value(
 
 
 CTL_STATE_BUCKETS_GUARD_PREFIX = "ctl_state_buckets."
+EXECUTION_CONTEXT_PARAMS_PREFIX = "execution_context.params."
 CTL_STATE_BUCKETS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
 
 
@@ -3640,8 +3725,12 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
 def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
     """Resolve a validated ctl guard ref to its current value.
 
-    Registry refs resolve from ctl_state_buckets (interpolating the execution
-    context, e.g. main_tag); context refs read the execution context directly."""
+    Registry refs return the RAW registry pattern (un-interpolated): registry
+    values may legitimately vary per run param (env_type, landing_zone), so the
+    guard pins the cfg TEXT — a silent edit of the pattern is caught, while
+    param-driven variation stays free (params are ctl-owned; main_tag is
+    guarded separately as a context ref). Context refs read the execution
+    context directly."""
     if ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
         _, domain, field = ref.split(".")
         buckets = load_ctl_state_buckets_cfg(ctl_cfg_root) or {}
@@ -3649,7 +3738,7 @@ def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dic
         if entry is None:
             known = ", ".join(sorted(buckets)) or "none"
             raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown domain {domain!r}; known: {known}")
-        return str(resolve_runtime_scalar(entry[field], execution_context, label=ref))
+        return str(entry[field])
     if ref not in execution_context:
         raise RuntimeError(
             f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
@@ -3677,7 +3766,7 @@ def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, objec
 def load_rendered_cfg_top_level_values(rendered_dir: Path, var_name: str) -> list[tuple[Path, object]]:
     values: list[tuple[Path, object]] = []
     for path in sorted(rendered_dir.rglob("*.yaml")):
-        if path.name in SCOPE_META_SKIP_FILENAMES:
+        if path.name in SCOPE_META_SKIP_FILENAMES or PLT_GUARDRAILS_DIRNAME in path.parts:
             continue
         data = load_yaml(path) or {}
         if not isinstance(data, dict) or var_name not in data:
@@ -3761,7 +3850,7 @@ def verify_plt_guardrails(
         if required_target_paths is not None and scope["target_path"] not in required_target_paths:
             continue
         matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
-        baseline_path = scope["scope_root"] / PLT_GUARDRAILS_FILENAME
+        baseline_path = scope_guard_baseline_path(scope, matching, scope_params)
         baseline = load_scope_guard_hashes(baseline_path, allow_missing=True)
         if not matching and not baseline:
             continue

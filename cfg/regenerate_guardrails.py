@@ -140,7 +140,8 @@ def run_plt(args: argparse.Namespace) -> int:
                 var_name = declaration["path"]
                 value = common.read_rendered_guard_value(target_dir, var_name, label=label)
                 hashes[var_name] = common.guard_value_hash(value, label=f"plt.{var_name}")
-            baseline_path = scope["scope_root"] / common.PLT_GUARDRAILS_FILENAME
+            baseline_path = common.scope_guard_baseline_path(scope, matching, scope_params)
+            baseline_path.parent.mkdir(parents=True, exist_ok=True)
             baseline_path.write_text(
                 yaml.safe_dump({"hashes": hashes}, sort_keys=True),
                 encoding="utf-8",
