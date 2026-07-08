@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Temporarily comment target ctl_state_bucket_key entries in a ctl cfg tree.
+"""Temporarily comment target ctl_state_backend_key entries in a ctl cfg tree.
 
 This is the second condition of the ctl-state sync-skip triad (mirroring the
 profile-only identity hatch): with the keys absent on all active targets, a
-profile that sets allow_skip_ctl_state_bucket_sync: true may run with
---skip-ctl-state-bucket-sync. Use --restore to reinstate the keys.
+profile that sets allow_skip_ctl_state_backend_sync: true may run with
+--skip-ctl-state-backend-sync. Use --restore to reinstate the keys.
 """
 
 from __future__ import annotations
@@ -15,17 +15,17 @@ from pathlib import Path
 
 
 MARKER = "atlas-tmp-no-ctl-state"
-KEY_RE = re.compile(r"^(?P<indent>\s*)ctl_state_bucket_key:\s*(?P<value>.+?)\s*$")
+KEY_RE = re.compile(r"^(?P<indent>\s*)ctl_state_backend_key:\s*(?P<value>.+?)\s*$")
 RESTORE_RE = re.compile(
-    rf"^(?P<indent>\s*)# {MARKER}: ctl_state_bucket_key:\s*(?P<value>.+?)\s*$"
+    rf"^(?P<indent>\s*)# {MARKER}: ctl_state_backend_key:\s*(?P<value>.+?)\s*$"
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Comment or restore ctl_state_bucket_key lines under targets/**/*.yaml "
-            "so local_dev can run with --skip-ctl-state-bucket-sync."
+            "Comment or restore ctl_state_backend_key lines under targets/**/*.yaml "
+            "so local_dev can run with --skip-ctl-state-backend-sync."
         )
     )
     parser.add_argument(
@@ -62,7 +62,7 @@ def comment_keys(text: str) -> tuple[str, int]:
         match = KEY_RE.match(line)
         if match:
             output.append(
-                f"{match.group('indent')}# {MARKER}: ctl_state_bucket_key: {match.group('value')}"
+                f"{match.group('indent')}# {MARKER}: ctl_state_backend_key: {match.group('value')}"
             )
             changed += 1
         else:
@@ -76,7 +76,7 @@ def restore_keys(text: str) -> tuple[str, int]:
     for line in text.splitlines():
         match = RESTORE_RE.match(line)
         if match:
-            output.append(f"{match.group('indent')}ctl_state_bucket_key: {match.group('value')}")
+            output.append(f"{match.group('indent')}ctl_state_backend_key: {match.group('value')}")
             changed += 1
         else:
             output.append(line)
@@ -103,7 +103,7 @@ def main() -> int:
             path.write_text(updated, encoding="utf-8")
 
     mode = "would change" if args.dry_run else "changed"
-    print(f"{mode}: {total} ctl_state_bucket_key line(s)")
+    print(f"{mode}: {total} ctl_state_backend_key line(s)")
     return 0
 
 

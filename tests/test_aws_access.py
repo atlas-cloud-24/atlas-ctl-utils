@@ -43,6 +43,10 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 }
             },
         }
+        self.account_registry = {
+            "dev": "111111111111",
+            "management": "333333333333",
+        }
         self.identities = {
             "org_admin": {
                 "provider": "aws",
@@ -76,6 +80,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
             )
 
         self.assertEqual(resolved["account_key"], "dev")
@@ -107,6 +112,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     self.levels,
                     execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                     implementation_key="local",
+                    account_registry=self.account_registry,
                 )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -124,6 +130,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
             )
         self.assertEqual(resolved["profile_name"], "oxygen-org-admin")
         self.assertEqual(resolved["permission_set_name"], "AdministratorAccess")
@@ -137,6 +144,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
             )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -175,13 +183,14 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "resolve_configured_profile_account_id",
             side_effect=account_ids.__getitem__,
         ):
-            with self.assertRaisesRegex(RuntimeError, "Conflicting AWS account IDs"):
+            with self.assertRaisesRegex(RuntimeError, "AWS account registry maps"):
                 common.validate_active_stage_aws_access(
                     stages,
                     self.identities,
                     self.levels,
                     execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                     implementation_key="local",
+                    account_registry=self.account_registry,
                 )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -268,6 +277,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
             )
@@ -281,6 +291,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
                 allow_profile_only=True,
                 profile_only_aws_profile="legacy-dev-profile",
             )
@@ -294,6 +305,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.levels,
                 execution_context={"execution_context.params.main_tag": "oxygen", "execution_context.params.env_type": "dev"},
                 implementation_key="local",
+                account_registry=self.account_registry,
                 allow_profile_only=True,
             )
 

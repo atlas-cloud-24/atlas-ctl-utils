@@ -3,12 +3,12 @@
 
 --mode plt: compose + render one cfg variation (one execution-input assignment)
 via the same engine code path the pipeline uses, then rewrite the scope-local
-`__guardrails__.yaml` (`hashes:` only) of every active scope with matching root
+`__guardrails__.yaml` (`guarded_vars:` value+hash entries) of every active scope with matching root
 declarations. The temp merged/rendered tree is discarded unless
 --keep-artifacts is passed; the only durable output is the committed baseline
 files.
 
---mode ctl: refresh the combined ctl `guardrails.guarded_vars` hashes from the
+--mode ctl: refresh the combined ctl `guardrails.guarded_vars` value+hash entries from the
 execution context built for the given input assignment (no rendering).
 """
 
@@ -135,21 +135,22 @@ def run_plt(args: argparse.Namespace) -> int:
                 continue
             target_dir = common.rendered_scope_target_dir(rendered_dir, scope["target_path"])
             label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
-            hashes: dict[str, str] = {}
+            guarded: dict[str, dict[str, str]] = {}
             for declaration in matching:
                 var_name = declaration["path"]
                 value = common.read_rendered_guard_value(target_dir, var_name, label=label)
-                hashes[var_name] = common.guard_value_hash(value, label=f"plt.{var_name}")
+                guarded[var_name] = common.guard_entry(value, label=f"plt.{var_name}")
             baseline_path = common.scope_guard_baseline_path(scope, matching, scope_params)
             baseline_path.parent.mkdir(parents=True, exist_ok=True)
             baseline_path.write_text(
-                yaml.safe_dump({"hashes": hashes}, sort_keys=True),
+                yaml.safe_dump({"guarded_vars": guarded}, sort_keys=True),
                 encoding="utf-8",
             )
             wrote_any = True
             print(f"wrote {baseline_path}")
-            for var_name in sorted(hashes):
-                print(f"  {var_name}: {hashes[var_name]}")
+            for var_name in sorted(guarded):
+                entry = guarded[var_name]
+                print(f"  {var_name}: {entry['value']} ({entry['hash']})")
 
         if not wrote_any:
             raise RuntimeError(
@@ -173,22 +174,23 @@ def run_ctl(args: argparse.Namespace) -> int:
         raise RuntimeError("no ctl guarded vars declared; pass --var to add one")
 
     execution_context = build_context(args, ctl_cfg_root)
-    hashes: dict[str, str] = dict(existing)
+    guarded: dict[str, dict[str, str]] = dict(existing)
     for ref in refs:
         ref = common.validate_ctl_guard_ref(ref, label="--var")
         # Context refs read the built context; ctl_state_buckets.* refs resolve
         # from the registry — same resolution the run-time verify uses.
         value = common.resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
-        hashes[ref] = common.guard_value_hash(value, label=ref)
+        guarded[ref] = common.guard_entry(value, label=ref)
 
     path = ctl_cfg_root / "guardrails.yaml"
     path.write_text(
-        yaml.safe_dump({"guardrails": {"guarded_vars": hashes}}, sort_keys=True),
+        yaml.safe_dump({"guardrails": {"guarded_vars": guarded}}, sort_keys=True),
         encoding="utf-8",
     )
     print(f"wrote {path}")
-    for var_name in sorted(hashes):
-        print(f"  {var_name}: {hashes[var_name]}")
+    for var_name in sorted(guarded):
+        entry = guarded[var_name]
+        print(f"  {var_name}: {entry['value']} ({entry['hash']})")
     return 0
 
 

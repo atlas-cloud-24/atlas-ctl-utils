@@ -15,7 +15,20 @@ def write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def make_plt_tree(root: Path, *, baseline_hash: str | None, declared: bool = True) -> Path:
+def entry_yaml(value: str, *, indent: str) -> str:
+    """guarded_vars entry block: value + matching hash (baseline self-integrity)."""
+    e = common.guard_entry(value, label="test")
+    return f"{indent}value: '{e['value']}'\n{indent}hash: {e['hash']}\n"
+
+
+def ctl_guardrails_yaml(ref: str, value: str) -> str:
+    return (
+        "guardrails:\n  guarded_vars:\n"
+        f"    {ref}:\n" + entry_yaml(value, indent="      ")
+    )
+
+
+def make_plt_tree(root: Path, *, baseline_value: str | None, declared: bool = True) -> Path:
     """One env/dev scope + rendered tree with aws_region: eu-west-2."""
     plt = root / "plt"
     if declared:
@@ -25,12 +38,12 @@ def make_plt_tree(root: Path, *, baseline_hash: str | None, declared: bool = Tru
         )
     write(
         plt / "env" / "dev" / common.SCOPE_META_FILENAME,
-        "type: scope\ntarget_path: /env\nscope_identity:\n  env_type: dev\nimports: []\n",
+        "type: scope\ntarget_path: /env\nselectors:\n  match:\n    execution_context.params.env_type: dev\nimports: []\n",
     )
-    if baseline_hash is not None:
+    if baseline_value is not None:
         write(
             plt / "env" / "dev" / common.PLT_GUARDRAILS_FILENAME,
-            f"hashes:\n  aws_region: {baseline_hash}\n",
+            "guarded_vars:\n  aws_region:\n" + entry_yaml(baseline_value, indent="    "),
         )
     rendered = root / "rendered"
     write(rendered / "env" / "general.yaml", "aws_region: eu-west-2\n")
@@ -50,12 +63,12 @@ def make_axes_plt_tree(root: Path, *, bucket: str, baseline_for: dict[str, str])
     )
     write(
         plt / "env" / "dev" / common.SCOPE_META_FILENAME,
-        "type: scope\ntarget_path: /env\nscope_identity:\n  env_type: dev\nimports: []\n",
+        "type: scope\ntarget_path: /env\nselectors:\n  match:\n    execution_context.params.env_type: dev\nimports: []\n",
     )
     for lz, name in baseline_for.items():
         write(
             plt / "env" / "dev" / common.PLT_GUARDRAILS_DIRNAME / f"{lz}.yaml",
-            f"hashes:\n  tfstate_s3_bucket_name: {common.guard_value_hash(name, label='test')}\n",
+            "guarded_vars:\n  tfstate_s3_bucket_name:\n" + entry_yaml(name, indent="    "),
         )
     rendered = root / "rendered"
     write(rendered / "env" / "tfstate.yaml", f"tfstate_s3_bucket_name: {bucket}\n")
@@ -66,10 +79,9 @@ class CtlGuardrailTests(unittest.TestCase):
     def test_ctl_guardrails_are_discovered_by_top_level_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("oxygen", label="test")
             write(
                 root / "not-a-special-name.yaml",
-                f"guardrails:\n  guarded_vars:\n    execution_context.params.main_tag: {expected}\n",
+                ctl_guardrails_yaml("execution_context.params.main_tag", "oxygen"),
             )
 
             common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
@@ -77,10 +89,9 @@ class CtlGuardrailTests(unittest.TestCase):
     def test_ctl_guardrails_reject_changed_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("oxygen", label="test")
             write(
                 root / "guardrails.yaml",
-                f"guardrails:\n  guarded_vars:\n    execution_context.params.main_tag: {expected}\n",
+                ctl_guardrails_yaml("execution_context.params.main_tag", "oxygen"),
             )
 
             with self.assertRaisesRegex(RuntimeError, "guarded ctl var .*main_tag.* changed"):
@@ -89,10 +100,9 @@ class CtlGuardrailTests(unittest.TestCase):
     def test_ctl_guardrails_reject_ctl_namespace_ref(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("provision", label="test")
             write(
                 root / "guardrails.yaml",
-                f"guardrails:\n  guarded_vars:\n    execution_context.ctl.action: {expected}\n",
+                ctl_guardrails_yaml("execution_context.ctl.action", "provision"),
             )
 
             with self.assertRaisesRegex(RuntimeError, "per-run switches and can never be guarded"):
@@ -111,10 +121,9 @@ class CtlGuardrailTests(unittest.TestCase):
                 f"    bucket_name: {pattern}\n"
                 "    bucket_region: eu-west-2\n",
             )
-            expected = common.guard_value_hash(pattern, label="test")
             write(
                 root / "guardrails.yaml",
-                f"guardrails:\n  guarded_vars:\n    ctl_state_buckets.org.bucket_name: {expected}\n",
+                ctl_guardrails_yaml("ctl_state_backends.org.bucket_name", pattern),
             )
 
             # verifies identically under ANY landing_zone param — no per-LZ ctl baselines needed
@@ -136,20 +145,18 @@ class CtlGuardrailTests(unittest.TestCase):
     def test_ctl_guardrails_reject_registry_ref_with_bad_field(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("x", label="test")
             write(
                 root / "guardrails.yaml",
-                f"guardrails:\n  guarded_vars:\n    ctl_state_buckets.deployments.execution_identity_key: {expected}\n",
+                ctl_guardrails_yaml("ctl_state_backends.deployments.execution_identity_key", "x"),
             )
 
-            with self.assertRaisesRegex(RuntimeError, "must be ctl_state_buckets"):
+            with self.assertRaisesRegex(RuntimeError, "must be ctl_state_backends"):
                 common.verify_ctl_guardrails(root, {})
 
     def test_ctl_guardrails_reject_bare_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("oxygen", label="test")
-            write(root / "guardrails.yaml", f"guardrails:\n  guarded_vars:\n    main_tag: {expected}\n")
+            write(root / "guardrails.yaml", ctl_guardrails_yaml("main_tag", "oxygen"))
 
             with self.assertRaisesRegex(RuntimeError, "fully-qualified execution-context path"):
                 common.verify_ctl_guardrails(root, {"execution_context.params.main_tag": "oxygen"})
@@ -159,24 +166,22 @@ class PltGuardrailTests(unittest.TestCase):
     def test_verifies_declared_var_against_rendered_scope_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("eu-west-2", label="test")
-            plt = make_plt_tree(root, baseline_hash=expected)
+            plt = make_plt_tree(root, baseline_value="eu-west-2")
 
             common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev"})
 
     def test_rejects_changed_rendered_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            wrong = common.guard_value_hash("eu-central-1", label="test")
-            plt = make_plt_tree(root, baseline_hash=wrong)
+            plt = make_plt_tree(root, baseline_value="eu-central-1")
 
-            with self.assertRaisesRegex(RuntimeError, "guarded plt var .*aws_region.* changed"):
+            with self.assertRaisesRegex(RuntimeError, "expected 'eu-central-1'.*got 'eu-west-2'"):
                 common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev"})
 
     def test_coverage_fails_when_declared_var_has_no_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plt = make_plt_tree(root, baseline_hash=None)
+            plt = make_plt_tree(root, baseline_value=None)
 
             with self.assertRaisesRegex(RuntimeError, "have no baseline"):
                 common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev"})
@@ -184,8 +189,7 @@ class PltGuardrailTests(unittest.TestCase):
     def test_rejects_baseline_hash_without_declaration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stray = common.guard_value_hash("eu-west-2", label="test")
-            plt = make_plt_tree(root, baseline_hash=stray, declared=False)
+            plt = make_plt_tree(root, baseline_value="eu-west-2", declared=False)
             write(plt / common.PLT_GUARDRAILS_FILENAME, "declare:\n  - path: other_var\n    match_target_path: /org\n")
 
             with self.assertRaisesRegex(RuntimeError, "no matching declaration"):
@@ -194,8 +198,7 @@ class PltGuardrailTests(unittest.TestCase):
     def test_rejects_unresolved_rendered_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("placeholder", label="test")
-            plt = make_plt_tree(root, baseline_hash=expected)
+            plt = make_plt_tree(root, baseline_value="placeholder")
             write(root / "rendered" / "env" / "general.yaml", "aws_region: ${run_id}\n")
 
             with self.assertRaisesRegex(RuntimeError, "not fully resolved after render"):
@@ -204,7 +207,7 @@ class PltGuardrailTests(unittest.TestCase):
     def test_declaration_selectors_narrow_within_scope_kind(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            plt = make_plt_tree(root, baseline_hash=None)
+            plt = make_plt_tree(root, baseline_value=None)
             # prod-only declaration: must not require a baseline in the dev scope
             write(
                 plt / common.PLT_GUARDRAILS_FILENAME,
@@ -212,7 +215,8 @@ class PltGuardrailTests(unittest.TestCase):
                 "  - path: aws_region\n"
                 "    match_target_path: /env\n"
                 "    selectors:\n"
-                "      env_type: prod\n",
+                "      match:\n"
+                "        execution_context.params.env_type: prod\n",
             )
 
             common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev"})
@@ -262,7 +266,7 @@ class PltGuardrailTests(unittest.TestCase):
             write(plt / "_common" / "all" / "notes.md", "not cfg\n")
             write(
                 plt / "env" / "dev" / common.SCOPE_META_FILENAME,
-                "type: scope\ntarget_path: /env\nscope_identity:\n  env_type: dev\n"
+                "type: scope\ntarget_path: /env\nselectors:\n  match:\n    execution_context.params.env_type: dev\n"
                 "imports:\n  - /_common/all\n",
             )
 
@@ -277,7 +281,7 @@ class PltGuardrailTests(unittest.TestCase):
                 "type: scope\ntarget_path: /env\nselectors:\n  env_type: dev\nimports: []\n",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "scope_identity"):
+            with self.assertRaisesRegex(RuntimeError, "match/in form"):
                 common.discover_active_cfg_scopes(plt, scope_params={"env_type": "dev"})
 
 
@@ -310,15 +314,14 @@ class BaselineAxesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             plt = make_axes_plt_tree(root, bucket="x", baseline_for={"live": "x"})
-            write(plt / "env" / "dev" / common.PLT_GUARDRAILS_FILENAME, "hashes: {}\n")
+            write(plt / "env" / "dev" / common.PLT_GUARDRAILS_FILENAME, "guarded_vars: {}\n")
             with self.assertRaisesRegex(RuntimeError, "stale flat baseline"):
                 common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev", "landing_zone": "live"})
 
     def test_baseline_dir_without_axes_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            expected = common.guard_value_hash("eu-west-2", label="test")
-            plt = make_plt_tree(root, baseline_hash=expected)
-            write(plt / "env" / "dev" / common.PLT_GUARDRAILS_DIRNAME / "live.yaml", "hashes: {}\n")
+            plt = make_plt_tree(root, baseline_value="eu-west-2")
+            write(plt / "env" / "dev" / common.PLT_GUARDRAILS_DIRNAME / "live.yaml", "guarded_vars: {}\n")
             with self.assertRaisesRegex(RuntimeError, "no declaration\\s+defines baseline_axes"):
                 common.verify_plt_guardrails(plt, root / "rendered", {"env_type": "dev"})

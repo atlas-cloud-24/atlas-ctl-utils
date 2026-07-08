@@ -16,18 +16,18 @@ class OptionalWriterIdentityTests(unittest.TestCase):
     def _load(self, body: str) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "ctl_state.yaml").write_text(body, encoding="utf-8")
-            return common.load_ctl_state_buckets_cfg(Path(tmp))
+            return common.load_ctl_state_backends_cfg(Path(tmp))
 
     def test_identity_key_is_optional(self):
         cfg = self._load(
-            "ctl_state_buckets:\n  env:\n    bucket_name: b\n    bucket_region: eu-central-1\n"
+            "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: b\n    bucket_region: eu-central-1\n"
         )
         self.assertNotIn("execution_identity_key", cfg["env"])
 
     def test_identity_key_when_present_must_be_non_empty(self):
         with self.assertRaisesRegex(RuntimeError, "execution_identity_key must be a non-empty string"):
             self._load(
-                "ctl_state_buckets:\n  env:\n    bucket_name: b\n    bucket_region: r\n    execution_identity_key: '  '\n"
+                "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: b\n    bucket_region: r\n    execution_identity_key: '  '\n"
             )
 
 
@@ -76,9 +76,9 @@ class RequiredTargetPathsTests(unittest.TestCase):
 class ResolveRunDomainTests(unittest.TestCase):
     INVENTORY = {
         "stage_targets": {
-            "env/core/baseline": {"ctl_state_bucket_key": "env"},
-            "env/ops/app": {"ctl_state_bucket_key": "env"},
-            "org/baseline": {"ctl_state_bucket_key": "deployments"},
+            "env/core/baseline": {"ctl_state_backend_key": "env"},
+            "env/ops/app": {"ctl_state_backend_key": "env"},
+            "org/baseline": {"ctl_state_backend_key": "deployments"},
             "dev/local": {},  # key commented out (skip hatch)
         }
     }
@@ -98,8 +98,8 @@ class ResolveRunDomainTests(unittest.TestCase):
             common.resolve_run_domain(wf, self.INVENTORY, self.REGISTRY)
 
     def test_unknown_domain_rejected(self):
-        inv = {"stage_targets": {"t": {"ctl_state_bucket_key": "staging"}}}
-        with self.assertRaisesRegex(RuntimeError, "no ctl_state_buckets entry"):
+        inv = {"stage_targets": {"t": {"ctl_state_backend_key": "staging"}}}
+        with self.assertRaisesRegex(RuntimeError, "no ctl_state_backends entry"):
             common.resolve_run_domain({"stages": ["t"]}, inv, self.REGISTRY)
 
 

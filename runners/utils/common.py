@@ -248,7 +248,7 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
     bundles governing ctl behavior (ref_policy, allow_aws_profile_only,
-    allow_skip_ctl_state_bucket_sync, ...)."""
+    allow_skip_ctl_state_backend_sync, ...)."""
     profiles: dict[str, dict] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
         if not isinstance(section, dict):
@@ -484,7 +484,7 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ workflow runner requires --workflow")
     if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
         raise RuntimeError("❌ workflow runner does not accept sub-workflow synthetic target args")
 
 
@@ -496,7 +496,7 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
         raise RuntimeError("❌ target runner does not accept sub-workflow synthetic target args")
 
 
@@ -504,7 +504,7 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
     """Validate args for a maintenance run."""
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_bucket_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
         raise RuntimeError("❌ maintenance runner does not accept sub-workflow synthetic target args")
     if not getattr(args, "maintenance_action", None):
         raise RuntimeError("❌ --maintenance-action is required for maintenance")
@@ -943,11 +943,11 @@ def build_active_stages(
 
         # State domain: which ctl-state bucket this target's results/lock live in.
         # Absent (commented in dev cfg) = no domain for this run → sync skippable.
-        ctl_state_bucket_key = target_cfg.get("ctl_state_bucket_key")
-        if ctl_state_bucket_key is not None:
-            if not isinstance(ctl_state_bucket_key, str) or not ctl_state_bucket_key.strip():
-                raise RuntimeError(f"Stage {stage_id!r} ctl_state_bucket_key must be a non-empty string")
-            active_stage["ctl_state_bucket_key"] = ctl_state_bucket_key.strip()
+        ctl_state_backend_key = target_cfg.get("ctl_state_backend_key")
+        if ctl_state_backend_key is not None:
+            if not isinstance(ctl_state_backend_key, str) or not ctl_state_backend_key.strip():
+                raise RuntimeError(f"Stage {stage_id!r} ctl_state_backend_key must be a non-empty string")
+            active_stage["ctl_state_backend_key"] = ctl_state_backend_key.strip()
 
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
@@ -1056,8 +1056,9 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     file with a `cfg_file_sets:` key contributes cfg-file-sets wherever it lives. The maps are
     unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
     error (same rule as targets), order-independent. `entry_depth` is how deep the
-    unique entries sit: 1 for flat catalogs (stage_sources/cfg_file_sets/aws_access_contexts),
-    2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>`.
+    unique entries sit: 1 for flat catalogs (stage_sources/cfg_file_sets),
+    2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>` and
+    `providers.<name>.<section>.<entry>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
     `_CONTENT_KEY_SKIP_TOP`) are skipped — they have dedicated loaders.
     """
@@ -1175,12 +1176,20 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
     if name in _stack:
         return {}
     wf = action_workflows.get(name) or {}
-    sel = {dim: list(vals) for dim, vals in (wf.get("selectors") or {}).items()}
+    effective = selector_requirements(wf.get("selectors") or {}, label=f"workflow {name} selectors")
     for workflow_key in (wf.get("import_workflow_keys") or []):
-        imp_sel = workflow_effective_selectors(action_workflows, workflow_key, (*_stack, name))
-        for dim, vals in imp_sel.items():
-            sel[dim] = [v for v in sel[dim] if v in vals] if dim in sel else list(vals)
-    return sel
+        imported = selector_requirements(
+            workflow_effective_selectors(action_workflows, workflow_key, (*_stack, name)),
+            label=f"workflow {workflow_key} effective selectors",
+        )
+        for ref, values in imported.items():
+            effective[ref] = effective[ref] & values if ref in effective else set(values)
+            if not effective[ref]:
+                raise RuntimeError(
+                    f"❌ workflow {name!r} selectors have empty intersection for {ref!r} "
+                    f"after importing {workflow_key!r}"
+                )
+    return selectors_to_in_shape(effective)
 
 
 def resolve_runtime_scalar(value, context: dict[str, object], *, label: str) -> str:
@@ -1245,9 +1254,39 @@ def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
     return identities
 
 
+def load_provider_catalogs(ctl_cfg_root: Path) -> dict:
+    """Load the `providers` collection: providers.<name>.<section>.<entry>.
+
+    One collection for all provider-owned catalogs, indexed by provider name —
+    never by assembling key names from prefixes (Phase 20 provider-catalog
+    end-state). Entries collide at depth 3, so multiple files may contribute to
+    one provider section. This loader is engine-generic: it validates structure
+    only and knows no provider names or section vocabularies — each provider
+    implementation validates its OWN subtree.
+    """
+    providers = collect_resource(ctl_cfg_root, "providers", entry_depth=3)
+    for provider_name in providers:
+        if not isinstance(provider_name, str) or not provider_name.strip():
+            raise RuntimeError(f"❌ providers keys must be non-empty strings: {ctl_cfg_root}")
+    return providers
+
+
+# The aws implementation owns its catalog schema; the engine core knows no
+# provider names or sections.
+_AWS_PROVIDER_CATALOG_SECTIONS = {"access_contexts", "accounts"}
+
+
+def _load_aws_provider_catalog(ctl_cfg_root: Path) -> dict:
+    catalog = load_provider_catalogs(ctl_cfg_root).get("aws", {})
+    unknown = sorted(set(catalog) - _AWS_PROVIDER_CATALOG_SECTIONS)
+    if unknown:
+        raise RuntimeError(f"❌ providers.aws has unknown sections {unknown}: {ctl_cfg_root}")
+    return catalog
+
+
 def load_aws_access_contexts_cfg(ctl_cfg_root: Path) -> dict:
     """Load logical AWS access contexts and runner-specific implementations."""
-    access_contexts = collect_resource(ctl_cfg_root, "aws_access_contexts")
+    access_contexts = _load_aws_provider_catalog(ctl_cfg_root).get("access_contexts", {})
 
     for access_context_key, access_context_cfg in access_contexts.items():
         if not isinstance(access_context_key, str) or not access_context_key.strip():
@@ -1265,6 +1304,31 @@ def load_aws_access_contexts_cfg(ctl_cfg_root: Path) -> dict:
             )
 
     return access_contexts
+
+
+def load_aws_account_registry_cfg(ctl_cfg_root: Path) -> dict[str, str]:
+    """Load the provider-owned AWS account registry: account_key -> account_id."""
+    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts", {})
+    registry: dict[str, str] = {}
+    for account_key, account_cfg in accounts.items():
+        if not isinstance(account_key, str) or not account_key.strip():
+            raise RuntimeError(f"❌ aws account keys must be non-empty strings: {ctl_cfg_root}")
+        if not isinstance(account_cfg, dict):
+            raise RuntimeError(f"❌ aws account {account_key!r} must be a mapping: {ctl_cfg_root}")
+        unknown = sorted(set(account_cfg) - {"account_id"})
+        if unknown:
+            raise RuntimeError(f"❌ aws account {account_key!r} has unknown fields {unknown}: {ctl_cfg_root}")
+        account_id = _require_non_empty_string(
+            account_cfg.get("account_id"),
+            f"providers.aws.accounts.{account_key}.account_id",
+            ctl_cfg_root,
+        )
+        if not re.fullmatch(r"\d{12}", account_id):
+            raise RuntimeError(
+                f"❌ providers.aws.accounts.{account_key}.account_id must be a 12-digit account id"
+            )
+        registry[account_key] = account_id
+    return registry
 
 
 def _validate_aws_access_implementation(
@@ -1345,16 +1409,12 @@ def _validate_direct_profile_expect(
         f"AWS access context {access_context_key!r}.{implementation_key}.expect.{principal_keys[0]}",
         path,
     )
-    # optional independent account pin (Phase 18 C4): recorded after vending, it
-    # catches a stale/mis-built profile whose own sso_account_id points at the
-    # wrong org — the profile-derived account check alone follows the profile.
     if "account_id" in expect_cfg:
-        _require_non_empty_string(
-            expect_cfg["account_id"],
-            f"AWS access context {access_context_key!r}.{implementation_key}.expect.account_id",
-            path,
+        raise RuntimeError(
+            f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect.account_id is deprecated; "
+            "put account IDs in providers.aws.accounts keyed by execution identity account_key"
         )
-    unknown = sorted(set(expect_cfg) - set(principal_keys) - {"account_id"})
+    unknown = sorted(set(expect_cfg) - set(principal_keys))
     if unknown:
         raise RuntimeError(
             f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect has unknown fields "
@@ -1455,6 +1515,12 @@ def resolve_stage_aws_access(
             f"❌ stage execution_identity_key {identity_key!r} is not defined in execution_identities.yaml"
         )
     provider = identity_cfg.get("provider")
+    runtime_provider = execution_context.get("execution_context.params.provider")
+    if runtime_provider is not None and str(runtime_provider) != provider:
+        raise RuntimeError(
+            f"❌ execution identity {identity_key!r} provider {provider!r} does not match "
+            f"runtime provider {runtime_provider!r}"
+        )
     if provider != "aws":
         raise RuntimeError(
             f"❌ execution identity {identity_key!r} provider {provider!r} is not implemented by this runner"
@@ -1478,7 +1544,7 @@ def resolve_stage_aws_access(
     access_context_cfg = aws_access_contexts.get(access_context_key)
     if not isinstance(access_context_cfg, dict):
         raise RuntimeError(
-            f"❌ Stage AWS access context {access_context_key!r} is not defined in aws_access_contexts.yaml"
+            f"❌ Stage AWS access context {access_context_key!r} is not defined in the aws_access_contexts catalog"
         )
     implementation_cfg = access_context_cfg.get(implementation_key)
     if not isinstance(implementation_cfg, dict):
@@ -1498,21 +1564,21 @@ def resolve_stage_aws_access(
         canonical_profile_name = resolve_runtime_scalar(
             implementation_cfg["profile_name"],
             context,
-            label=f"aws_access_contexts.{access_context_key}.{implementation_key}.profile_name",
+            label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.profile_name",
         )
         expect_cfg = implementation_cfg["expect"]
         if "permission_set_name" in expect_cfg:
             resolved["permission_set_name"] = resolve_runtime_scalar(
                 expect_cfg["permission_set_name"],
                 context,
-                label=f"aws_access_contexts.{access_context_key}.{implementation_key}.expect.permission_set_name",
+                label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.expect.permission_set_name",
             )
             resolved["credential_provider_kind"] = "identity_center_profile"
         else:
             resolved["role_name"] = resolve_runtime_scalar(
                 expect_cfg["role_name"],
                 context,
-                label=f"aws_access_contexts.{access_context_key}.{implementation_key}.expect.role_name",
+                label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.expect.role_name",
             )
             resolved["credential_provider_kind"] = "assume_role_profile"
     elif "iam_role_key" in implementation_cfg:
@@ -1525,34 +1591,16 @@ def resolve_stage_aws_access(
         )
 
     canonical_account_id = resolve_configured_profile_account_id(canonical_profile_name)
-    pinned_account_id = expect_cfg.get("account_id")
-    if pinned_account_id is not None:
-        pinned_account_id = str(resolve_runtime_scalar(
-            pinned_account_id,
-            context,
-            label=f"aws_access_contexts.{access_context_key}.{implementation_key}.expect.account_id",
-        )).strip()
-        if not re.fullmatch(r"\d{12}", pinned_account_id):
-            raise RuntimeError(
-                f"❌ expect.account_id for {access_context_key!r} must be a 12-digit account id, "
-                f"got {pinned_account_id!r}"
-            )
-        if pinned_account_id != canonical_account_id:
-            raise RuntimeError(
-                f"❌ profile {canonical_profile_name!r} resolves to account {canonical_account_id}, but "
-                f"cfg pins {access_context_key!r} to {pinned_account_id} (stale or wrong-org profile?)"
-            )
     if account_registry is None:
-        expected_account_id = canonical_account_id
-    else:
-        expected_account_id = account_registry.get(account_key)
-        if expected_account_id is None:
-            raise RuntimeError(f"❌ AWS account registry has no key {account_key!r}")
-        if expected_account_id != canonical_account_id:
-            raise RuntimeError(
-                f"❌ AWS account registry maps {account_key!r} to {expected_account_id}, but canonical "
-                f"profile {canonical_profile_name!r} resolves to {canonical_account_id}"
-            )
+        raise RuntimeError("❌ AWS account registry is required for declared execution identities")
+    expected_account_id = account_registry.get(account_key)
+    if expected_account_id is None:
+        raise RuntimeError(f"❌ AWS account registry has no key {account_key!r}")
+    if expected_account_id != canonical_account_id:
+        raise RuntimeError(
+            f"❌ AWS account registry maps {account_key!r} to {expected_account_id}, but canonical "
+            f"profile {canonical_profile_name!r} resolves to {canonical_account_id}"
+        )
     override_name = aws_access_override_env_name(access_context_key)
     selected_profile_name = os.getenv(override_name, "").strip() or canonical_profile_name
     selected_account_id = resolve_configured_profile_account_id(selected_profile_name)
@@ -1621,16 +1669,24 @@ def validate_active_stage_aws_access(
     *,
     execution_context: dict[str, object],
     implementation_key: str,
+    account_registry: dict[str, str] | None = None,
     allow_profile_only: bool = False,
     profile_only_aws_profile: str | None = None,
 ) -> dict[str, str]:
-    """Validate selected bindings and return a normalized account-key registry."""
+    """Validate selected bindings and return the normalized account-key registry used by stages."""
     validate_profile_only_request(
         active_stages,
         allow_profile_only=allow_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
     )
-    account_registry: dict[str, str] = {}
+    if any(stage.get("execution_identity_key") is not None for stage in active_stages.values()):
+        if account_registry is None:
+            raise RuntimeError("❌ AWS account registry is required for declared execution identities")
+        expected_account_registry = dict(account_registry)
+    else:
+        expected_account_registry = account_registry or {}
+
+    validated_account_registry: dict[str, str] = {}
     for stage_id, stage in active_stages.items():
         resolved = resolve_stage_aws_access(
             stage,
@@ -1638,6 +1694,7 @@ def validate_active_stage_aws_access(
             aws_access_contexts,
             execution_context=execution_context,
             implementation_key=implementation_key,
+            account_registry=expected_account_registry,
             allow_profile_only=allow_profile_only,
             profile_only_aws_profile=profile_only_aws_profile,
         )
@@ -1652,12 +1709,12 @@ def validate_active_stage_aws_access(
             continue
         account_key = resolved["account_key"]
         account_id = resolved["expected_account_id"]
-        previous = account_registry.get(account_key)
+        previous = validated_account_registry.get(account_key)
         if previous is not None and previous != account_id:
             raise RuntimeError(
                 f"❌ Conflicting AWS account IDs for {account_key!r}: {previous} and {account_id}"
             )
-        account_registry[account_key] = account_id
+        validated_account_registry[account_key] = account_id
         logging.info(
             "Validated AWS access for stage %s: execution_identity_key=%s account_key=%s "
             "access_context_key=%s implementation_key=%s credential_provider_kind=%s",
@@ -1668,7 +1725,7 @@ def validate_active_stage_aws_access(
             resolved["implementation_key"],
             resolved["credential_provider_kind"],
         )
-    return account_registry
+    return validated_account_registry
 
 
 def configure_stage_aws_env(
@@ -1802,6 +1859,55 @@ def merge_config_dirs(
     return merged_files
 
 
+def _flatten_yaml_leaf_values(value, path: tuple[object, ...] = ()) -> dict[tuple[object, ...], object]:
+    if isinstance(value, dict):
+        leaves: dict[tuple[object, ...], object] = {}
+        for key, child in value.items():
+            leaves.update(_flatten_yaml_leaf_values(child, path + (key,)))
+        return leaves
+    return {path: value}
+
+
+def _scope_final_yaml_leaves(scope: dict, *, skip_filenames: set[str]) -> dict[tuple[str, tuple[object, ...]], object]:
+    with tempfile.TemporaryDirectory(prefix="atlas-scope-leaves-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        merge_config_dirs(
+            source_dirs=scope["source_dirs"],
+            dest_dir=str(tmp_path),
+            clear_dest=True,
+            skip_filenames=skip_filenames,
+        )
+        leaves: dict[tuple[str, tuple[object, ...]], object] = {}
+        for yaml_path in sorted(tmp_path.rglob("*.yaml")):
+            rel_path = yaml_path.relative_to(tmp_path).as_posix()
+            data = load_cfg_yaml(str(yaml_path))
+            for leaf_path, leaf_value in _flatten_yaml_leaf_values(data).items():
+                leaves[(rel_path, leaf_path)] = leaf_value
+        return leaves
+
+
+def validate_cross_scope_leaf_conflicts(scopes: list[dict], *, target_path: str, skip_filenames: set[str]) -> None:
+    """Reject shared-target producers that define different final values for one YAML leaf."""
+    if len(scopes) < 2:
+        return
+    owners: dict[tuple[str, tuple[object, ...]], tuple[object, dict]] = {}
+    for scope in scopes:
+        for leaf_key, leaf_value in _scope_final_yaml_leaves(scope, skip_filenames=skip_filenames).items():
+            previous = owners.get(leaf_key)
+            if previous is None:
+                owners[leaf_key] = (leaf_value, scope)
+                continue
+            previous_value, previous_scope = previous
+            if previous_value != leaf_value:
+                rel_path, yaml_path = leaf_key
+                rendered_path = ".".join(str(part) for part in yaml_path) or "<root>"
+                raise RuntimeError(
+                    f"❌ cross-scope cfg conflict for target_path {target_path!r} at "
+                    f"{rel_path}:{rendered_path}: {previous_scope['scope_id']} and {scope['scope_id']} "
+                    "produce different final values"
+                )
+
+
 def _add_workflow_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ctl-variants",
@@ -1873,10 +1979,10 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
         help="execution identity key for a synthetic target",
     )
     parser.add_argument(
-        "--ctl-state-bucket-key",
-        dest="ctl_state_bucket_key",
+        "--ctl-state-backend-key",
+        dest="ctl_state_backend_key",
         default=None,
-        help="state domain for a synthetic target (ctl_state_buckets key); "
+        help="state domain for a synthetic target (ctl_state_backends key); "
         "omit = no domain (sync skippable via the skip triad)",
     )
     parser.add_argument(
@@ -1928,11 +2034,11 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
     )
     parser.add_argument(
-        "--skip-ctl-state-bucket-sync",
+        "--skip-ctl-state-backend-sync",
         action="store_true",
-        help="Run without ctl-state bucket sync; honored only when the ctl profile "
-        "sets allow_skip_ctl_state_bucket_sync: true AND no active target declares "
-        "a ctl_state_bucket_key (a declared state domain always syncs)",
+        help="Run without ctl-state backend sync; honored only when the ctl profile "
+        "sets allow_skip_ctl_state_backend_sync: true AND no active target declares "
+        "a ctl_state_backend_key (a declared state domain always syncs)",
     )
 
     if run_type == "workflow":
@@ -2184,17 +2290,7 @@ def variant_source_action(action: str) -> str:
 
 def _selectors_subset(child: dict | None, parent: dict | None):
     """(ok, reason) — True if child selectors are a subset of parent's, per dimension."""
-    if not child:
-        return True, None
-    parent = parent or {}
-    for dim, child_vals in child.items():
-        pvals = parent.get(dim)
-        if pvals is None:
-            continue
-        extra = [v for v in (child_vals or []) if v not in pvals]
-        if extra:
-            return False, f"{dim}={extra} not allowed by target {dim}={pvals}"
-    return True, None
+    return selector_subset(child, parent, child_label="variant selectors", parent_label="target selectors")
 
 
 def apply_ctl_variants_to_workflow_cfg(
@@ -2408,13 +2504,13 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         }
         if execution_identity_key is not None:
             resolved["execution_identity_key"] = execution_identity_key.strip()
-        ctl_state_bucket_key = target_def.get("ctl_state_bucket_key")
-        if ctl_state_bucket_key is not None:
-            if not isinstance(ctl_state_bucket_key, str) or not ctl_state_bucket_key.strip():
+        ctl_state_backend_key = target_def.get("ctl_state_backend_key")
+        if ctl_state_backend_key is not None:
+            if not isinstance(ctl_state_backend_key, str) or not ctl_state_backend_key.strip():
                 raise RuntimeError(
-                    f"❌ target {target_name!r} ctl_state_bucket_key must be a non-empty string"
+                    f"❌ target {target_name!r} ctl_state_backend_key must be a non-empty string"
                 )
-            resolved["ctl_state_bucket_key"] = ctl_state_bucket_key.strip()
+            resolved["ctl_state_backend_key"] = ctl_state_backend_key.strip()
         if target_def.get("provisions_ctl_state_bucket") is True:
             resolved["provisions_ctl_state_bucket"] = True
         if "selectors" in target_def:
@@ -3279,7 +3375,8 @@ def force_unlock_ctl_state_lock(ctl_state_local_root: Path, lock_id: str, mainte
 
 
 SCOPE_META_FILENAME = "__meta__.yaml"
-SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME, PLT_GUARDRAILS_FILENAME}
+SCOPE_COMPOSITION_FILENAME = "__scope_composition__.yaml"
+SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME, PLT_GUARDRAILS_FILENAME, SCOPE_COMPOSITION_FILENAME}
 
 def selector_expected_values(expected, *, label: str) -> list[str]:
     if isinstance(expected, str) and expected:
@@ -3315,11 +3412,60 @@ def execution_context_miss_message(execution_context: dict[str, object], ref: st
     return f"{ref!r} not found in execution context; available: {available}"
 
 
+def selector_requirements(selectors: dict | None, *, label: str, structured_only: bool = False) -> dict[str, set[str]]:
+    """Normalize selector requirements to ref -> allowed string values.
+
+    New selector metadata uses {match: {ref: scalar}, in: {ref: [values]}}.
+    Constraint `when` maps still use the direct {ref: [values]} shape, so the
+    legacy direct map is accepted only when structured_only is false.
+    """
+    if not selectors:
+        return {}
+    if not isinstance(selectors, dict):
+        raise RuntimeError(f"❌ selectors must be a mapping: {label}")
+
+    uses_structured = any(key in selectors for key in ("match", "in"))
+    if uses_structured:
+        unknown = sorted(set(selectors) - {"match", "in"})
+        if unknown:
+            raise RuntimeError(f"❌ selectors has unsupported keys {unknown}: {label}")
+        requirements: dict[str, set[str]] = {}
+        raw_match = selectors.get("match") or {}
+        raw_in = selectors.get("in") or {}
+        if not isinstance(raw_match, dict):
+            raise RuntimeError(f"❌ selectors.match must be a mapping: {label}")
+        if not isinstance(raw_in, dict):
+            raise RuntimeError(f"❌ selectors.in must be a mapping: {label}")
+        overlap = set(raw_match) & set(raw_in)
+        if overlap:
+            raise RuntimeError(f"❌ selector refs cannot appear in both match and in: {sorted(overlap)} ({label})")
+        for ref, expected in raw_match.items():
+            ref = validate_execution_context_ref(ref, label=f"{label}.match")
+            values = selector_expected_values(expected, label=f"{label}.match.{ref}")
+            if len(values) != 1:
+                raise RuntimeError(f"❌ {label}.match.{ref} must be one exact value")
+            requirements[ref] = set(values)
+        for ref, expected in raw_in.items():
+            ref = validate_execution_context_ref(ref, label=f"{label}.in")
+            requirements[ref] = set(selector_expected_values(expected, label=f"{label}.in.{ref}"))
+        return requirements
+
+    if structured_only:
+        raise RuntimeError(f"❌ selectors must use match/in form: {label}")
+
+    requirements = {}
+    for ref, expected in selectors.items():
+        ref = validate_execution_context_ref(ref, label=label)
+        requirements[ref] = set(selector_expected_values(expected, label=f"{label}.{ref}"))
+    return requirements
+
+
 def selector_matches(
     selectors: dict | None,
     execution_context: dict[str, object],
     *,
     label: str,
+    structured_only: bool = False,
 ) -> bool:
     """Return whether selector constraints match the execution context.
 
@@ -3328,14 +3474,8 @@ def selector_matches(
     error here. The miss is logged with the available keys so a typo'd
     execution input is self-evident.
     """
-    if not selectors:
-        return True
-    if not isinstance(selectors, dict):
-        raise RuntimeError(f"❌ selectors must be a mapping: {label}")
-
-    for ref, expected in selectors.items():
-        validate_execution_context_ref(ref, label=label)
-        allowed_values = selector_expected_values(expected, label=f"{label}.{ref}")
+    requirements = selector_requirements(selectors, label=label, structured_only=structured_only)
+    for ref, allowed_values in requirements.items():
         if ref not in execution_context:
             logging.info("Selector %s: %s", label, execution_context_miss_message(execution_context, ref))
             return False
@@ -3344,19 +3484,31 @@ def selector_matches(
     return True
 
 
-def scope_identity_matches(constraints: dict | None, scope_identity: dict[str, object], *, label: str) -> bool:
-    """Match bare-key constraints against a scope's identity.
+def selectors_to_in_shape(requirements: dict[str, set[str]]) -> dict:
+    if not requirements:
+        return {}
+    return {"in": {ref: sorted(values) for ref, values in sorted(requirements.items())}}
 
-    Scope identity is scope *mechanism* metadata, deliberately outside the
-    execution-context reference grammar (bare keys, not qualified paths).
-    """
-    if not constraints:
-        return True
-    if not isinstance(constraints, dict):
-        raise RuntimeError(f"❌ scope identity constraints must be a mapping: {label}")
-    for key, expected in constraints.items():
-        allowed_values = selector_expected_values(expected, label=f"{label}.{key}")
-        if key not in scope_identity or str(scope_identity[key]) not in allowed_values:
+
+def selector_subset(child: dict | None, parent: dict | None, *, child_label: str, parent_label: str) -> tuple[bool, str | None]:
+    child_req = selector_requirements(child, label=child_label)
+    parent_req = selector_requirements(parent, label=parent_label)
+    for ref, child_values in child_req.items():
+        parent_values = parent_req.get(ref)
+        if parent_values is None:
+            continue
+        extra = sorted(child_values - parent_values)
+        if extra:
+            return False, f"{ref}={extra} not allowed by target {ref}={sorted(parent_values)}"
+    return True, None
+
+
+def selector_requirements_cover_scope(declaration_selectors: dict | None, scope_selectors: dict | None, *, label: str) -> bool:
+    declaration_req = selector_requirements(declaration_selectors, label=label)
+    scope_req = selector_requirements(scope_selectors, label=f"{label} scope", structured_only=True)
+    for ref, declaration_values in declaration_req.items():
+        scope_values = scope_req.get(ref)
+        if scope_values is None or not scope_values <= declaration_values:
             return False
     return True
 
@@ -3417,14 +3569,21 @@ def build_execution_context(
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
 
-    # CLI params first, so cfg params may reference them.
+    # cfg-declared params are inserted first (so they lead the rendered
+    # context), but CLI values are staged up front so cfg params may still
+    # reference them. Collision semantics are unchanged (hard error).
+    staged_cli: dict[str, str] = {}
     for key, value in execution_params.items():
-        put("params", key, value, label=f"--execution-params {key}")
+        label = f"--execution-params {key}"
+        if not CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
+        staged_cli[key] = _context_scalar(value, label=label)
+    lookup = dict(context)
+    lookup.update({f"{EXECUTION_CONTEXT_ROOT}.params.{key}": value for key, value in staged_cli.items()})
 
     for key, raw in load_execution_params(ctl_cfg_root).items():
         label = f"{EXECUTION_PARAMS_KEY}.{key}"
-        ref_key = f"{EXECUTION_CONTEXT_ROOT}.params.{key}"
-        if ref_key in context:
+        if key in staged_cli:
             raise RuntimeError(
                 f"❌ {label} collides with a --execution-params CLI value; define it in one place"
             )
@@ -3432,9 +3591,10 @@ def build_execution_context(
             match = EXECUTION_CONTEXT_PARAM_REF_RE.match(raw.strip())
             if match:
                 ref = match.group(1)
-                if ref not in context:
+                if ref not in lookup:
                     continue
-                put("params", key, context[ref], label=label)
+                put("params", key, lookup[ref], label=label)
+                lookup[f"{EXECUTION_CONTEXT_ROOT}.params.{key}"] = lookup[ref]
                 continue
             if "${" in raw:
                 raise RuntimeError(
@@ -3442,6 +3602,10 @@ def build_execution_context(
                     f"${{{EXECUTION_CONTEXT_ROOT}.<ctl|params>.<key>}} reference is allowed, got {raw!r}"
                 )
         put("params", key, raw, label=label)
+        lookup[f"{EXECUTION_CONTEXT_ROOT}.params.{key}"] = context[f"{EXECUTION_CONTEXT_ROOT}.params.{key}"]
+
+    for key, value in staged_cli.items():
+        put("params", key, value, label=f"--execution-params {key}")
     return context
 
 
@@ -3485,23 +3649,46 @@ def guard_value_hash(value, *, label: str) -> str:
     return hashlib.sha256(guard_value_text(value, label=label).encode("utf-8")).hexdigest()
 
 
+def guard_entry(value, *, label: str) -> dict[str, str]:
+    """Baseline entry for a guarded value: plaintext + its sha256.
+
+    The value makes baselines/diffs reviewable and errors readable; the hash
+    stays the comparison primitive and doubles as the entry's self-integrity
+    check (a hand-edited value with a stale hash is rejected at load)."""
+    text = guard_value_text(value, label=label)
+    return {"value": text, "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+
 def validate_guard_hash(raw_hash, *, label: str) -> str:
     if not isinstance(raw_hash, str) or not GUARD_HASH_RE.fullmatch(raw_hash):
         raise RuntimeError(f"❌ {label} must be a lowercase sha256 hex string")
     return raw_hash
 
 
-def merge_guarded_vars(dst: dict[str, str], raw_guarded_vars, *, origin: Path) -> None:
+def merge_guarded_vars(dst: dict[str, dict[str, str]], raw_guarded_vars, *, origin: Path) -> None:
     if raw_guarded_vars is None:
         return
     if not isinstance(raw_guarded_vars, dict):
         raise RuntimeError(f"❌ guarded_vars must be a mapping: {origin}")
-    for var_name, raw_hash in raw_guarded_vars.items():
+    for var_name, raw_entry in raw_guarded_vars.items():
         if not isinstance(var_name, str) or not var_name.strip():
             raise RuntimeError(f"❌ guarded_vars keys must be non-empty strings: {origin}")
         if var_name in dst:
             raise RuntimeError(f"❌ duplicate guarded var {var_name!r}: {origin}")
-        dst[var_name] = validate_guard_hash(raw_hash, label=f"guarded_vars.{var_name}")
+        label = f"guarded_vars.{var_name}"
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {"value", "hash"}:
+            raise RuntimeError(f"❌ {label} must be a mapping with exactly value + hash: {origin}")
+        value = raw_entry["value"]
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"❌ {label}.value must be a non-empty string: {origin}")
+        entry_hash = validate_guard_hash(raw_entry["hash"], label=f"{label}.hash")
+        computed = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        if computed != entry_hash:
+            raise RuntimeError(
+                f"❌ {label} is self-inconsistent: value {value!r} hashes to {computed}, "
+                f"but hash says {entry_hash} (regenerate the baseline): {origin}"
+            )
+        dst[var_name] = {"value": value, "hash": entry_hash}
 
 
 def load_plt_guard_declarations(plt_cfg_root: Path) -> list[dict]:
@@ -3598,8 +3785,8 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
         )
 
 
-def load_scope_guard_hashes(path: Path, *, allow_missing: bool = False) -> dict[str, str]:
-    """Load a scope-local generated baseline file: hashes -> {var_name: sha256}."""
+def load_scope_guarded_vars(path: Path, *, allow_missing: bool = False) -> dict[str, dict[str, str]]:
+    """Load a scope-local generated baseline file: guarded_vars -> {var: {value, hash}}."""
     if not path.is_file():
         if allow_missing:
             return {}
@@ -3607,12 +3794,12 @@ def load_scope_guard_hashes(path: Path, *, allow_missing: bool = False) -> dict[
     data = load_yaml(path) or {}
     if not isinstance(data, dict):
         raise RuntimeError(f"❌ {path.name} must contain a mapping: {path}")
-    unknown = set(data) - {"hashes"}
+    unknown = set(data) - {"guarded_vars"}
     if unknown:
         raise RuntimeError(f"❌ scope {path.name} has unsupported keys {sorted(unknown)}: {path}")
-    hashes: dict[str, str] = {}
-    merge_guarded_vars(hashes, data.get("hashes"), origin=path)
-    return hashes
+    guarded: dict[str, dict[str, str]] = {}
+    merge_guarded_vars(guarded, data.get("guarded_vars"), origin=path)
+    return guarded
 
 
 def scope_guard_baseline_path(scope: dict, matching_declarations: list[dict], scope_params: dict[str, str]) -> Path:
@@ -3653,15 +3840,15 @@ def scope_guard_baseline_path(scope: dict, matching_declarations: list[dict], sc
 def guard_declaration_matches_scope(declaration: dict, scope: dict) -> bool:
     if declaration["match_target_path"] != scope["target_path"]:
         return False
-    return scope_identity_matches(
+    return selector_requirements_cover_scope(
         declaration["selectors"],
-        scope.get("scope_identity") or {},
+        scope.get("selectors") or {},
         label=f"guard declaration {declaration['path']!r}",
     )
 
 
-def load_ctl_guarded_vars(ctl_cfg_root: Path) -> dict[str, str]:
-    guarded: dict[str, str] = {}
+def load_ctl_guarded_vars(ctl_cfg_root: Path) -> dict[str, dict[str, str]]:
+    guarded: dict[str, dict[str, str]] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "guardrails"):
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ guardrails must be a mapping: {path}")
@@ -3676,20 +3863,23 @@ def verify_guarded_value(
     owner: str,
     var_name: str,
     value,
-    expected_hash: str,
+    expected: dict[str, str],
     *,
     label: str,
 ) -> None:
-    actual_hash = guard_value_hash(value, label=f"{owner}.{var_name}")
-    if actual_hash != expected_hash:
+    actual = guard_entry(value, label=f"{owner}.{var_name}")
+    if actual["hash"] != expected["hash"]:
         raise RuntimeError(
-            f"❌ guarded {owner} var {var_name!r} changed: expected sha256 {expected_hash}, got {actual_hash}"
+            f"❌ guarded {owner} var {var_name!r} changed: "
+            f"expected {expected['value']!r} ({expected['hash']}), "
+            f"got {actual['value']!r} ({actual['hash']})"
         )
 
 
-CTL_STATE_BUCKETS_GUARD_PREFIX = "ctl_state_buckets."
+CTL_STATE_BACKENDS_GUARD_PREFIX = "ctl_state_backends."
+CTL_STATE_BUCKETS_GUARD_PREFIX = "ctl_state_buckets."  # legacy guard ref alias
 EXECUTION_CONTEXT_PARAMS_PREFIX = "execution_context.params."
-CTL_STATE_BUCKETS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
+CTL_STATE_BACKENDS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
 
 
 def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
@@ -3698,19 +3888,21 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
     - an execution-context ref (`execution_context.params.<key>`) —
       `execution_context.ctl.*` is forbidden: action/profile are per-run
       switches, so hashing them can never be correct;
-    - a ctl-state registry ref (`ctl_state_buckets.<domain>.<bucket_name|bucket_region>`)
+    - a ctl-state registry ref (`ctl_state_backends.<domain>.<bucket_name|bucket_region>`)
       — resolved from the registry (env-invariant values only, e.g. the
       org_state bucket)."""
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
     value = ref.strip()
-    if value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+    if value.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX) or value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
         parts = value.split(".")
-        if len(parts) != 3 or parts[2] not in CTL_STATE_BUCKETS_GUARDABLE_FIELDS:
+        if len(parts) != 3 or parts[2] not in CTL_STATE_BACKENDS_GUARDABLE_FIELDS:
             raise RuntimeError(
-                f"❌ {label}: {value!r} must be ctl_state_buckets.<domain>."
-                f"<{'|'.join(CTL_STATE_BUCKETS_GUARDABLE_FIELDS)}>"
+                f"❌ {label}: {value!r} must be ctl_state_backends.<domain>."
+                f"<{'|'.join(CTL_STATE_BACKENDS_GUARDABLE_FIELDS)}>"
             )
+        if value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+            return CTL_STATE_BACKENDS_GUARD_PREFIX + value[len(CTL_STATE_BUCKETS_GUARD_PREFIX):]
         return value
     value = validate_execution_context_ref(value, label=label)
     _, namespace, _ = value.split(".", 2)
@@ -3731,9 +3923,11 @@ def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dic
     param-driven variation stays free (params are ctl-owned; main_tag is
     guarded separately as a context ref). Context refs read the execution
     context directly."""
-    if ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+    if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX) or ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+        if ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+            ref = CTL_STATE_BACKENDS_GUARD_PREFIX + ref[len(CTL_STATE_BUCKETS_GUARD_PREFIX):]
         _, domain, field = ref.split(".")
-        buckets = load_ctl_state_buckets_cfg(ctl_cfg_root) or {}
+        buckets = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
         entry = buckets.get(domain)
         if entry is None:
             known = ", ".join(sorted(buckets)) or "none"
@@ -3750,14 +3944,14 @@ def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, objec
     guarded = load_ctl_guarded_vars(ctl_cfg_root)
     if not guarded:
         return
-    for ref, expected_hash in guarded.items():
+    for ref, expected in guarded.items():
         validate_ctl_guard_ref(ref)
         value = resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
         verify_guarded_value(
             "ctl",
             ref,
             value,
-            expected_hash,
+            expected,
             label=ref,
         )
     logging.info("Ctl guardrails verified: %s", sorted(guarded))
@@ -3851,7 +4045,7 @@ def verify_plt_guardrails(
             continue
         matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
         baseline_path = scope_guard_baseline_path(scope, matching, scope_params)
-        baseline = load_scope_guard_hashes(baseline_path, allow_missing=True)
+        baseline = load_scope_guarded_vars(baseline_path, allow_missing=True)
         if not matching and not baseline:
             continue
 
@@ -3966,6 +4160,95 @@ def find_nested_cfg_meta(root: Path, *, exclude: Path | None = None) -> Path | N
     return None
 
 
+def execution_context_from_scope_params(scope_params: dict[str, str]) -> dict[str, object]:
+    return {f"{EXECUTION_CONTEXT_PARAMS_PREFIX}{key}": value for key, value in (scope_params or {}).items()}
+
+
+def scope_prefix_matches(scope_id: str, prefix: str) -> bool:
+    return scope_id == prefix or scope_id.startswith(prefix + "/")
+
+
+def load_scope_composition(plt_cfg_root: Path) -> dict[str, list[str]]:
+    path = plt_cfg_root / SCOPE_COMPOSITION_FILENAME
+    if not path.is_file():
+        return {}
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ {SCOPE_COMPOSITION_FILENAME} must contain a mapping: {path}")
+    unknown = set(data) - {"scope_composition"}
+    if unknown:
+        raise RuntimeError(f"❌ {SCOPE_COMPOSITION_FILENAME} has unsupported keys {sorted(unknown)}: {path}")
+    raw_rules = data.get("scope_composition") or []
+    if not isinstance(raw_rules, list):
+        raise RuntimeError(f"❌ scope_composition must be a list: {path}")
+
+    rules: dict[str, list[str]] = {}
+    for index, raw_rule in enumerate(raw_rules):
+        label = f"scope_composition[{index}] in {path}"
+        if not isinstance(raw_rule, dict):
+            raise RuntimeError(f"❌ {label} must be a mapping")
+        unknown = set(raw_rule) - {"target_path", "scopes"}
+        if unknown:
+            raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
+        target_path = normalize_cfg_absolute_path(raw_rule.get("target_path"), label=f"{label}.target_path")
+        if target_path in rules:
+            raise RuntimeError(f"❌ duplicate scope composition target_path {target_path!r}: {path}")
+        raw_scopes = raw_rule.get("scopes") or []
+        if not isinstance(raw_scopes, list) or not raw_scopes:
+            raise RuntimeError(f"❌ {label}.scopes must be a non-empty list")
+        prefixes: list[str] = []
+        for raw_scope in raw_scopes:
+            prefix = normalize_cfg_absolute_path(raw_scope, label=f"{label}.scopes")
+            if prefix in prefixes:
+                raise RuntimeError(f"❌ duplicate scope composition prefix {prefix!r}: {label}")
+            prefixes.append(prefix)
+        rules[target_path] = prefixes
+    return rules
+
+
+def validate_scope_composition(active_scopes: list[dict], composition: dict[str, list[str]]) -> None:
+    target_scopes: dict[str, list[dict]] = collections.defaultdict(list)
+    for scope in active_scopes:
+        target_scopes[scope["target_path"]].append(scope)
+
+    for target_path, scopes in target_scopes.items():
+        prefixes = composition.get(target_path)
+        if prefixes is None:
+            if len(scopes) > 1:
+                rendered = ", ".join(str(scope["meta_path"]) for scope in scopes)
+                raise RuntimeError(f"Duplicate active cfg target_path {target_path!r}: {rendered}")
+            continue
+
+        seen_prefixes: dict[str, dict] = {}
+        seen_match: dict[tuple[tuple[str, tuple[str, ...]], ...], dict] = {}
+        for scope in scopes:
+            matches = [prefix for prefix in prefixes if scope_prefix_matches(scope["scope_id"], prefix)]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"❌ active cfg scope {scope['scope_id']} -> {target_path} must match exactly one "
+                    f"scope_composition prefix {prefixes}; matched {matches}"
+                )
+            prefix = matches[0]
+            previous = seen_prefixes.get(prefix)
+            if previous is not None:
+                raise RuntimeError(
+                    f"❌ multiple active cfg scopes for target_path {target_path!r} and prefix {prefix!r}: "
+                    f"{previous['meta_path']} and {scope['meta_path']}"
+                )
+            seen_prefixes[prefix] = scope
+
+            match_req = selector_requirements((scope.get("selectors") or {}).get("match") and {"match": (scope.get("selectors") or {}).get("match")}, label=f"scope {scope['scope_id']} match")
+            match_key = tuple(sorted((ref, tuple(sorted(values))) for ref, values in match_req.items()))
+            previous_match = seen_match.get(match_key)
+            if match_key and previous_match is not None:
+                raise RuntimeError(
+                    f"❌ duplicate active cfg scope match for target_path {target_path!r}: "
+                    f"{previous_match['meta_path']} and {scope['meta_path']}"
+                )
+            if match_key:
+                seen_match[match_key] = scope
+
+
 def validate_no_cfg_meta_inside_data_dir(src: Path, *, import_path: str, meta_path: Path) -> None:
     """Reject imports that point at another metadata-owned tree."""
     nested_meta = find_nested_cfg_meta(src)
@@ -3980,7 +4263,7 @@ def load_scope_candidate(
     plt_cfg_root: Path,
     meta_path: Path,
     meta_cfg: dict,
-    scope_params: dict[str, str],
+    execution_context: dict[str, object],
 ) -> dict | None:
     """Load one scope __meta__.yaml and return an active merge scope, or None."""
     cfg_root = plt_cfg_root.resolve()
@@ -3991,28 +4274,22 @@ def load_scope_candidate(
         raise RuntimeError(f"Scope metadata escapes plt cfg root: {meta_path}") from exc
 
     scope_rel = scope_root.relative_to(cfg_root).as_posix()
-    scope_path = "/" + scope_rel if scope_rel != "." else "/"
+    scope_id = "/" + scope_rel if scope_rel != "." else "/"
 
-    for legacy in ("selectors", "identity_selectors"):
+    for legacy in ("scope_identity", "identity_selectors"):
         if legacy in meta_cfg:
             raise RuntimeError(
-                f"scope {SCOPE_META_FILENAME} must use scope_identity (renamed from {legacy}): {meta_path}"
+                f"scope {SCOPE_META_FILENAME} must use selectors.match/selectors.in, not {legacy}: {meta_path}"
             )
-    scope_identity = meta_cfg.get("scope_identity") or {}
-    if not isinstance(scope_identity, dict):
-        raise RuntimeError(f"scope_identity must be a mapping: {meta_path}")
-    for key, value in scope_identity.items():
-        if not isinstance(value, (str, int, bool)):
-            raise RuntimeError(
-                f"scope_identity.{key} must be a single scalar (identity dimensions are AND-only, "
-                f"lists are not allowed): {meta_path}"
-            )
-    # A scope is active when every identity dimension equals the corresponding
-    # plt execution input (bare keys — scope mechanism, not the reference grammar).
-    for key, value in scope_identity.items():
-        if key not in scope_params or str(scope_params[key]) != str(value):
-            logging.info("Skipping inactive cfg scope %s for params %s", meta_path, scope_params)
-            return None
+
+    selectors = meta_cfg.get("selectors") or {}
+    if not selector_matches(selectors, execution_context, label=str(meta_path), structured_only=True):
+        logging.info("Skipping inactive cfg scope %s for execution context %s", meta_path, execution_context)
+        return None
+
+    nested = find_nested_cfg_meta(scope_root, exclude=meta_path)
+    if nested is not None:
+        raise RuntimeError(f"❌ nested cfg metadata is not allowed under scope {scope_id}: {nested}")
 
     if "target_path" not in meta_cfg:
         raise RuntimeError(f"target_path is required in scope {SCOPE_META_FILENAME}: {meta_path}")
@@ -4049,15 +4326,16 @@ def load_scope_candidate(
         source_dirs.append(str(src))
 
     if scope_root in seen_imports:
-        raise RuntimeError(f"Scope imports itself in {meta_path}: {scope_path}")
+        raise RuntimeError(f"Scope imports itself in {meta_path}: {scope_id}")
 
     source_dirs.append(str(scope_root))
     return {
         "meta_path": meta_path,
         "scope_root": scope_root,
-        "scope_path": scope_path,
+        "scope_path": scope_id,
+        "scope_id": scope_id,
         "target_path": target_path,
-        "scope_identity": scope_identity,
+        "selectors": selectors,
         "source_dirs": source_dirs,
     }
 
@@ -4066,37 +4344,31 @@ def discover_active_cfg_scopes(
     plt_cfg_root: Path,
     *,
     scope_params: dict[str, str],
+    execution_context: dict[str, object] | None = None,
 ) -> list[dict]:
     """Discover active cfg merge scopes from type: scope metadata."""
     cfg_root = plt_cfg_root.resolve()
-    runtime_selectors = scope_params
+    runtime_context = execution_context or execution_context_from_scope_params(scope_params)
     active_scopes: list[dict] = []
-    target_paths: dict[str, Path] = {}
 
     for meta_path in discover_cfg_meta_paths(cfg_root):
         meta_cfg = load_cfg_meta(meta_path)
         if meta_cfg["type"] == "overlay":
             continue
 
-        scope = load_scope_candidate(cfg_root, meta_path, meta_cfg, runtime_selectors)
+        scope = load_scope_candidate(cfg_root, meta_path, meta_cfg, runtime_context)
         if scope is None:
             continue
-
-        target_path = scope["target_path"]
-        previous_meta_path = target_paths.get(target_path)
-        if previous_meta_path is not None and previous_meta_path != scope["meta_path"]:
-            raise RuntimeError(
-                f"Duplicate active cfg target_path {target_path!r}: {previous_meta_path} and {scope['meta_path']}"
-            )
-        target_paths[target_path] = scope["meta_path"]
         active_scopes.append(scope)
 
     if not active_scopes:
         raise RuntimeError(f"No active cfg scopes found under: {cfg_root}")
 
+    validate_scope_composition(active_scopes, load_scope_composition(cfg_root))
+
     logging.info(
         "Active cfg scopes: %s",
-        [f"{scope['scope_path']} -> {scope['target_path']}" for scope in active_scopes],
+        [f"{scope['scope_id']} -> {scope['target_path']}" for scope in active_scopes],
     )
     return active_scopes
 
@@ -4253,9 +4525,8 @@ def merge_plt_cfg_dirs(
 ) -> dict[str, list[str]]:
     """Build scoped merged cfg trees from typed __meta__.yaml metadata.
 
-    Scope activation matches scope_identity against plt execution inputs
-    (bare keys); overlay gating matches overlay selectors against the full
-    execution context (fully-qualified refs), so overlays require it.
+    Scope and overlay activation both use the uniform selectors.match/selectors.in
+    execution-context selector model.
     With `required_target_paths` set, only the scopes serving those target
     paths merge (selective merge: a run composes only the cfg its stages
     consume); None = every active scope."""
@@ -4273,8 +4544,12 @@ def merge_plt_cfg_dirs(
     composition_files = set(SCOPE_META_SKIP_FILENAMES)
 
     def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> None:
-        active_scopes = discover_active_cfg_scopes(effective_cfg_root, scope_params=runtime_selectors)
-
+        active_scopes = discover_active_cfg_scopes(
+            effective_cfg_root,
+            scope_params=runtime_selectors,
+            execution_context=execution_context,
+        )
+        selected_scopes: list[dict] = []
         for scope in active_scopes:
             target_path = scope["target_path"]
             if required_target_paths is not None and target_path not in required_target_paths:
@@ -4284,6 +4559,22 @@ def merge_plt_cfg_dirs(
                     target_path,
                 )
                 continue
+            selected_scopes.append(scope)
+
+        scopes_by_target: dict[str, list[dict]] = collections.defaultdict(list)
+        for scope in selected_scopes:
+            scopes_by_target[scope["target_path"]].append(scope)
+        for target_path, scopes in scopes_by_target.items():
+            validate_cross_scope_leaf_conflicts(
+                scopes,
+                target_path=target_path,
+                skip_filenames=composition_files,
+            )
+
+        merged_target_paths: set[str] = set()
+
+        for scope in selected_scopes:
+            target_path = scope["target_path"]
             target_rel = target_path.lstrip("/")
             target_dest = (plt_merged_dir / target_rel).resolve()
             try:
@@ -4299,12 +4590,13 @@ def merge_plt_cfg_dirs(
             merge_config_dirs(
                 source_dirs=scope["source_dirs"],
                 dest_dir=str(target_dest),
-                clear_dest=True,
+                clear_dest=target_path not in merged_target_paths,
                 source_log_roots=effective_source_log_roots,
                 dest_log_roots=dest_log_roots,
                 merged_files=merged_files,
                 skip_filenames=composition_files,
             )
+            merged_target_paths.add(target_path)
 
     if selected_overlays:
         with tempfile.TemporaryDirectory(prefix="atlas-plt-cfg-") as tmp_dir:
@@ -4556,56 +4848,80 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
 # S3 bucket. Local-first mechanics, remote system of record after final push.
 # ---------------------------------------------------------------------------
 
-def load_ctl_state_buckets_cfg(ctl_cfg_root: Path) -> dict | None:
-    """Load the optional ctl_state_buckets registry: {domain: {bucket_name, bucket_region, [execution_identity_key]}}.
+def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
+    """Load the optional ctl-state backend registry.
 
-    Keyed by the state domain (the value of a target's ctl_state_bucket_key).
-    bucket_name + bucket_region are ctl-owned and required; execution_identity_key
-    (the s3 writer) is optional — when omitted the writer falls back to the run's
-    --aws-profile (only under a profile that allows profile-only, e.g. local dev)."""
+    Canonical schema is ``ctl_state_backends``:
+    {domain: {provider, backend_type, bucket_name, bucket_region,
+    [execution_identity_key]}}. ``ctl_state_buckets`` is accepted as a
+    temporary compatibility alias for older cfg and is normalized to AWS/S3.
+    """
     merged: dict = {}
-    for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_state_buckets"):
+    seen_sources: dict[str, Path] = {}
+    sections = list(collect_top_level_sections(ctl_cfg_root, "ctl_state_backends"))
+    legacy_sections = list(collect_top_level_sections(ctl_cfg_root, "ctl_state_buckets"))
+    if sections and legacy_sections:
+        raise RuntimeError("❌ ctl cfg must not define both ctl_state_backends and legacy ctl_state_buckets")
+    section_name = "ctl_state_backends" if sections else "ctl_state_buckets"
+    entries = sections if sections else legacy_sections
+    for path, section in entries:
         if not isinstance(section, dict):
-            raise RuntimeError(f"❌ ctl_state_buckets must be a mapping: {path}")
+            raise RuntimeError(f"❌ {section_name} must be a mapping: {path}")
         for domain, entry in section.items():
             # Domains are consumer-defined vocabulary (the engine stays cfg-shape
             # agnostic): any non-empty snake_case key is a valid state domain.
             if not isinstance(domain, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", domain):
-                raise RuntimeError(f"❌ ctl_state_buckets domain must be a snake_case key: {domain!r} in {path}")
+                raise RuntimeError(f"❌ {section_name} domain must be a snake_case key: {domain!r} in {path}")
             if domain in merged:
-                raise RuntimeError(f"❌ duplicate ctl_state_buckets domain {domain!r}: {path}")
+                raise RuntimeError(f"❌ duplicate {section_name} domain {domain!r}: {path} (first: {seen_sources[domain]})")
             if not isinstance(entry, dict):
-                raise RuntimeError(f"❌ ctl_state_buckets.{domain} must be a mapping: {path}")
-            unknown = set(entry) - {"bucket_name", "bucket_region", "execution_identity_key"}
+                raise RuntimeError(f"❌ {section_name}.{domain} must be a mapping: {path}")
+            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity_key"}
+            unknown = set(entry) - allowed
             if unknown:
-                raise RuntimeError(f"❌ ctl_state_buckets.{domain} has unsupported keys {sorted(unknown)}: {path}")
+                raise RuntimeError(f"❌ {section_name}.{domain} has unsupported keys {sorted(unknown)}: {path}")
+            provider = entry.get("provider", "aws" if section_name == "ctl_state_buckets" else None)
+            backend_type = entry.get("backend_type", "s3" if section_name == "ctl_state_buckets" else None)
+            for field, value in (("provider", provider), ("backend_type", backend_type)):
+                if not isinstance(value, str) or not value.strip():
+                    raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
             for field in ("bucket_name", "bucket_region"):
                 if not isinstance(entry.get(field), str) or not entry[field].strip():
-                    raise RuntimeError(f"❌ ctl_state_buckets.{domain}.{field} must be a non-empty string: {path}")
-            resolved = {"bucket_name": entry["bucket_name"].strip(), "bucket_region": entry["bucket_region"].strip()}
+                    raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
+            if provider.strip() != "aws" or backend_type.strip() != "s3":
+                raise RuntimeError(
+                    f"❌ {section_name}.{domain} provider/backend_type {provider!r}/{backend_type!r} is not supported yet; "
+                    "available ctl-state backend: aws/s3"
+                )
+            resolved = {
+                "provider": provider.strip(),
+                "backend_type": backend_type.strip(),
+                "bucket_name": entry["bucket_name"].strip(),
+                "bucket_region": entry["bucket_region"].strip(),
+            }
             identity_key = entry.get("execution_identity_key")
             if identity_key is not None:
                 if not isinstance(identity_key, str) or not identity_key.strip():
                     raise RuntimeError(
-                        f"❌ ctl_state_buckets.{domain}.execution_identity_key must be a non-empty string: {path}"
+                        f"❌ {section_name}.{domain}.execution_identity_key must be a non-empty string: {path}"
                     )
                 resolved["execution_identity_key"] = identity_key.strip()
             merged[domain] = resolved
+            seen_sources[domain] = path
     return merged or None
 
-
-def ctl_allows_skip_ctl_state_bucket_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
-    """Profile policy bool: may a run skip the ctl-state bucket sync?
+def ctl_allows_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    """Profile policy bool: may a run skip the ctl-state backend sync?
 
     Absent = false (strict). This only *permits* the per-run
-    --skip-ctl-state-bucket-sync decision; skipping additionally requires that no
-    active target declares a ctl_state_bucket_key (the sync-skip triad, mirroring
+    --skip-ctl-state-backend-sync decision; skipping additionally requires that no
+    active target declares a ctl_state_backend_key (the sync-skip triad, mirroring
     the profile-only identity fallback)."""
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    value = policy.get("allow_skip_ctl_state_bucket_sync", False)
+    value = policy.get("allow_skip_ctl_state_backend_sync", False)
     if not isinstance(value, bool):
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allow_skip_ctl_state_bucket_sync must be a bool: {value!r}"
+            f"❌ ctl profile {ctl_profile!r} allow_skip_ctl_state_backend_sync must be a bool: {value!r}"
         )
     return value
 
@@ -4732,7 +5048,7 @@ def configure_ctl_state_sync(
     execution_context: dict[str, object],
     run_dir: Path,
     *,
-    skip_ctl_state_bucket_sync: bool,
+    skip_ctl_state_backend_sync: bool,
     provisions_ctl_state_bucket: bool = False,
     profile_only_aws_profile: str | None = None,
     execution_identities: dict | None = None,
@@ -4742,14 +5058,14 @@ def configure_ctl_state_sync(
     """Resolve the run's ctl-state bucket (by domain) and arm the global syncer.
 
     Routes by the run's single state `domain` (from resolve_run_domain): the
-    bucket name+region come straight from the ctl_state_buckets registry — no
+    bucket name+region come straight from the ctl_state_backends registry — no
     execution-context involvement. Existence is re-checked at each sync point, so
     a bucket-creating run mirrors itself at finalization.
 
     Skip semantics — a three-condition triad, mirroring the profile-only identity
     fallback: sync is skipped only when the profile allows it
-    (allow_skip_ctl_state_bucket_sync: true), no active target declares a
-    ctl_state_bucket_key (domain is None), AND --skip-ctl-state-bucket-sync is
+    (allow_skip_ctl_state_backend_sync: true), no active target declares a
+    ctl_state_backend_key (domain is None), AND --skip-ctl-state-backend-sync is
     passed. A declared domain always syncs (the arg is rejected); a missing
     domain never syncs silently (the skip must be explicit).
     """
@@ -4757,45 +5073,45 @@ def configure_ctl_state_sync(
     _CTL_STATE_SYNCER = None
     _CTL_STATE_SYNC_NOTE = {"mode": "disabled"}
 
-    buckets = load_ctl_state_buckets_cfg(ctl_cfg_root)
+    buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
     if buckets is None and domain is None:
         # Consumer has no ctl-state feature at all: nothing to sync or skip.
-        if skip_ctl_state_bucket_sync:
-            logging.info("--skip-ctl-state-bucket-sync has no effect: no ctl_state_buckets registry defined")
+        if skip_ctl_state_backend_sync:
+            logging.info("--skip-ctl-state-backend-sync has no effect: no ctl_state_backends registry defined")
         return None
     if domain is not None and buckets is None:
         raise RuntimeError(
-            f"❌ targets declare ctl_state_bucket_key {domain!r} but no ctl_state_buckets registry is defined"
+            f"❌ targets declare ctl_state_backend_key {domain!r} but no ctl_state_backends registry is defined"
         )
 
-    allow_skip = ctl_allows_skip_ctl_state_bucket_sync(ctl_cfg_root, ctl_profile)
-    if skip_ctl_state_bucket_sync and not allow_skip:
+    allow_skip = ctl_allows_skip_ctl_state_backend_sync(ctl_cfg_root, ctl_profile)
+    if skip_ctl_state_backend_sync and not allow_skip:
         raise RuntimeError(
-            "❌ --skip-ctl-state-bucket-sync is not allowed: ctl profile sets "
-            "allow_skip_ctl_state_bucket_sync: false"
+            "❌ --skip-ctl-state-backend-sync is not allowed: ctl profile sets "
+            "allow_skip_ctl_state_backend_sync: false"
         )
 
     if domain is None:
         # No active target declares a state domain (keys commented, dev cfg).
-        if not skip_ctl_state_bucket_sync:
+        if not skip_ctl_state_backend_sync:
             raise RuntimeError(
-                "❌ no active target declares ctl_state_bucket_key; pass "
-                "--skip-ctl-state-bucket-sync to run without ctl-state sync "
+                "❌ no active target declares ctl_state_backend_key; pass "
+                "--skip-ctl-state-backend-sync to run without ctl-state sync "
                 "(or restore the keys)"
             )
         _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "no_domain"}
         return None
 
-    if skip_ctl_state_bucket_sync:
+    if skip_ctl_state_backend_sync:
         raise RuntimeError(
-            f"❌ --skip-ctl-state-bucket-sync is not allowed: active targets declare "
-            f"ctl_state_bucket_key {domain!r} — a declared state domain always syncs"
+            f"❌ --skip-ctl-state-backend-sync is not allowed: active targets declare "
+            f"ctl_state_backend_key {domain!r} — a declared state domain always syncs"
         )
 
     entry = buckets[domain]  # domain existence validated by resolve_run_domain
     bucket_name = str(
         resolve_runtime_scalar(
-            entry["bucket_name"], execution_context, label=f"ctl_state_buckets.{domain}.bucket_name"
+            entry["bucket_name"], execution_context, label=f"ctl_state_backends.{domain}.bucket_name"
         )
     )
     bucket_region = entry["bucket_region"]
@@ -4810,12 +5126,14 @@ def configure_ctl_state_sync(
     if identity_key:
         identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
         contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
+        account_registry = load_aws_account_registry_cfg(ctl_cfg_root)
         resolved = resolve_stage_aws_access(
             {"execution_identity_key": identity_key},
             identities,
             contexts,
             execution_context=execution_context,
             implementation_key=aws_implementation_key,
+            account_registry=account_registry,
         )
         if not resolved or not resolved.get("profile_name"):
             raise RuntimeError(
@@ -4826,7 +5144,7 @@ def configure_ctl_state_sync(
         writer_profile = profile_only_aws_profile.strip()
     else:
         raise RuntimeError(
-            f"❌ ctl_state_buckets.{domain} declares no execution_identity_key; "
+            f"❌ ctl_state_backends.{domain} declares no execution_identity_key; "
             f"provide --aws-profile under a profile that allows profile-only access, "
             f"or add an execution_identity_key"
         )
@@ -5420,7 +5738,7 @@ def run_maintenance(
     plt_merged_dir: Path,
     log_file: Path,
     profile_only_aws_profile: str | None,
-    skip_ctl_state_bucket_sync: bool = False,
+    skip_ctl_state_backend_sync: bool = False,
 ) -> None:
     """Run a maintenance action against a single stage target."""
     if maintenance_action == "force-unlock" and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir):
@@ -5439,7 +5757,7 @@ def run_maintenance(
     ctl_state_domain = resolve_run_domain(
         {"stages": [{"target": stage_target}]},
         inventory_cfg,
-        load_ctl_state_buckets_cfg(ctl_cfg_root),
+        load_ctl_state_backends_cfg(ctl_cfg_root),
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
@@ -5447,7 +5765,7 @@ def run_maintenance(
         ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_state_bucket_sync=skip_ctl_state_bucket_sync,
+        skip_ctl_state_backend_sync=skip_ctl_state_backend_sync,
         profile_only_aws_profile=profile_only_aws_profile,
         aws_implementation_key=aws_implementation_key,
     )
@@ -5502,6 +5820,7 @@ def run_maintenance(
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
+    aws_account_registry_cfg = load_aws_account_registry_cfg(ctl_cfg_root)
     allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
@@ -5509,6 +5828,7 @@ def run_maintenance(
         aws_access_contexts,
         execution_context=execution_context,
         implementation_key=aws_implementation_key,
+        account_registry=aws_account_registry_cfg,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
     )
@@ -5587,13 +5907,13 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
 def resolve_run_domain(
     workflow_cfg: dict,
     inventory_cfg: dict,
-    ctl_state_buckets_cfg: dict | None,
+    ctl_state_backends_cfg: dict | None,
 ) -> str | None:
     """Resolve the run's single ctl-state domain from its active targets.
 
     One state domain per run: all active targets that declare a
-    `ctl_state_bucket_key` must declare the *same* one — that is the run's domain
-    (and it must exist in the ctl_state_buckets registry). Targets that omit it
+    `ctl_state_backend_key` must declare the *same* one — that is the run's domain
+    (and it must exist in the ctl_state_backends registry). Targets that omit it
     (commented in dev cfg) are the skip hatch. A run whose active targets declare
     *different* domains is a hard error (a run is one state/lock/outdate boundary).
     Returns the domain key, or None when no active target declares one."""
@@ -5601,7 +5921,7 @@ def resolve_run_domain(
     seen: dict[str, str] = {}  # domain -> first target that declared it
     for entry in workflow_cfg.get("stages", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
-        domain = (targets.get(target_name) or {}).get("ctl_state_bucket_key")
+        domain = (targets.get(target_name) or {}).get("ctl_state_backend_key")
         if domain is None:
             continue
         seen.setdefault(domain, target_name)
@@ -5614,10 +5934,10 @@ def resolve_run_domain(
             f"domain — split it into separate single-domain runs"
         )
     domain = next(iter(seen))
-    if ctl_state_buckets_cfg is not None and domain not in ctl_state_buckets_cfg:
-        known = ", ".join(sorted(ctl_state_buckets_cfg)) or "none"
+    if ctl_state_backends_cfg is not None and domain not in ctl_state_backends_cfg:
+        known = ", ".join(sorted(ctl_state_backends_cfg)) or "none"
         raise RuntimeError(
-            f"❌ ctl_state_bucket_key {domain!r} has no ctl_state_buckets entry; known domains: {known}"
+            f"❌ ctl_state_backend_key {domain!r} has no ctl_state_backends entry; known domains: {known}"
         )
     return domain
 
@@ -5663,12 +5983,12 @@ def build_sub_workflow_cfg(
     cfg_file_set_name: str,
     sub_workflow: str,
     execution_identity_key: str | None,
-    ctl_state_bucket_key: str | None = None,
+    ctl_state_backend_key: str | None = None,
 ) -> tuple[dict, dict]:
     """Build a one-target cfg for a synthetic repo-local sub_workflow run.
 
     The synthetic target is composed directly from CLI args and need not exist
-    in targets/<action>/. --ctl-state-bucket-key supplies the state domain the
+    in targets/<action>/. --ctl-state-backend-key supplies the state domain the
     declared targets carry in cfg; omitted = no domain (skip triad applies).
     """
     stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
@@ -5686,8 +6006,8 @@ def build_sub_workflow_cfg(
     }
     if execution_identity_key:
         resolved["execution_identity_key"] = execution_identity_key
-    if ctl_state_bucket_key:
-        resolved["ctl_state_bucket_key"] = ctl_state_bucket_key
+    if ctl_state_backend_key:
+        resolved["ctl_state_backend_key"] = ctl_state_backend_key
     name = "sub_workflow"
     inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
     workflow_cfg = {
@@ -5719,7 +6039,7 @@ def run_pipeline(
     profile_only_aws_profile: str | None,
     target_name: str | None = None,
     sub_workflow_run: dict | None = None,
-    skip_ctl_state_bucket_sync: bool = False,
+    skip_ctl_state_backend_sync: bool = False,
 ) -> None:
     """
     Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
@@ -5747,7 +6067,7 @@ def run_pipeline(
             cfg_file_set_name=sub_workflow_run["cfg_file_set"],
             sub_workflow=sub_workflow_run["sub_workflow"],
             execution_identity_key=sub_workflow_run.get("execution_identity_key"),
-            ctl_state_bucket_key=sub_workflow_run.get("ctl_state_bucket_key"),
+            ctl_state_backend_key=sub_workflow_run.get("ctl_state_backend_key"),
         )
     elif target_name:
         inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
@@ -5775,7 +6095,7 @@ def run_pipeline(
     # syncer for that domain's bucket. Done after the target is known so a missing
     # bucket is tolerated only for the ctl-state bootstrap target.
     ctl_state_domain = resolve_run_domain(
-        workflow_cfg, inventory_cfg, load_ctl_state_buckets_cfg(ctl_cfg_root)
+        workflow_cfg, inventory_cfg, load_ctl_state_backends_cfg(ctl_cfg_root)
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
@@ -5783,7 +6103,7 @@ def run_pipeline(
         ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_state_bucket_sync=skip_ctl_state_bucket_sync,
+        skip_ctl_state_backend_sync=skip_ctl_state_backend_sync,
         provisions_ctl_state_bucket=run_provisions_ctl_state_bucket(workflow_cfg, inventory_cfg),
         profile_only_aws_profile=profile_only_aws_profile,
         aws_implementation_key=aws_implementation_key,
@@ -5839,6 +6159,7 @@ def run_pipeline(
     validate_stages_have_commits(active_stages, ctl_ref_policy)
     execution_identities = load_execution_identities_cfg(ctl_cfg_root)
     aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
+    aws_account_registry_cfg = load_aws_account_registry_cfg(ctl_cfg_root)
     allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
     aws_account_registry = validate_active_stage_aws_access(
         active_stages,
@@ -5846,6 +6167,7 @@ def run_pipeline(
         aws_access_contexts,
         execution_context=execution_context,
         implementation_key=aws_implementation_key,
+        account_registry=aws_account_registry_cfg,
         allow_profile_only=allow_aws_profile_only,
         profile_only_aws_profile=profile_only_aws_profile,
     )

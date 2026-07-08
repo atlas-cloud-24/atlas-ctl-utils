@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 def target_files(ctl_cfg: Path) -> list[Path]:
     """Files that may carry execution_identity_key: targets/**, plus any yaml
-    defining the ctl_state_buckets registry (the s3 writer identities)."""
+    defining the ctl_state_backends registry (or legacy ctl_state_buckets; the writer identities)."""
     targets_root = ctl_cfg / "targets"
     if not targets_root.is_dir():
         raise RuntimeError(f"targets directory not found: {targets_root}")
@@ -54,7 +54,7 @@ def target_files(ctl_cfg: Path) -> list[Path]:
     for path in sorted(ctl_cfg.rglob("*.yaml")):
         if targets_root in path.parents:
             continue
-        if re.search(r"^ctl_state_buckets:\s*$", path.read_text(encoding="utf-8"), re.MULTILINE):
+        if re.search(r"^ctl_state_(?:backends|buckets):\s*$", path.read_text(encoding="utf-8"), re.MULTILINE):
             files.append(path)
     return files
 
