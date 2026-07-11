@@ -46,7 +46,7 @@ class WriteCtlCfgSnapshotTests(unittest.TestCase):
             ctl_dir = common.write_ctl_cfg_snapshot(
                 run_dir,
                 ctl_profile="commit_required",
-                ctl_profile_policy_cfg={"ref_policy": "commit", "allow_skip_ctl_state_backend_sync": False},
+                ctl_profile_policy_cfg={"ref_policy": "commit", "allow_skip_ctl_state_sync": False},
                 inventory_name="provision",
                 workflow_cfg={"meta": {"action": "provision"}, "stages": ["env/core/baseline"]},
                 inventory_cfg={"stage_targets": {"env/core/baseline": {"ref_key": "env/${execution_context.params.env_type}"}}},
@@ -61,7 +61,7 @@ class WriteCtlCfgSnapshotTests(unittest.TestCase):
             )
             profile = yaml.safe_load((ctl_dir / "profile.yaml").read_text())
             self.assertEqual(profile["ctl_profile"], "commit_required")
-            self.assertEqual(profile["policy"]["allow_skip_ctl_state_backend_sync"], False)
+            self.assertEqual(profile["policy"]["allow_skip_ctl_state_sync"], False)
             active = yaml.safe_load((ctl_dir / "active_stages.yaml").read_text())
             self.assertEqual(active["env/core/baseline"]["commit"], "abc123")
 

@@ -117,7 +117,8 @@ class CtlGuardrailTests(unittest.TestCase):
             pattern = "${execution_context.params.main_tag}-${execution_context.params.landing_zone}-org-ctl-state"
             write(
                 root / "ctl_state.yaml",
-                "ctl_state_buckets:\n  org:\n"
+                "ctl_state_backends:\n  org:\n"
+                "    provider: aws\n    backend_type: s3\n"
                 f"    bucket_name: {pattern}\n"
                 "    bucket_region: eu-west-2\n",
             )
@@ -135,7 +136,8 @@ class CtlGuardrailTests(unittest.TestCase):
             # a tampered pattern is rejected
             write(
                 root / "ctl_state.yaml",
-                "ctl_state_buckets:\n  org:\n"
+                "ctl_state_backends:\n  org:\n"
+                "    provider: aws\n    backend_type: s3\n"
                 "    bucket_name: ${execution_context.params.main_tag}-evil-org-ctl-state\n"
                 "    bucket_region: eu-west-2\n",
             )

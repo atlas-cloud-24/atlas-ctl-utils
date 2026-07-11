@@ -34,26 +34,26 @@ class OptionalWriterIdentityTests(unittest.TestCase):
 class ResultsBootstrapDetectionTests(unittest.TestCase):
     INVENTORY = {
         "stage_targets": {
-            "env/ctl-state": {"sub_workflow": "env_ctl_state_bucket", "provisions_ctl_state_bucket": True},
+            "env/ctl-state-backend": {"sub_workflow": "env_ctl_state_backend", "provisions_ctl_state_backend": True},
             "env/core/baseline": {"sub_workflow": "baseline"},
         }
     }
 
     def test_true_when_a_bootstrap_target_is_in_the_run(self):
-        wf = {"stages": ["env/ctl-state"]}
-        self.assertTrue(common.run_provisions_ctl_state_bucket(wf, self.INVENTORY))
+        wf = {"stages": ["env/ctl-state-backend"]}
+        self.assertTrue(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_true_when_mixed_workflow_includes_a_bootstrap_target(self):
-        wf = {"stages": ["env/core/baseline", {"target": "env/ctl-state"}]}
-        self.assertTrue(common.run_provisions_ctl_state_bucket(wf, self.INVENTORY))
+        wf = {"stages": ["env/core/baseline", {"target": "env/ctl-state-backend"}]}
+        self.assertTrue(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_false_for_a_normal_run(self):
         wf = {"stages": ["env/core/baseline"]}
-        self.assertFalse(common.run_provisions_ctl_state_bucket(wf, self.INVENTORY))
+        self.assertFalse(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_false_when_target_missing_or_no_flag(self):
-        self.assertFalse(common.run_provisions_ctl_state_bucket({"stages": ["unknown"]}, self.INVENTORY))
-        self.assertFalse(common.run_provisions_ctl_state_bucket({"stages": []}, self.INVENTORY))
+        self.assertFalse(common.run_provisions_ctl_state_backend({"stages": ["unknown"]}, self.INVENTORY))
+        self.assertFalse(common.run_provisions_ctl_state_backend({"stages": []}, self.INVENTORY))
 
 
 class RequiredTargetPathsTests(unittest.TestCase):

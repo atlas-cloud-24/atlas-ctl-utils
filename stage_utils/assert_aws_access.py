@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assert that the active AWS credentials match the target account and access context."""
+"""Assert that active AWS credentials match the target account and principal."""
 
 import json
 import os
@@ -20,7 +20,11 @@ def validate_caller_identity(
     expected_permission_set_name: str | None = None,
     expected_role_name: str | None = None,
 ) -> tuple[str, str]:
-    if bool(expected_permission_set_name) == bool(expected_role_name):
+    principal_expectation_count = sum(
+        bool(value)
+        for value in (expected_permission_set_name, expected_role_name)
+    )
+    if principal_expectation_count != 1:
         raise RuntimeError(
             "exactly one expected permission-set name or role name is required"
         )
@@ -69,25 +73,21 @@ def require_env(name: str) -> str:
     return value
 
 
-def get_caller_identity(profile_name: str) -> dict:
+def get_caller_identity(profile_name: str | None) -> dict:
+    cmd = ["aws", "sts", "get-caller-identity", "--output", "json"]
+    if profile_name:
+        cmd += ["--profile", profile_name]
     result = subprocess.run(
-        [
-            "aws",
-            "sts",
-            "get-caller-identity",
-            "--profile",
-            profile_name,
-            "--output",
-            "json",
-        ],
+        cmd,
         text=True,
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
+        source = f"profile {profile_name!r}" if profile_name else "ambient role-chain credentials"
         raise RuntimeError(
-            f"AWS access assertion failed for profile {profile_name!r}: {detail}"
+            f"AWS access assertion failed for {source}: {detail}"
         )
 
     try:
@@ -98,7 +98,8 @@ def get_caller_identity(profile_name: str) -> dict:
 
 
 def main() -> int:
-    profile_name = require_env("AWS_PROFILE")
+    role_chain = os.getenv("ATLAS_AWS_ROLE_CHAIN", "").strip().lower() == "true"
+    profile_name = None if role_chain else require_env("AWS_PROFILE")
     caller = get_caller_identity(profile_name)
 
     profile_only = os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"
@@ -128,9 +129,9 @@ def main() -> int:
         "AWS access: "
         f"execution_identity_key={os.getenv('ATLAS_EXECUTION_IDENTITY_KEY', '')} "
         f"account_key={os.getenv('ATLAS_AWS_ACCOUNT_KEY', '')} "
-        f"access_context_key={os.getenv('ATLAS_AWS_ACCESS_CONTEXT_KEY', '')} "
+        f"credential_source_key={os.getenv('ATLAS_AWS_CREDENTIAL_SOURCE_KEY', '')} "
         f"implementation_key={os.getenv('ATLAS_AWS_IMPLEMENTATION_KEY', '')} "
-        f"profile={profile_name} account={actual_account_id} arn={actual_arn}"
+        f"profile={profile_name or '<role-chain credentials>'} account={actual_account_id} arn={actual_arn}"
     )
     return 0
 

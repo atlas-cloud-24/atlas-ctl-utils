@@ -44,31 +44,6 @@ FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES = (
 )
 FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$?([A-Za-z_][A-Za-z0-9_]*)")
 FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
-AWS_CREDENTIAL_ENV_VARS = (
-    "AWS_PROFILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_CONFIG_FILE",
-    "AWS_SHARED_CREDENTIALS_FILE",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_SECURITY_TOKEN",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_ROLE_ARN",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-)
-AWS_ACCESS_STAGE_ENV_VARS = (
-    "ATLAS_AWS_ASSERT_ACCESS",
-    "ATLAS_AWS_PROFILE_ONLY_ACCESS",
-    "ATLAS_EXECUTION_IDENTITY_KEY",
-    "ATLAS_AWS_ACCOUNT_KEY",
-    "ATLAS_AWS_ACCESS_CONTEXT_KEY",
-    "ATLAS_AWS_IMPLEMENTATION_KEY",
-    "ATLAS_AWS_EXPECT_ACCOUNT_ID",
-    "ATLAS_AWS_EXPECT_PERMISSION_SET_NAME",
-    "ATLAS_AWS_EXPECT_ROLE_NAME",
-)
 
 SERVICE_ID = "atlas-ctl-orchestrator-local"
 CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
@@ -247,8 +222,9 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
 
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
-    bundles governing ctl behavior (ref_policy, allow_aws_profile_only,
-    allow_skip_ctl_state_backend_sync, ...)."""
+    bundles governing ctl behavior: ref_policy, allowed_execution_access_modes
+    (§12), and the ctl-state sync skip permissions
+    (allow_agreed_skip_ctl_state_backend_sync, allow_force_skip_ctl_state_backend_sync)."""
     profiles: dict[str, dict] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
         if not isinstance(section, dict):
@@ -280,9 +256,96 @@ def ctl_ref_policy(ctl_cfg_root: Path, ctl_profile: str) -> str:
     return ref_policy.strip()
 
 
-def ctl_allows_aws_profile_only(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    return policy.get("allow_aws_profile_only") is True
+    value = policy.get(key, False)
+    if not isinstance(value, bool):
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} {key} must be a bool: {value!r}")
+    return value
+
+
+EXECUTION_ACCESS_MODES = ("standard", "direct", "bypass")
+
+# Phase 26 — execution runtime (WHERE a stage's box is produced). CTL selects one
+# runtime for the whole run; the stage declares which it can run in (a constraint).
+KNOWN_RUNTIMES = ("local", "ci")
+DEFAULT_RUNTIME = "local"
+# Stage box images (stage.yaml runtime.image). CTL owns how each is built/run.
+STAGE_IMAGES = ("infra", "ops")
+
+
+def stage_supported_runtimes(runtime_cfg: dict, *, label: str) -> set[str]:
+    """Runtimes a stage can run in (§Phase 26); absent = all KNOWN_RUNTIMES."""
+    raw = runtime_cfg.get("supported_runtimes")
+    if raw is None:
+        return set(KNOWN_RUNTIMES)
+    if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
+        raise RuntimeError(f"❌ stage runtime.supported_runtimes must be a list of strings: {label}")
+    runtimes = set(raw)
+    unknown = runtimes - set(KNOWN_RUNTIMES)
+    if unknown:
+        raise RuntimeError(f"❌ stage runtime.supported_runtimes has unknown runtimes {sorted(unknown)}: {label}")
+    if not runtimes:
+        raise RuntimeError(f"❌ stage runtime.supported_runtimes must not be empty: {label}")
+    return runtimes
+
+
+def ctl_allowed_runtimes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
+    """Runtimes the ctl profile authorizes (§Phase 26). Absent = all KNOWN_RUNTIMES."""
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
+    raw = policy.get("allowed_runtimes")
+    if raw is None:
+        return set(KNOWN_RUNTIMES)
+    if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes must be a list of strings")
+    runtimes = set(raw)
+    unknown = runtimes - set(KNOWN_RUNTIMES)
+    if unknown:
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes has unknown runtimes {sorted(unknown)}")
+    if not runtimes:
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes must not be empty")
+    return runtimes
+
+
+def validate_runtime(ctl_cfg_root: Path, ctl_profile: str, runtime: str) -> None:
+    """Reconcile the selected runtime against the ctl profile (§Phase 26): a known
+    runtime, allowed by the profile. Per-stage `supported_runtimes` is enforced in
+    run_stages, where the repo-local stage manifest is loaded."""
+    if runtime not in KNOWN_RUNTIMES:
+        raise RuntimeError(f"❌ unknown runtime {runtime!r} (known: {sorted(KNOWN_RUNTIMES)})")
+    allowed = ctl_allowed_runtimes(ctl_cfg_root, ctl_profile)
+    if runtime not in allowed:
+        raise RuntimeError(
+            f"❌ runtime {runtime!r} is not allowed by ctl profile {ctl_profile!r} (allowed: {sorted(allowed)})"
+        )
+
+
+def ctl_allowed_execution_access_modes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
+    """Modes the ctl profile authorizes (§12). Absent = {standard} only."""
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
+    raw = policy.get("allowed_execution_access_modes")
+    if raw is None:
+        return {"standard"}
+    if not isinstance(raw, list) or not all(isinstance(m, str) for m in raw):
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes must be a list of strings"
+        )
+    modes = set(raw)
+    unknown = modes - set(EXECUTION_ACCESS_MODES)
+    if unknown:
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes has unknown modes {sorted(unknown)}"
+        )
+    modes.add("standard")  # standard is always permitted
+    return modes
+
+
+def ctl_allows_agreed_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_agreed_skip_ctl_state_backend_sync")
+
+
+def ctl_allows_force_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_force_skip_ctl_state_backend_sync")
 
 
 def ref_policy_requires_commits(ref_policy: str) -> bool:
@@ -345,20 +408,43 @@ def normalize_ctl_state_local_root(value: str) -> Path:
     return root
 
 
-def normalize_optional_aws_profile(value: str | None) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError("❌ --aws-profile must be a non-empty profile name when provided")
-    return value.strip()
 
 
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
     args.execution_params = selectors_to_map(args.execution_param, label="execution param")
     args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
-    args.aws_profile = normalize_optional_aws_profile(args.aws_profile)
+    if getattr(args, "provider_credential", None) is not None:
+        value = args.provider_credential.strip()
+        args.provider_credential = value or None
+    args.execution_access_mode = normalize_execution_access_mode(args)
     args.run_id = generate_uuid7()
+
+
+def normalize_execution_access_mode(args: argparse.Namespace) -> str:
+    """Collapse the two mutually-exclusive access flags into one mode (§12)."""
+    use_direct = getattr(args, "use_direct_execution_access", False)
+    bypass = getattr(args, "bypass_execution_identity", False)
+    if use_direct and bypass:
+        raise RuntimeError(
+            "❌ --agreed-use-direct-execution-access and --force-bypass-execution-identity "
+            "are mutually exclusive"
+        )
+    if bypass:
+        if not getattr(args, "provider_credential", None):
+            raise RuntimeError(
+                "❌ --force-bypass-execution-identity requires the substitute credential "
+                "(--provider-credential): nothing to run with"
+            )
+        return "bypass"
+    if getattr(args, "provider_credential", None) and not bypass:
+        raise RuntimeError(
+            "❌ --provider-credential cannot override declared execution identities; "
+            "pass it only together with --force-bypass-execution-identity"
+        )
+    if use_direct:
+        return "direct"
+    return "standard"
 
 
 def _uuid7_timestamp_ms() -> int:
@@ -929,12 +1015,6 @@ def build_active_stages(
             "cfg_files": cfg_files,
         }
 
-        for legacy_field in ("aws_account_key", "aws_access_context_key"):
-            if legacy_field in stage_over or legacy_field in target_cfg:
-                raise RuntimeError(
-                    f"Stage {stage_id!r} uses deprecated {legacy_field}; use execution_identity_key"
-                )
-
         execution_identity_key = stage_over.get("execution_identity_key") or target_cfg.get("execution_identity_key")
         if execution_identity_key is not None:
             if not isinstance(execution_identity_key, str) or not execution_identity_key.strip():
@@ -1217,6 +1297,20 @@ def resolve_runtime_scalar(value, context: dict[str, object], *, label: str) -> 
     return resolved
 
 
+def get_provider_adapter(provider: str):
+    """Dispatch to the provider adapter (utils.providers); unknown = hard error."""
+    from utils.providers import get_adapter
+    return get_adapter(provider)
+
+
+def run_provider_adapter(execution_context: dict[str, object]):
+    """The run's adapter, selected by the required provider execution param."""
+    provider = execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.params.provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise RuntimeError("❌ execution param 'provider' is required to select the provider adapter")
+    return get_provider_adapter(provider.strip())
+
+
 def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
     """Load provider-neutral execution identities from ctl cfg."""
     identities = collect_resource(ctl_cfg_root, "execution_identities")
@@ -1232,24 +1326,9 @@ def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
         if not isinstance(provider, str) or not provider.strip():
             raise RuntimeError(f"❌ execution identity {identity_key!r} must define non-empty provider")
         provider = provider.strip()
-        if provider == "aws":
-            allowed_fields = {"provider", "account_key", "access_context_key"}
-            unknown = sorted(set(identity_cfg) - allowed_fields)
-            if unknown:
-                raise RuntimeError(f"❌ execution identity {identity_key!r} has unknown fields {unknown}")
-            for field in ("account_key", "access_context_key"):
-                _require_non_empty_string(
-                    identity_cfg.get(field),
-                    f"execution_identities.{identity_key}.{field}",
-                    ctl_cfg_root,
-                )
-        else:
-            provider_fields = sorted(set(identity_cfg) - {"provider"})
-            if not provider_fields:
-                raise RuntimeError(
-                    f"❌ execution identity {identity_key!r} provider {provider!r} must define "
-                    "provider-specific fields"
-                )
+        # the generic loader owns only the envelope; the identity payload is the
+        # selected provider adapter's schema
+        get_provider_adapter(provider).validate_execution_identity(identity_key, identity_cfg, ctl_cfg_root)
 
     return identities
 
@@ -1271,155 +1350,24 @@ def load_provider_catalogs(ctl_cfg_root: Path) -> dict:
     return providers
 
 
-# The aws implementation owns its catalog schema; the engine core knows no
-# provider names or sections.
-_AWS_PROVIDER_CATALOG_SECTIONS = {"access_contexts", "accounts"}
 
 
-def _load_aws_provider_catalog(ctl_cfg_root: Path) -> dict:
-    catalog = load_provider_catalogs(ctl_cfg_root).get("aws", {})
-    unknown = sorted(set(catalog) - _AWS_PROVIDER_CATALOG_SECTIONS)
-    if unknown:
-        raise RuntimeError(f"❌ providers.aws has unknown sections {unknown}: {ctl_cfg_root}")
-    return catalog
 
 
-def load_aws_access_contexts_cfg(ctl_cfg_root: Path) -> dict:
-    """Load logical AWS access contexts and runner-specific implementations."""
-    access_contexts = _load_aws_provider_catalog(ctl_cfg_root).get("access_contexts", {})
-
-    for access_context_key, access_context_cfg in access_contexts.items():
-        if not isinstance(access_context_key, str) or not access_context_key.strip():
-            raise RuntimeError(f"❌ AWS access-context keys must be non-empty strings: {ctl_cfg_root}")
-        if not isinstance(access_context_cfg, dict) or not access_context_cfg:
-            raise RuntimeError(
-                f"❌ AWS access context {access_context_key!r} must be a non-empty mapping: {ctl_cfg_root}"
-            )
-        for implementation_key, implementation_cfg in access_context_cfg.items():
-            _validate_aws_access_implementation(
-                access_context_key,
-                implementation_key,
-                implementation_cfg,
-                ctl_cfg_root,
-            )
-
-    return access_contexts
 
 
-def load_aws_account_registry_cfg(ctl_cfg_root: Path) -> dict[str, str]:
-    """Load the provider-owned AWS account registry: account_key -> account_id."""
-    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts", {})
-    registry: dict[str, str] = {}
-    for account_key, account_cfg in accounts.items():
-        if not isinstance(account_key, str) or not account_key.strip():
-            raise RuntimeError(f"❌ aws account keys must be non-empty strings: {ctl_cfg_root}")
-        if not isinstance(account_cfg, dict):
-            raise RuntimeError(f"❌ aws account {account_key!r} must be a mapping: {ctl_cfg_root}")
-        unknown = sorted(set(account_cfg) - {"account_id"})
-        if unknown:
-            raise RuntimeError(f"❌ aws account {account_key!r} has unknown fields {unknown}: {ctl_cfg_root}")
-        account_id = _require_non_empty_string(
-            account_cfg.get("account_id"),
-            f"providers.aws.accounts.{account_key}.account_id",
-            ctl_cfg_root,
-        )
-        if not re.fullmatch(r"\d{12}", account_id):
-            raise RuntimeError(
-                f"❌ providers.aws.accounts.{account_key}.account_id must be a 12-digit account id"
-            )
-        registry[account_key] = account_id
-    return registry
 
 
-def _validate_aws_access_implementation(
-    access_context_key: str,
-    implementation_key: str,
-    implementation_cfg: dict,
-    path: Path,
-) -> None:
-    if not isinstance(implementation_key, str) or not implementation_key.strip():
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r} implementation keys must be non-empty strings: {path}"
-        )
-    if not isinstance(implementation_cfg, dict):
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key} must be a mapping: {path}"
-        )
-
-    credential_keys = [
-        key for key in ("profile_name", "iam_role_key")
-        if key in implementation_cfg
-    ]
-    if len(credential_keys) != 1:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key} must define exactly one of "
-            f"profile_name or iam_role_key: {path}"
-        )
-    credential_key = credential_keys[0]
-    _require_non_empty_string(
-        implementation_cfg[credential_key],
-        f"AWS access context {access_context_key!r}.{implementation_key}.{credential_key}",
-        path,
-    )
-
-    if implementation_key == "local" and credential_key != "profile_name":
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.local must use profile_name: {path}"
-        )
-    if implementation_key == "ci" and credential_key != "iam_role_key":
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.ci must use iam_role_key: {path}"
-        )
-
-    expect_cfg = implementation_cfg.get("expect")
-    if credential_key == "profile_name":
-        _validate_direct_profile_expect(access_context_key, implementation_key, expect_cfg, path)
-    elif expect_cfg is not None:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key} must not duplicate expect "
-            f"beside {credential_key}: {path}"
-        )
-
-    unknown = sorted(set(implementation_cfg) - {credential_key, "expect"})
-    if unknown:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key} has unknown fields {unknown}: {path}"
-        )
 
 
-def _validate_direct_profile_expect(
-    access_context_key: str,
-    implementation_key: str,
-    expect_cfg,
-    path: Path,
-) -> None:
-    if not isinstance(expect_cfg, dict):
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect must be a mapping "
-            "for direct profile_name bindings"
-        )
-    principal_keys = [key for key in ("permission_set_name", "role_name") if key in expect_cfg]
-    if len(principal_keys) != 1:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect must define exactly one "
-            f"of permission_set_name or role_name: {path}"
-        )
-    _require_non_empty_string(
-        expect_cfg[principal_keys[0]],
-        f"AWS access context {access_context_key!r}.{implementation_key}.expect.{principal_keys[0]}",
-        path,
-    )
-    if "account_id" in expect_cfg:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect.account_id is deprecated; "
-            "put account IDs in providers.aws.accounts keyed by execution identity account_key"
-        )
-    unknown = sorted(set(expect_cfg) - set(principal_keys))
-    if unknown:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key}.expect has unknown fields "
-            f"{unknown}: {path}"
-        )
+
+
+
+
+
+
+
+
 
 
 def _require_non_empty_string(value, label: str, path: Path | None = None) -> str:
@@ -1429,372 +1377,40 @@ def _require_non_empty_string(value, label: str, path: Path | None = None) -> st
     return value.strip()
 
 
-def aws_access_override_env_name(access_context_key: str) -> str:
-    suffix = re.sub(r"[^A-Za-z0-9]", "_", access_context_key).upper()
-    return f"ATLAS_AWS_PROFILE_{suffix}"
 
 
-def _read_aws_profile_setting(profile_name: str, setting: str) -> str | None:
-    aws_env = os.environ.copy()
-    aws_env.pop("AWS_CONFIG_FILE", None)
-    aws_env.pop("AWS_SHARED_CREDENTIALS_FILE", None)
-    try:
-        result = subprocess.run(
-            ["aws", "configure", "get", setting, "--profile", profile_name],
-            text=True,
-            capture_output=True,
-            check=False,
-            env=aws_env,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("❌ AWS CLI is required for local AWS access resolution") from exc
-    if result.returncode != 0:
-        return None
-    value = result.stdout.strip()
-    return value or None
 
 
-@functools.lru_cache(maxsize=None)
-def resolve_configured_profile_account_id(profile_name: str) -> str:
-    account_id = _read_aws_profile_setting(profile_name, "sso_account_id")
-    if account_id:
-        if not re.fullmatch(r"\d{12}", account_id):
-            raise RuntimeError(
-                f"❌ AWS profile {profile_name!r} has invalid sso_account_id {account_id!r}"
-            )
-        return account_id
-
-    role_arn = _read_aws_profile_setting(profile_name, "role_arn")
-    if role_arn:
-        match = re.fullmatch(r"arn:[^:]+:iam::(\d{12}):role/.+", role_arn)
-        if not match:
-            raise RuntimeError(f"❌ AWS profile {profile_name!r} has invalid role_arn {role_arn!r}")
-        return match.group(1)
-
-    raise RuntimeError(
-        f"❌ Cannot derive an AWS account ID from canonical profile {profile_name!r}; "
-        "configure sso_account_id or role_arn in ~/.aws/config"
-    )
 
 
-def resolve_stage_aws_access(
-    stage: dict,
-    execution_identities: dict,
-    aws_access_contexts: dict,
-    *,
-    execution_context: dict[str, object],
-    implementation_key: str,
-    account_registry: dict[str, str] | None = None,
-    allow_profile_only: bool = False,
-    profile_only_aws_profile: str | None = None,
-) -> dict[str, str] | None:
-    for legacy_field in ("aws_account_key", "aws_access_context_key"):
-        if legacy_field in stage:
-            raise RuntimeError(f"❌ stage uses deprecated {legacy_field}; use execution_identity_key")
-
-    identity_key = stage.get("execution_identity_key")
-    if identity_key is None:
-        profile_name = (profile_only_aws_profile or "").strip()
-        if allow_profile_only and profile_name:
-            return {
-                "provider": "aws",
-                "execution_identity_key": "profile_only",
-                "implementation_key": "profile_only",
-                "credential_provider_kind": "aws_profile_only",
-                "profile_name": profile_name,
-                "profile_only": "true",
-            }
-        return None
-    if not isinstance(identity_key, str) or not identity_key.strip():
-        raise RuntimeError("❌ stage execution_identity_key must be a non-empty string")
-    identity_key = identity_key.strip()
-
-    identity_cfg = execution_identities.get(identity_key)
-    if not isinstance(identity_cfg, dict):
-        raise RuntimeError(
-            f"❌ stage execution_identity_key {identity_key!r} is not defined in execution_identities.yaml"
-        )
-    provider = identity_cfg.get("provider")
-    runtime_provider = execution_context.get("execution_context.params.provider")
-    if runtime_provider is not None and str(runtime_provider) != provider:
-        raise RuntimeError(
-            f"❌ execution identity {identity_key!r} provider {provider!r} does not match "
-            f"runtime provider {runtime_provider!r}"
-        )
-    if provider != "aws":
-        raise RuntimeError(
-            f"❌ execution identity {identity_key!r} provider {provider!r} is not implemented by this runner"
-        )
-
-    raw_account_key = identity_cfg.get("account_key")
-    raw_access_context_key = identity_cfg.get("access_context_key")
-
-    context = dict(execution_context)
-    account_key = resolve_runtime_scalar(
-        raw_account_key,
-        context,
-        label=f"execution_identities.{identity_key}.account_key",
-    )
-    access_context_key = resolve_runtime_scalar(
-        raw_access_context_key,
-        context,
-        label=f"execution_identities.{identity_key}.access_context_key",
-    )
-
-    access_context_cfg = aws_access_contexts.get(access_context_key)
-    if not isinstance(access_context_cfg, dict):
-        raise RuntimeError(
-            f"❌ Stage AWS access context {access_context_key!r} is not defined in the aws_access_contexts catalog"
-        )
-    implementation_cfg = access_context_cfg.get(implementation_key)
-    if not isinstance(implementation_cfg, dict):
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r} has no {implementation_key!r} implementation"
-        )
-
-    resolved: dict[str, str] = {
-        "provider": "aws",
-        "execution_identity_key": identity_key,
-        "account_key": account_key,
-        "access_context_key": access_context_key,
-        "implementation_key": implementation_key,
-    }
-
-    if "profile_name" in implementation_cfg:
-        canonical_profile_name = resolve_runtime_scalar(
-            implementation_cfg["profile_name"],
-            context,
-            label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.profile_name",
-        )
-        expect_cfg = implementation_cfg["expect"]
-        if "permission_set_name" in expect_cfg:
-            resolved["permission_set_name"] = resolve_runtime_scalar(
-                expect_cfg["permission_set_name"],
-                context,
-                label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.expect.permission_set_name",
-            )
-            resolved["credential_provider_kind"] = "identity_center_profile"
-        else:
-            resolved["role_name"] = resolve_runtime_scalar(
-                expect_cfg["role_name"],
-                context,
-                label=f"providers.aws.access_contexts.{access_context_key}.{implementation_key}.expect.role_name",
-            )
-            resolved["credential_provider_kind"] = "assume_role_profile"
-    elif "iam_role_key" in implementation_cfg:
-        raise RuntimeError(
-            f"❌ AWS implementation {implementation_key!r} uses iam_role_key, but CI OIDC activation is deferred"
-        )
-    else:
-        raise RuntimeError(
-            f"❌ AWS access context {access_context_key!r}.{implementation_key} has no supported credential binding"
-        )
-
-    canonical_account_id = resolve_configured_profile_account_id(canonical_profile_name)
-    if account_registry is None:
-        raise RuntimeError("❌ AWS account registry is required for declared execution identities")
-    expected_account_id = account_registry.get(account_key)
-    if expected_account_id is None:
-        raise RuntimeError(f"❌ AWS account registry has no key {account_key!r}")
-    if expected_account_id != canonical_account_id:
-        raise RuntimeError(
-            f"❌ AWS account registry maps {account_key!r} to {expected_account_id}, but canonical "
-            f"profile {canonical_profile_name!r} resolves to {canonical_account_id}"
-        )
-    override_name = aws_access_override_env_name(access_context_key)
-    selected_profile_name = os.getenv(override_name, "").strip() or canonical_profile_name
-    selected_account_id = resolve_configured_profile_account_id(selected_profile_name)
-    if selected_account_id != expected_account_id:
-        raise RuntimeError(
-            f"❌ AWS profile override {selected_profile_name!r} resolves to account {selected_account_id}, "
-            f"but canonical profile {canonical_profile_name!r} resolves to {expected_account_id}"
-        )
-
-    resolved["profile_name"] = selected_profile_name
-    resolved["expected_account_id"] = expected_account_id
-    return resolved
 
 
-def validate_profile_only_request(
+
+
+def validate_execution_identity_coverage(
     active_stages: dict,
     *,
-    allow_profile_only: bool,
-    profile_only_aws_profile: str | None,
+    execution_access_mode: str = "standard",
 ) -> None:
-    stages_with_identity = sorted(
-        stage_id for stage_id, stage in active_stages.items()
-        if stage.get("execution_identity_key") is not None
-    )
+    """Every stage declares its execution identity, always. The only run without
+    identities is bypass mode (--force-bypass-execution-identity + substitute
+    credential), which covers identity-less stages too."""
+    if execution_access_mode == "bypass":
+        return
     stages_without_identity = sorted(
         stage_id for stage_id, stage in active_stages.items()
         if stage.get("execution_identity_key") is None
     )
-
-    if profile_only_aws_profile and stages_with_identity:
+    if stages_without_identity:
         raise RuntimeError(
-            "❌ --aws-profile can be used only when every selected stage has no "
-            "execution_identity_key; declared execution identities cannot be overridden. "
-            f"Stages with identity: {', '.join(stages_with_identity)}"
-        )
-
-    if stages_with_identity and stages_without_identity:
-        raise RuntimeError(
-            "❌ selected stages mix declared execution_identity_key with missing identities. "
-            "Either declare execution_identity_key for every selected stage, or comment/remove it "
-            "from every selected stage and use profile-only fallback. "
-            f"With identity: {', '.join(stages_with_identity)}; "
-            f"without identity: {', '.join(stages_without_identity)}"
-        )
-
-    if not stages_without_identity:
-        return
-
-    rendered = ", ".join(stages_without_identity)
-    if not allow_profile_only:
-        raise RuntimeError(
-            "❌ selected stages have no execution_identity_key and profile-only fallback is not "
-            f"allowed by ctl cfg policy: {rendered}"
-        )
-    if not profile_only_aws_profile:
-        raise RuntimeError(
-            "❌ selected stages have no execution_identity_key and require --aws-profile because "
-            f"profile-only fallback is enabled for this ctl policy: {rendered}"
+            "❌ selected stages have no execution_identity_key: "
+            + ", ".join(stages_without_identity)
+            + "; declare it, or run with --force-bypass-execution-identity + --provider-credential"
         )
 
 
-def validate_active_stage_aws_access(
-    active_stages: dict,
-    execution_identities: dict,
-    aws_access_contexts: dict,
-    *,
-    execution_context: dict[str, object],
-    implementation_key: str,
-    account_registry: dict[str, str] | None = None,
-    allow_profile_only: bool = False,
-    profile_only_aws_profile: str | None = None,
-) -> dict[str, str]:
-    """Validate selected bindings and return the normalized account-key registry used by stages."""
-    validate_profile_only_request(
-        active_stages,
-        allow_profile_only=allow_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
-    )
-    if any(stage.get("execution_identity_key") is not None for stage in active_stages.values()):
-        if account_registry is None:
-            raise RuntimeError("❌ AWS account registry is required for declared execution identities")
-        expected_account_registry = dict(account_registry)
-    else:
-        expected_account_registry = account_registry or {}
-
-    validated_account_registry: dict[str, str] = {}
-    for stage_id, stage in active_stages.items():
-        resolved = resolve_stage_aws_access(
-            stage,
-            execution_identities,
-            aws_access_contexts,
-            execution_context=execution_context,
-            implementation_key=implementation_key,
-            account_registry=expected_account_registry,
-            allow_profile_only=allow_profile_only,
-            profile_only_aws_profile=profile_only_aws_profile,
-        )
-        if resolved is None:
-            continue
-        if resolved.get("profile_only") == "true":
-            logging.info(
-                "Using temporary explicit --aws-profile access for stage %s: profile=%s",
-                stage_id,
-                resolved["profile_name"],
-            )
-            continue
-        account_key = resolved["account_key"]
-        account_id = resolved["expected_account_id"]
-        previous = validated_account_registry.get(account_key)
-        if previous is not None and previous != account_id:
-            raise RuntimeError(
-                f"❌ Conflicting AWS account IDs for {account_key!r}: {previous} and {account_id}"
-            )
-        validated_account_registry[account_key] = account_id
-        logging.info(
-            "Validated AWS access for stage %s: execution_identity_key=%s account_key=%s "
-            "access_context_key=%s implementation_key=%s credential_provider_kind=%s",
-            stage_id,
-            resolved["execution_identity_key"],
-            account_key,
-            resolved["access_context_key"],
-            resolved["implementation_key"],
-            resolved["credential_provider_kind"],
-        )
-    return validated_account_registry
 
 
-def configure_stage_aws_env(
-    stage_id: str,
-    stage: dict,
-    stage_env: dict[str, str],
-    execution_identities: dict,
-    aws_access_contexts: dict,
-    *,
-    execution_context: dict[str, object],
-    implementation_key: str,
-    account_registry: dict[str, str],
-    allow_profile_only: bool = False,
-    profile_only_aws_profile: str | None = None,
-) -> None:
-    """Apply one stage's selected AWS access implementation and assertion metadata."""
-    for var_name in AWS_ACCESS_STAGE_ENV_VARS:
-        stage_env.pop(var_name, None)
-
-    for var_name in AWS_CREDENTIAL_ENV_VARS:
-        stage_env.pop(var_name, None)
-
-    resolved = resolve_stage_aws_access(
-        stage,
-        execution_identities,
-        aws_access_contexts,
-        execution_context=execution_context,
-        implementation_key=implementation_key,
-        account_registry=account_registry,
-        allow_profile_only=allow_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
-    )
-    if resolved is None:
-        return
-
-    stage_env["AWS_EC2_METADATA_DISABLED"] = "true"
-    stage_env["AWS_PROFILE"] = resolved["profile_name"]
-    stage_env["ATLAS_AWS_ASSERT_ACCESS"] = "true"
-    stage_env["ATLAS_EXECUTION_IDENTITY_KEY"] = resolved["execution_identity_key"]
-
-    if resolved.get("profile_only") == "true":
-        stage_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"] = "true"
-        logging.info(
-            "Resolved temporary explicit --aws-profile access for stage %s: profile=%s",
-            stage_id,
-            resolved["profile_name"],
-        )
-        return
-
-    stage_env["ATLAS_AWS_ACCOUNT_KEY"] = resolved["account_key"]
-    stage_env["ATLAS_AWS_ACCESS_CONTEXT_KEY"] = resolved["access_context_key"]
-    stage_env["ATLAS_AWS_IMPLEMENTATION_KEY"] = resolved["implementation_key"]
-    stage_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"] = resolved["expected_account_id"]
-    if resolved.get("permission_set_name"):
-        stage_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"] = resolved["permission_set_name"]
-    if resolved.get("role_name"):
-        stage_env["ATLAS_AWS_EXPECT_ROLE_NAME"] = resolved["role_name"]
-
-    logging.info(
-        "Resolved AWS access for stage %s: execution_identity_key=%s account_key=%s "
-        "access_context_key=%s implementation_key=%s credential_provider_kind=%s expected_account_id=%s",
-        stage_id,
-        resolved["execution_identity_key"],
-        resolved["account_key"],
-        resolved["access_context_key"],
-        resolved["implementation_key"],
-        resolved["credential_provider_kind"],
-        resolved["expected_account_id"],
-    )
 
 
 def merge_config_dirs(
@@ -2002,9 +1618,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
     )
     parser.add_argument(
-        "--aws-profile",
+        "--provider-credential",
+        dest="provider_credential",
         default=None,
-        help="Temporary profile-only fallback for runs where every selected stage lacks execution_identity_key",
+        help="Substitute provider credential (an opaque provider-specific selector, "
+        "e.g. a local profile name); required with and only valid together with "
+        "--force-bypass-execution-identity",
     )
     parser.add_argument(
         "--plt-overlays",
@@ -2033,12 +1652,54 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         type=parse_selector_arg,
         help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
     )
+    # Execution access is a provider-neutral MODE (§12): standard (normal
+    # execution access the adapter materializes), direct (approved
+    # bootstrap/recovery access from the identity's direct source), bypass
+    # (forced substitute credential, identity checks bypassed). Neither flag =
+    # standard; the two flags are mutually exclusive.
     parser.add_argument(
-        "--skip-ctl-state-backend-sync",
+        "--agreed-use-direct-execution-access",
         action="store_true",
-        help="Run without ctl-state backend sync; honored only when the ctl profile "
-        "sets allow_skip_ctl_state_backend_sync: true AND no active target declares "
-        "a ctl_state_backend_key (a declared state domain always syncs)",
+        dest="use_direct_execution_access",
+        help="Use DIRECT execution access: each stage runs with its identity's "
+        "direct_credential_source_key profile (account-id + principal checked, no role "
+        "chain); requires the ctl profile to allow the 'direct' mode and every active "
+        "target to set allow_direct_execution_access: true",
+    )
+    parser.add_argument(
+        "--force-bypass-execution-identity",
+        action="store_true",
+        dest="bypass_execution_identity",
+        help="BYPASS execution identity (whole-run emergency/debug): every stage runs "
+        "with the --provider-credential substitute credential; identity cfg is not "
+        "resolved and nothing is checked; requires the ctl profile to allow the 'bypass' "
+        "mode and --provider-credential",
+    )
+    # Execution runtime (§Phase 26): WHERE CTL produces each stage's clean box.
+    # One runtime per run; CTL owns the box, the stage only declares its image.
+    parser.add_argument(
+        "--runtime",
+        choices=KNOWN_RUNTIMES,
+        default=DEFAULT_RUNTIME,
+        help="Execution runtime: 'local' builds a fresh Docker box per stage on this "
+        "machine; 'ci' runs each stage on the GitHub Actions runner (no Docker-in-"
+        "Docker). Must be allowed by the ctl profile (allowed_runtimes) and supported "
+        "by every active stage (stage.yaml runtime.supported_runtimes).",
+    )
+    parser.add_argument(
+        "--agreed-skip-ctl-state-backend-sync",
+        action="store_true",
+        dest="agreed_skip_ctl_state_backend_sync",
+        help="Skip syncing local ctl-state to the ctl-state backend (backend bucket or "
+        "synchronizer role missing); requires profile allow_agreed_skip_ctl_state_backend_sync "
+        "and every active target to declare the skip_ctl_state_backend_sync key",
+    )
+    parser.add_argument(
+        "--force-skip-ctl-state-backend-sync",
+        action="store_true",
+        dest="force_skip_ctl_state_backend_sync",
+        help="Blanket override: skip ctl-state backend sync for EVERY active target, "
+        "ignoring target keys; requires profile allow_force_skip_ctl_state_backend_sync",
     )
 
     if run_type == "workflow":
@@ -2475,11 +2136,6 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         if not isinstance(sub_workflow, str) or not sub_workflow:
             raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'sub_workflow_key'")
 
-        for legacy_field in ("aws_account_key", "aws_access_context_key"):
-            if legacy_field in target_def:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} uses deprecated {legacy_field}; use execution_identity_key"
-                )
         execution_identity_key = target_def.get("execution_identity_key")
         if execution_identity_key is not None and (
             not isinstance(execution_identity_key, str) or not execution_identity_key.strip()
@@ -2511,8 +2167,38 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
                     f"❌ target {target_name!r} ctl_state_backend_key must be a non-empty string"
                 )
             resolved["ctl_state_backend_key"] = ctl_state_backend_key.strip()
-        if target_def.get("provisions_ctl_state_bucket") is True:
-            resolved["provisions_ctl_state_bucket"] = True
+        if "provisions_ctl_state_bucket" in target_def:
+            raise RuntimeError(
+                f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
+                "use provisions_ctl_state_backend"
+            )
+        if target_def.get("provisions_ctl_state_backend") is True:
+            resolved["provisions_ctl_state_backend"] = True
+        for legacy_flag in (  # removed keys
+            "allow_skip_ctl_entry",
+            "allow_skip_ctl_state_sync",
+            "skip_ctl_role_chain",  # removed
+            "execution_access_modes",
+        ):
+            if legacy_flag in target_def:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} uses removed {legacy_flag}; "
+                    "use allow_direct_execution_access (§12) for access, "
+                    "skip_ctl_state_backend_sync for sync"
+                )
+        # ctl-state sync stays a skip key (an operation opt-in)
+        if "skip_ctl_state_backend_sync" in target_def:
+            expected_ref = "${execution_context.ctl.agreed_skip_ctl_state_backend_sync}"
+            if target_def["skip_ctl_state_backend_sync"] != expected_ref:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} skip_ctl_state_backend_sync must be exactly {expected_ref!r} "
+                    "(presence = skip-capable; the VALUE is always the run's ctl decision, never a literal)"
+                )
+            resolved["skip_ctl_state_backend_sync"] = target_def["skip_ctl_state_backend_sync"]
+        # allow_direct_execution_access: does the target opt into DIRECT mode (§12); default False
+        if "allow_direct_execution_access" in target_def:
+            target_allows_direct_execution_access(target_def)  # validate
+            resolved["allow_direct_execution_access"] = target_def["allow_direct_execution_access"]
         if "selectors" in target_def:
             resolved["selectors"] = target_def["selectors"]
         if "required_plt_overlay_keys" in target_def:
@@ -3387,7 +3073,7 @@ def selector_expected_values(expected, *, label: str) -> list[str]:
 
 
 EXECUTION_CONTEXT_ROOT = "execution_context"
-EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params")
+EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params", "provider")
 EXECUTION_CONTEXT_REF_RE = re.compile(
     rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})\.[A-Za-z_][A-Za-z0-9_]*$"
 )
@@ -3552,6 +3238,9 @@ def build_execution_context(
     action: str | None,
     ctl_profile: str | None,
     execution_params: dict[str, str],
+    execution_access_mode: str = "standard",
+    agreed_skip_ctl_state_backend_sync: bool = False,
+    force_skip_ctl_state_backend_sync: bool = False,
 ) -> dict[str, object]:
     """Build the flat dotted execution context: the closed, namespaced facts of
     this execution. Two namespaces — `ctl` (promoted engine args) and `params`
@@ -3568,6 +3257,9 @@ def build_execution_context(
         put("ctl", "action", action, label="promoted --action")
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
+    put("ctl", "execution_access_mode", execution_access_mode, label="promoted execution access mode")
+    put("ctl", "agreed_skip_ctl_state_backend_sync", bool(agreed_skip_ctl_state_backend_sync), label="promoted --agreed-skip-ctl-state-backend-sync")
+    put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
 
     # cfg-declared params are inserted first (so they lead the rendered
     # context), but CLI values are staged up front so cfg params may still
@@ -3607,6 +3299,8 @@ def build_execution_context(
     for key, value in staged_cli.items():
         put("params", key, value, label=f"--execution-params {key}")
     return context
+
+
 
 
 def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -3877,7 +3571,6 @@ def verify_guarded_value(
 
 
 CTL_STATE_BACKENDS_GUARD_PREFIX = "ctl_state_backends."
-CTL_STATE_BUCKETS_GUARD_PREFIX = "ctl_state_buckets."  # legacy guard ref alias
 EXECUTION_CONTEXT_PARAMS_PREFIX = "execution_context.params."
 CTL_STATE_BACKENDS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
 
@@ -3894,15 +3587,13 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
     value = ref.strip()
-    if value.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX) or value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
+    if value.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
         parts = value.split(".")
         if len(parts) != 3 or parts[2] not in CTL_STATE_BACKENDS_GUARDABLE_FIELDS:
             raise RuntimeError(
                 f"❌ {label}: {value!r} must be ctl_state_backends.<domain>."
                 f"<{'|'.join(CTL_STATE_BACKENDS_GUARDABLE_FIELDS)}>"
             )
-        if value.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
-            return CTL_STATE_BACKENDS_GUARD_PREFIX + value[len(CTL_STATE_BUCKETS_GUARD_PREFIX):]
         return value
     value = validate_execution_context_ref(value, label=label)
     _, namespace, _ = value.split(".", 2)
@@ -3923,9 +3614,7 @@ def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dic
     param-driven variation stays free (params are ctl-owned; main_tag is
     guarded separately as a context ref). Context refs read the execution
     context directly."""
-    if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX) or ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
-        if ref.startswith(CTL_STATE_BUCKETS_GUARD_PREFIX):
-            ref = CTL_STATE_BACKENDS_GUARD_PREFIX + ref[len(CTL_STATE_BUCKETS_GUARD_PREFIX):]
+    if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
         _, domain, field = ref.split(".")
         buckets = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
         entry = buckets.get(domain)
@@ -4851,19 +4540,14 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
 def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
     """Load the optional ctl-state backend registry.
 
-    Canonical schema is ``ctl_state_backends``:
+    Schema is ``ctl_state_backends``:
     {domain: {provider, backend_type, bucket_name, bucket_region,
-    [execution_identity_key]}}. ``ctl_state_buckets`` is accepted as a
-    temporary compatibility alias for older cfg and is normalized to AWS/S3.
+    [execution_identity_key]}}.
     """
     merged: dict = {}
     seen_sources: dict[str, Path] = {}
-    sections = list(collect_top_level_sections(ctl_cfg_root, "ctl_state_backends"))
-    legacy_sections = list(collect_top_level_sections(ctl_cfg_root, "ctl_state_buckets"))
-    if sections and legacy_sections:
-        raise RuntimeError("❌ ctl cfg must not define both ctl_state_backends and legacy ctl_state_buckets")
-    section_name = "ctl_state_backends" if sections else "ctl_state_buckets"
-    entries = sections if sections else legacy_sections
+    section_name = "ctl_state_backends"
+    entries = list(collect_top_level_sections(ctl_cfg_root, section_name))
     for path, section in entries:
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ {section_name} must be a mapping: {path}")
@@ -4880,19 +4564,14 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
             unknown = set(entry) - allowed
             if unknown:
                 raise RuntimeError(f"❌ {section_name}.{domain} has unsupported keys {sorted(unknown)}: {path}")
-            provider = entry.get("provider", "aws" if section_name == "ctl_state_buckets" else None)
-            backend_type = entry.get("backend_type", "s3" if section_name == "ctl_state_buckets" else None)
+            provider = entry.get("provider")
+            backend_type = entry.get("backend_type")
             for field, value in (("provider", provider), ("backend_type", backend_type)):
                 if not isinstance(value, str) or not value.strip():
                     raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
             for field in ("bucket_name", "bucket_region"):
                 if not isinstance(entry.get(field), str) or not entry[field].strip():
                     raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
-            if provider.strip() != "aws" or backend_type.strip() != "s3":
-                raise RuntimeError(
-                    f"❌ {section_name}.{domain} provider/backend_type {provider!r}/{backend_type!r} is not supported yet; "
-                    "available ctl-state backend: aws/s3"
-                )
             resolved = {
                 "provider": provider.strip(),
                 "backend_type": backend_type.strip(),
@@ -4910,134 +4589,9 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
             seen_sources[domain] = path
     return merged or None
 
-def ctl_allows_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
-    """Profile policy bool: may a run skip the ctl-state backend sync?
-
-    Absent = false (strict). This only *permits* the per-run
-    --skip-ctl-state-backend-sync decision; skipping additionally requires that no
-    active target declares a ctl_state_backend_key (the sync-skip triad, mirroring
-    the profile-only identity fallback)."""
-    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    value = policy.get("allow_skip_ctl_state_backend_sync", False)
-    if not isinstance(value, bool):
-        raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allow_skip_ctl_state_backend_sync must be a bool: {value!r}"
-        )
-    return value
 
 
-class CtlStateSyncer:
-    """Incremental mirror of the local ctl-state tree to the domain bucket.
-
-    Forward sync is add/update only — never deletes remote objects (the local
-    root is ephemeral; remote cleanup is bucket lifecycle rules only).
-    """
-
-    STATE_LAYER_INCLUDES = ("*/RUN.yaml", "*/STATUS.yaml", "*/MANIFEST.yaml")
-
-    def __init__(self, results_root: Path, bucket_name: str, bucket_region: str, aws_profile: str, *, required: bool):
-        self.results_root = Path(results_root).resolve()
-        self.bucket_name = bucket_name
-        self.bucket_region = bucket_region
-        self.aws_profile = aws_profile
-        self.required = required
-        self.state = "pending"
-        self.detail: str | None = None
-        self.ready = False
-
-    def _aws_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        env["AWS_PROFILE"] = self.aws_profile
-        return env
-
-    def _run_aws(self, args: list[str]) -> subprocess.CompletedProcess:
-        # Region is explicit (ctl-owned registry), never the profile default.
-        return subprocess.run(
-            ["aws", "--region", self.bucket_region, *args],
-            env=self._aws_env(),
-            capture_output=True,
-            text=True,
-        )
-
-    def bucket_exists(self) -> bool:
-        result = self._run_aws(["s3api", "head-bucket", "--bucket", self.bucket_name])
-        return result.returncode == 0
-
-    def _fail(self, action: str, detail: str) -> None:
-        self.state = "failed"
-        self.detail = f"{action}: {detail}"
-        message = f"ctl-state sync {action} failed for s3://{self.bucket_name}: {detail}"
-        if self.required:
-            raise RuntimeError(f"❌ {message}")
-        logging.warning("%s (sync not strict; continuing)", message)
-
-    def ensure_ready(self, reason: str) -> bool:
-        """Confirm the bucket exists, re-checked at every sync point (not once at
-        run start). On first confirmation, hydrate the state layer. A run that
-        *creates* its bucket therefore mirrors itself at finalization; only a run
-        whose bucket never appears stays local. Mirrors `terraform init
-        -migrate-state`: create with a local backend, migrate in once it exists."""
-        if self.ready:
-            return True
-        if not self.bucket_exists():
-            self.state = "local"
-            self.detail = f"{reason}: bucket s3://{self.bucket_name} not present yet"
-            if self.required:
-                logging.warning(
-                    "ctl-state bucket s3://%s not present at %r; results stay local (bootstrap run?)",
-                    self.bucket_name,
-                    reason,
-                )
-            return False
-        self.ready = True
-        self.pull_state_layer()
-        return True
-
-    def pull_state_layer(self) -> None:
-        """Reverse sync: hydrate slots + RUN/STATUS/MANIFEST from the bucket (small files only)."""
-        args = ["s3", "sync", f"s3://{self.bucket_name}", str(self.results_root), "--exclude", "*"]
-        for pattern in self.STATE_LAYER_INCLUDES:
-            args += ["--include", pattern]
-        result = self._run_aws(args)
-        if result.returncode != 0:
-            self._fail("state pull", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
-        else:
-            logging.info("Ctl results state layer pulled from s3://%s", self.bucket_name)
-
-    def push(self, reason: str) -> None:
-        """Forward incremental mirror of the whole local results tree (never deletes)."""
-        if not self.ensure_ready(f"push ({reason})"):
-            return
-        result = self._run_aws(["s3", "sync", str(self.results_root), f"s3://{self.bucket_name}", "--no-progress"])
-        if result.returncode != 0:
-            self._fail(f"push ({reason})", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
-        else:
-            self.state = "synced"
-            self.detail = reason
-            logging.info("Ctl-state synced to s3://%s (%s)", self.bucket_name, reason)
-
-    def remove_prefix(self, rel_prefix: str) -> None:
-        """Explicit slot-transition removal of one remote prefix.
-
-        Distinct from the mirror (which never deletes): state slots are
-        pointers, and a slot removed locally must not linger remotely.
-        """
-        if not self.ensure_ready(f"slot removal ({rel_prefix})"):
-            return
-        result = self._run_aws(
-            ["s3", "rm", f"s3://{self.bucket_name}/{rel_prefix.strip('/')}", "--recursive"]
-        )
-        if result.returncode != 0:
-            self._fail(f"slot removal ({rel_prefix})", result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error")
-
-    def summary(self) -> dict[str, str]:
-        payload = {"mode": "enabled", "bucket": self.bucket_name, "state": self.state}
-        if self.detail:
-            payload["detail"] = self.detail
-        return payload
-
-
-_CTL_STATE_SYNCER: CtlStateSyncer | None = None
+_CTL_STATE_SYNCER = None
 _CTL_STATE_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
 
 
@@ -5048,12 +4602,12 @@ def configure_ctl_state_sync(
     execution_context: dict[str, object],
     run_dir: Path,
     *,
-    skip_ctl_state_backend_sync: bool,
-    provisions_ctl_state_bucket: bool = False,
-    profile_only_aws_profile: str | None = None,
-    execution_identities: dict | None = None,
-    aws_access_contexts: dict | None = None,
-    aws_implementation_key: str = "local",
+    agreed_skip_ctl_state_backend_sync: bool = False,
+    force_skip_ctl_state_backend_sync: bool = False,
+    provisions_ctl_state_backend: bool = False,
+    execution_access_mode: str = "standard",
+    provider_credential: str | None = None,
+    provider_implementation_key: str = "local",
 ) -> dict[str, str] | None:
     """Resolve the run's ctl-state bucket (by domain) and arm the global syncer.
 
@@ -5062,53 +4616,49 @@ def configure_ctl_state_sync(
     execution-context involvement. Existence is re-checked at each sync point, so
     a bucket-creating run mirrors itself at finalization.
 
-    Skip semantics — a three-condition triad, mirroring the profile-only identity
-    fallback: sync is skipped only when the profile allows it
-    (allow_skip_ctl_state_backend_sync: true), no active target declares a
-    ctl_state_backend_key (domain is None), AND --skip-ctl-state-backend-sync is
-    passed. A declared domain always syncs (the arg is rejected); a missing
-    domain never syncs silently (the skip must be explicit).
+    Skip semantics: ctl-state sync may be skipped only when the selected ctl
+    profile, the active target set, and the per-run flag all allow the exception.
+    A declared domain normally syncs; a backend-provisioning target may tolerate
+    a missing bucket at run start only when the per-run skip flag is set.
     """
     global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE
     _CTL_STATE_SYNCER = None
     _CTL_STATE_SYNC_NOTE = {"mode": "disabled"}
 
+    # Skip actions are permission/target-validated upstream (validate_skip_requests);
+    # here they only select behavior.
+    sync_skip = agreed_skip_ctl_state_backend_sync or force_skip_ctl_state_backend_sync
+
     buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
     if buckets is None and domain is None:
         # Consumer has no ctl-state feature at all: nothing to sync or skip.
-        if skip_ctl_state_backend_sync:
-            logging.info("--skip-ctl-state-backend-sync has no effect: no ctl_state_backends registry defined")
+        if sync_skip:
+            logging.info("ctl-state sync skip has no effect: no ctl_state_backends registry defined")
         return None
     if domain is not None and buckets is None:
         raise RuntimeError(
             f"❌ targets declare ctl_state_backend_key {domain!r} but no ctl_state_backends registry is defined"
         )
 
-    allow_skip = ctl_allows_skip_ctl_state_backend_sync(ctl_cfg_root, ctl_profile)
-    if skip_ctl_state_backend_sync and not allow_skip:
-        raise RuntimeError(
-            "❌ --skip-ctl-state-backend-sync is not allowed: ctl profile sets "
-            "allow_skip_ctl_state_backend_sync: false"
-        )
+    if force_skip_ctl_state_backend_sync:
+        _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "force_skip"}
+        return None
 
     if domain is None:
-        # No active target declares a state domain (keys commented, dev cfg).
-        if not skip_ctl_state_backend_sync:
+        # No active target declares a state domain. This is allowed only by an
+        # explicit run-level skip request that was validated against target policy.
+        if not sync_skip:
             raise RuntimeError(
                 "❌ no active target declares ctl_state_backend_key; pass "
-                "--skip-ctl-state-backend-sync to run without ctl-state sync "
+                "--agreed-skip-ctl-state-backend-sync to run without ctl-state sync "
                 "(or restore the keys)"
             )
         _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "no_domain"}
         return None
 
-    if skip_ctl_state_backend_sync:
-        raise RuntimeError(
-            f"❌ --skip-ctl-state-backend-sync is not allowed: active targets declare "
-            f"ctl_state_backend_key {domain!r} — a declared state domain always syncs"
-        )
-
     entry = buckets[domain]  # domain existence validated by resolve_run_domain
+    backend_adapter = get_provider_adapter(entry["provider"])
+    backend_adapter.validate_state_backend_entry(domain, entry, ctl_cfg_root)
     bucket_name = str(
         resolve_runtime_scalar(
             entry["bucket_name"], execution_context, label=f"ctl_state_backends.{domain}.bucket_name"
@@ -5117,37 +4667,25 @@ def configure_ctl_state_sync(
     bucket_region = entry["bucket_region"]
     result = {"domain": domain, "bucket_name": bucket_name, "bucket_region": bucket_region}
 
-    # Resolve the writer's AWS profile. The registry entry declares an
-    # execution_identity_key or omits it — mirroring stages: a declared identity
-    # is resolved (and --aws-profile never overrides it); an omitted one falls
-    # back to the run's --aws-profile, but only under a profile that permits
-    # profile-only access (e.g. local dev).
+    # Resolve the synchronizer credential through the backend's provider
+    # adapter. Identity-bypass runs use the substitute credential; otherwise the
+    # backend's declared identity resolves in DIRECT mode. The chain-mode sync
+    # leg (entry -> runner -> synchronizer role) lands with the member-account
+    # roles implementation (Phase 6).
     identity_key = entry.get("execution_identity_key")
-    if identity_key:
-        identities = execution_identities if execution_identities is not None else load_execution_identities_cfg(ctl_cfg_root)
-        contexts = aws_access_contexts if aws_access_contexts is not None else load_aws_access_contexts_cfg(ctl_cfg_root)
-        account_registry = load_aws_account_registry_cfg(ctl_cfg_root)
-        resolved = resolve_stage_aws_access(
-            {"execution_identity_key": identity_key},
-            identities,
-            contexts,
-            execution_context=execution_context,
-            implementation_key=aws_implementation_key,
-            account_registry=account_registry,
-        )
-        if not resolved or not resolved.get("profile_name"):
-            raise RuntimeError(
-                f"❌ ctl-state writer identity {identity_key!r} did not resolve to an AWS profile"
-            )
-        writer_profile = resolved["profile_name"]
-    elif ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile) and profile_only_aws_profile:
-        writer_profile = profile_only_aws_profile.strip()
-    else:
+    if identity_key is None and execution_access_mode != "bypass":
         raise RuntimeError(
             f"❌ ctl_state_backends.{domain} declares no execution_identity_key; "
-            f"provide --aws-profile under a profile that allows profile-only access, "
-            f"or add an execution_identity_key"
+            f"add one, or run with --force-bypass-execution-identity + --provider-credential"
         )
+    synchronizer_credential = backend_adapter.resolve_synchronizer_credential(
+        identity_key,
+        ctl_cfg_root,
+        execution_context=execution_context,
+        implementation_key=provider_implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+    )
 
     results_root_value = load_run_metadata(run_dir).get("ctl_state_local_root")
     if not isinstance(results_root_value, str) or not results_root_value:
@@ -5156,19 +4694,20 @@ def configure_ctl_state_sync(
     # A declared domain always syncs: the syncer is strict and a missing bucket is
     # a hard error unless this run provisions it. Existence is re-checked at every
     # sync point, so a bootstrap run mirrors itself once the bucket exists.
-    syncer = CtlStateSyncer(
+    syncer = backend_adapter.create_state_syncer(
         Path(results_root_value),
         bucket_name,
         bucket_region,
-        writer_profile,
+        synchronizer_credential,
         required=True,
     )
     _CTL_STATE_SYNCER = syncer
     bucket_ready = syncer.ensure_ready("run started")
-    if not bucket_ready and not provisions_ctl_state_bucket:
+    if not bucket_ready and not (provisions_ctl_state_backend and sync_skip):
         raise RuntimeError(
-            f"❌ ctl-state bucket s3://{bucket_name} ({bucket_region}) not found; "
-            f"provision it via the ctl-state bootstrap target first"
+            f"❌ ctl-state backend bucket {bucket_name!r} ({bucket_region}) not found; "
+            f"provision it via the ctl-state backend target first, or pass "
+            f"--agreed-skip-ctl-state-backend-sync for a target/profile that explicitly allows it"
         )
     syncer.push("run started")
     _CTL_STATE_SYNC_NOTE = syncer.summary()
@@ -5424,13 +4963,12 @@ def prepare_stage_repo(
     stage: dict,
     run_dir: Path,
     tooling_env: dict[str, str],
-    execution_identities: dict | None = None,
-    aws_access_contexts: dict | None = None,
-    aws_account_registry: dict[str, str] | None = None,
+    provider_adapter=None,
+    provider_catalogs: dict | None = None,
     execution_context: dict[str, object] | None = None,
-    aws_implementation_key: str | None = None,
-    allow_aws_profile_only: bool = False,
-    profile_only_aws_profile: str | None = None,
+    provider_implementation_key: str | None = None,
+    execution_access_mode: str = "standard",
+    provider_credential: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Clone/copy a stage repo, materialize child modules, and prepare its execution env."""
     repo_path = run_dir / "stages_source" / stage_id
@@ -5459,25 +4997,19 @@ def prepare_stage_repo(
     stage_env = os.environ.copy()
     stage_env.update(tooling_env)
     stage_env["ATLAS_STAGE_UTILS_DIR"] = str(materialize_stage_utils(run_dir).parent)
-    if aws_access_contexts is not None:
-        if (
-            execution_identities is None
-            or aws_account_registry is None
-            or execution_context is None
-            or aws_implementation_key is None
-        ):
-            raise RuntimeError("❌ incomplete AWS access context for stage preparation")
-        configure_stage_aws_env(
+    if provider_adapter is not None:
+        if provider_catalogs is None or execution_context is None or provider_implementation_key is None:
+            raise RuntimeError("❌ incomplete provider inputs for stage preparation")
+        provider_adapter.materialize_stage_binding(
             stage_id,
             stage,
             stage_env,
-            execution_identities,
-            aws_access_contexts,
+            provider_catalogs,
             execution_context=execution_context,
-            implementation_key=aws_implementation_key,
-            account_registry=aws_account_registry,
-            allow_profile_only=allow_aws_profile_only,
-            profile_only_aws_profile=profile_only_aws_profile,
+            implementation_key=provider_implementation_key,
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+                run_dir=run_dir,
         )
     return repo_path, stage_env
 
@@ -5503,6 +5035,17 @@ def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo
         env_sh = runtime_cfg.get("env_sh", True)
         if not isinstance(values_json, bool) or not isinstance(env_sh, bool):
             raise RuntimeError(f"Stage metadata runtime flags must be booleans: {stage_meta_path}")
+        # Phase 26: the stage declares its BOX (image + docker capability), CTL owns
+        # how the box is run. image is required; docker_build defaults false.
+        image = runtime_cfg.get("image")
+        if not isinstance(image, str) or image not in STAGE_IMAGES:
+            raise RuntimeError(
+                f"Stage metadata runtime.image must be one of {sorted(STAGE_IMAGES)}: {stage_meta_path}"
+            )
+        docker_build = runtime_cfg.get("docker_build", False)
+        if not isinstance(docker_build, bool):
+            raise RuntimeError(f"Stage metadata runtime.docker_build must be a boolean: {stage_meta_path}")
+        supported_runtimes = stage_supported_runtimes(runtime_cfg, label=str(stage_meta_path))
         cfg_files = stage_meta.get("cfg_files", [])
         if cfg_files is None:
             cfg_files = []
@@ -5517,6 +5060,9 @@ def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo
                 "runtime": {
                     "values_json": values_json,
                     "env_sh": env_sh,
+                    "image": image,
+                    "docker_build": docker_build,
+                    "supported_runtimes": sorted(supported_runtimes),
                 },
                 "env_vars": {
                     "inventory": {},
@@ -5610,6 +5156,13 @@ def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]
     return key_var, uri_var
 
 
+def _stage_box_name(stage_id: str, repo_stage_id: str) -> str:
+    """A valid, unique-per-run Docker tag / box name for a stage (§Phase 26)."""
+    raw = f"atlas-{stage_id}-{repo_stage_id}-stage-local"
+    name = re.sub(r"[^a-z0-9._-]+", "-", raw.lower())
+    return re.sub(r"-{2,}", "-", name).strip("-")
+
+
 def run_stages(
     active_stages: dict,
     run_dir: Path,
@@ -5620,17 +5173,22 @@ def run_stages(
     run_id: str,
     tooling_refs: dict,
     use_local_tooling_cfg: bool,
-    execution_identities: dict,
-    aws_access_contexts: dict,
-    aws_account_registry: dict[str, str],
-    aws_implementation_key: str,
-    allow_aws_profile_only: bool,
-    profile_only_aws_profile: str | None,
+    provider_adapter,
+    provider_catalogs: dict,
+    provider_implementation_key: str,
+    execution_access_mode: str = "standard",
+    provider_credential: str | None = None,
+    runtime: str = DEFAULT_RUNTIME,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
-    stage_runner_script = "local_dev.sh" if use_local_tooling_cfg else "local.sh"
+    # Phase 26: CTL owns the execution box. It invokes the ctl-owned runtime
+    # dispatcher (run_stage.sh) — never a per-stage run script — passing the box
+    # spec the stage declared (image / docker_build) plus the active runtime and
+    # tooling source. The stage carries only src/stage.sh + stage.yaml.
+    runtime_dispatcher = str(materialize_stage_utils(run_dir) / "run_stage.sh")
+    tooling_mode = "repo_path" if use_local_tooling_cfg else "repo_url"
     mutation_marked = False
     for stage_id, stage in active_stages.items():
         log_stage_banner(f"[{inventory_name}] [{stage_id}]")
@@ -5639,14 +5197,13 @@ def run_stages(
             stage,
             run_dir,
             tooling_env,
-            execution_identities=execution_identities,
-            aws_access_contexts=aws_access_contexts,
-            aws_account_registry=aws_account_registry,
+            provider_adapter=provider_adapter,
+            provider_catalogs=provider_catalogs,
             execution_context=execution_context,
-            aws_implementation_key=aws_implementation_key,
-            allow_aws_profile_only=allow_aws_profile_only,
-            profile_only_aws_profile=profile_only_aws_profile,
-        )
+            provider_implementation_key=provider_implementation_key,
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+            )
 
         workflow_name = stage.get("workflow")
         if not isinstance(workflow_name, str) or not workflow_name:
@@ -5683,19 +5240,36 @@ def run_stages(
                 repo_stage_id = repo_stage["id"]
                 repo_stage_path = repo_stage["path"]
                 log_stage_banner(f"[{inventory_name}] [{stage_id}] [{repo_stage_id}]", ch="-")
-                stage_run_cmd = [f"./{repo_stage_path}/run/{stage_runner_script}"]
+                repo_stage_runtime = repo_stage.get("runtime", {})
+                supported = set(repo_stage_runtime.get("supported_runtimes", KNOWN_RUNTIMES))
+                if runtime not in supported:
+                    raise RuntimeError(
+                        f"❌ runtime {runtime!r} not supported by stage "
+                        f"{stage_id}/{repo_stage_id} (supported: {sorted(supported)})"
+                    )
+                stage_run_cmd = [runtime_dispatcher]
                 repo_stage_env = dict(stage_env)
                 repo_stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
                 repo_stage_env["cfg_files"] = json.dumps(repo_stage.get("cfg_files"))
                 repo_stage_env["STAGE_WRITE_VALUES_JSON"] = (
-                    "true" if repo_stage.get("runtime", {}).get("values_json", True) else "false"
+                    "true" if repo_stage_runtime.get("values_json", True) else "false"
                 )
                 repo_stage_env["STAGE_WRITE_ENV_SH"] = (
-                    "true" if repo_stage.get("runtime", {}).get("env_sh", True) else "false"
+                    "true" if repo_stage_runtime.get("env_sh", True) else "false"
                 )
                 repo_stage_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
                 repo_stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
                 repo_stage_env["STAGE_ARTIFACTS_DIR"] = str(stage_artifacts_dir)
+                # Phase 26: CTL owns the box; hand the dispatcher the runtime + the
+                # stage's declared box spec. stage_dir locates src/stage.sh in the repo.
+                repo_stage_env["ATLAS_STAGE_RUNTIME"] = runtime
+                repo_stage_env["ATLAS_STAGE_NAME"] = _stage_box_name(stage_id, repo_stage_id)
+                repo_stage_env["ATLAS_STAGE_IMAGE"] = repo_stage_runtime["image"]
+                repo_stage_env["ATLAS_STAGE_DOCKER_BUILD"] = (
+                    "true" if repo_stage_runtime.get("docker_build", False) else "false"
+                )
+                repo_stage_env["stage_dir"] = repo_stage_path
+                repo_stage_env["local_stage_tooling_mode"] = tooling_mode
 
                 logging.info(" ".join(stage_run_cmd))
                 run_and_log(
@@ -5732,13 +5306,15 @@ def run_maintenance(
     stage_repo_key: str,
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
-    aws_implementation_key: str,
+    provider_implementation_key: str,
     run_dir: Path,
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
-    profile_only_aws_profile: str | None,
-    skip_ctl_state_backend_sync: bool = False,
+    provider_credential: str | None,
+    agreed_skip_ctl_state_backend_sync: bool = False,
+    force_skip_ctl_state_backend_sync: bool = False,
+    execution_access_mode: str = "standard",
 ) -> None:
     """Run a maintenance action against a single stage target."""
     if maintenance_action == "force-unlock" and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir):
@@ -5750,12 +5326,28 @@ def run_maintenance(
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        execution_access_mode=execution_access_mode,
     )
     scope_params = scope_params_from_context(execution_context)
     validate_execution_context_constraints(ctl_cfg_root, execution_context)
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+    maintenance_workflow_cfg = {"stages": [{"target": stage_target}]}
+    validate_target_policy_constraints(ctl_cfg_root, ctl_profile, maintenance_workflow_cfg, inventory_cfg)
+    validate_execution_access(
+        ctl_cfg_root,
+        ctl_profile,
+        maintenance_workflow_cfg,
+        inventory_cfg,
+        execution_context=execution_context,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+    )
     ctl_state_domain = resolve_run_domain(
-        {"stages": [{"target": stage_target}]},
+        maintenance_workflow_cfg,
         inventory_cfg,
         load_ctl_state_backends_cfg(ctl_cfg_root),
     )
@@ -5765,9 +5357,11 @@ def run_maintenance(
         ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_state_backend_sync=skip_ctl_state_backend_sync,
-        profile_only_aws_profile=profile_only_aws_profile,
-        aws_implementation_key=aws_implementation_key,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+        provider_implementation_key=provider_implementation_key,
     )
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
@@ -5818,19 +5412,15 @@ def run_maintenance(
     )
 
     validate_stages_have_commits(active_stages, ctl_ref_policy)
-    execution_identities = load_execution_identities_cfg(ctl_cfg_root)
-    aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    aws_account_registry_cfg = load_aws_account_registry_cfg(ctl_cfg_root)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
-    aws_account_registry = validate_active_stage_aws_access(
+    provider_adapter = run_provider_adapter(execution_context)
+    provider_catalogs = provider_adapter.load_runtime_catalogs(ctl_cfg_root)
+    provider_adapter.validate_active_stage_access(
         active_stages,
-        execution_identities,
-        aws_access_contexts,
+        provider_catalogs,
         execution_context=execution_context,
-        implementation_key=aws_implementation_key,
-        account_registry=aws_account_registry_cfg,
-        allow_profile_only=allow_aws_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
+        implementation_key=provider_implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
     plt_stages_dir_path = run_cfg_distribution(
@@ -5853,19 +5443,16 @@ def run_maintenance(
         stage,
         run_dir,
         tooling_env,
-        execution_identities=execution_identities,
-        aws_access_contexts=aws_access_contexts,
-        aws_account_registry=aws_account_registry,
+        provider_adapter=provider_adapter,
+        provider_catalogs=provider_catalogs,
         execution_context=execution_context,
-        aws_implementation_key=aws_implementation_key,
-        allow_aws_profile_only=allow_aws_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
     )
-    run_and_log(
-        ["python3", str(materialize_stage_utils(run_dir) / "assert_aws_access.py")],
-        cwd=repo_path,
-        env=stage_env,
-    )
+    assertion_argv = provider_adapter.stage_assertion_argv(materialize_stage_utils(run_dir))
+    if assertion_argv:
+        run_and_log(assertion_argv, cwd=repo_path, env=stage_env)
 
     stage_cfg_dir = plt_stages_dir_path / stage_id / "input"
     if not stage_cfg_dir.is_dir():
@@ -5942,18 +5529,177 @@ def resolve_run_domain(
     return domain
 
 
-def run_provisions_ctl_state_bucket(workflow_cfg: dict, inventory_cfg: dict) -> bool:
+def run_provisions_ctl_state_backend(workflow_cfg: dict, inventory_cfg: dict) -> bool:
     """Whether any target in this run is the ctl-state bucket-creating target
-    (declares provisions_ctl_state_bucket: true). Such a run may legitimately start
+    (declares provisions_ctl_state_backend: true). Such a run may legitimately start
     before its results bucket exists; every other run must find it already there
     under a `required` sync policy."""
     targets = inventory_cfg.get("stage_targets", {})
     for entry in workflow_cfg.get("stages", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
         target_cfg = targets.get(target_name) or {}
-        if target_cfg.get("provisions_ctl_state_bucket") is True:
+        if target_cfg.get("provisions_ctl_state_backend") is True:
             return True
     return False
+
+
+def active_target_names(workflow_cfg: dict) -> list[str]:
+    names: list[str] = []
+    for entry in workflow_cfg.get("stages", []):
+        target_name = entry if isinstance(entry, str) else entry.get("target")
+        if isinstance(target_name, str) and target_name:
+            names.append(target_name)
+    return names
+
+
+def active_targets_missing_key(workflow_cfg: dict, inventory_cfg: dict, skip_key: str) -> list[str]:
+    """Targets that do NOT declare the given skip_* key (presence = capability)."""
+    targets = inventory_cfg.get("stage_targets", {})
+    missing: list[str] = []
+    for target_name in active_target_names(workflow_cfg):
+        target_cfg = targets.get(target_name) or {}
+        if skip_key not in target_cfg:
+            missing.append(target_name)
+    return missing
+
+
+def target_allows_direct_execution_access(target_cfg: dict) -> bool:
+    """Whether a target opts into DIRECT execution access (§12); default False.
+
+    `standard` is always permitted and `bypass` is profile-gated (not per-target),
+    so `direct` is the only mode a target actually gates — hence a boolean flag
+    rather than a mode list."""
+    raw = target_cfg.get("allow_direct_execution_access", False)
+    if not isinstance(raw, bool):
+        raise RuntimeError("❌ target allow_direct_execution_access must be a boolean")
+    return raw
+
+
+def validate_execution_access(
+    ctl_cfg_root: Path,
+    ctl_profile: str,
+    workflow_cfg: dict,
+    inventory_cfg: dict,
+    *,
+    execution_context: dict[str, object],
+    execution_access_mode: str,
+    agreed_skip_ctl_state_backend_sync: bool,
+    force_skip_ctl_state_backend_sync: bool,
+    provider_credential: str | None,
+) -> None:
+    """Validate the run's execution ACCESS MODE (§12) and the ctl-state sync
+    skip actions. `standard` needs no permission; `direct`/`bypass` are gated by
+    the ctl profile and (for direct) by each active target and its identity."""
+    if execution_access_mode not in EXECUTION_ACCESS_MODES:
+        raise RuntimeError(f"❌ unknown execution access mode {execution_access_mode!r}")
+
+    # bypass: whole-run substitute credential, emergency/debug
+    if execution_access_mode == "bypass":
+        if not provider_credential:
+            raise RuntimeError(
+                "❌ bypass execution access requires the substitute credential (--provider-credential)"
+            )
+    elif provider_credential:
+        raise RuntimeError(
+            "❌ --provider-credential is valid only with --force-bypass-execution-identity"
+        )
+
+    # profile authorizes the mode
+    allowed_modes = ctl_allowed_execution_access_modes(ctl_cfg_root, ctl_profile)
+    if execution_access_mode not in allowed_modes:
+        raise RuntimeError(
+            f"❌ execution access mode {execution_access_mode!r} is not allowed by ctl "
+            f"profile {ctl_profile!r} (allowed: {sorted(allowed_modes)})"
+        )
+
+    # direct: every active target must allow direct and its identity must
+    # declare a direct credential source
+    if execution_access_mode == "direct":
+        identities = load_execution_identities_cfg(ctl_cfg_root)
+        targets = inventory_cfg.get("stage_targets", {})
+        for target_name in active_target_names(workflow_cfg):
+            target_cfg = targets.get(target_name) or {}
+            if not target_allows_direct_execution_access(target_cfg):
+                raise RuntimeError(
+                    f"❌ direct execution access requested, but target {target_name!r} does not "
+                    "set allow_direct_execution_access: true"
+                )
+            identity_ref = target_cfg.get("execution_identity_key")
+            if identity_ref is None:
+                continue  # coverage is validated separately
+            identity_key = resolve_runtime_scalar(
+                identity_ref, execution_context,
+                label=f"target {target_name} execution_identity_key",
+            )
+            identity_cfg = identities.get(identity_key) or {}
+            if not identity_cfg.get("direct_credential_source_key"):
+                raise RuntimeError(
+                    f"❌ direct execution access: target {target_name!r} identity "
+                    f"{identity_key!r} declares no direct_credential_source_key"
+                )
+
+    # ctl-state sync skip (an operation, orthogonal to access mode)
+    sync_permission_checks = (
+        ("--agreed-skip-ctl-state-backend-sync", agreed_skip_ctl_state_backend_sync, "allow_agreed_skip_ctl_state_backend_sync", ctl_allows_agreed_skip_ctl_state_backend_sync),
+        ("--force-skip-ctl-state-backend-sync", force_skip_ctl_state_backend_sync, "allow_force_skip_ctl_state_backend_sync", ctl_allows_force_skip_ctl_state_backend_sync),
+    )
+    for arg_name, requested, permission_key, profile_check in sync_permission_checks:
+        if requested and not profile_check(ctl_cfg_root, ctl_profile):
+            raise RuntimeError(
+                f"❌ {arg_name} was requested, but ctl profile {ctl_profile!r} does not grant {permission_key}"
+            )
+    if agreed_skip_ctl_state_backend_sync:
+        missing = active_targets_missing_key(workflow_cfg, inventory_cfg, "skip_ctl_state_backend_sync")
+        if missing:
+            raise RuntimeError(
+                "❌ --agreed-skip-ctl-state-backend-sync was requested, but active targets do not "
+                "declare skip_ctl_state_backend_sync: " + ", ".join(sorted(missing))
+            )
+
+
+def load_target_policy_constraints(ctl_cfg_root: Path) -> list[dict]:
+    constraints: list[dict] = []
+    for path, section in collect_top_level_sections(ctl_cfg_root, "target_policy_constraints"):
+        if not isinstance(section, list):
+            raise RuntimeError(f"❌ target_policy_constraints must be a list: {path}")
+        for idx, raw in enumerate(section, start=1):
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} must be a mapping: {path}")
+            target_prefix = raw.get("target_prefix")
+            required_ref_policy = raw.get("required_ref_policy")
+            if not isinstance(target_prefix, str) or not target_prefix.strip():
+                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} target_prefix must be a non-empty string: {path}")
+            if not isinstance(required_ref_policy, str) or not required_ref_policy.strip():
+                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} required_ref_policy must be a non-empty string: {path}")
+            constraints.append({
+                "target_prefix": target_prefix.strip(),
+                "required_ref_policy": required_ref_policy.strip(),
+            })
+    return constraints
+
+
+def validate_target_policy_constraints(
+    ctl_cfg_root: Path,
+    ctl_profile: str,
+    workflow_cfg: dict,
+    inventory_cfg: dict,
+) -> None:
+    del inventory_cfg  # reserved for future target-policy dimensions
+    active = active_target_names(workflow_cfg)
+    if not active:
+        return
+    selected_ref_policy = ctl_ref_policy(ctl_cfg_root, ctl_profile)
+    for constraint in load_target_policy_constraints(ctl_cfg_root):
+        prefix = constraint["target_prefix"]
+        matching = sorted(target for target in active if target.startswith(prefix))
+        if not matching:
+            continue
+        required_ref_policy = constraint["required_ref_policy"]
+        if selected_ref_policy != required_ref_policy:
+            raise RuntimeError(
+                f"❌ active targets under {prefix!r} require ref_policy {required_ref_policy!r}; "
+                f"ctl profile {ctl_profile!r} uses {selected_ref_policy!r}. Targets: {', '.join(matching)}"
+            )
 
 
 def validate_workflow_target_selectors(
@@ -6031,15 +5777,18 @@ def run_pipeline(
     stage_repo_key: str,
     require_stage_ref: bool,
     use_local_tooling_cfg: bool,
-    aws_implementation_key: str,
+    provider_implementation_key: str,
     run_dir: Path,
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
-    profile_only_aws_profile: str | None,
+    provider_credential: str | None,
     target_name: str | None = None,
     sub_workflow_run: dict | None = None,
-    skip_ctl_state_backend_sync: bool = False,
+    agreed_skip_ctl_state_backend_sync: bool = False,
+    force_skip_ctl_state_backend_sync: bool = False,
+    execution_access_mode: str = "standard",
+    runtime: str = DEFAULT_RUNTIME,
 ) -> None:
     """
     Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
@@ -6052,6 +5801,9 @@ def run_pipeline(
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        execution_access_mode=execution_access_mode,
     )
     scope_params = scope_params_from_context(execution_context)
     validate_execution_context_constraints(ctl_cfg_root, execution_context)
@@ -6089,6 +5841,23 @@ def run_pipeline(
         )
     if not sub_workflow_run:
         validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
+    validate_target_policy_constraints(ctl_cfg_root, ctl_profile, workflow_cfg, inventory_cfg)
+    validate_execution_access(
+        ctl_cfg_root,
+        ctl_profile,
+        workflow_cfg,
+        inventory_cfg,
+        execution_context=execution_context,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+    )
+    validate_runtime(ctl_cfg_root, ctl_profile, runtime)
+
+    # Provider facts must exist before backend resolution and plt rendering:
+    # member-account backend names interpolate execution_context.provider.*.
+    run_provider_adapter(execution_context).derive_provider_facts(execution_context, workflow_cfg, inventory_cfg, ctl_cfg_root)
 
     # Ctl-state sync: resolve the run's single state domain from its active
     # targets (one-domain-per-run; hard error if they disagree), then arm the
@@ -6103,10 +5872,12 @@ def run_pipeline(
         ctl_state_domain,
         execution_context,
         run_dir,
-        skip_ctl_state_backend_sync=skip_ctl_state_backend_sync,
-        provisions_ctl_state_bucket=run_provisions_ctl_state_bucket(workflow_cfg, inventory_cfg),
-        profile_only_aws_profile=profile_only_aws_profile,
-        aws_implementation_key=aws_implementation_key,
+        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        provisions_ctl_state_backend=run_provisions_ctl_state_backend(workflow_cfg, inventory_cfg),
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+        provider_implementation_key=provider_implementation_key,
     )
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
 
@@ -6155,21 +5926,17 @@ def run_pipeline(
     if isinstance(ctl_state_local_root_value, str) and ctl_state_local_root_value:
         mark_removed_definitions_outdated(Path(ctl_state_local_root_value), ctl_cfg_root)
 
-    # Validate stages have commits and resolvable AWS access before execution.
+    # Validate stages have commits and resolvable provider access before execution.
     validate_stages_have_commits(active_stages, ctl_ref_policy)
-    execution_identities = load_execution_identities_cfg(ctl_cfg_root)
-    aws_access_contexts = load_aws_access_contexts_cfg(ctl_cfg_root)
-    aws_account_registry_cfg = load_aws_account_registry_cfg(ctl_cfg_root)
-    allow_aws_profile_only = ctl_allows_aws_profile_only(ctl_cfg_root, ctl_profile)
-    aws_account_registry = validate_active_stage_aws_access(
+    provider_adapter = run_provider_adapter(execution_context)
+    provider_catalogs = provider_adapter.load_runtime_catalogs(ctl_cfg_root)
+    provider_adapter.validate_active_stage_access(
         active_stages,
-        execution_identities,
-        aws_access_contexts,
+        provider_catalogs,
         execution_context=execution_context,
-        implementation_key=aws_implementation_key,
-        account_registry=aws_account_registry_cfg,
-        allow_profile_only=allow_aws_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
+        implementation_key=provider_implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
     )
 
     write_target_stage_flow_artifact(
@@ -6216,12 +5983,12 @@ def run_pipeline(
         inventory_name, execution_context, run_id,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
-        execution_identities=execution_identities,
-        aws_access_contexts=aws_access_contexts,
-        aws_account_registry=aws_account_registry,
-        aws_implementation_key=aws_implementation_key,
-        allow_aws_profile_only=allow_aws_profile_only,
-        profile_only_aws_profile=profile_only_aws_profile,
+        provider_adapter=provider_adapter,
+        provider_catalogs=provider_catalogs,
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+        runtime=runtime,
     )
 
     print_run_summary(run_id, log_file)

@@ -71,6 +71,16 @@ def main() -> int:
         ctl_profile=None,
         execution_params=dict(args.execution_param),
     )
+    common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+
+    # Provider facts for validation renders come from the provider adapter
+    # (real runs derive them from the run's identities).
+    provider = execution_context.get("execution_context.params.provider")
+    if isinstance(provider, str) and provider.strip():
+        common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(
+            execution_context, ctl_cfg_root
+        )
+
     scope_params = common.scope_params_from_context(execution_context)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))

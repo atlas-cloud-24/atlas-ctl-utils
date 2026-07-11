@@ -95,12 +95,26 @@ run_local_stage() {
     -t "$stage_name" \
     "$stage_dir"
 
+  # Credential isolation: never mount the full host ~/.aws. Profile-based
+  # bindings mount ONLY the generated per-stage config (plus the SSO token
+  # cache, which holds no profile definitions); role-chain bindings carry STS
+  # env credentials and need no mounts at all.
+  provider_binding_mount_args=()
+  if [ -n "${ATLAS_PROVIDER_BINDING_DIR:-}" ]; then
+    provider_binding_mount_args+=(-v "${ATLAS_PROVIDER_BINDING_DIR}:/mnt/provider_binding:ro")
+    provider_binding_mount_args+=(-e AWS_CONFIG_FILE=/mnt/provider_binding/config)
+    provider_binding_mount_args+=(-e AWS_SHARED_CREDENTIALS_FILE=/mnt/provider_binding/credentials)
+    if [ -d "$HOME/.aws/sso" ]; then
+      provider_binding_mount_args+=(-v "$HOME/.aws/sso:/root/.aws/sso:ro")
+    fi
+  fi
+
   docker run --rm --name "$stage_name" \
     --entrypoint sh \
     -v "$PWD:/mnt/source:ro" \
     -v "$(realpath "$origin_cfg_base_dir_path"):/mnt/origin_cfg:ro" \
     -v "$stage_utils_dir_host:/mnt/stage_utils:ro" \
-    -v "$HOME/.aws:/root/.aws:ro" \
+    "${provider_binding_mount_args[@]}" \
     -e ATLAS_EXECUTION_CONTEXT_FILE \
     -e ATLAS_STAGE_UTILS_DIR=/mnt/stage_utils \
     -e stage_dir="$stage_dir" \
@@ -108,11 +122,15 @@ run_local_stage() {
     -e STAGE_WRITE_VALUES_JSON \
     -e STAGE_WRITE_ENV_SH \
     -e AWS_PROFILE="${AWS_PROFILE:-}" \
+    -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
+    -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+    -e AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
     -e ATLAS_AWS_ASSERT_ACCESS \
     -e ATLAS_AWS_PROFILE_ONLY_ACCESS \
+    -e ATLAS_AWS_ROLE_CHAIN \
     -e ATLAS_EXECUTION_IDENTITY_KEY \
     -e ATLAS_AWS_ACCOUNT_KEY \
-    -e ATLAS_AWS_ACCESS_CONTEXT_KEY \
+    -e ATLAS_AWS_CREDENTIAL_SOURCE_KEY \
     -e ATLAS_AWS_IMPLEMENTATION_KEY \
     -e ATLAS_AWS_EXPECT_ACCOUNT_ID \
     -e ATLAS_AWS_EXPECT_PERMISSION_SET_NAME \

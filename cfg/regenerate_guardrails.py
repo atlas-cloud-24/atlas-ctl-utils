@@ -91,6 +91,13 @@ def build_context(args: argparse.Namespace, ctl_cfg_root: Path | None) -> dict[s
             ctl_profile=None,
             execution_params=dict(args.execution_param),
         )
+        # Provider facts for baseline renders come from the provider adapter
+        # (real runs derive them from the run's identities).
+        provider = context.get("execution_context.params.provider")
+        if isinstance(provider, str) and provider.strip():
+            common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(
+                context, ctl_cfg_root
+            )
     else:
         for key, value in dict(args.execution_param).items():
             context[f"{common.EXECUTION_CONTEXT_ROOT}.params.{key}"] = value
@@ -177,7 +184,7 @@ def run_ctl(args: argparse.Namespace) -> int:
     guarded: dict[str, dict[str, str]] = dict(existing)
     for ref in refs:
         ref = common.validate_ctl_guard_ref(ref, label="--var")
-        # Context refs read the built context; ctl_state_buckets.* refs resolve
+        # Context refs read the built context; ctl_state_backends.* refs resolve
         # from the registry — same resolution the run-time verify uses.
         value = common.resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
         guarded[ref] = common.guard_entry(value, label=ref)
