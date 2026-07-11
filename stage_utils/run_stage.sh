@@ -52,10 +52,11 @@ case "$runtime" in
     run_local_stage
     ;;
   ci)
-    # CI runtime: the GitHub Actions runner IS the clean isolated box (fresh VM
-    # per job), so the stage runs directly on it — no Docker-in-Docker. Not yet
-    # wired (Phase 26.3); the orchestrator will run AS the GHA job and invoke
-    # ./"${stage_dir}"/src/stage.sh on the runner.
+    # CI runtime (not yet wired — Phase 26.3): default box = the SAME per-stage
+    # Docker image as local, run by CTL as the GHA job using the runner's host
+    # Docker (NOT Docker-in-Docker) for byte-identical tooling. `ci` differs from
+    # local in credentials (OIDC) and cfg source, not the box. A native-on-runner
+    # mechanism (run src/stage.sh directly) stays an optional per-stage choice.
     echo "❌ ci runtime not yet implemented (Phase 26.3)"
     exit 1
     ;;
