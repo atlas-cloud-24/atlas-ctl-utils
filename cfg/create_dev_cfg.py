@@ -119,6 +119,15 @@ def stage_sources_files(root_dir: Path) -> list[Path]:
     return [sources_path] if sources_path.is_file() else []
 
 
+def cfg_source_files(root_dir: Path) -> list[Path]:
+    found = []
+    for path in sorted(root_dir.rglob("*.yaml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if isinstance(doc, dict) and "cfg_sources" in doc:
+            found.append(path)
+    return found
+
+
 def workflow_files(root_dir: Path) -> list[Path]:
     paths = set((root_dir / "workflows").rglob("*.yaml"))
     variants_root = root_dir / "variants"
@@ -174,6 +183,19 @@ def required_repo_entries(paths: list[Path]) -> set[str]:
                     repo_entries.add(module_name)
 
     return repo_entries
+
+
+def required_cfg_source_entries(paths: list[Path]) -> set[str]:
+    names = set()
+    for path in paths:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        entries = doc.get("cfg_sources") if isinstance(doc, dict) else None
+        if not isinstance(entries, dict):
+            continue
+        for name, entry in entries.items():
+            if isinstance(name, str) and isinstance(entry, dict) and isinstance(entry.get("repo_url"), str):
+                names.add(name)
+    return names
 
 
 def required_global_refs(paths: list[Path]) -> set[str]:
@@ -355,6 +377,29 @@ def rewrite_stage_sources(root_dir: Path, repo_map: dict[str, str]) -> list[Path
     return rewritten_paths
 
 
+def rewrite_cfg_source_file(path: Path, repo_map: dict[str, str]) -> int:
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    entries = doc.get("cfg_sources") if isinstance(doc, dict) else None
+    if not isinstance(entries, dict):
+        raise ValueError(f"cfg_sources must be a mapping: {path}")
+    replacements = 0
+    for name, entry in entries.items():
+        if not isinstance(entry, dict) or "repo_url" not in entry:
+            continue
+        entries[name] = {"repo_path": repo_map[name]}
+        replacements += 1
+    path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    return replacements
+
+
+def rewrite_cfg_sources(root_dir: Path, repo_map: dict[str, str]) -> list[Path]:
+    rewritten = []
+    for path in cfg_source_files(root_dir):
+        if rewrite_cfg_source_file(path, repo_map):
+            rewritten.append(path)
+    return rewritten
+
+
 def strip_branch_from_workflow_file(path: Path) -> int:
     rewritten_lines: list[str] = []
     removals = 0
@@ -445,14 +490,17 @@ def main() -> int:
             validate_target_dir(source_dir, target_dir)
 
             source_stage_sources = stage_sources_files(source_dir)
+            source_cfg_sources = cfg_source_files(source_dir)
             source_refs = refs_files(source_dir)
             required_repo_names = required_repo_entries(source_stage_sources)
+            required_cfg_source_names = required_cfg_source_entries(source_cfg_sources)
+            required_path_names = required_repo_names | required_cfg_source_names
             required_global_ref_names = required_global_refs(source_refs)
 
             repo_map = {
                 name: path
                 for name, path in path_map.items()
-                if name in required_repo_names
+                if name in required_path_names
             }
             global_ref_map = {
                 name: path
@@ -460,16 +508,15 @@ def main() -> int:
                 if name in required_global_ref_names
             }
 
-            missing = sorted(required_repo_names - set(repo_map))
+            missing = sorted(required_path_names - set(repo_map))
             if missing:
-                raise ValueError(
-                    "missing repo paths for stage_sources repos: " + ", ".join(missing)
-                )
+                raise ValueError("missing local repo paths: " + ", ".join(missing))
 
-            warn_about_extra_mappings(repo_map, required_repo_names, "repo")
+            warn_about_extra_mappings(repo_map, required_path_names, "repo")
             warn_about_extra_mappings(global_ref_map, required_global_ref_names, "global ref")
             copy_source_tree(source_dir, target_dir, args.force)
             rewritten_paths = rewrite_stage_sources(target_dir, repo_map)
+            rewritten_cfg_sources = rewrite_cfg_sources(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
             local_global_path = write_local_global_file(target_dir, global_ref_map)
             removed_refs = remove_refs(target_dir)
@@ -485,6 +532,8 @@ def main() -> int:
     print(f"created dev config: {target_dir}")
     for path in rewritten_paths:
         print(f"rewrote stage_sources: {path}")
+    for path in rewritten_cfg_sources:
+        print(f"rewrote cfg_sources: {path}")
     for path in rewritten_workflows:
         print(f"rewrote workflow: {path}")
     if local_global_path is not None:

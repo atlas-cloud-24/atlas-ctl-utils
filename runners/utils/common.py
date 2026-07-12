@@ -53,6 +53,10 @@ EXECUTION_CONTEXT_FILENAME = "execution_context.yaml"
 
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 PLT_GUARDRAILS_DIRNAME = "__guardrails__"
+PLT_GUARDRAIL_BASELINES_KEY = "plt_guardrail_baselines"
+CTL_GUARDRAIL_DECLARATIONS_KEY = "ctl_guardrail_declarations"
+CTL_GUARDRAIL_BASELINES_KEY = "ctl_guardrail_baselines"
+CFG_SOURCE_KEYS = ("plt", "guardrails")
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
 _UUID7_LAST_TIMESTAMP_MS = -1
@@ -267,56 +271,56 @@ def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
 EXECUTION_ACCESS_MODES = ("standard", "direct", "bypass")
 
 # Phase 26 — execution runtime (WHERE a stage's box is produced). CTL selects one
-# runtime for the whole run; the stage declares which it can run in (a constraint).
-KNOWN_RUNTIMES = ("local", "ci")
-DEFAULT_RUNTIME = "local"
+# runtime for the whole run (always explicit, no default); the stage declares
+# which it can run in (a constraint).
+EXECUTION_RUNTIMES = ("local", "ci")
 # Stage box images (stage.yaml runtime.image). CTL owns how each is built/run.
 STAGE_IMAGES = ("infra", "ops")
 
 
-def stage_supported_runtimes(runtime_cfg: dict, *, label: str) -> set[str]:
-    """Runtimes a stage can run in (§Phase 26); absent = all KNOWN_RUNTIMES."""
-    raw = runtime_cfg.get("supported_runtimes")
+def stage_supported_execution_runtimes(runtime_cfg: dict, *, label: str) -> set[str]:
+    """Runtimes a stage can run in (§Phase 26); absent = all EXECUTION_RUNTIMES."""
+    raw = runtime_cfg.get("supported_execution_runtimes")
     if raw is None:
-        return set(KNOWN_RUNTIMES)
+        return set(EXECUTION_RUNTIMES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ stage runtime.supported_runtimes must be a list of strings: {label}")
+        raise RuntimeError(f"❌ stage runtime.supported_execution_runtimes must be a list of strings: {label}")
     runtimes = set(raw)
-    unknown = runtimes - set(KNOWN_RUNTIMES)
+    unknown = runtimes - set(EXECUTION_RUNTIMES)
     if unknown:
-        raise RuntimeError(f"❌ stage runtime.supported_runtimes has unknown runtimes {sorted(unknown)}: {label}")
+        raise RuntimeError(f"❌ stage runtime.supported_execution_runtimes has unknown runtimes {sorted(unknown)}: {label}")
     if not runtimes:
-        raise RuntimeError(f"❌ stage runtime.supported_runtimes must not be empty: {label}")
+        raise RuntimeError(f"❌ stage runtime.supported_execution_runtimes must not be empty: {label}")
     return runtimes
 
 
-def ctl_allowed_runtimes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
-    """Runtimes the ctl profile authorizes (§Phase 26). Absent = all KNOWN_RUNTIMES."""
+def ctl_allowed_execution_runtimes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
+    """Runtimes the ctl profile authorizes (§Phase 26). Absent = all EXECUTION_RUNTIMES."""
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    raw = policy.get("allowed_runtimes")
+    raw = policy.get("allowed_execution_runtimes")
     if raw is None:
-        return set(KNOWN_RUNTIMES)
+        return set(EXECUTION_RUNTIMES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes must be a list of strings")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtimes must be a list of strings")
     runtimes = set(raw)
-    unknown = runtimes - set(KNOWN_RUNTIMES)
+    unknown = runtimes - set(EXECUTION_RUNTIMES)
     if unknown:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes has unknown runtimes {sorted(unknown)}")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtimes has unknown runtimes {sorted(unknown)}")
     if not runtimes:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_runtimes must not be empty")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtimes must not be empty")
     return runtimes
 
 
-def validate_runtime(ctl_cfg_root: Path, ctl_profile: str, runtime: str) -> None:
+def validate_execution_runtime(ctl_cfg_root: Path, ctl_profile: str, execution_runtime: str) -> None:
     """Reconcile the selected runtime against the ctl profile (§Phase 26): a known
-    runtime, allowed by the profile. Per-stage `supported_runtimes` is enforced in
+    runtime, allowed by the profile. Per-stage `supported_execution_runtimes` is enforced in
     run_stages, where the repo-local stage manifest is loaded."""
-    if runtime not in KNOWN_RUNTIMES:
-        raise RuntimeError(f"❌ unknown runtime {runtime!r} (known: {sorted(KNOWN_RUNTIMES)})")
-    allowed = ctl_allowed_runtimes(ctl_cfg_root, ctl_profile)
-    if runtime not in allowed:
+    if execution_runtime not in EXECUTION_RUNTIMES:
+        raise RuntimeError(f"❌ unknown execution runtime {execution_runtime!r} (known: {sorted(EXECUTION_RUNTIMES)})")
+    allowed = ctl_allowed_execution_runtimes(ctl_cfg_root, ctl_profile)
+    if execution_runtime not in allowed:
         raise RuntimeError(
-            f"❌ runtime {runtime!r} is not allowed by ctl profile {ctl_profile!r} (allowed: {sorted(allowed)})"
+            f"❌ execution runtime {execution_runtime!r} is not allowed by ctl profile {ctl_profile!r} (allowed: {sorted(allowed)})"
         )
 
 
@@ -662,27 +666,16 @@ def validate_stages_have_commits(active_stages: dict, ref_policy: str) -> None:
             "   Using branch references is not allowed for reproducibility."
         )
 
-def validate_cfg_refs_have_commits(
+def validate_ctl_cfg_ref_has_commit(
     ref_policy: str,
     ctl_cfg_branch: str | None,
     ctl_cfg_commit: str | None,
-    plt_cfg_branch: str | None,
-    plt_cfg_commit: str | None,
 ) -> None:
-    """Validate that cfg repos use commits when ref_policy requires it."""
-    if not ref_policy_requires_commits(ref_policy):
-        return
-
-    errors = []
-    if ctl_cfg_branch and not ctl_cfg_commit:
-        errors.append(f"--ctl-cfg uses branch='{ctl_cfg_branch}' but commit is required")
-    if plt_cfg_branch and not plt_cfg_commit:
-        errors.append(f"--plt-cfg uses branch='{plt_cfg_branch}' but commit is required")
-
-    if errors:
+    """Validate the CLI-selected ctl cfg ref under a strict ref policy."""
+    if ref_policy_requires_commits(ref_policy) and ctl_cfg_branch and not ctl_cfg_commit:
         raise RuntimeError(
-            "❌ ref_policy=commit_required requires cfg repos to use @commit=sha (not @branch=name).\n"
-            f"   {'; '.join(errors)}"
+            "❌ ref_policy=commit_required requires --ctl-cfg to use @commit=sha "
+            f"(not branch={ctl_cfg_branch!r})"
         )
 
 
@@ -1179,6 +1172,100 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
         _merge(merged, section, "", yf)
 
     return merged
+
+
+def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
+    """Load the ctl-owned one-to-one plt and guardrail source bindings."""
+    entries = collect_resource(ctl_cfg_root, "cfg_sources")
+    expected = set(CFG_SOURCE_KEYS)
+    actual = set(entries)
+    if actual != expected:
+        raise RuntimeError(
+            f"❌ cfg_sources must define exactly {sorted(expected)}; "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+        )
+    normalized: dict[str, dict[str, object]] = {}
+    for key in CFG_SOURCE_KEYS:
+        raw = entries[key]
+        label = f"cfg_sources.{key}"
+        if not isinstance(raw, dict) or not raw:
+            raise RuntimeError(f"❌ {label} must be a non-empty mapping")
+        keys = set(raw)
+        if keys == {"repo_path"}:
+            value = raw["repo_path"]
+            if not isinstance(value, str) or not value.strip():
+                raise RuntimeError(f"❌ {label}.repo_path must be a non-empty string")
+            normalized[key] = {"repo_path": value.strip()}
+            continue
+        if keys != {"repo_url", "ref"}:
+            raise RuntimeError(f"❌ {label} must contain either repo_path only or exactly repo_url + ref")
+        url, ref = raw["repo_url"], raw["ref"]
+        if not isinstance(url, str) or not url.strip():
+            raise RuntimeError(f"❌ {label}.repo_url must be a non-empty string")
+        if not isinstance(ref, dict) or len(ref) != 1:
+            raise RuntimeError(f"❌ {label}.ref must contain exactly one of branch or commit")
+        kind, value = next(iter(ref.items()))
+        if kind not in {"branch", "commit"} or not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"❌ {label}.ref must contain a non-empty branch or commit")
+        normalized[key] = {"repo_url": url.strip(), "ref": {kind: value.strip()}}
+    return normalized
+
+
+def validate_cfg_source_refs(
+    sources: dict[str, dict[str, object]],
+    ref_policy: str,
+) -> None:
+    """Require exact companion commits under commit_required."""
+    if not ref_policy_requires_commits(ref_policy):
+        return
+    errors = []
+    for key in CFG_SOURCE_KEYS:
+        entry = sources[key]
+        ref = entry.get("ref") or {}
+        if "repo_path" in entry:
+            errors.append(f"{key} uses repo_path")
+        elif not isinstance(ref, dict) or not ref.get("commit"):
+            errors.append(f"{key} is not commit-pinned")
+    if errors:
+        raise RuntimeError(
+            "❌ ref_policy=commit_required requires commit-pinned cfg sources: "
+            + ", ".join(errors)
+        )
+
+
+def materialize_cfg_sources(
+    ctl_cfg_root: Path,
+    *,
+    ref_policy: str,
+    run_cfg_dir: Path,
+    token: str | None = None,
+) -> dict[str, Path]:
+    """Resolve local companion roots or clone their ctl-bound remote refs."""
+    sources = load_cfg_sources(ctl_cfg_root)
+    validate_cfg_source_refs(sources, ref_policy)
+    run_cfg_dir.mkdir(parents=True, exist_ok=True)
+    roots = {}
+    for key in CFG_SOURCE_KEYS:
+        entry = sources[key]
+        if "repo_path" in entry:
+            root = Path(str(entry["repo_path"])).expanduser()
+            root = (ctl_cfg_root / root).resolve() if not root.is_absolute() else root.resolve()
+            if not root.is_dir():
+                raise RuntimeError(f"❌ cfg_sources.{key}.repo_path not found: {root}")
+            roots[key] = root
+            continue
+        ref = entry["ref"]
+        assert isinstance(ref, dict)
+        root = (run_cfg_dir / f"{key}_cfg").resolve()
+        try:
+            root.relative_to(run_cfg_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"❌ cfg source destination escapes run cfg dir: {root}") from exc
+        if root.exists():
+            shutil.rmtree(root)
+        git_clone(str(entry["repo_url"]), ref.get("branch"), ref.get("commit"), root, token)
+        roots[key] = root
+    return roots
 
 
 def _deep_merge_refs(dst: dict, src: dict, yf: Path, path: str = "") -> None:
@@ -1678,13 +1765,14 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     # Execution runtime (§Phase 26): WHERE CTL produces each stage's clean box.
     # One runtime per run; CTL owns the box, the stage only declares its image.
     parser.add_argument(
-        "--runtime",
-        choices=KNOWN_RUNTIMES,
-        default=DEFAULT_RUNTIME,
-        help="Execution runtime: 'local' builds a fresh Docker box per stage on this "
-        "machine; 'ci' runs each stage on the GitHub Actions runner (no Docker-in-"
-        "Docker). Must be allowed by the ctl profile (allowed_runtimes) and supported "
-        "by every active stage (stage.yaml runtime.supported_runtimes).",
+        "--execution-runtime",
+        choices=EXECUTION_RUNTIMES,
+        required=True,
+        help="Execution runtime (required, no default): 'local' builds a fresh Docker "
+        "box per stage on this machine; 'ci' runs each stage on the GitHub Actions "
+        "runner (no Docker-in-Docker). Must be allowed by the ctl profile "
+        "(allowed_execution_runtimes) and supported by every active stage "
+        "(stage.yaml runtime.supported_execution_runtimes).",
     )
     parser.add_argument(
         "--agreed-skip-ctl-state-backend-sync",
@@ -3241,6 +3329,7 @@ def build_execution_context(
     execution_access_mode: str = "standard",
     agreed_skip_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
+    execution_runtime: str,
 ) -> dict[str, object]:
     """Build the flat dotted execution context: the closed, namespaced facts of
     this execution. Two namespaces — `ctl` (promoted engine args) and `params`
@@ -3260,6 +3349,7 @@ def build_execution_context(
     put("ctl", "execution_access_mode", execution_access_mode, label="promoted execution access mode")
     put("ctl", "agreed_skip_ctl_state_backend_sync", bool(agreed_skip_ctl_state_backend_sync), label="promoted --agreed-skip-ctl-state-backend-sync")
     put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
+    put("ctl", "execution_runtime", execution_runtime, label="promoted execution runtime")
 
     # cfg-declared params are inserted first (so they lead the rendered
     # context), but CLI values are staged up front so cfg params may still
@@ -3386,7 +3476,7 @@ def merge_guarded_vars(dst: dict[str, dict[str, str]], raw_guarded_vars, *, orig
 
 
 def load_plt_guard_declarations(plt_cfg_root: Path) -> list[dict]:
-    """Load root plt guard declarations: declare -> [{path, match_target_path, selectors}].
+    """Load root plt guard declarations: declare -> [{var, match_target_path, selectors}].
 
     The root declarations live either in a single `__guardrails__.yaml` file or,
     split by concern, in a `__guardrails__/` directory of *.yaml files merged by
@@ -3449,15 +3539,15 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
         label = f"declare[{index}] in {path}"
         if not isinstance(raw, dict):
             raise RuntimeError(f"❌ {label} must be a mapping")
-        unknown = set(raw) - {"path", "match_target_path", "selectors"}
+        unknown = set(raw) - {"var", "match_target_path", "selectors"}
         if unknown:
             raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
-        var_name = raw.get("path")
+        var_name = raw.get("var")
         if not isinstance(var_name, str) or not var_name.strip():
-            raise RuntimeError(f"❌ {label} path must be a non-empty string")
+            raise RuntimeError(f"❌ {label} var must be a non-empty string")
         var_name = var_name.strip()
         if "." in var_name:
-            raise RuntimeError(f"❌ {label} path must be a top-level key (no dots): {var_name!r}")
+            raise RuntimeError(f"❌ {label} var must be a top-level key (no dots): {var_name!r}")
         match_target_path = normalize_cfg_absolute_path(
             raw.get("match_target_path"),
             label=f"{label} match_target_path",
@@ -3471,7 +3561,7 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
         seen.add(key)
         declarations.append(
             {
-                "path": var_name,
+                "var": var_name,
                 "match_target_path": match_target_path,
                 "selectors": selectors or {},
                 "baseline_axes": tuple(axes),
@@ -3479,56 +3569,157 @@ def _load_guard_declarations_file(path: Path, declarations: list[dict], seen: se
         )
 
 
-def load_scope_guarded_vars(path: Path, *, allow_missing: bool = False) -> dict[str, dict[str, str]]:
-    """Load a scope-local generated baseline file: guarded_vars -> {var: {value, hash}}."""
-    if not path.is_file():
-        if allow_missing:
-            return {}
-        raise RuntimeError(f"❌ guardrails baseline file not found: {path}")
-    data = load_yaml(path) or {}
-    if not isinstance(data, dict):
-        raise RuntimeError(f"❌ {path.name} must contain a mapping: {path}")
-    unknown = set(data) - {"guarded_vars"}
-    if unknown:
-        raise RuntimeError(f"❌ scope {path.name} has unsupported keys {sorted(unknown)}: {path}")
-    guarded: dict[str, dict[str, str]] = {}
-    merge_guarded_vars(guarded, data.get("guarded_vars"), origin=path)
-    return guarded
+def guard_baseline_identity(
+    scope_path: str,
+    axes: dict[str, str],
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return scope_path, tuple(sorted(axes.items()))
 
 
-def scope_guard_baseline_path(scope: dict, matching_declarations: list[dict], scope_params: dict[str, str]) -> Path:
-    """Baseline file for a scope: flat `__guardrails__.yaml`, or one file per
-    axis-value combination under `__guardrails__/` when any matching
-    declaration carries baseline_axes (values read from the run's params)."""
-    axes = sorted({axis for d in matching_declarations for axis in d.get("baseline_axes", ())})
-    scope_root = scope["scope_root"]
-    flat = scope_root / PLT_GUARDRAILS_FILENAME
-    axis_dir = scope_root / PLT_GUARDRAILS_DIRNAME
-    if not axes:
-        if axis_dir.is_dir():
-            raise RuntimeError(
-                f"❌ scope {scope['scope_path']} has a {PLT_GUARDRAILS_DIRNAME}/ dir but no declaration "
-                f"defines baseline_axes; remove the dir or declare the axes"
+def resolve_guard_axes(
+    matching_declarations: list[dict],
+    execution_context: dict[str, object],
+    *,
+    scope_path: str,
+) -> dict[str, str]:
+    refs = sorted({axis for declaration in matching_declarations for axis in declaration.get("baseline_axes", ())})
+    axes = {}
+    for ref in refs:
+        if ref not in execution_context:
+            raise RuntimeError(f"❌ baseline axis {ref!r} for scope {scope_path} has no value in this run")
+        axes[ref] = guard_value_text(execution_context[ref], label=f"baseline axis {ref} for scope {scope_path}")
+    return axes
+
+
+def load_plt_guardrail_baselines(
+    guardrails_cfg_root: Path,
+) -> dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, object]]:
+    """Load explicit plt baseline identities from the separate guardrail repo."""
+    result = {}
+    for path in sorted(guardrails_cfg_root.rglob("*.yaml")):
+        data = load_yaml(path) or {}
+        if not isinstance(data, dict) or PLT_GUARDRAIL_BASELINES_KEY not in data:
+            continue
+        entries = data[PLT_GUARDRAIL_BASELINES_KEY]
+        if not isinstance(entries, list):
+            raise RuntimeError(f"❌ {PLT_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
+        for index, raw in enumerate(entries):
+            label = f"{PLT_GUARDRAIL_BASELINES_KEY}[{index}] in {path}"
+            required_keys = {"scope_path", "guarded_vars"}
+            allowed_keys = required_keys | {"axes"}
+            if (
+                not isinstance(raw, dict)
+                or not required_keys.issubset(raw)
+                or set(raw) - allowed_keys
+            ):
+                raise RuntimeError(
+                    f"❌ {label} must contain scope_path and guarded_vars, "
+                    "with optional non-empty axes"
+                )
+            scope_path = normalize_cfg_absolute_path(
+                raw["scope_path"],
+                label=f"{label}.scope_path",
+                allow_root=True,
             )
-        return flat
-    if flat.is_file():
-        raise RuntimeError(
-            f"❌ scope {scope['scope_path']} has a flat {PLT_GUARDRAILS_FILENAME} but its declarations "
-            f"define baseline_axes {axes}; remove the stale flat baseline"
+            raw_axes = raw.get("axes", {})
+            if not isinstance(raw_axes, dict):
+                raise RuntimeError(f"❌ {label}.axes must be a mapping")
+            if "axes" in raw and not raw_axes:
+                raise RuntimeError(f"❌ {label}.axes must be omitted when empty")
+            axes = {}
+            for ref, value in raw_axes.items():
+                ref = validate_execution_context_ref(ref, label=f"{label}.axes")
+                if not ref.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
+                    raise RuntimeError(f"❌ {label}.axes keys must be params refs")
+                axes[ref] = guard_value_text(value, label=f"{label}.axes.{ref}")
+            guarded = {}
+            merge_guarded_vars(guarded, raw["guarded_vars"], origin=path)
+            identity = guard_baseline_identity(scope_path, axes)
+            if identity in result:
+                raise RuntimeError(f"❌ duplicate plt guardrail baseline identity {identity!r}: {path}")
+            result[identity] = {"scope_path": scope_path, "axes": axes, "guarded_vars": guarded, "origin": path}
+    return result
+
+
+def plt_guardrail_baseline_file(root: Path, scope_path: str) -> Path:
+    normalized = normalize_cfg_absolute_path(scope_path, label="plt guardrail scope_path", allow_root=True)
+    rel = normalized.lstrip("/") or "_root"
+    path = (root / "invariants" / "plt" / f"{rel}.yaml").resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"❌ plt guardrail output escapes guardrail cfg root: {path}") from exc
+    return path
+
+
+def write_plt_guardrail_baseline(
+    root: Path,
+    *,
+    scope_path: str,
+    axes: dict[str, str],
+    guarded_vars: dict[str, dict[str, str]],
+) -> Path:
+    """Replace one explicit identity in the scope-organized generated file."""
+    path = plt_guardrail_baseline_file(root, scope_path)
+    entries = []
+    if path.is_file():
+        data = load_yaml(path) or {}
+        if not isinstance(data, dict) or set(data) != {PLT_GUARDRAIL_BASELINES_KEY}:
+            raise RuntimeError(
+                f"❌ generated plt guardrail file must contain only "
+                f"{PLT_GUARDRAIL_BASELINES_KEY}: {path}"
+            )
+        entries = data[PLT_GUARDRAIL_BASELINES_KEY]
+        if not isinstance(entries, list):
+            raise RuntimeError(f"❌ {PLT_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
+
+    identity = guard_baseline_identity(scope_path, axes)
+    replacement = {"scope_path": scope_path}
+    if axes:
+        replacement["axes"] = dict(sorted(axes.items()))
+    replacement["guarded_vars"] = guarded_vars
+    kept = []
+    replaced = False
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"❌ invalid generated plt guardrail entry: {path}")
+        raw_axes_cfg = raw.get("axes", {})
+        if not isinstance(raw_axes_cfg, dict) or ("axes" in raw and not raw_axes_cfg):
+            raise RuntimeError(f"❌ invalid generated plt guardrail axes: {path}")
+        raw_axes = {
+            str(key): guard_value_text(value, label=f"axes.{key}")
+            for key, value in raw_axes_cfg.items()
+        }
+        raw_identity = guard_baseline_identity(str(raw.get("scope_path") or ""), raw_axes)
+        if raw_identity == identity:
+            if replaced:
+                raise RuntimeError(f"❌ duplicate generated plt guardrail identity in {path}")
+            kept.append(replacement)
+            replaced = True
+        else:
+            kept.append(raw)
+    if not replaced:
+        kept.append(replacement)
+    kept.sort(
+        key=lambda entry: guard_baseline_identity(
+            str(entry["scope_path"]),
+            {str(key): str(value) for key, value in dict(entry.get("axes", {})).items()},
         )
-    values: list[str] = []
-    for axis in axes:
-        key = axis[len(EXECUTION_CONTEXT_PARAMS_PREFIX):]
-        value = scope_params.get(key)
-        if not value:
-            raise RuntimeError(
-                f"❌ baseline axis {axis!r} for scope {scope['scope_path']} has no value in this run's "
-                f"params; pass --execution-params {key}=<value>"
-            )
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", str(value)):
-            raise RuntimeError(f"❌ baseline axis {axis!r} value {value!r} is not filename-safe")
-        values.append(str(value))
-    return axis_dir / ("__".join(values) + ".yaml")
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump({PLT_GUARDRAIL_BASELINES_KEY: kept}, sort_keys=False)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(rendered)
+        temporary_path = Path(handle.name)
+    os.replace(temporary_path, path)
+    return path
 
 
 def guard_declaration_matches_scope(declaration: dict, scope: dict) -> bool:
@@ -3537,20 +3728,8 @@ def guard_declaration_matches_scope(declaration: dict, scope: dict) -> bool:
     return selector_requirements_cover_scope(
         declaration["selectors"],
         scope.get("selectors") or {},
-        label=f"guard declaration {declaration['path']!r}",
+        label=f"guard declaration {declaration['var']!r}",
     )
-
-
-def load_ctl_guarded_vars(ctl_cfg_root: Path) -> dict[str, dict[str, str]]:
-    guarded: dict[str, dict[str, str]] = {}
-    for path, section in collect_top_level_sections(ctl_cfg_root, "guardrails"):
-        if not isinstance(section, dict):
-            raise RuntimeError(f"❌ guardrails must be a mapping: {path}")
-        unknown = set(section) - {"guarded_vars"}
-        if unknown:
-            raise RuntimeError(f"❌ guardrails has unsupported keys {sorted(unknown)}: {path}")
-        merge_guarded_vars(guarded, section.get("guarded_vars"), origin=path)
-    return guarded
 
 
 def verify_guarded_value(
@@ -3575,15 +3754,7 @@ EXECUTION_CONTEXT_PARAMS_PREFIX = "execution_context.params."
 CTL_STATE_BACKENDS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
 
 
-def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
-    """A ctl guarded var is keyed by one of two fully-qualified ref forms:
-
-    - an execution-context ref (`execution_context.params.<key>`) —
-      `execution_context.ctl.*` is forbidden: action/profile are per-run
-      switches, so hashing them can never be correct;
-    - a ctl-state registry ref (`ctl_state_backends.<domain>.<bucket_name|bucket_region>`)
-      — resolved from the registry (env-invariant values only, e.g. the
-      org_state bucket)."""
+def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guard declaration") -> str:
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
     value = ref.strip()
@@ -3600,28 +3771,189 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guarded_vars") -> str:
     if namespace == "ctl":
         raise RuntimeError(
             f"❌ {label}: {value!r} guards an {EXECUTION_CONTEXT_ROOT}.ctl.* value; "
-            f"action/profile are per-run switches and can never be guarded"
+            "per-run control switches cannot be guarded"
         )
     return value
 
 
-def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
-    """Resolve a validated ctl guard ref to its current value.
+def ctl_guard_domain(ref: str) -> str | None:
+    if not ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
+        return None
+    return ref.split(".", 2)[1]
 
-    Registry refs return the RAW registry pattern (un-interpolated): registry
-    values may legitimately vary per run param (env_type, landing_zone), so the
-    guard pins the cfg TEXT — a silent edit of the pattern is caught, while
-    param-driven variation stays free (params are ctl-owned; main_tag is
-    guarded separately as a context ref). Context refs read the execution
-    context directly."""
+
+def load_ctl_guard_declarations(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
+    """Load ctl guard declarations; generated values never live in ctl cfg."""
+    declarations = {}
+    for path, section in collect_top_level_sections(ctl_cfg_root, CTL_GUARDRAIL_DECLARATIONS_KEY):
+        if not isinstance(section, list):
+            raise RuntimeError(f"❌ {CTL_GUARDRAIL_DECLARATIONS_KEY} must be a list: {path}")
+        for index, raw in enumerate(section):
+            label = f"{CTL_GUARDRAIL_DECLARATIONS_KEY}[{index}] in {path}"
+            if not isinstance(raw, dict) or not {"ref"}.issubset(raw) or set(raw) - {"ref", "baseline_axes"}:
+                raise RuntimeError(f"❌ {label} must contain ref and optional baseline_axes")
+            ref = validate_ctl_guard_ref(raw["ref"], label=label)
+            raw_axes = raw.get("baseline_axes", [])
+            if not isinstance(raw_axes, list) or any(not isinstance(axis, str) for axis in raw_axes):
+                raise RuntimeError(f"❌ {label}.baseline_axes must be a list of execution-context refs")
+            axes = []
+            for axis in raw_axes:
+                axis = validate_execution_context_ref(axis, label=f"{label}.baseline_axes")
+                if not axis.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
+                    raise RuntimeError(f"❌ {label}.baseline_axes entries must be params refs")
+                if axis in axes:
+                    raise RuntimeError(f"❌ duplicate baseline axis {axis!r}: {label}")
+                axes.append(axis)
+            if ref in declarations:
+                raise RuntimeError(f"❌ duplicate ctl guard declaration {ref!r}: {path}")
+            declarations[ref] = {
+                "ref": ref,
+                "baseline_axes": tuple(sorted(axes)),
+                "origin": path,
+            }
+    return declarations
+
+
+def ctl_guard_baseline_identity(
+    ref: str,
+    axes: dict[str, str],
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return ref, tuple(sorted(axes.items()))
+
+
+def load_ctl_guardrail_baselines(
+    guardrails_cfg_root: Path,
+) -> dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, object]]:
+    baselines = {}
+    for path in sorted(guardrails_cfg_root.rglob("*.yaml")):
+        data = load_yaml(path) or {}
+        if not isinstance(data, dict) or CTL_GUARDRAIL_BASELINES_KEY not in data:
+            continue
+        entries = data[CTL_GUARDRAIL_BASELINES_KEY]
+        if not isinstance(entries, list):
+            raise RuntimeError(f"❌ {CTL_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
+        for index, raw in enumerate(entries):
+            label = f"{CTL_GUARDRAIL_BASELINES_KEY}[{index}] in {path}"
+            required = {"ref", "value", "hash"}
+            allowed = required | {"axes"}
+            if not isinstance(raw, dict) or not required.issubset(raw) or set(raw) - allowed:
+                raise RuntimeError(
+                    f"❌ {label} must contain ref, value, hash, and optional non-empty axes"
+                )
+            ref = validate_ctl_guard_ref(raw["ref"], label=label)
+            raw_axes = raw.get("axes", {})
+            if not isinstance(raw_axes, dict):
+                raise RuntimeError(f"❌ {label}.axes must be a mapping")
+            if "axes" in raw and not raw_axes:
+                raise RuntimeError(f"❌ {label}.axes must be omitted when empty")
+            axes = {}
+            for axis, value in raw_axes.items():
+                axis = validate_execution_context_ref(axis, label=f"{label}.axes")
+                if not axis.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
+                    raise RuntimeError(f"❌ {label}.axes keys must be params refs")
+                axes[axis] = guard_value_text(value, label=f"{label}.axes.{axis}")
+            guarded = {}
+            merge_guarded_vars(
+                guarded,
+                {ref: {"value": raw["value"], "hash": raw["hash"]}},
+                origin=path,
+            )
+            identity = ctl_guard_baseline_identity(ref, axes)
+            if identity in baselines:
+                raise RuntimeError(f"❌ duplicate ctl guardrail baseline identity {identity!r}: {path}")
+            baselines[identity] = {
+                "ref": ref,
+                "axes": axes,
+                "value": guarded[ref]["value"],
+                "hash": guarded[ref]["hash"],
+                "origin": path,
+            }
+    return baselines
+
+
+def ctl_guardrail_baseline_file(root: Path) -> Path:
+    return root.resolve() / "invariants" / "ctl" / "guardrails.yaml"
+
+
+def write_ctl_guardrail_baseline(
+    root: Path,
+    *,
+    ref: str,
+    axes: dict[str, str],
+    value,
+) -> Path:
+    """Replace one resolved ctl baseline identity atomically."""
+    path = ctl_guardrail_baseline_file(root)
+    entries = []
+    if path.is_file():
+        data = load_yaml(path) or {}
+        if not isinstance(data, dict) or set(data) != {CTL_GUARDRAIL_BASELINES_KEY}:
+            raise RuntimeError(
+                f"❌ generated ctl guardrail file must contain only {CTL_GUARDRAIL_BASELINES_KEY}: {path}"
+            )
+        entries = data[CTL_GUARDRAIL_BASELINES_KEY]
+        if not isinstance(entries, list):
+            raise RuntimeError(f"❌ {CTL_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
+
+    identity = ctl_guard_baseline_identity(ref, axes)
+    guarded = guard_entry(value, label=ref)
+    replacement = {"ref": ref}
+    if axes:
+        replacement["axes"] = dict(sorted(axes.items()))
+    replacement.update(guarded)
+    kept = []
+    replaced = False
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"❌ invalid generated ctl guardrail entry: {path}")
+        raw_axes_cfg = raw.get("axes", {})
+        if not isinstance(raw_axes_cfg, dict) or ("axes" in raw and not raw_axes_cfg):
+            raise RuntimeError(f"❌ invalid generated ctl guardrail axes: {path}")
+        raw_axes = {
+            str(key): guard_value_text(axis_value, label=f"axes.{key}")
+            for key, axis_value in raw_axes_cfg.items()
+        }
+        raw_identity = ctl_guard_baseline_identity(str(raw.get("ref") or ""), raw_axes)
+        if raw_identity == identity:
+            if replaced:
+                raise RuntimeError(f"❌ duplicate generated ctl guardrail identity in {path}")
+            kept.append(replacement)
+            replaced = True
+        else:
+            kept.append(raw)
+    if not replaced:
+        kept.append(replacement)
+    kept.sort(
+        key=lambda entry: ctl_guard_baseline_identity(
+            str(entry["ref"]),
+            {str(key): str(axis_value) for key, axis_value in dict(entry.get("axes", {})).items()},
+        )
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump({CTL_GUARDRAIL_BASELINES_KEY: kept}, sort_keys=False)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as handle:
+        handle.write(rendered)
+        temporary_path = Path(handle.name)
+    os.replace(temporary_path, path)
+    return path
+
+
+def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
+    """Resolve a ctl declaration to its materialized value for this run."""
     if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
         _, domain, field = ref.split(".")
-        buckets = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
-        entry = buckets.get(domain)
+        backends = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
+        entry = backends.get(domain)
         if entry is None:
-            known = ", ".join(sorted(buckets)) or "none"
+            known = ", ".join(sorted(backends)) or "none"
             raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown domain {domain!r}; known: {known}")
-        return str(entry[field])
+        return resolve_runtime_scalar(
+            entry[field],
+            execution_context,
+            label=f"ctl guarded var {ref}",
+        )
     if ref not in execution_context:
         raise RuntimeError(
             f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
@@ -3629,21 +3961,54 @@ def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dic
     return execution_context[ref]
 
 
-def verify_ctl_guardrails(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
-    guarded = load_ctl_guarded_vars(ctl_cfg_root)
-    if not guarded:
+def verify_ctl_guardrails(
+    ctl_cfg_root: Path,
+    guardrails_cfg_root: Path,
+    execution_context: dict[str, object],
+    ctl_state_backend_key: str | None,
+) -> None:
+    declarations = load_ctl_guard_declarations(ctl_cfg_root)
+    if not declarations:
         return
-    for ref, expected in guarded.items():
-        validate_ctl_guard_ref(ref)
-        value = resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
-        verify_guarded_value(
-            "ctl",
-            ref,
-            value,
-            expected,
-            label=ref,
+    baselines = load_ctl_guardrail_baselines(guardrails_cfg_root)
+    for entry in baselines.values():
+        declaration = declarations.get(entry["ref"])
+        if declaration is None:
+            raise RuntimeError(
+                f"❌ ctl baseline {entry['ref']!r} in {entry['origin']} has no declaration"
+            )
+        expected_axes = set(declaration["baseline_axes"])
+        if set(entry["axes"]) != expected_axes:
+            raise RuntimeError(
+                f"❌ ctl baseline {entry['ref']!r} in {entry['origin']} has axes "
+                f"{sorted(entry['axes'])}; expected {sorted(expected_axes)}"
+            )
+
+    active = []
+    for declaration in declarations.values():
+        domain = ctl_guard_domain(declaration["ref"])
+        if domain is None or domain == ctl_state_backend_key:
+            active.append(declaration)
+    for declaration in active:
+        ref = declaration["ref"]
+        axes = resolve_guard_axes(
+            [declaration],
+            execution_context,
+            scope_path=f"ctl guard {ref}",
         )
-    logging.info("Ctl guardrails verified: %s", sorted(guarded))
+        identity = ctl_guard_baseline_identity(ref, axes)
+        baseline = baselines.get(identity)
+        if baseline is None:
+            raise RuntimeError(
+                f"❌ ctl guard {ref!r} has no baseline for axes {axes} in {guardrails_cfg_root}"
+            )
+        value = resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
+        verify_guarded_value("ctl", ref, value, baseline, label=ref)
+    logging.info(
+        "Ctl guardrails verified for backend=%s: %s",
+        ctl_state_backend_key,
+        sorted(declaration["ref"] for declaration in active),
+    )
 
 
 def load_rendered_cfg_top_level_values(rendered_dir: Path, var_name: str) -> list[tuple[Path, object]]:
@@ -3711,71 +4076,80 @@ def required_target_paths_for_stages(active_stages: dict) -> set[str] | None:
 
 def verify_plt_guardrails(
     plt_cfg_root: Path,
-    plt_rendered_dir: Path,
-    scope_params: dict[str, str],
-    required_target_paths: set[str] | None = None,
-) -> None:
-    """Verify declared plt guards against the rendered cfg of every active scope.
-
-    Coverage: each declaration matching an active scope must have a baseline
-    hash in that scope's local guardrails file, and every baseline hash must
-    correspond to a matching declaration. With `required_target_paths` set,
-    only the scopes this run merged/rendered are verified (scopes are
-    independent; the full tree is checked by the validate-all action).
-    """
-    declarations = load_plt_guard_declarations(plt_cfg_root)
-    if not declarations:
-        return
-    if not discover_cfg_meta_paths(plt_cfg_root):
-        raise RuntimeError(f"❌ plt guard declarations exist but no cfg scopes found under: {plt_cfg_root}")
-
-    for scope in discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
-        if required_target_paths is not None and scope["target_path"] not in required_target_paths:
-            continue
-        matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
-        baseline_path = scope_guard_baseline_path(scope, matching, scope_params)
-        baseline = load_scope_guarded_vars(baseline_path, allow_missing=True)
-        if not matching and not baseline:
-            continue
-
-        declared_names = {d["path"] for d in matching}
-        unbaselined = sorted(declared_names - set(baseline))
-        if unbaselined:
-            raise RuntimeError(
-                f"❌ guarded vars {unbaselined} declared for scope {scope['scope_path']} have no baseline "
-                f"in {baseline_path}; run regenerate_guardrails.py for this variation"
-            )
-        undeclared = sorted(set(baseline) - declared_names)
-        if undeclared:
-            raise RuntimeError(
-                f"❌ baseline hashes {undeclared} in {baseline_path} have no matching declaration; "
-                f"remove them or declare them at the plt cfg root"
-            )
-
-        target_dir = rendered_scope_target_dir(plt_rendered_dir, scope["target_path"])
-        if not target_dir.is_dir():
-            raise RuntimeError(
-                f"❌ rendered target dir not found for scope {scope['scope_path']}: {target_dir}"
-            )
-        label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
-        for declaration in matching:
-            var_name = declaration["path"]
-            value = read_rendered_guard_value(target_dir, var_name, label=label)
-            verify_guarded_value("plt", var_name, value, baseline[var_name], label=f"{label}.{var_name}")
-        logging.info("Plt guardrails verified for %s: %s", scope["scope_path"], sorted(declared_names))
-
-
-def verify_guardrails(
-    ctl_cfg_root: Path,
-    plt_cfg_root: Path,
+    guardrails_cfg_root: Path,
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
     required_target_paths: set[str] | None = None,
 ) -> None:
-    verify_ctl_guardrails(ctl_cfg_root, execution_context)
-    verify_plt_guardrails(plt_cfg_root, plt_rendered_dir, scope_params, required_target_paths)
+    """Verify plt declarations against explicit baselines in guardrail cfg."""
+    declarations = load_plt_guard_declarations(plt_cfg_root)
+    if not declarations:
+        return
+    if not discover_cfg_meta_paths(plt_cfg_root):
+        raise RuntimeError(f"❌ plt guard declarations exist but no cfg scopes found under: {plt_cfg_root}")
+    baselines = load_plt_guardrail_baselines(guardrails_cfg_root)
+    for scope in discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
+        if required_target_paths is not None and scope["target_path"] not in required_target_paths:
+            continue
+        matching = [d for d in declarations if guard_declaration_matches_scope(d, scope)]
+        axes = resolve_guard_axes(matching, execution_context, scope_path=scope["scope_path"])
+        entry = baselines.get(guard_baseline_identity(scope["scope_path"], axes))
+        baseline = entry["guarded_vars"] if entry else {}
+        if not matching and not baseline:
+            continue
+        names = {d["var"] for d in matching}
+        missing = sorted(names - set(baseline))
+        if missing:
+            raise RuntimeError(
+                f"❌ guarded vars {missing} declared for scope {scope['scope_path']} "
+                f"have no baseline for axes {axes} in {guardrails_cfg_root}; "
+                "run regenerate_guardrails.py for this variation"
+            )
+        extra = sorted(set(baseline) - names)
+        if extra:
+            origin = entry["origin"] if entry else guardrails_cfg_root
+            raise RuntimeError(f"❌ baseline vars {extra} in {origin} have no matching declaration")
+        target_dir = rendered_scope_target_dir(plt_rendered_dir, scope["target_path"])
+        if not target_dir.is_dir():
+            raise RuntimeError(f"❌ rendered target dir not found for scope {scope['scope_path']}: {target_dir}")
+        label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
+        for declaration in matching:
+            name = declaration["var"]
+            value = read_rendered_guard_value(target_dir, name, label=label)
+            verify_guarded_value("plt", name, value, baseline[name], label=f"{label}.{name}")
+        logging.info(
+            "Plt guardrails verified for %s axes=%s: %s",
+            scope["scope_path"],
+            axes,
+            sorted(names),
+        )
 
+
+def verify_guardrails(
+    ctl_cfg_root: Path,
+    plt_cfg_root: Path,
+    guardrails_cfg_root: Path,
+    plt_rendered_dir: Path,
+    execution_context: dict[str, object],
+    scope_params: dict[str, str],
+    ctl_state_backend_key: str | None,
+    required_target_paths: set[str] | None = None,
+) -> None:
+    verify_ctl_guardrails(
+        ctl_cfg_root,
+        guardrails_cfg_root,
+        execution_context,
+        ctl_state_backend_key,
+    )
+    verify_plt_guardrails(
+        plt_cfg_root,
+        guardrails_cfg_root,
+        plt_rendered_dir,
+        execution_context,
+        scope_params,
+        required_target_paths,
+    )
 
 
 def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = False) -> str:
@@ -4505,8 +4879,13 @@ def write_ctl_cfg_snapshot(
     return ctl_dir
 
 
-def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path) -> None:
-    """Write all git meta files to artifacts directory."""
+def write_git_metas(
+    ctl_cfg_root: Path,
+    plt_cfg_root: Path,
+    guardrails_cfg_root: Path,
+    artifacts_dir: Path,
+) -> None:
+    """Write ctl, plt, guardrail, and orchestrator git metadata."""
     # ctl_cfg_git_meta
     write_git_meta_to_file(
         git_dir=ctl_cfg_root,
@@ -4529,6 +4908,12 @@ def write_git_metas(ctl_cfg_root: Path, plt_cfg_root: Path, artifacts_dir: Path)
         dest_dir=artifacts_dir,
         filename="plt_cfg_git_meta.yaml",
         generator=SERVICE_ID
+    )
+    write_git_meta_to_file(
+        git_dir=guardrails_cfg_root,
+        dest_dir=artifacts_dir,
+        filename="guardrails_cfg_git_meta.yaml",
+        generator=SERVICE_ID,
     )
 
 
@@ -5045,7 +5430,7 @@ def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo
         docker_build = runtime_cfg.get("docker_build", False)
         if not isinstance(docker_build, bool):
             raise RuntimeError(f"Stage metadata runtime.docker_build must be a boolean: {stage_meta_path}")
-        supported_runtimes = stage_supported_runtimes(runtime_cfg, label=str(stage_meta_path))
+        supported_execution_runtimes = stage_supported_execution_runtimes(runtime_cfg, label=str(stage_meta_path))
         cfg_files = stage_meta.get("cfg_files", [])
         if cfg_files is None:
             cfg_files = []
@@ -5062,7 +5447,7 @@ def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo
                     "env_sh": env_sh,
                     "image": image,
                     "docker_build": docker_build,
-                    "supported_runtimes": sorted(supported_runtimes),
+                    "supported_execution_runtimes": sorted(supported_execution_runtimes),
                 },
                 "env_vars": {
                     "inventory": {},
@@ -5176,9 +5561,9 @@ def run_stages(
     provider_adapter,
     provider_catalogs: dict,
     provider_implementation_key: str,
+    execution_runtime: str,  # required, no default — the CLI (--execution-runtime) supplies it
     execution_access_mode: str = "standard",
     provider_credential: str | None = None,
-    runtime: str = DEFAULT_RUNTIME,
 ) -> None:
     """Clone and run all active stages."""
     os.chdir(run_dir)
@@ -5241,10 +5626,10 @@ def run_stages(
                 repo_stage_path = repo_stage["path"]
                 log_stage_banner(f"[{inventory_name}] [{stage_id}] [{repo_stage_id}]", ch="-")
                 repo_stage_runtime = repo_stage.get("runtime", {})
-                supported = set(repo_stage_runtime.get("supported_runtimes", KNOWN_RUNTIMES))
-                if runtime not in supported:
+                supported = set(repo_stage_runtime.get("supported_execution_runtimes", EXECUTION_RUNTIMES))
+                if execution_runtime not in supported:
                     raise RuntimeError(
-                        f"❌ runtime {runtime!r} not supported by stage "
+                        f"❌ execution runtime {execution_runtime!r} not supported by stage "
                         f"{stage_id}/{repo_stage_id} (supported: {sorted(supported)})"
                     )
                 stage_run_cmd = [runtime_dispatcher]
@@ -5262,7 +5647,7 @@ def run_stages(
                 repo_stage_env["STAGE_ARTIFACTS_DIR"] = str(stage_artifacts_dir)
                 # Phase 26: CTL owns the box; hand the dispatcher the runtime + the
                 # stage's declared box spec. stage_dir locates src/stage.sh in the repo.
-                repo_stage_env["ATLAS_STAGE_RUNTIME"] = runtime
+                repo_stage_env["ATLAS_EXECUTION_RUNTIME"] = execution_runtime
                 repo_stage_env["ATLAS_STAGE_NAME"] = _stage_box_name(stage_id, repo_stage_id)
                 repo_stage_env["ATLAS_STAGE_IMAGE"] = repo_stage_runtime["image"]
                 repo_stage_env["ATLAS_STAGE_DOCKER_BUILD"] = (
@@ -5293,6 +5678,7 @@ def print_run_summary(run_id: str, log_file: Path) -> None:
 def run_maintenance(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
+    guardrails_cfg_root: Path,
     ctl_state_local_root: Path,
     ctl_profile: str,
     execution_params: dict[str, str],
@@ -5312,6 +5698,7 @@ def run_maintenance(
     plt_merged_dir: Path,
     log_file: Path,
     provider_credential: str | None,
+    execution_runtime: str,
     agreed_skip_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     execution_access_mode: str = "standard",
@@ -5329,6 +5716,7 @@ def run_maintenance(
         agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         execution_access_mode=execution_access_mode,
+        execution_runtime=execution_runtime,
     )
     scope_params = scope_params_from_context(execution_context)
     validate_execution_context_constraints(ctl_cfg_root, execution_context)
@@ -5346,10 +5734,22 @@ def run_maintenance(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
+    run_provider_adapter(execution_context).derive_provider_facts(
+        execution_context,
+        maintenance_workflow_cfg,
+        inventory_cfg,
+        ctl_cfg_root,
+    )
     ctl_state_domain = resolve_run_domain(
         maintenance_workflow_cfg,
         inventory_cfg,
         load_ctl_state_backends_cfg(ctl_cfg_root),
+    )
+    verify_ctl_guardrails(
+        ctl_cfg_root,
+        guardrails_cfg_root,
+        execution_context,
+        ctl_state_domain,
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
@@ -5407,7 +5807,13 @@ def run_maintenance(
     record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
     verify_guardrails(
-        ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params,
+        ctl_cfg_root,
+        plt_cfg_root,
+        guardrails_cfg_root,
+        plt_rendered_dir,
+        execution_context,
+        scope_params,
+        ctl_state_domain,
         required_target_paths=required_target_paths_for_stages(active_stages),
     )
 
@@ -5422,7 +5828,7 @@ def run_maintenance(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
-    write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
+    write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
     plt_stages_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path,
         plt_rendered_dir,
@@ -5766,6 +6172,7 @@ def build_sub_workflow_cfg(
 def run_pipeline(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,
+    guardrails_cfg_root: Path,
     ctl_profile: str,
     execution_params: dict[str, str],
     ctl_ref_policy: str,
@@ -5783,12 +6190,12 @@ def run_pipeline(
     plt_merged_dir: Path,
     log_file: Path,
     provider_credential: str | None,
+    execution_runtime: str,  # required, no default — the CLI (--execution-runtime) supplies it
     target_name: str | None = None,
     sub_workflow_run: dict | None = None,
     agreed_skip_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     execution_access_mode: str = "standard",
-    runtime: str = DEFAULT_RUNTIME,
 ) -> None:
     """
     Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
@@ -5804,6 +6211,7 @@ def run_pipeline(
         agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         execution_access_mode=execution_access_mode,
+        execution_runtime=execution_runtime
     )
     scope_params = scope_params_from_context(execution_context)
     validate_execution_context_constraints(ctl_cfg_root, execution_context)
@@ -5853,7 +6261,7 @@ def run_pipeline(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
-    validate_runtime(ctl_cfg_root, ctl_profile, runtime)
+    validate_execution_runtime(ctl_cfg_root, ctl_profile, execution_runtime)
 
     # Provider facts must exist before backend resolution and plt rendering:
     # member-account backend names interpolate execution_context.provider.*.
@@ -5865,6 +6273,12 @@ def run_pipeline(
     # bucket is tolerated only for the ctl-state bootstrap target.
     ctl_state_domain = resolve_run_domain(
         workflow_cfg, inventory_cfg, load_ctl_state_backends_cfg(ctl_cfg_root)
+    )
+    verify_ctl_guardrails(
+        ctl_cfg_root,
+        guardrails_cfg_root,
+        execution_context,
+        ctl_state_domain,
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
@@ -5910,7 +6324,13 @@ def run_pipeline(
     # against rendered values, then distribute stage input views from it.
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
     verify_guardrails(
-        ctl_cfg_root, plt_cfg_root, plt_rendered_dir, execution_context, scope_params,
+        ctl_cfg_root,
+        plt_cfg_root,
+        guardrails_cfg_root,
+        plt_rendered_dir,
+        execution_context,
+        scope_params,
+        ctl_state_domain,
         required_target_paths=required_target_paths_for_stages(active_stages),
     )
 
@@ -5955,7 +6375,7 @@ def run_pipeline(
     )
 
     # Write git metas
-    write_git_metas(ctl_cfg_root, plt_cfg_root, artifacts_dir)
+    write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
 
     # Resolved ctl cfg snapshot (self-describing run, next to cfg/plt/)
     write_ctl_cfg_snapshot(
@@ -5988,7 +6408,7 @@ def run_pipeline(
         provider_implementation_key=provider_implementation_key,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
-        runtime=runtime,
+        execution_runtime=execution_runtime,
     )
 
     print_run_summary(run_id, log_file)

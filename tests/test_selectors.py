@@ -45,6 +45,7 @@ class ExecutionContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = common.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="commit_required",
+                execution_runtime="local",
                 execution_params={"env_type": "dev"})
         self.assertEqual(ctx["execution_context.ctl.action"], "plan")
         self.assertEqual(ctx["execution_context.ctl.profile"], "commit_required")
@@ -55,7 +56,8 @@ class ExecutionContextTests(unittest.TestCase):
     def test_cfg_param_ref_to_absent_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = common.build_execution_context(
-                self._ctl_root(tmp), action="plan", ctl_profile="p", execution_params={})
+                self._ctl_root(tmp), action="plan", ctl_profile="p",
+                execution_runtime="local", execution_params={})
         self.assertNotIn("execution_context.params.derived", ctx)
 
     def test_cli_cfg_param_collision_errors(self):
@@ -63,12 +65,14 @@ class ExecutionContextTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "collides with a --execution-params"):
                 common.build_execution_context(
                     self._ctl_root(tmp), action="plan", ctl_profile="p",
+                    execution_runtime="local",
                     execution_params={"main_tag": "other"})
 
     def test_nested_view_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = common.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="p",
+                execution_runtime="local",
                 execution_params={"env_type": "dev"})
         nested = common.execution_context_nested(ctx)
         self.assertEqual(nested["execution_context"]["ctl"]["action"], "plan")

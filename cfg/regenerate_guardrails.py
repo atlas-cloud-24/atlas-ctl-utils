@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""Regenerate guardrail baselines.
+"""Regenerate ctl or plt guardrail baselines.
 
---mode plt: compose + render one cfg variation (one execution-input assignment)
-via the same engine code path the pipeline uses, then rewrite the scope-local
-`__guardrails__.yaml` (`guarded_vars:` value+hash entries) of every active scope with matching root
-declarations. The temp merged/rendered tree is discarded unless
---keep-artifacts is passed; the only durable output is the committed baseline
-files.
-
---mode ctl: refresh the combined ctl `guardrails.guarded_vars` value+hash entries from the
-execution context built for the given input assignment (no rendering).
+Plt mode resolves writable local plt and guardrail repositories from the dev ctl
+cfg binding. Ctl mode reads declarations from ctl cfg and writes resolved baselines to the bound guardrail repository.
 """
 
 from __future__ import annotations
@@ -19,8 +12,6 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-
-import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
@@ -32,8 +23,7 @@ def key_value(value: str) -> tuple[str, str]:
     if "=" not in value:
         raise argparse.ArgumentTypeError(f"Expected key=value, got {value!r}")
     key, raw = value.split("=", 1)
-    key = key.strip()
-    raw = raw.strip()
+    key, raw = key.strip(), raw.strip()
     if not key or not raw:
         raise argparse.ArgumentTypeError(f"Expected non-empty key=value, got {value!r}")
     return key, raw
@@ -42,170 +32,185 @@ def key_value(value: str) -> tuple[str, str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("plt", "ctl"))
-    parser.add_argument("--cfg-root", required=True, help="Owner cfg root (plt or ctl per --mode).")
-    parser.add_argument(
-        "--execution-params",
-        dest="execution_param",
-        action="append",
-        type=key_value,
-        default=[],
-        help="Execution param key=value defining the cfg variation. May be repeated.",
-    )
-    parser.add_argument(
-        "--ctl-cfg-root",
-        help="Ctl cfg root used to build the execution context for rendering (plt mode).",
-    )
-    parser.add_argument(
-        "--execution-context",
-        action="append",
-        type=key_value,
-        default=[],
-        help="Extra execution-context entry as full dotted key=value; overrides built values.",
-    )
-    parser.add_argument(
-        "--var",
-        action="append",
-        dest="vars",
-        help="Ctl mode: fully-qualified execution-context ref to add/regenerate "
-        "(e.g. execution_context.params.main_tag). Defaults to already-declared vars.",
-    )
-    parser.add_argument(
-        "--keep-artifacts",
-        action="store_true",
-        help="Plt mode: keep the temp merged/rendered tree for inspection.",
-    )
+    parser.add_argument("--ctl-cfg-root", required=True, help="Dev ctl cfg root with writable local cfg sources.")
+    parser.add_argument("--execution-runtime", required=True, choices=common.EXECUTION_RUNTIMES)
+    parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
+    parser.add_argument("--execution-context", action="append", type=key_value, default=[])
+    parser.add_argument("--var", action="append", dest="vars", help="Ctl mode declaration ref; repeatable.")
+    parser.add_argument("--ctl-state-backend-key", help="Ctl mode backend variation to regenerate.")
+    parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
-    if args.mode == "ctl" and args.keep_artifacts:
+    if args.mode == "plt":
+        if args.vars:
+            parser.error("--var is not valid with --mode plt")
+        if args.ctl_state_backend_key:
+            parser.error("--ctl-state-backend-key is not valid with --mode plt")
+    elif args.keep_artifacts:
         parser.error("--keep-artifacts is only valid with --mode plt")
-    if args.mode == "plt" and args.vars:
-        parser.error("--var is only valid with --mode ctl; plt vars come from root declarations")
     return args
 
 
-def build_context(args: argparse.Namespace, ctl_cfg_root: Path | None) -> dict[str, object]:
-    context: dict[str, object] = {}
-    if ctl_cfg_root is not None:
-        context = common.build_execution_context(
-            ctl_cfg_root,
-            action=None,
-            ctl_profile=None,
-            execution_params=dict(args.execution_param),
-        )
-        # Provider facts for baseline renders come from the provider adapter
-        # (real runs derive them from the run's identities).
-        provider = context.get("execution_context.params.provider")
-        if isinstance(provider, str) and provider.strip():
-            common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(
-                context, ctl_cfg_root
-            )
-    else:
-        for key, value in dict(args.execution_param).items():
-            context[f"{common.EXECUTION_CONTEXT_ROOT}.params.{key}"] = value
+def build_context(args: argparse.Namespace, ctl_cfg_root: Path) -> dict[str, object]:
+    context = common.build_execution_context(
+        ctl_cfg_root,
+        action=None,
+        ctl_profile=None,
+        execution_params=dict(args.execution_param),
+        execution_runtime=args.execution_runtime,
+    )
+    provider = context.get("execution_context.params.provider")
+    if isinstance(provider, str) and provider.strip():
+        common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(context, ctl_cfg_root)
     for key, value in args.execution_context:
         context[key] = value
     return context
 
 
+def bound_local_roots(ctl_cfg_root: Path, temp_root: Path) -> tuple[Path, Path]:
+    sources = common.load_cfg_sources(ctl_cfg_root)
+    remote = [key for key, entry in sources.items() if "repo_path" not in entry]
+    if remote:
+        raise RuntimeError(
+            "guardrail regeneration requires writable local cfg sources; "
+            f"use generated dev ctl cfg (remote entries: {remote})"
+        )
+    roots = common.materialize_cfg_sources(
+        ctl_cfg_root,
+        ref_policy="local_dirty_allowed",
+        run_cfg_dir=temp_root / "cfg",
+    )
+    return roots["plt"], roots["guardrails"]
+
+
 def run_plt(args: argparse.Namespace) -> int:
-    plt_cfg_root = Path(args.cfg_root).expanduser().resolve()
-    if not plt_cfg_root.is_dir():
-        raise RuntimeError(f"plt cfg root not found: {plt_cfg_root}")
-    declarations = common.load_plt_guard_declarations(plt_cfg_root)
-    if not declarations:
-        raise RuntimeError(f"no guard declarations at the plt cfg root: {plt_cfg_root}")
-
-    ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve() if args.ctl_cfg_root else None
+    ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
+    if not ctl_cfg_root.is_dir():
+        raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
     execution_context = build_context(args, ctl_cfg_root)
-    scope_params = dict(args.execution_param)
+    common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+    scope_params = common.scope_params_from_context(execution_context)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="atlas-regenerate-guardrails-"))
+    temp_root = Path(tempfile.mkdtemp(prefix="atlas-regenerate-guardrails-"))
     try:
-        merged_dir = tmp_dir / "merged"
-        rendered_dir = tmp_dir / "rendered"
-        # Same engine code path as the pipeline: compose scopes, then render.
+        plt_cfg_root, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
+        declarations = common.load_plt_guard_declarations(plt_cfg_root)
+        if not declarations:
+            raise RuntimeError(f"no guard declarations at the plt cfg root: {plt_cfg_root}")
+
+        merged_dir = temp_root / "merged"
         common.merge_plt_cfg_dirs(
             plt_cfg_root=plt_cfg_root,
             plt_merged_dir=merged_dir,
             ctl_profile="regenerate-guardrails",
             plt_overlays=[],
             scope_params=scope_params,
+            execution_context=execution_context,
         )
-        rendered_dir.mkdir(parents=True)
-        for entry in sorted(merged_dir.iterdir()):
-            if entry.is_dir():
-                common.render_scope_tree(entry, rendered_dir / entry.name, dict(execution_context))
+        rendered_dir = common.render_plt_cfg(merged_dir, temp_root, execution_context)
 
-        wrote_any = False
+        wrote = []
         for scope in common.discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
             matching = [d for d in declarations if common.guard_declaration_matches_scope(d, scope)]
             if not matching:
                 continue
             target_dir = common.rendered_scope_target_dir(rendered_dir, scope["target_path"])
             label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
-            guarded: dict[str, dict[str, str]] = {}
+            guarded = {}
             for declaration in matching:
-                var_name = declaration["path"]
-                value = common.read_rendered_guard_value(target_dir, var_name, label=label)
-                guarded[var_name] = common.guard_entry(value, label=f"plt.{var_name}")
-            baseline_path = common.scope_guard_baseline_path(scope, matching, scope_params)
-            baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            baseline_path.write_text(
-                yaml.safe_dump({"guarded_vars": guarded}, sort_keys=True),
-                encoding="utf-8",
+                name = declaration["var"]
+                value = common.read_rendered_guard_value(target_dir, name, label=label)
+                guarded[name] = common.guard_entry(value, label=f"plt.{name}")
+            axes = common.resolve_guard_axes(matching, execution_context, scope_path=scope["scope_path"])
+            path = common.write_plt_guardrail_baseline(
+                guardrails_cfg_root,
+                scope_path=scope["scope_path"],
+                axes=axes,
+                guarded_vars=guarded,
             )
-            wrote_any = True
-            print(f"wrote {baseline_path}")
-            for var_name in sorted(guarded):
-                entry = guarded[var_name]
-                print(f"  {var_name}: {entry['value']} ({entry['hash']})")
-
-        if not wrote_any:
-            raise RuntimeError(
-                f"no active scope matched any declaration for params {scope_params}; nothing written"
-            )
+            wrote.append(path)
+            print(f"wrote {path} scope={scope['scope_path']} axes={axes}")
+        if not wrote:
+            raise RuntimeError(f"no active scope matched a declaration for params {scope_params}")
     finally:
         if args.keep_artifacts:
-            print(f"kept artifacts: {tmp_dir}")
+            print(f"kept artifacts: {temp_root}")
         else:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(temp_root, ignore_errors=True)
     return 0
 
 
 def run_ctl(args: argparse.Namespace) -> int:
-    ctl_cfg_root = Path(args.cfg_root).expanduser().resolve()
+    ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
-    existing = common.load_ctl_guarded_vars(ctl_cfg_root)
-    refs = args.vars or sorted(existing)
-    if not refs:
-        raise RuntimeError("no ctl guarded vars declared; pass --var to add one")
-
     execution_context = build_context(args, ctl_cfg_root)
-    guarded: dict[str, dict[str, str]] = dict(existing)
-    for ref in refs:
-        ref = common.validate_ctl_guard_ref(ref, label="--var")
-        # Context refs read the built context; ctl_state_backends.* refs resolve
-        # from the registry — same resolution the run-time verify uses.
-        value = common.resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
-        guarded[ref] = common.guard_entry(value, label=ref)
+    common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
 
-    path = ctl_cfg_root / "guardrails.yaml"
-    path.write_text(
-        yaml.safe_dump({"guardrails": {"guarded_vars": guarded}}, sort_keys=True),
-        encoding="utf-8",
-    )
-    print(f"wrote {path}")
-    for var_name in sorted(guarded):
-        entry = guarded[var_name]
-        print(f"  {var_name}: {entry['value']} ({entry['hash']})")
+    declarations = common.load_ctl_guard_declarations(ctl_cfg_root)
+    if not declarations:
+        raise RuntimeError("no ctl guard declarations found")
+    requested_refs = args.vars or sorted(declarations)
+    unknown = sorted(set(requested_refs) - set(declarations))
+    if unknown:
+        raise RuntimeError(f"unknown ctl guard declarations: {unknown}")
+
+    requested_domains = {
+        common.ctl_guard_domain(ref)
+        for ref in requested_refs
+        if common.ctl_guard_domain(ref) is not None
+    }
+    if args.ctl_state_backend_key:
+        mismatched = sorted(
+            domain for domain in requested_domains if domain != args.ctl_state_backend_key
+        ) if args.vars else []
+        if mismatched:
+            raise RuntimeError(
+                f"--var refs select backends {mismatched}, not {args.ctl_state_backend_key!r}"
+            )
+        backend_key = args.ctl_state_backend_key
+    elif len(requested_domains) == 1:
+        backend_key = next(iter(requested_domains))
+    elif requested_domains:
+        raise RuntimeError(
+            "--ctl-state-backend-key is required when regenerating multiple backend declarations"
+        )
+    else:
+        backend_key = None
+
+    active = []
+    for ref in requested_refs:
+        domain = common.ctl_guard_domain(ref)
+        if domain is None or domain == backend_key:
+            active.append(declarations[ref])
+    if not active:
+        raise RuntimeError("no ctl guard declarations match this backend variation")
+
+    temp_root = Path(tempfile.mkdtemp(prefix="atlas-regenerate-ctl-guardrails-"))
+    try:
+        _, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
+        for declaration in active:
+            ref = declaration["ref"]
+            axes = common.resolve_guard_axes(
+                [declaration],
+                execution_context,
+                scope_path=f"ctl guard {ref}",
+            )
+            value = common.resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
+            path = common.write_ctl_guardrail_baseline(
+                guardrails_cfg_root,
+                ref=ref,
+                axes=axes,
+                value=value,
+            )
+            print(f"wrote {path} ref={ref} axes={axes}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
     return 0
 
 
 def main() -> int:
     args = parse_args()
-    if args.mode == "plt":
-        return run_plt(args)
-    return run_ctl(args)
+    return run_plt(args) if args.mode == "plt" else run_ctl(args)
 
 
 if __name__ == "__main__":

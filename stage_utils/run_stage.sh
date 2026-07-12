@@ -6,7 +6,7 @@ set -euo pipefail
 # image + work in stage.yaml (runtime.image / runtime.docker_build) and src/stage.sh.
 #
 # Required env (set by the engine):
-#   ATLAS_STAGE_RUNTIME       local | ci        — the active runtime (CTL selects)
+#   ATLAS_EXECUTION_RUNTIME       local | ci        — the active runtime (CTL selects)
 #   ATLAS_STAGE_NAME          unique box/tag name for this stage
 #   ATLAS_STAGE_IMAGE         infra | ops        — stage.yaml runtime.image
 #   ATLAS_STAGE_DOCKER_BUILD  true | false       — stage.yaml runtime.docker_build
@@ -16,7 +16,7 @@ set -euo pipefail
 # plus everything run_local_stage already consumes (execution context, provider
 # binding, cfg/artifact dirs, AWS_*/ATLAS_AWS_* passthroughs).
 
-runtime="${ATLAS_STAGE_RUNTIME:?ATLAS_STAGE_RUNTIME must be set}"
+runtime="${ATLAS_EXECUTION_RUNTIME:?ATLAS_EXECUTION_RUNTIME must be set}"
 : "${ATLAS_STAGE_NAME:?ATLAS_STAGE_NAME must be set}"
 : "${ATLAS_STAGE_IMAGE:?ATLAS_STAGE_IMAGE must be set}"
 : "${stage_dir:?stage_dir must be set}"
@@ -61,7 +61,7 @@ case "$runtime" in
     exit 1
     ;;
   *)
-    echo "❌ unknown ATLAS_STAGE_RUNTIME: ${runtime}"
+    echo "❌ unknown ATLAS_EXECUTION_RUNTIME: ${runtime}"
     exit 1
     ;;
 esac
