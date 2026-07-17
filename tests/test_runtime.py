@@ -3,7 +3,7 @@
 CTL owns the execution box: it selects one runtime per run and invokes the
 ctl-owned dispatcher (stage_utils/run_stage.sh) — never a per-stage run script.
 Stages declare only their box (stage.yaml runtime.image / docker_build) and a
-runtime constraint (supported_execution_runtimes); CTL reconciles the selected runtime
+runtime constraint (supported_execution_runtime_modes); CTL reconciles the selected runtime
 against the ctl profile and every active stage.
 """
 import re
@@ -22,17 +22,17 @@ ATLAS_STACK = REPO_ROOT.parent
 
 class RuntimePrimitivesTests(unittest.TestCase):
     def test_stage_supported_execution_runtimes_default_and_validate(self):
-        self.assertEqual(common.stage_supported_execution_runtimes({}, label="x"), {"local", "ci"})
+        self.assertEqual(common.stage_supported_execution_runtime_modes({}, label="x"), {"local", "ci"})
         self.assertEqual(
-            common.stage_supported_execution_runtimes({"supported_execution_runtimes": ["ci"]}, label="x"), {"ci"}
+            common.stage_supported_execution_runtime_modes({"supported_execution_runtime_modes": ["ci"]}, label="x"), {"ci"}
         )
         for bad in (
-            {"supported_execution_runtimes": ["teleport"]},
-            {"supported_execution_runtimes": []},
-            {"supported_execution_runtimes": "ci"},
+            {"supported_execution_runtime_modes": ["teleport"]},
+            {"supported_execution_runtime_modes": []},
+            {"supported_execution_runtime_modes": "ci"},
         ):
             with self.assertRaises(RuntimeError):
-                common.stage_supported_execution_runtimes(bad, label="x")
+                common.stage_supported_execution_runtime_modes(bad, label="x")
 
     def test_ctl_allowed_execution_runtimes_default_and_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,26 +40,26 @@ class RuntimePrimitivesTests(unittest.TestCase):
             (root / "ctl_profiles.yaml").write_text(
                 "ctl_profiles:\n"
                 "  open: { ref_policy: commit_required }\n"
-                "  local_only: { ref_policy: commit_required, allowed_execution_runtimes: [local] }\n"
+                "  local_only: { ref_policy: commit_required, allow_execution_runtime_modes: [local] }\n"
             )
-            self.assertEqual(common.ctl_allowed_execution_runtimes(root, "open"), {"local", "ci"})
-            self.assertEqual(common.ctl_allowed_execution_runtimes(root, "local_only"), {"local"})
+            self.assertEqual(common.ctl_allowed_execution_runtime_modes(root, "open"), {"local", "ci"})
+            self.assertEqual(common.ctl_allowed_execution_runtime_modes(root, "local_only"), {"local"})
 
-    def test_validate_execution_runtime(self):
+    def test_validate_execution_runtime_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
                 "ctl_profiles:\n"
                 "  open: { ref_policy: commit_required }\n"
-                "  local_only: { ref_policy: commit_required, allowed_execution_runtimes: [local] }\n"
+                "  local_only: { ref_policy: commit_required, allow_execution_runtime_modes: [local] }\n"
             )
-            common.validate_execution_runtime(root, "open", "local")  # ok
-            common.validate_execution_runtime(root, "open", "ci")  # ok
-            common.validate_execution_runtime(root, "local_only", "local")  # ok
+            common.validate_execution_runtime_mode(root, "open", "local")  # ok
+            common.validate_execution_runtime_mode(root, "open", "ci")  # ok
+            common.validate_execution_runtime_mode(root, "local_only", "local")  # ok
             with self.assertRaisesRegex(RuntimeError, "not allowed by ctl profile"):
-                common.validate_execution_runtime(root, "local_only", "ci")
+                common.validate_execution_runtime_mode(root, "local_only", "ci")
             with self.assertRaisesRegex(RuntimeError, "unknown execution runtime"):
-                common.validate_execution_runtime(root, "open", "teleport")
+                common.validate_execution_runtime_mode(root, "open", "teleport")
 
     def test_stage_box_name_valid_and_unique(self):
         a = common._stage_box_name("landing_zone/org/stack_sets", "provision/infra")
@@ -95,8 +95,8 @@ class RuntimeContractTests(unittest.TestCase):
                 runtime_cfg.get("docker_build", False), bool,
                 f"{sy} runtime.docker_build must be bool",
             )
-            # supported_execution_runtimes (if present) must validate
-            common.stage_supported_execution_runtimes(runtime_cfg, label=str(sy))
+            # supported_execution_runtime_modes (if present) must validate
+            common.stage_supported_execution_runtime_modes(runtime_cfg, label=str(sy))
 
     def test_stages_do_not_invoke_docker_directly(self):
         # src/stage.sh is runtime-neutral work; only ecr/frontend legitimately use

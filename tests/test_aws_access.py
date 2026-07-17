@@ -55,7 +55,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     "profile_name": "${execution_context.params.main_tag}-ctl-entry",
                     "expect": {
                         "account_key": "ctl_plane",
-                        "permission_set_name": "oxygen-live-ctl-entry",
+                        "permission_set_name": "CtlEntryAccess",
                     },
                 }
             },
@@ -131,7 +131,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_context=self.context,
                 implementation_key="local",
                 account_registry=self.account_registry,
-                execution_access_mode="direct",
+                execution_access_mode="agreed_direct",
             )
         self.assertEqual(resolved["account_key"], "dev")
         self.assertEqual(resolved["profile_name"], "oxygen-dev-deploy")
@@ -155,7 +155,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_context=self.context,
                 implementation_key="local",
                 account_registry=self.account_registry,
-                execution_access_mode="direct",
+                execution_access_mode="agreed_direct",
             )
         self.assertEqual(resolved["profile_name"], "oxygen-dev-ctl-state-synchronizer")
 
@@ -169,7 +169,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_context=self.context,
                 implementation_key="local",
                 account_registry=self.account_registry,
-                execution_access_mode="direct",
+                execution_access_mode="agreed_direct",
             )
 
     def test_execution_identity_loader_rejects_pre_rename_fields(self):
@@ -211,7 +211,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     execution_context=self.context,
                     implementation_key="local",
                     account_registry=self.account_registry,
-                    execution_access_mode="direct",
+                    execution_access_mode="agreed_direct",
                 )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -236,7 +236,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_context=self.context,
                 implementation_key="ci",
                 account_registry=self.account_registry,
-                execution_access_mode="direct",
+                execution_access_mode="agreed_direct",
             )
 
     def test_unknown_runtime_placeholder_fails(self):
@@ -270,7 +270,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     execution_context=self.context,
                     implementation_key="local",
                     account_registry=self.account_registry,
-                    execution_access_mode="direct",
+                    execution_access_mode="agreed_direct",
                 )
 
     # --- chain mode (default) ---
@@ -289,7 +289,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         )
         self.assertEqual(resolved["credential_provider_kind"], "role_chain")
         self.assertEqual(resolved["entry_profile_name"], "oxygen-ctl-entry")
-        self.assertEqual(resolved["entry_permission_set_name"], "oxygen-live-ctl-entry")
+        self.assertEqual(resolved["entry_permission_set_name"], "CtlEntryAccess")
         self.assertEqual(
             resolved["hop_role_arns"],
             [
@@ -360,7 +360,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.credential_sources,
             execution_context=self.context,
             implementation_key="local",
-            execution_access_mode="bypass",
+            execution_access_mode="force_bypass",
             provider_credential="my-sandbox-admin",
         )
         self.assertEqual(resolved["profile_name"], "my-sandbox-admin")
@@ -376,7 +376,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.credential_sources,
                 execution_context=self.context,
                 implementation_key="local",
-                execution_access_mode="bypass",
+                execution_access_mode="force_bypass",
             )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -391,7 +391,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             execution_context=self.context,
             implementation_key="local",
             account_registry={},
-            execution_access_mode="bypass",
+            execution_access_mode="force_bypass",
             provider_credential="my-sandbox-admin",
         )
         self.assertEqual(stage_env["AWS_PROFILE"], "my-sandbox-admin")
@@ -439,7 +439,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_context=self.context,
                 implementation_key="local",
                 account_registry=self.account_registry,
-                execution_access_mode="direct",
+                execution_access_mode="agreed_direct",
             )
         self.assertEqual(stage_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"], "111111111111")
         self.assertEqual(stage_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"], "NonProdDeployAccess")
@@ -465,7 +465,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     execution_context=self.context,
                     implementation_key="local",
                     account_registry=self.account_registry,
-                    execution_access_mode="direct",
+                    execution_access_mode="agreed_direct",
                 )
 
     def test_chain_resolution_requires_entry_account_key(self):
@@ -473,7 +473,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         sources["ctl_entry"] = {
             "local": {
                 "profile_name": "oxygen-ctl-entry",
-                "expect": {"permission_set_name": "oxygen-live-ctl-entry"},
+                "expect": {"permission_set_name": "CtlEntryAccess"},
             }
         }
         with self.assertRaisesRegex(RuntimeError, r"must declare\s+expect.account_key"):
@@ -493,13 +493,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
         caller = {
             "Account": "444444444444",
             "Arn": "arn:aws:sts::444444444444:assumed-role/"
-                   "AWSReservedSSO_oxygen-live-ctl-entry-evil_abc123/session",
+                   "AWSReservedSSO_CtlEntryAccess-evil_abc123/session",
         }
         with self.assertRaisesRegex(RuntimeError, "permission-set mismatch"):
             assert_aws_access.validate_caller_identity(
                 caller,
                 expected_account_id="444444444444",
-                expected_permission_set_name="oxygen-live-ctl-entry",
+                expected_permission_set_name="CtlEntryAccess",
             )
 
     # --- identity coverage ---
@@ -514,7 +514,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_identity_coverage_allows_anything_under_bypass(self):
         stages = {"declared": {"execution_identity_key": "env_deploy"}, "bare": {}}
         common.validate_execution_identity_coverage(
-            stages, execution_access_mode="bypass"
+            stages, execution_access_mode="force_bypass"
         )
 
     @mock.patch.dict(os.environ, {}, clear=True)

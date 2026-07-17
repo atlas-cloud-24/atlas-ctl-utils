@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ctl-cfg-root", required=True)
     parser.add_argument("--ctl-profile", required=True)
-    parser.add_argument("--execution-runtime", required=True, choices=common.EXECUTION_RUNTIMES)
+    parser.add_argument("--execution-runtime-mode", required=True, choices=common.EXECUTION_RUNTIME_MODES)
     parser.add_argument("--ctl-state-backend-key", required=True)
     parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
     parser.add_argument("--keep-artifacts", action="store_true")
@@ -48,12 +48,9 @@ def main() -> int:
         action=None,
         ctl_profile=args.ctl_profile,
         execution_params=dict(args.execution_param),
-        execution_runtime=args.execution_runtime,
+        execution_runtime_mode=args.execution_runtime_mode,
     )
     common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
-    provider = execution_context.get("execution_context.params.provider")
-    if isinstance(provider, str) and provider.strip():
-        common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(execution_context, ctl_cfg_root)
     scope_params = common.scope_params_from_context(execution_context)
 
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))

@@ -9,6 +9,7 @@ dispatch through utils.providers.get_adapter().
 
 import configparser
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -394,7 +395,7 @@ def assert_profile_caller(
     expected_account_id: str,
     expect_principal: dict[str, str],
     label: str,
-) -> None:
+) -> dict:
     """Engine-side caller assertion (shared implementation with the stage check)."""
     module = _assertion()
     caller = module.get_caller_identity(profile_name)
@@ -407,6 +408,7 @@ def assert_profile_caller(
         )
     except RuntimeError as error:
         raise RuntimeError(f"❌ {label}: {error}") from error
+    return caller
 
 
 def validate_credential_path(hop_role_arns: list[str]) -> None:
@@ -425,6 +427,51 @@ def validate_credential_path(hop_role_arns: list[str]) -> None:
         seen.add(arn)
 
 
+def _run_aws_json(
+    cmd: list[str], env_extra: dict[str, str] | None = None
+) -> dict:
+    env = os.environ.copy()
+    env["AWS_EC2_METADATA_DISABLED"] = "true"
+    if env_extra:
+        env.update(env_extra)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        operation = " ".join(cmd[:4])
+        raise RuntimeError(f"❌ {operation} failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def _assume_role_credentials(
+    role_arn: str,
+    *,
+    session_name: str,
+    entry_profile_name: str,
+    env_extra: dict[str, str] | None,
+    use_profile: bool,
+) -> tuple[dict[str, str], dict]:
+    cmd = [
+        "aws",
+        "sts",
+        "assume-role",
+        "--output",
+        "json",
+        "--role-arn",
+        role_arn,
+        "--role-session-name",
+        session_name,
+    ]
+    if use_profile:
+        cmd += ["--profile", entry_profile_name]
+    response = _run_aws_json(cmd, env_extra)
+    raw = response["Credentials"]
+    credentials = {
+        "AWS_ACCESS_KEY_ID": raw["AccessKeyId"],
+        "AWS_SECRET_ACCESS_KEY": raw["SecretAccessKey"],
+        "AWS_SESSION_TOKEN": raw["SessionToken"],
+    }
+    return credentials, response.get("AssumedRoleUser") or {}
+
+
 def assume_ctl_role_chain(
     entry_profile_name: str,
     hop_role_arns: list[str],
@@ -434,26 +481,20 @@ def assume_ctl_role_chain(
     entry_permission_set_name: str | None = None,
     entry_role_name: str | None = None,
 ) -> dict[str, str]:
-    """Execute the entry-profile -> [ordered role hops] AssumeRole path via the
-    AWS CLI, iterating an arbitrary-length hop list (§12.3). Returns the FINAL
-    role's temporary credentials as env-var names. The entry credential's expect
-    is asserted against its caller ARN before the first hop.
-    """
+    """Execute and validate an arbitrary-length entry-profile role path."""
     validate_credential_path(hop_role_arns)
 
-    def _aws(cmd: list[str], env_extra: dict[str, str] | None = None) -> dict:
-        env = os.environ.copy()
-        env["AWS_EC2_METADATA_DISABLED"] = "true"
-        if env_extra:
-            env.update(env_extra)
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(f"❌ {' '.join(cmd[:4])} failed: {result.stderr.strip()}")
-        return json.loads(result.stdout)
-
-    # Phase 14: exact shared validation (assumed-role ARN parsing, anchored
-    # AWSReservedSSO pattern, entry account) — no substring matching.
-    caller = _aws(["aws", "sts", "get-caller-identity", "--output", "json", "--profile", entry_profile_name])
+    caller = _run_aws_json(
+        [
+            "aws",
+            "sts",
+            "get-caller-identity",
+            "--output",
+            "json",
+            "--profile",
+            entry_profile_name,
+        ]
+    )
     try:
         _assertion().validate_caller_identity(
             caller,
@@ -462,26 +503,20 @@ def assume_ctl_role_chain(
             expected_role_name=entry_role_name,
         )
     except RuntimeError as error:
-        raise RuntimeError(f"❌ entry profile {entry_profile_name!r}: {error}") from error
+        raise RuntimeError(
+            f"❌ entry profile {entry_profile_name!r}: {error}"
+        ) from error
 
-    def _assume(role_arn: str, env_extra: dict[str, str] | None, use_profile: bool) -> dict[str, str]:
-        cmd = ["aws", "sts", "assume-role", "--output", "json",
-               "--role-arn", role_arn, "--role-session-name", session_name]
-        if use_profile:
-            cmd += ["--profile", entry_profile_name]
-        creds = _aws(cmd, env_extra)["Credentials"]
-        return {
-            "AWS_ACCESS_KEY_ID": creds["AccessKeyId"],
-            "AWS_SECRET_ACCESS_KEY": creds["SecretAccessKey"],
-            "AWS_SESSION_TOKEN": creds["SessionToken"],
-        }
-
-    # Iterate the ordered path: the first hop assumes from the entry profile,
-    # each subsequent hop chains from the previous hop's credentials.
-    creds: dict[str, str] = {}
+    credentials: dict[str, str] = {}
     for index, role_arn in enumerate(hop_role_arns):
-        creds = _assume(role_arn, creds or None, use_profile=(index == 0))
-    return creds
+        credentials, _ = _assume_role_credentials(
+            role_arn,
+            session_name=session_name,
+            entry_profile_name=entry_profile_name,
+            env_extra=credentials or None,
+            use_profile=index == 0,
+        )
+    return credentials
 
 
 def resolve_stage_aws_access(
@@ -496,11 +531,12 @@ def resolve_stage_aws_access(
     provider_credential: str | None = None,
     ctl_role_chain: dict | None = None,
     stage_roles: dict | None = None,
-) -> dict[str, str] | None:
+    validate_local_credential: bool = True,
+) -> dict | None:
     """Resolve one stage's AWS access per §Skip Model D.
 
-    Three modes (§12): bypass (--force-bypass-execution-identity + substitute
-    credential; nothing checked), direct (--agreed-use-direct-execution-access; the identity's
+    Three modes (§12): bypass (--execution-access-mode force_bypass + substitute
+    credential; nothing checked), direct (--execution-access-mode agreed_direct; the identity's
     direct_credential_source_key profile + account and principal checks), and
     chain (default; entry profile -> runner role -> stage role, entry expect
     checked, stage asserts account + stage-role principal).
@@ -509,7 +545,7 @@ def resolve_stage_aws_access(
         if legacy_field in stage:
             raise RuntimeError(f"❌ stage uses deprecated {legacy_field}; use execution_identity_key")
 
-    if execution_access_mode == "bypass":
+    if execution_access_mode == "force_bypass":
         profile_name = (provider_credential or "").strip()
         if not profile_name:
             raise RuntimeError("❌ bypass execution access requires the --provider-credential substitute credential")
@@ -531,7 +567,11 @@ def resolve_stage_aws_access(
         raise RuntimeError("❌ stage execution_identity_key must be a non-empty string")
     identity_key = identity_key.strip()
 
-    identity_cfg = execution_identities.get(identity_key)
+    # a group execution_identity_key resolves to its one concrete member for this
+    # run's context (§Phase 10); a concrete key returns itself
+    identity_key, identity_cfg = common.resolve_execution_identity_entry(
+        execution_identities, identity_key, execution_context
+    )
     if not isinstance(identity_cfg, dict):
         raise RuntimeError(
             f"❌ stage execution_identity_key {identity_key!r} is not defined in execution_identities.yaml"
@@ -569,7 +609,7 @@ def resolve_stage_aws_access(
         "expected_account_id": expected_account_id,
     }
 
-    if execution_access_mode == "direct":
+    if execution_access_mode == "agreed_direct":
         # Direct mode (Phase 14): both independent facts are validated — the
         # destination account (identity account_key -> registry) AND the actual
         # principal (the credential source's declared expect).
@@ -599,20 +639,21 @@ def resolve_stage_aws_access(
             context,
             label=f"providers.aws.credential_sources.{direct_source_key}.{implementation_key}.profile_name",
         )
-        canonical_account_id = resolve_configured_profile_account_id(canonical_profile_name)
-        if expected_account_id != canonical_account_id:
-            raise RuntimeError(
-                f"❌ AWS account registry maps {account_key!r} to {expected_account_id}, but canonical "
-                f"profile {canonical_profile_name!r} resolves to {canonical_account_id}"
-            )
         override_name = aws_credential_source_override_env_name(direct_source_key)
         selected_profile_name = os.getenv(override_name, "").strip() or canonical_profile_name
-        selected_account_id = resolve_configured_profile_account_id(selected_profile_name)
-        if selected_account_id != expected_account_id:
-            raise RuntimeError(
-                f"❌ AWS profile override {selected_profile_name!r} resolves to account {selected_account_id}, "
-                f"but canonical profile {canonical_profile_name!r} resolves to {expected_account_id}"
-            )
+        if validate_local_credential:
+            canonical_account_id = resolve_configured_profile_account_id(canonical_profile_name)
+            if expected_account_id != canonical_account_id:
+                raise RuntimeError(
+                    f"❌ AWS account registry maps {account_key!r} to {expected_account_id}, but canonical "
+                    f"profile {canonical_profile_name!r} resolves to {canonical_account_id}"
+                )
+            selected_account_id = resolve_configured_profile_account_id(selected_profile_name)
+            if selected_account_id != expected_account_id:
+                raise RuntimeError(
+                    f"❌ AWS profile override {selected_profile_name!r} resolves to account {selected_account_id}, "
+                    f"but canonical profile {canonical_profile_name!r} resolves to {expected_account_id}"
+                )
         direct_expect = implementation_cfg.get("expect") or {}
         direct_expect_account_key = direct_expect.get("account_key")
         if direct_expect_account_key:
@@ -639,7 +680,7 @@ def resolve_stage_aws_access(
     if ctl_role_chain is None:
         raise RuntimeError(
             "❌ steady-state runs require providers.aws.ctl_role_chain; define it, or run "
-            "with --agreed-use-direct-execution-access (bootstrap) or --force-bypass-execution-identity"
+            "with --execution-access-mode agreed_direct (bootstrap) or --execution-access-mode force_bypass"
         )
     stage_roles = stage_roles or {}
     entry_source_key = ctl_role_chain["entry_credential_source_key"]
@@ -726,6 +767,308 @@ def resolve_stage_aws_access(
     return resolved
 
 
+
+_ROLE_ARN_PATTERN = re.compile(
+    r"^arn:[^:]+:iam::(?P<account_id>[0-9]{12}):role/(?P<role_name>.+)$"
+)
+
+
+def _preflight_failure_reason(error: BaseException) -> str:
+    detail = " ".join(str(error).split())
+    detail = re.sub(
+        r"(?i)((?:access[ _-]?key|secret|token|password)\s*[:=]\s*)\S+",
+        r"\1<redacted>",
+        detail,
+    )
+    # report statuses carry the ❌ mark; the reason text stays plain
+    detail = detail.lstrip("❌ ").strip()
+    return detail or error.__class__.__name__
+
+
+def _preflight_session_name(
+    stage_id: str, execution_context: dict[str, object]
+) -> str:
+    consumer = str(
+        execution_context.get("execution_context.params.main_tag") or "ctl"
+    )
+    digest_input = json.dumps(execution_context, sort_keys=True, default=str) + stage_id
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()[:10]
+    raw = f"{consumer}-identity-preflight-{digest}"
+    normalized = re.sub(r"[^A-Za-z0-9+=,.@-]", "-", raw).strip("-")
+    return (normalized or f"ctl-identity-preflight-{digest}")[:64]
+
+
+def _path_node(
+    node_type: str,
+    *,
+    cfg_key: str | None,
+    expected_name: str | None,
+    expected_account: str | None,
+    status: str,
+) -> dict:
+    name = expected_name or cfg_key or "<configured>"
+    node = {
+        "node_type": node_type,
+        "display": f"{node_type}: {name}",
+        "status": status,
+    }
+    if cfg_key:
+        node["cfg_key"] = cfg_key
+    if expected_name:
+        node["expected_name"] = expected_name
+    if expected_account:
+        node["expected_account"] = expected_account
+    return node
+
+
+def _role_arn_parts(role_arn: str) -> tuple[str | None, str]:
+    match = _ROLE_ARN_PATTERN.fullmatch(role_arn)
+    if not match:
+        return None, role_arn.rsplit("/", 1)[-1]
+    return match.group("account_id"), match.group("role_name")
+
+
+def preflight_execution_identity(
+    stage_id: str,
+    stage: dict,
+    catalogs: dict,
+    *,
+    execution_context: dict[str, object],
+    implementation_key: str,
+    execution_access_mode: str = "standard",
+    provider_credential: str | None = None,
+    live_check: bool = True,
+) -> dict:
+    """Resolve one target path and optionally prove it with read-only STS calls."""
+    raw_identity_key = stage.get("execution_identity_key")
+    try:
+        resolved = resolve_stage_aws_access(
+            stage,
+            catalogs["execution_identities"],
+            catalogs["credential_sources"],
+            execution_context=execution_context,
+            implementation_key=implementation_key,
+            account_registry=catalogs["account_registry"],
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+            ctl_role_chain=catalogs["ctl_role_chain"],
+            stage_roles=catalogs["stage_roles"],
+            validate_local_credential=live_check,
+        )
+    except Exception as error:
+        reason = _preflight_failure_reason(error)
+        # the report nests this error under its execution_identity line, so a
+        # trailing "(execution identity '<same key>')" label is redundant here
+        if raw_identity_key:
+            suffix = f"(execution identity {raw_identity_key!r})"
+            if reason.endswith(suffix):
+                reason = reason[: -len(suffix)].rstrip()
+        return {
+            "execution_identity_key": raw_identity_key,
+            "provider": "aws",
+            "access_mode": execution_access_mode,
+            "status": "failed",
+            "provider_path": [],
+            "failure_reason": reason,
+        }
+
+    if not resolved:
+        return {
+            "execution_identity_key": raw_identity_key,
+            "provider": "aws",
+            "access_mode": execution_access_mode,
+            "status": "failed",
+            "provider_path": [],
+            "failure_reason": "selected target has no execution identity",
+        }
+    if resolved.get("identity_bypass") == "true":
+        return {
+            "execution_identity_key": (
+                raw_identity_key
+                or resolved.get("execution_identity_key")
+                or "<unresolved>"
+            ),
+            "provider": "aws",
+            "access_mode": execution_access_mode,
+            "status": "not_applicable",
+            "provider_path": [],
+            "reason": "execution identity was bypassed for this run",
+        }
+
+    result = {
+        "execution_identity_key": resolved["execution_identity_key"],
+        "provider": "aws",
+        "access_mode": execution_access_mode,
+        "status": "force_skipped" if not live_check else "passed",
+        "provider_path": [],
+    }
+    if not live_check:
+        result["reason"] = (
+            "execution-identity live preflight was force-skipped for this run"
+        )
+    skipped_status = "force_skipped"
+
+    if resolved["credential_provider_kind"] == "direct_profile":
+        principal_type = (
+            "permission_set" if resolved.get("permission_set_name") else "role"
+        )
+        principal_name = resolved.get("permission_set_name") or resolved.get("role_name")
+        nodes = [
+            _path_node(
+                "credential_source",
+                cfg_key=resolved["credential_source_key"],
+                expected_name=None,
+                expected_account=resolved["expected_account_id"],
+                status=skipped_status if not live_check else "passed",
+            ),
+            _path_node(
+                principal_type,
+                cfg_key=resolved["credential_source_key"],
+                expected_name=principal_name,
+                expected_account=resolved["expected_account_id"],
+                status=skipped_status if not live_check else "passed",
+            ),
+        ]
+        nodes[-1]["purpose"] = "target"
+        nodes[-1]["display"] = f"required_{principal_type}: {principal_name}"
+        result["provider_path"] = nodes
+        if not live_check:
+            return result
+        try:
+            caller = assert_profile_caller(
+                resolved["profile_name"],
+                expected_account_id=resolved["expected_account_id"],
+                expect_principal={
+                    key: resolved[key]
+                    for key in ("permission_set_name", "role_name")
+                    if resolved.get(key)
+                },
+                label=f"execution identity {resolved['execution_identity_key']!r}",
+            )
+            nodes[-1]["observed_account"] = caller.get("Account")
+            nodes[-1]["observed_principal"] = caller.get("Arn")
+            return result
+        except Exception as error:
+            reason = _preflight_failure_reason(error)
+            nodes[-1]["status"] = "failed"
+            nodes[-1]["failure_reason"] = reason
+            result["status"] = "failed"
+            result["failure_reason"] = reason
+            return result
+
+    entry_name = resolved.get("entry_permission_set_name") or resolved.get(
+        "entry_role_name"
+    )
+    entry_type = (
+        "permission_set" if resolved.get("entry_permission_set_name") else "role"
+    )
+    nodes = [
+        _path_node(
+            "credential_source",
+            cfg_key=resolved["credential_source_key"],
+            expected_name=None,
+            expected_account=resolved["entry_account_id"],
+            status=skipped_status if not live_check else "passed",
+        ),
+        _path_node(
+            entry_type,
+            cfg_key=resolved["credential_source_key"],
+            expected_name=entry_name,
+            expected_account=resolved["entry_account_id"],
+            status=skipped_status if not live_check else "passed",
+        ),
+    ]
+    hop_arns = resolved["hop_role_arns"]
+    role_keys = [catalogs["ctl_role_chain"]["runner_role_key"]]
+    if len(hop_arns) > 2:
+        role_keys.extend(f"hop_{index}" for index in range(2, len(hop_arns)))
+    role_keys.append(resolved["stage_role_key"])
+    hop_nodes = []
+    for index, role_arn in enumerate(hop_arns):
+        account_id, role_name = _role_arn_parts(role_arn)
+        hop_nodes.append(
+            _path_node(
+                "role",
+                cfg_key=role_keys[index] if index < len(role_keys) else None,
+                expected_name=role_name,
+                expected_account=account_id,
+                status=skipped_status if not live_check else "passed",
+            )
+        )
+    nodes.extend(hop_nodes)
+    if hop_nodes:
+        hop_nodes[-1]["purpose"] = "target"
+        hop_nodes[-1]["display"] = (
+            f"required_role: {hop_nodes[-1]['expected_name']}"
+        )
+    result["provider_path"] = nodes
+    if not live_check:
+        return result
+
+    try:
+        caller = assert_profile_caller(
+            resolved["entry_profile_name"],
+            expected_account_id=resolved["entry_account_id"],
+            expect_principal={
+                "permission_set_name": resolved.get("entry_permission_set_name"),
+                "role_name": resolved.get("entry_role_name"),
+            },
+            label=f"entry credential source {resolved['credential_source_key']!r}",
+        )
+        nodes[1]["observed_account"] = caller.get("Account")
+        nodes[1]["observed_principal"] = caller.get("Arn")
+    except Exception as error:
+        reason = _preflight_failure_reason(error)
+        nodes[1]["status"] = "failed"
+        nodes[1]["failure_reason"] = reason
+        result["provider_path"] = nodes[:2]
+        result["status"] = "failed"
+        result["failure_reason"] = reason
+        return result
+
+    credentials: dict[str, str] = {}
+    session_name = _preflight_session_name(stage_id, execution_context)
+    for index, role_arn in enumerate(hop_arns):
+        try:
+            credentials, assumed_user = _assume_role_credentials(
+                role_arn,
+                session_name=session_name,
+                entry_profile_name=resolved["entry_profile_name"],
+                env_extra=credentials or None,
+                use_profile=index == 0,
+            )
+            if assumed_user.get("Arn"):
+                hop_nodes[index]["observed_principal"] = assumed_user["Arn"]
+        except Exception as error:
+            reason = _preflight_failure_reason(error)
+            hop_nodes[index]["status"] = "failed"
+            hop_nodes[index]["failure_reason"] = reason
+            result["provider_path"] = nodes[: 3 + index]
+            result["status"] = "failed"
+            result["failure_reason"] = reason
+            return result
+
+    try:
+        final_caller = _run_aws_json(
+            ["aws", "sts", "get-caller-identity", "--output", "json"],
+            credentials,
+        )
+        _assertion().validate_caller_identity(
+            final_caller,
+            expected_account_id=resolved["expected_account_id"],
+            expected_role_name=resolved["role_name"],
+        )
+        hop_nodes[-1]["observed_account"] = final_caller.get("Account")
+        hop_nodes[-1]["observed_principal"] = final_caller.get("Arn")
+        return result
+    except Exception as error:
+        reason = _preflight_failure_reason(error)
+        hop_nodes[-1]["status"] = "failed"
+        hop_nodes[-1]["failure_reason"] = reason
+        result["status"] = "failed"
+        result["failure_reason"] = reason
+        return result
+
 def validate_active_stage_aws_access(
     active_stages: dict,
     execution_identities: dict,
@@ -744,7 +1087,7 @@ def validate_active_stage_aws_access(
         active_stages,
         execution_access_mode=execution_access_mode,
     )
-    if execution_access_mode != "bypass" and any(
+    if execution_access_mode != "force_bypass" and any(
         stage.get("execution_identity_key") is not None for stage in active_stages.values()
     ):
         if account_registry is None:
@@ -868,6 +1211,36 @@ def materialize_profile_binding(binding_dir: Path, profile_name: str, stage_env:
     stage_env["ATLAS_PROVIDER_BINDING_DIR"] = str(binding_dir)
 
 
+def derive_ctl_runner_arn(
+    ctl_role_chain: dict | None,
+    stage_roles: dict | None,
+    account_registry: dict[str, str],
+    execution_context: dict[str, object],
+) -> str | None:
+    """Compose the ctl-runner role ARN from the ctl registries (§Phase 9).
+
+    Resolved from ctl_role_chain.runner_role_key -> stage_roles entry
+    (account_key + role_name) -> account registry id. Returns None when any
+    link is missing (e.g. the registry id is not populated yet) — consumers
+    treat the fact as absent, never guess."""
+    if not ctl_role_chain or not stage_roles:
+        return None
+    runner_entry = stage_roles.get(ctl_role_chain.get("runner_role_key")) or {}
+    account_key = runner_entry.get("account_key")
+    role_name = runner_entry.get("role_name")
+    if not account_key or not role_name:
+        return None
+    account_id = (account_registry or {}).get(account_key)
+    if not account_id:
+        return None
+    role_name = str(
+        common.resolve_runtime_scalar(
+            role_name, execution_context, label="stage_roles runner role_name"
+        )
+    )
+    return f"arn:aws:iam::{account_id}:role/{role_name}"
+
+
 def configure_stage_aws_env(
     stage_id: str,
     stage: dict,
@@ -929,6 +1302,15 @@ def configure_stage_aws_env(
     stage_env["ATLAS_AWS_IMPLEMENTATION_KEY"] = resolved["implementation_key"]
     stage_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"] = resolved["expected_account_id"]
 
+    # §Phase 9: adapter-derived run fact — the trusted ctl-runner ARN, composed
+    # from the ctl registries; never authored in plt cfg. Absent when the
+    # runner's account id is not registered yet.
+    ctl_runner_arn = derive_ctl_runner_arn(
+        ctl_role_chain, stage_roles, account_registry, execution_context
+    )
+    if ctl_runner_arn:
+        stage_env["ATLAS_AWS_CTL_RUNNER_ARN"] = ctl_runner_arn
+
     if resolved["credential_provider_kind"] == "role_chain":
         # Standard mode: hand the stage the FINAL role's assumed credentials
         # (produced by iterating the ordered hop path); the stage asserts
@@ -975,52 +1357,6 @@ def configure_stage_aws_env(
         resolved["credential_provider_kind"],
         resolved["expected_account_id"],
     )
-
-
-def derive_provider_account_fact(
-    execution_context: dict[str, object],
-    workflow_cfg: dict,
-    inventory_cfg: dict,
-    ctl_cfg_root: Path,
-) -> None:
-    """Provider-adapter hook: derive read-only execution_context.provider.* facts.
-
-    AWS resolves each active target's execution_identity_key account_key through
-    providers.aws.accounts and exposes `execution_context.provider.account_id`
-    when the active targets resolve exactly ONE registry account id. When they
-    do not (no identities, mixed accounts, or unpopulated registry ids), the
-    fact stays absent: a rendered scope referencing it then hard-fails with the
-    standard missing-reference error. CLI/cfg params can never write the
-    `provider` namespace (params only ever land in execution_context.params.*).
-    """
-    identities = common.load_execution_identities_cfg(ctl_cfg_root)
-    registry = load_aws_account_registry_cfg(ctl_cfg_root) or {}
-    targets = inventory_cfg.get("stage_targets", {})
-    account_ids: set[str] = set()
-    for target_name in common.active_target_names(workflow_cfg):
-        target_cfg = targets.get(target_name) or {}
-        identity_ref = target_cfg.get("execution_identity_key")
-        if identity_ref is None:
-            continue
-        identity_key = common.resolve_runtime_scalar(
-            identity_ref, execution_context,
-            label=f"target {target_name} execution_identity_key",
-        )
-        identity_cfg = identities.get(identity_key) or {}
-        if identity_cfg.get("provider") != "aws":
-            continue
-        account_key = identity_cfg.get("account_key")
-        if not account_key:
-            continue
-        account_id = registry.get(account_key)
-        if account_id:
-            account_ids.add(str(account_id))
-    if len(account_ids) == 1:
-        execution_context[f"{common.EXECUTION_CONTEXT_ROOT}.provider.account_id"] = account_ids.pop()
-        logging.info(
-            "Derived provider fact execution_context.provider.account_id=%s",
-            execution_context[f"{common.EXECUTION_CONTEXT_ROOT}.provider.account_id"],
-        )
 
 
 class CtlStateSyncer:
@@ -1257,7 +1593,7 @@ def resolve_synchronizer_credential(
     execution_access_mode: str = "standard",
     provider_credential: str | None = None,
 ) -> str:
-    if execution_access_mode == "bypass":
+    if execution_access_mode == "force_bypass":
         if not provider_credential:
             raise RuntimeError(
                 "❌ bypass execution access requires the --provider-credential substitute credential"
@@ -1275,7 +1611,7 @@ def resolve_synchronizer_credential(
         execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
-        execution_access_mode="direct",
+        execution_access_mode="agreed_direct",
     )
     if not resolved or not resolved.get("profile_name"):
         raise RuntimeError(
@@ -1298,21 +1634,18 @@ def create_state_syncer(results_root, bucket_name: str, bucket_region: str, cred
     return CtlStateSyncer(results_root, bucket_name, bucket_region, credential, required=required)
 
 
-def derive_provider_facts(execution_context, workflow_cfg, inventory_cfg, ctl_cfg_root) -> None:
-    derive_provider_account_fact(execution_context, workflow_cfg, inventory_cfg, ctl_cfg_root)
+def ctl_state_backend_locator(domain: str, entry: dict, execution_context: dict[str, object]) -> list[str]:
+    """Canonical local-mirror path segments for one ctl-state backend (§Phase 30).
 
-
-def synthesize_validation_provider_facts(execution_context: dict[str, object], ctl_cfg_root: Path) -> None:
-    """Provider fact for validation renders: real runs derive it from the run's
-    identities; here it comes from the accounts registry via params.account when
-    resolvable, a uniform registry id, or a placeholder."""
-    registry = load_aws_account_registry_cfg(ctl_cfg_root)
-    account_key = execution_context.get("execution_context.params.account")
-    unique_ids = set(registry.values())
-    execution_context["execution_context.provider.account_id"] = (
-        registry.get(account_key) if account_key and registry.get(account_key)
-        else (unique_ids.pop() if len(unique_ids) == 1 else "000000000000")
+    S3 bucket names are globally unique within the partition, so
+    ["aws", "s3", <bucket>] is collision-free; a provider whose backend names
+    are not unique must add its own scoping segments here."""
+    bucket_name = str(
+        common.resolve_runtime_scalar(
+            entry["bucket_name"], execution_context, label=f"ctl_state_backends.{domain}.bucket_name"
+        )
     )
+    return ["aws", "s3", bucket_name]
 
 
 def normalize_provider_credential(value: str | None) -> str | None:

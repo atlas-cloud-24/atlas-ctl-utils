@@ -57,13 +57,12 @@ class ProviderBoundaryTests(unittest.TestCase):
             "validate_execution_identity",
             "load_runtime_catalogs",
             "validate_active_stage_access",
+            "preflight_execution_identity",
             "materialize_stage_binding",
             "stage_assertion_argv",
             "validate_state_backend_entry",
             "resolve_synchronizer_credential",
             "create_state_syncer",
-            "derive_provider_facts",
-            "synthesize_validation_provider_facts",
             "normalize_provider_credential",
         ):
             self.assertTrue(callable(getattr(aws_adapter, operation, None)), operation)
@@ -85,7 +84,7 @@ class ContractWrapperTests(unittest.TestCase):
             catalogs,
             execution_context={},
             implementation_key="local",
-            execution_access_mode="bypass",
+            execution_access_mode="force_bypass",
             provider_credential="substitute",
         )
         stage_env: dict[str, str] = {}
@@ -96,7 +95,7 @@ class ContractWrapperTests(unittest.TestCase):
             catalogs,
             execution_context={},
             implementation_key="local",
-            execution_access_mode="bypass",
+            execution_access_mode="force_bypass",
             provider_credential="substitute",
         )
         self.assertEqual(stage_env.get("AWS_PROFILE"), "substitute")
@@ -218,18 +217,18 @@ class ExecutionAccessModeTests(unittest.TestCase):
             (root / "ctl_profiles.yaml").write_text(
                 "ctl_profiles:\n"
                 "  strict: { ref_policy: commit_required }\n"
-                "  boot: { ref_policy: commit_required, allowed_execution_access_modes: [standard, direct] }\n"
+                "  boot: { ref_policy: commit_required, allow_execution_access_modes: [standard, agreed_direct] }\n"
             )
             self.assertEqual(common.ctl_allowed_execution_access_modes(root, "strict"), {"standard"})
-            self.assertEqual(common.ctl_allowed_execution_access_modes(root, "boot"), {"standard", "direct"})
+            self.assertEqual(common.ctl_allowed_execution_access_modes(root, "boot"), {"standard", "agreed_direct"})
 
     def test_target_direct_access_default_and_validate(self):
-        self.assertFalse(common.target_allows_direct_execution_access({}))
+        self.assertFalse(common.target_allows_agreed_direct_execution_access({}))
         self.assertTrue(
-            common.target_allows_direct_execution_access({"allow_direct_execution_access": True})
+            common.target_allows_agreed_direct_execution_access({"allow_agreed_direct_execution_access": True})
         )
         self.assertFalse(
-            common.target_allows_direct_execution_access({"allow_direct_execution_access": False})
+            common.target_allows_agreed_direct_execution_access({"allow_agreed_direct_execution_access": False})
         )
         with self.assertRaisesRegex(RuntimeError, "must be a boolean"):
-            common.target_allows_direct_execution_access({"allow_direct_execution_access": ["direct"]})
+            common.target_allows_agreed_direct_execution_access({"allow_agreed_direct_execution_access": ["agreed_direct"]})

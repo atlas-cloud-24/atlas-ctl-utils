@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("plt", "ctl"))
     parser.add_argument("--ctl-cfg-root", required=True, help="Dev ctl cfg root with writable local cfg sources.")
-    parser.add_argument("--execution-runtime", required=True, choices=common.EXECUTION_RUNTIMES)
+    parser.add_argument("--execution-runtime-mode", required=True, choices=common.EXECUTION_RUNTIME_MODES)
     parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
     parser.add_argument("--execution-context", action="append", type=key_value, default=[])
     parser.add_argument("--var", action="append", dest="vars", help="Ctl mode declaration ref; repeatable.")
@@ -56,11 +56,8 @@ def build_context(args: argparse.Namespace, ctl_cfg_root: Path) -> dict[str, obj
         action=None,
         ctl_profile=None,
         execution_params=dict(args.execution_param),
-        execution_runtime=args.execution_runtime,
+        execution_runtime_mode=args.execution_runtime_mode,
     )
-    provider = context.get("execution_context.params.provider")
-    if isinstance(provider, str) and provider.strip():
-        common.get_provider_adapter(provider.strip()).synthesize_validation_provider_facts(context, ctl_cfg_root)
     for key, value in args.execution_context:
         context[key] = value
     return context
@@ -93,9 +90,9 @@ def run_plt(args: argparse.Namespace) -> int:
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-regenerate-guardrails-"))
     try:
         plt_cfg_root, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
-        declarations = common.load_plt_guard_declarations(plt_cfg_root)
-        if not declarations:
-            raise RuntimeError(f"no guard declarations at the plt cfg root: {plt_cfg_root}")
+        policies = common.load_plt_guardrail_policies(plt_cfg_root)
+        if not policies:
+            raise RuntimeError(f"no plt guardrail policies at the plt cfg root: {plt_cfg_root}")
 
         merged_dir = temp_root / "merged"
         common.merge_plt_cfg_dirs(
@@ -108,29 +105,47 @@ def run_plt(args: argparse.Namespace) -> int:
         )
         rendered_dir = common.render_plt_cfg(merged_dir, temp_root, execution_context)
 
+        active_scopes = common.discover_active_cfg_scopes(
+            plt_cfg_root,
+            scope_params=scope_params,
+            execution_context=execution_context,
+        )
+        scopes_by_target = {}
+        for scope in active_scopes:
+            scopes_by_target.setdefault(scope["target_path"], []).append(scope)
+        composition = common.load_scope_composition(plt_cfg_root)
+
         wrote = []
-        for scope in common.discover_active_cfg_scopes(plt_cfg_root, scope_params=scope_params):
-            matching = [d for d in declarations if common.guard_declaration_matches_scope(d, scope)]
-            if not matching:
+        for target_path, scopes in sorted(scopes_by_target.items()):
+            matching = common.active_plt_guardrail_policies(
+                policies,
+                target_path,
+                execution_context,
+            )
+            names = common.protected_vars_for_policies(matching, target_path=target_path)
+            if not names:
                 continue
-            target_dir = common.rendered_scope_target_dir(rendered_dir, scope["target_path"])
-            label = f"plt scope {scope['scope_path']}->{scope['target_path']}"
-            guarded = {}
-            for declaration in matching:
-                name = declaration["var"]
+            target_dir = common.rendered_scope_target_dir(rendered_dir, target_path)
+            label = f"plt target {target_path}"
+            protected_values = {}
+            for name in names:
                 value = common.read_rendered_guard_value(target_dir, name, label=label)
-                guarded[name] = common.guard_entry(value, label=f"plt.{name}")
-            axes = common.resolve_guard_axes(matching, execution_context, scope_path=scope["scope_path"])
+                protected_values[name] = common.guard_value_text(value, label=f"plt.{name}")
+            instance = common.build_plt_guardrail_instance(
+                target_path,
+                scopes,
+                composition,
+                execution_context,
+            )
             path = common.write_plt_guardrail_baseline(
                 guardrails_cfg_root,
-                scope_path=scope["scope_path"],
-                axes=axes,
-                guarded_vars=guarded,
+                instance=instance,
+                protected_values=protected_values,
             )
             wrote.append(path)
-            print(f"wrote {path} scope={scope['scope_path']} axes={axes}")
+            print(f"wrote {path} instance={instance}")
         if not wrote:
-            raise RuntimeError(f"no active scope matched a declaration for params {scope_params}")
+            raise RuntimeError(f"no active rendered target matched a plt guardrail policy for params {scope_params}")
     finally:
         if args.keep_artifacts:
             print(f"kept artifacts: {temp_root}")

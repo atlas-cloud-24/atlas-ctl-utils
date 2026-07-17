@@ -12,17 +12,19 @@ Adapter contract (module-level callables):
     load_runtime_catalogs(ctl_cfg_root) -> opaque catalogs bundle
     validate_active_stage_access(active_stages, catalogs, *, execution_context,
         implementation_key, execution_access_mode, provider_credential)
+    preflight_execution_identity(stage_id, stage, catalogs, *, execution_context,
+        implementation_key, execution_access_mode, provider_credential, live_check) -> result
     materialize_stage_binding(stage_id, stage, stage_env, catalogs, *,
         execution_context, implementation_key, execution_access_mode, provider_credential)
     stage_assertion_argv(stage_utils_dir) -> argv | None
     validate_state_backend_entry(domain, entry, path)
+    ctl_state_backend_locator(domain, entry, execution_context) -> [segments]
+        (canonical local-mirror path segments, unique within the provider's
+        namespace; e.g. aws -> ["aws", "s3", <bucket>])
     resolve_synchronizer_credential(identity_key, ctl_cfg_root, *,
         execution_context, implementation_key, execution_access_mode, provider_credential)
     create_state_syncer(results_root, bucket_name, bucket_region, credential, *,
         required)
-    derive_provider_facts(execution_context, workflow_cfg, inventory_cfg,
-        ctl_cfg_root)
-    synthesize_validation_provider_facts(execution_context, ctl_cfg_root)
     normalize_provider_credential(value)
 """
 
