@@ -10,7 +10,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 renderer_spec = importlib.util.spec_from_file_location(
     "render_aws_sso_profiles",
-    REPO_ROOT / "stage_utils" / "providers" / "aws" / "render_sso_profiles.py",
+    REPO_ROOT / "step_utils" / "providers" / "aws" / "render_sso_profiles.py",
 )
 renderer = importlib.util.module_from_spec(renderer_spec)
 renderer_spec.loader.exec_module(renderer)

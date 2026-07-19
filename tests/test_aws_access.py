@@ -15,7 +15,7 @@ from utils.providers import aws as aws_adapter  # noqa: E402
 
 assert_spec = importlib.util.spec_from_file_location(
     "assert_aws_access",
-    REPO_ROOT / "stage_utils" / "assert_aws_access.py",
+    REPO_ROOT / "step_utils" / "assert_aws_access.py",
 )
 assert_aws_access = importlib.util.module_from_spec(assert_spec)
 assert_spec.loader.exec_module(assert_aws_access)
@@ -74,16 +74,16 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "env_deploy": {
                 "provider": "aws",
                 "account_key": "${execution_context.params.env_type}",
-                "ctl_stage_role_key": "ctl_stage",
+                "ctl_target_role_key": "ctl_target",
                 "direct_credential_source_key": "non_prod_deploy",
             },
             "env_readonly": {
                 "provider": "aws",
                 "account_key": "${execution_context.params.env_type}",
-                "ctl_stage_role_key": "ctl_stage",
+                "ctl_target_role_key": "ctl_target",
                 "direct_credential_source_key": "non_prod_readonly",
             },
-            "env_no_stage_role": {
+            "env_no_target_role": {
                 "provider": "aws",
                 "account_key": "${execution_context.params.env_type}",
             },
@@ -93,17 +93,17 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 "direct_credential_source_key": "ctl_state_synchronizer",
             },
         }
-        self.stage_roles = {
+        self.target_roles = {
             "ctl_runner": {
                 "account_key": "ctl_plane",
                 "role_name": "${execution_context.params.main_tag}-ctl-runner",
             },
-            "ctl_stage": {
-                "role_name": "${execution_context.params.main_tag}-ctl-stage",
+            "ctl_target": {
+                "role_name": "${execution_context.params.main_tag}-ctl-target_run",
             },
             "org_ctl_member_account_roles": {
                 "account_key": "management",
-                "role_name": "${execution_context.params.main_tag}-ctl-stage-org-member-account-roles",
+                "role_name": "${execution_context.params.main_tag}-ctl-target_run-org-member-account-roles",
             },
         }
         self.ctl_role_chain = {
@@ -124,7 +124,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ):
-            resolved = aws_adapter.resolve_stage_aws_access(
+            resolved = aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "env_deploy"},
                 self.identities,
                 self.credential_sources,
@@ -148,7 +148,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ):
-            resolved = aws_adapter.resolve_stage_aws_access(
+            resolved = aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "ctl_state_dev_synchronizer"},
                 self.identities,
                 self.credential_sources,
@@ -162,8 +162,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_requires_direct_credential_source_key(self):
         with self.assertRaisesRegex(RuntimeError, "no direct_credential_source_key"):
-            aws_adapter.resolve_stage_aws_access(
-                {"execution_identity_key": "env_no_stage_role"},
+            aws_adapter.resolve_target_aws_access(
+                {"execution_identity_key": "env_no_target_role"},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -204,7 +204,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             side_effect=account_ids.__getitem__,
         ):
             with self.assertRaisesRegex(RuntimeError, "profile override"):
-                aws_adapter.resolve_stage_aws_access(
+                aws_adapter.resolve_target_aws_access(
                     {"execution_identity_key": "env_deploy"},
                     self.identities,
                     self.credential_sources,
@@ -217,7 +217,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_missing_execution_identity_fails(self):
         with self.assertRaisesRegex(RuntimeError, "is not defined in execution_identities"):
-            aws_adapter.resolve_stage_aws_access(
+            aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "missing"},
                 self.identities,
                 self.credential_sources,
@@ -229,7 +229,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_missing_runner_implementation_fails(self):
         with self.assertRaisesRegex(RuntimeError, "has no 'ci' implementation"):
-            aws_adapter.resolve_stage_aws_access(
+            aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "env_deploy"},
                 self.identities,
                 self.credential_sources,
@@ -253,7 +253,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "oxygen-dev-deploy": "111111111111",
             "oxygen-dev-readonly": "222222222222",
         }
-        stages = {
+        target_runs = {
             "deploy": {"execution_identity_key": "env_deploy"},
             "readonly": {"execution_identity_key": "env_readonly"},
         }
@@ -263,8 +263,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
             side_effect=account_ids.__getitem__,
         ):
             with self.assertRaisesRegex(RuntimeError, "AWS account registry maps"):
-                aws_adapter.validate_active_stage_aws_access(
-                    stages,
+                aws_adapter.validate_active_target_run_aws_access(
+                    target_runs,
                     self.identities,
                     self.credential_sources,
                     execution_context=self.context,
@@ -276,8 +276,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
     # --- chain mode (default) ---
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_chain_mode_derives_runner_and_stage_role_arns(self):
-        resolved = aws_adapter.resolve_stage_aws_access(
+    def test_chain_mode_derives_runner_and_target_role_arns(self):
+        resolved = aws_adapter.resolve_target_aws_access(
             {"execution_identity_key": "env_deploy"},
             self.identities,
             self.credential_sources,
@@ -285,7 +285,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             implementation_key="local",
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
-            stage_roles=self.stage_roles,
+            target_roles=self.target_roles,
         )
         self.assertEqual(resolved["credential_provider_kind"], "role_chain")
         self.assertEqual(resolved["entry_profile_name"], "oxygen-ctl-entry")
@@ -294,21 +294,21 @@ class AwsAccessResolutionTests(unittest.TestCase):
             resolved["hop_role_arns"],
             [
                 "arn:aws:iam::444444444444:role/oxygen-ctl-runner",
-                "arn:aws:iam::111111111111:role/oxygen-ctl-stage",
+                "arn:aws:iam::111111111111:role/oxygen-ctl-target_run",
             ],
         )
-        self.assertEqual(resolved["role_name"], "oxygen-ctl-stage")
+        self.assertEqual(resolved["role_name"], "oxygen-ctl-target_run")
         self.assertEqual(resolved["expected_account_id"], "111111111111")
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_chain_mode_identity_stage_role_override(self):
+    def test_chain_mode_identity_target_role_override(self):
         identities = dict(self.identities)
         identities["org_ctl_member_account_roles"] = {
             "provider": "aws",
             "account_key": "management",
-            "ctl_stage_role_key": "org_ctl_member_account_roles",
+            "ctl_target_role_key": "org_ctl_member_account_roles",
         }
-        resolved = aws_adapter.resolve_stage_aws_access(
+        resolved = aws_adapter.resolve_target_aws_access(
             {"execution_identity_key": "org_ctl_member_account_roles"},
             identities,
             self.credential_sources,
@@ -316,32 +316,32 @@ class AwsAccessResolutionTests(unittest.TestCase):
             implementation_key="local",
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
-            stage_roles=self.stage_roles,
+            target_roles=self.target_roles,
         )
         self.assertEqual(
             resolved["hop_role_arns"][-1],
-            "arn:aws:iam::333333333333:role/oxygen-ctl-stage-org-member-account-roles",
+            "arn:aws:iam::333333333333:role/oxygen-ctl-target_run-org-member-account-roles",
         )
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_chain_mode_requires_ctl_stage_role_key(self):
-        # Phase 15: a target identity without ctl_stage_role_key is invalid in chain mode
-        with self.assertRaisesRegex(RuntimeError, "declares no ctl_stage_role_key"):
-            aws_adapter.resolve_stage_aws_access(
-                {"execution_identity_key": "env_no_stage_role"},
+    def test_chain_mode_requires_ctl_target_role_key(self):
+        # Phase 15: a target identity without ctl_target_role_key is invalid in chain mode
+        with self.assertRaisesRegex(RuntimeError, "must declare exactly one of ctl_target_role_key"):
+            aws_adapter.resolve_target_aws_access(
+                {"execution_identity_key": "env_no_target_role"},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
                 implementation_key="local",
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
-                stage_roles=self.stage_roles,
+                target_roles=self.target_roles,
             )
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_chain_mode_requires_ctl_role_chain_cfg(self):
         with self.assertRaisesRegex(RuntimeError, "require providers.aws.ctl_role_chain"):
-            aws_adapter.resolve_stage_aws_access(
+            aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "env_deploy"},
                 self.identities,
                 self.credential_sources,
@@ -354,7 +354,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_identity_bypass_uses_substitute_credential_even_with_identity(self):
-        resolved = aws_adapter.resolve_stage_aws_access(
+        resolved = aws_adapter.resolve_target_aws_access(
             {"execution_identity_key": "env_deploy"},
             self.identities,
             self.credential_sources,
@@ -370,7 +370,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_identity_bypass_requires_substitute_credential(self):
         with self.assertRaisesRegex(RuntimeError, "requires the --provider-credential"):
-            aws_adapter.resolve_stage_aws_access(
+            aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "env_deploy"},
                 self.identities,
                 self.credential_sources,
@@ -380,12 +380,12 @@ class AwsAccessResolutionTests(unittest.TestCase):
             )
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_identity_bypass_configures_stage_env_without_checks(self):
-        stage_env = {"AWS_ACCESS_KEY_ID": "secret"}
-        aws_adapter.configure_stage_aws_env(
+    def test_identity_bypass_configures_target_env_without_checks(self):
+        target_env = {"AWS_ACCESS_KEY_ID": "secret"}
+        aws_adapter.configure_target_aws_env(
             "test",
             {"execution_identity_key": "env_deploy"},
-            stage_env,
+            target_env,
             self.identities,
             self.credential_sources,
             execution_context=self.context,
@@ -394,10 +394,10 @@ class AwsAccessResolutionTests(unittest.TestCase):
             execution_access_mode="force_bypass",
             provider_credential="my-sandbox-admin",
         )
-        self.assertEqual(stage_env["AWS_PROFILE"], "my-sandbox-admin")
-        self.assertEqual(stage_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"], "true")
-        self.assertNotIn("ATLAS_AWS_EXPECT_ACCOUNT_ID", stage_env)
-        self.assertNotIn("AWS_ACCESS_KEY_ID", stage_env)
+        self.assertEqual(target_env["AWS_PROFILE"], "my-sandbox-admin")
+        self.assertEqual(target_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"], "true")
+        self.assertNotIn("ATLAS_AWS_EXPECT_ACCOUNT_ID", target_env)
+        self.assertNotIn("AWS_ACCESS_KEY_ID", target_env)
 
     # --- Phase 14: expect everywhere ---
 
@@ -424,16 +424,16 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_binding_exports_principal_expectation(self):
-        stage_env: dict[str, str] = {}
+        target_env: dict[str, str] = {}
         with mock.patch.object(
             aws_adapter,
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ):
-            aws_adapter.configure_stage_aws_env(
-                "stage",
+            aws_adapter.configure_target_aws_env(
+                "target_run",
                 {"execution_identity_key": "env_deploy"},
-                stage_env,
+                target_env,
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -441,8 +441,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
-        self.assertEqual(stage_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"], "111111111111")
-        self.assertEqual(stage_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"], "NonProdDeployAccess")
+        self.assertEqual(target_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"], "111111111111")
+        self.assertEqual(target_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"], "NonProdDeployAccess")
 
     def test_direct_expect_account_key_conflict_is_rejected(self):
         sources = dict(self.credential_sources)
@@ -458,7 +458,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             return_value="333333333333",
         ):
             with self.assertRaisesRegex(RuntimeError, "expect.account_key resolves to"):
-                aws_adapter.resolve_stage_aws_access(
+                aws_adapter.resolve_target_aws_access(
                     {"execution_identity_key": "org_admin"},
                     self.identities,
                     sources,
@@ -477,7 +477,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             }
         }
         with self.assertRaisesRegex(RuntimeError, r"must declare\s+expect.account_key"):
-            aws_adapter.resolve_stage_aws_access(
+            aws_adapter.resolve_target_aws_access(
                 {"execution_identity_key": "env_deploy"},
                 self.identities,
                 sources,
@@ -485,7 +485,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 implementation_key="local",
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
-                stage_roles=self.stage_roles,
+                target_roles=self.target_roles,
             )
 
     def test_entry_validation_is_exact_not_substring(self):
@@ -505,42 +505,42 @@ class AwsAccessResolutionTests(unittest.TestCase):
     # --- identity coverage ---
 
     def test_identity_coverage_rejects_missing_identity_without_bypass(self):
-        stages = {"declared": {"execution_identity_key": "env_deploy"}, "bare": {}}
+        target_runs = {"declared": {"execution_identity_key": "env_deploy"}, "bare": {}}
         with self.assertRaisesRegex(RuntimeError, "have no execution_identity_key"):
             common.validate_execution_identity_coverage(
-                stages, execution_access_mode="standard"
+                target_runs, execution_access_mode="standard"
             )
 
     def test_identity_coverage_allows_anything_under_bypass(self):
-        stages = {"declared": {"execution_identity_key": "env_deploy"}, "bare": {}}
+        target_runs = {"declared": {"execution_identity_key": "env_deploy"}, "bare": {}}
         common.validate_execution_identity_coverage(
-            stages, execution_access_mode="force_bypass"
+            target_runs, execution_access_mode="force_bypass"
         )
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_non_aws_stage_drops_inherited_credentials(self):
-        stage_env = {
+    def test_non_aws_target_drops_inherited_credentials(self):
+        target_env = {
             "AWS_PROFILE": "wrong",
             "AWS_DEFAULT_PROFILE": "wrong-default",
             "AWS_CONFIG_FILE": "/tmp/wrong-config",
             "AWS_SHARED_CREDENTIALS_FILE": "/tmp/wrong-credentials",
             "AWS_ACCESS_KEY_ID": "secret",
         }
-        aws_adapter.configure_stage_aws_env(
+        aws_adapter.configure_target_aws_env(
             "test",
             {},
-            stage_env,
+            target_env,
             self.identities,
             self.credential_sources,
             execution_context=self.context,
             implementation_key="local",
             account_registry={},
         )
-        self.assertNotIn("AWS_PROFILE", stage_env)
-        self.assertNotIn("AWS_DEFAULT_PROFILE", stage_env)
-        self.assertNotIn("AWS_CONFIG_FILE", stage_env)
-        self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", stage_env)
-        self.assertNotIn("AWS_ACCESS_KEY_ID", stage_env)
+        self.assertNotIn("AWS_PROFILE", target_env)
+        self.assertNotIn("AWS_DEFAULT_PROFILE", target_env)
+        self.assertNotIn("AWS_CONFIG_FILE", target_env)
+        self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", target_env)
+        self.assertNotIn("AWS_ACCESS_KEY_ID", target_env)
 
     def test_synchronizer_asserts_selected_profile_principal(self):
         with (
@@ -564,11 +564,14 @@ class AwsAccessResolutionTests(unittest.TestCase):
             ),
             mock.patch.object(aws_adapter, "assert_profile_caller") as assertion,
         ):
-            credential = aws_adapter.resolve_synchronizer_credential(
+            credential = aws_adapter.resolve_ctl_state_credential(
                 "ctl_state_dev_synchronizer",
                 Path("/cfg"),
                 execution_context=self.context,
                 implementation_key="local",
+                operation="sync",
+                bucket_name="oxygen-live-ctl-state",
+                execution_access_mode="agreed_direct",
             )
 
         self.assertEqual(credential, "oxygen-dev-ctl-state-synchronizer")
@@ -576,7 +579,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "oxygen-dev-ctl-state-synchronizer",
             expected_account_id="111111111111",
             expect_principal={"role_name": "oxygen-ctl-state-synchronizer"},
-            label="ctl-state synchronizer identity " + repr("ctl_state_dev_synchronizer"),
+            label="ctl-state sync identity " + repr("ctl_state_dev_synchronizer"),
         )
 
 

@@ -6,7 +6,7 @@ The source cfg can be either:
 - an HTTP/HTTPS git URL, optionally with `@branch=...`, `@tag=...`, or `@commit=...`
 
 The script copies the source cfg into a target directory, rewrites
-`stage_sources.yaml` so each stage source uses `repo_path` instead of `repo_url`,
+`target_sources.yaml` so each target_run source uses `repo_path` instead of `repo_url`,
 removes ineffective `branch` keys from workflow YAMLs, writes local `tooling` repo-path overrides
 to `local_repos.yaml`, and removes `refs/` from the generated dev cfg.
 
@@ -40,7 +40,7 @@ import yaml
 
 
 REF_SPEC_RE = re.compile(r"^(?P<source>.+)@(?P<kind>branch|tag|commit)=(?P<value>.+)$")
-STAGE_LINE_RE = re.compile(r"^  (?P<stage>[^:\n]+):\s*$")
+TARGET_SOURCE_LINE_RE = re.compile(r"^  (?P<target_run>[^:\n]+):\s*$")
 REPO_URL_LINE_RE = re.compile(r"^    repo_url:\s*.+$")
 WORKFLOW_BRANCH_LINE_RE = re.compile(r"^\s+branch:\s*.+$")
 LOCAL_GLOBAL_CFG_NAME = "local_repos.yaml"
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Copy a ctl cfg directory into a target directory and rewrite "
-            "stage_sources.yaml repo_url values to repo_path using a JSON file "
-            "with stage-source-to-path mappings and optional tooling repo-to-path mappings."
+            "target_sources.yaml repo_url values to repo_path using a JSON file "
+            "with target_run-source-to-path mappings and optional tooling repo-to-path mappings."
         )
     )
     parser.add_argument(
@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         dest="repo_map_file",
         help=(
-            "Path to a JSON file with stage-source-to-path mappings and optional tooling "
+            "Path to a JSON file with target_run-source-to-path mappings and optional tooling "
             "repo-to-path mappings. Matching tooling entries from source refs are "
             "written to local_repos.yaml as local repo paths."
         ),
@@ -95,15 +95,15 @@ def load_path_map(path_map_file: str, *, map_label: str) -> dict[str, str]:
         raise ValueError(f"{map_label} must decode to a JSON object")
 
     repo_map: dict[str, str] = {}
-    for stage, repo_path in data.items():
-        if not isinstance(stage, str) or not isinstance(repo_path, str):
+    for target_run, repo_path in data.items():
+        if not isinstance(target_run, str) or not isinstance(repo_path, str):
             raise ValueError(f"{map_label} must contain only string keys and values")
 
         normalized_path = Path(repo_path).expanduser()
         if not normalized_path.is_absolute():
             normalized_path = (Path.cwd() / normalized_path).resolve()
 
-        repo_map[stage] = str(normalized_path)
+        repo_map[target_run] = str(normalized_path)
 
     return repo_map
 
@@ -112,10 +112,10 @@ def load_repo_map(repo_map_file: str) -> dict[str, str]:
     return load_path_map(repo_map_file, map_label="repo_map_file")
 
 
-def stage_sources_files(root_dir: Path) -> list[Path]:
-    # Only stage_sources.yaml carries repo_url/modules to rewrite; per-action
+def target_sources_files(root_dir: Path) -> list[Path]:
+    # Only target_sources.yaml carries repo_url/modules to rewrite; per-action
     # targets/*.yaml reference sources through source_key and have nothing to rewrite.
-    sources_path = root_dir / "stage_sources.yaml"
+    sources_path = root_dir / "target_sources.yaml"
     return [sources_path] if sources_path.is_file() else []
 
 
@@ -157,20 +157,20 @@ def required_repo_entries(paths: list[Path]) -> set[str]:
         if not isinstance(sources_doc, dict):
             continue
 
-        stage_sources_cfg = sources_doc.get("stage_sources")
-        if stage_sources_cfg is None:
-            stage_sources_cfg = sources_doc.get("stages") or {}
-        if not isinstance(stage_sources_cfg, dict):
+        target_sources_cfg = sources_doc.get("target_sources")
+        if target_sources_cfg is None:
+            target_sources_cfg = sources_doc.get("target_runs") or {}
+        if not isinstance(target_sources_cfg, dict):
             continue
 
-        for stage_name, stage_cfg in stage_sources_cfg.items():
-            if not isinstance(stage_name, str) or not isinstance(stage_cfg, dict):
+        for target_run_name, target_run_cfg in target_sources_cfg.items():
+            if not isinstance(target_run_name, str) or not isinstance(target_run_cfg, dict):
                 continue
 
-            if isinstance(stage_cfg.get("repo_url"), str):
-                repo_entries.add(stage_name)
+            if isinstance(target_run_cfg.get("repo_url"), str):
+                repo_entries.add(target_run_name)
 
-            modules_cfg = stage_cfg.get("modules") or {}
+            modules_cfg = target_run_cfg.get("modules") or {}
             if not isinstance(modules_cfg, dict):
                 continue
 
@@ -290,8 +290,8 @@ def validate_source_dir(source_dir: Path) -> None:
     if not source_dir.is_dir():
         raise ValueError(f"source cfg directory not found: {source_dir}")
 
-    if not stage_sources_files(source_dir):
-        raise ValueError(f"source cfg has no stage_sources.yaml file: {source_dir}")
+    if not target_sources_files(source_dir):
+        raise ValueError(f"source cfg has no target_sources.yaml file: {source_dir}")
 
 
 def validate_target_dir(source_dir: Path, target_dir: Path) -> None:
@@ -329,29 +329,29 @@ def line_ending_for(line: str) -> str:
     return ""
 
 
-def rewrite_stage_sources_file(path: Path, repo_map: dict[str, str]) -> int:
+def rewrite_target_sources_file(path: Path, repo_map: dict[str, str]) -> int:
     sources_doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(sources_doc, dict):
-        raise ValueError(f"stage_sources YAML must contain a mapping: {path}")
+        raise ValueError(f"target_sources YAML must contain a mapping: {path}")
 
-    stage_sources_cfg = sources_doc.get("stage_sources")
-    if stage_sources_cfg is None:
-        stage_sources_cfg = sources_doc.pop("stages", {}) or {}
-    if not isinstance(stage_sources_cfg, dict):
-        raise ValueError(f"stage_sources YAML must contain a 'stage_sources' mapping: {path}")
-    sources_doc["stage_sources"] = stage_sources_cfg
+    target_sources_cfg = sources_doc.get("target_sources")
+    if target_sources_cfg is None:
+        target_sources_cfg = sources_doc.pop("target_runs", {}) or {}
+    if not isinstance(target_sources_cfg, dict):
+        raise ValueError(f"target_sources YAML must contain a 'target_sources' mapping: {path}")
+    sources_doc["target_sources"] = target_sources_cfg
 
     replacements = 0
-    for stage_name, stage_cfg in stage_sources_cfg.items():
-        if not isinstance(stage_cfg, dict):
+    for target_run_name, target_run_cfg in target_sources_cfg.items():
+        if not isinstance(target_run_cfg, dict):
             continue
 
-        if isinstance(stage_cfg.get("repo_url"), str):
-            stage_cfg["repo_path"] = repo_map[stage_name]
-            del stage_cfg["repo_url"]
+        if isinstance(target_run_cfg.get("repo_url"), str):
+            target_run_cfg["repo_path"] = repo_map[target_run_name]
+            del target_run_cfg["repo_url"]
             replacements += 1
 
-        modules_cfg = stage_cfg.get("modules") or {}
+        modules_cfg = target_run_cfg.get("modules") or {}
         if not isinstance(modules_cfg, dict):
             continue
 
@@ -367,11 +367,11 @@ def rewrite_stage_sources_file(path: Path, repo_map: dict[str, str]) -> int:
     return replacements
 
 
-def rewrite_stage_sources(root_dir: Path, repo_map: dict[str, str]) -> list[Path]:
+def rewrite_target_sources(root_dir: Path, repo_map: dict[str, str]) -> list[Path]:
     rewritten_paths: list[Path] = []
 
-    for sources_path in stage_sources_files(root_dir):
-        if rewrite_stage_sources_file(sources_path, repo_map):
+    for sources_path in target_sources_files(root_dir):
+        if rewrite_target_sources_file(sources_path, repo_map):
             rewritten_paths.append(sources_path)
 
     return rewritten_paths
@@ -489,10 +489,10 @@ def main() -> int:
             validate_source_dir(source_dir)
             validate_target_dir(source_dir, target_dir)
 
-            source_stage_sources = stage_sources_files(source_dir)
+            source_target_sources = target_sources_files(source_dir)
             source_cfg_sources = cfg_source_files(source_dir)
             source_refs = refs_files(source_dir)
-            required_repo_names = required_repo_entries(source_stage_sources)
+            required_repo_names = required_repo_entries(source_target_sources)
             required_cfg_source_names = required_cfg_source_entries(source_cfg_sources)
             required_path_names = required_repo_names | required_cfg_source_names
             required_global_ref_names = required_global_refs(source_refs)
@@ -515,7 +515,7 @@ def main() -> int:
             warn_about_extra_mappings(repo_map, required_path_names, "repo")
             warn_about_extra_mappings(global_ref_map, required_global_ref_names, "global ref")
             copy_source_tree(source_dir, target_dir, args.force)
-            rewritten_paths = rewrite_stage_sources(target_dir, repo_map)
+            rewritten_paths = rewrite_target_sources(target_dir, repo_map)
             rewritten_cfg_sources = rewrite_cfg_sources(target_dir, repo_map)
             rewritten_workflows = rewrite_workflows(target_dir)
             local_global_path = write_local_global_file(target_dir, global_ref_map)
@@ -531,7 +531,7 @@ def main() -> int:
     print(f"source cfg: {source_dir}")
     print(f"created dev config: {target_dir}")
     for path in rewritten_paths:
-        print(f"rewrote stage_sources: {path}")
+        print(f"rewrote target_sources: {path}")
     for path in rewritten_cfg_sources:
         print(f"rewrote cfg_sources: {path}")
     for path in rewritten_workflows:

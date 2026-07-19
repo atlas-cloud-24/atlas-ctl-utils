@@ -1,44 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-run_local_stage() {
+run_local_step() {
   local github_workspace="${github_workspace:-/github/workspace}"
-  local tooling_mode="${local_stage_tooling_mode:-repo_url}"
+  local tooling_mode="${local_step_tooling_mode:-repo_url}"
 
-  if [[ -z "${stage_name:-}" ]]; then
-    echo "❌ stage_name must be set before calling run_local_stage"
+  if [[ -z "${step_name:-}" ]]; then
+    echo "❌ step_name must be set before calling run_local_step"
     exit 1
   fi
-  if [[ -z "${stage_dir:-}" ]]; then
-    echo "❌ stage_dir must be set before calling run_local_stage"
+  if [[ -z "${step_dir:-}" ]]; then
+    echo "❌ step_dir must be set before calling run_local_step"
     exit 1
   fi
   if [[ -z "${dockerfile_path:-}" ]]; then
-    echo "❌ dockerfile_path must be set before calling run_local_stage"
+    echo "❌ dockerfile_path must be set before calling run_local_step"
     exit 1
   fi
 
-  : "${ATLAS_STAGE_UTILS_DIR:?must be set}"
-  local stage_utils_dir_host
-  stage_utils_dir_host="$(realpath "$ATLAS_STAGE_UTILS_DIR")"
-  if [[ ! -d "$stage_utils_dir_host/ctl" ]]; then
-    echo "❌ ATLAS_STAGE_UTILS_DIR/ctl not found: $stage_utils_dir_host/ctl"
+  : "${ATLAS_STEP_UTILS_DIR:?must be set}"
+  local step_utils_dir_host
+  step_utils_dir_host="$(realpath "$ATLAS_STEP_UTILS_DIR")"
+  if [[ ! -d "$step_utils_dir_host/ctl" ]]; then
+    echo "❌ ATLAS_STEP_UTILS_DIR/ctl not found: $step_utils_dir_host/ctl"
     exit 1
   fi
 
   if [[ "$tooling_mode" == "repo_path" ]]; then
-    stage_name="${stage_name}-dev"
+    step_name="${step_name}-dev"
   elif [[ "$tooling_mode" != "repo_url" ]]; then
-    echo "❌ unsupported local_stage_tooling_mode: $tooling_mode"
+    echo "❌ unsupported local_step_tooling_mode: $tooling_mode"
     exit 1
   fi
 
-  if ! declare -p local_stage_extra_docker_args >/dev/null 2>&1; then
-    declare -a local_stage_extra_docker_args=()
+  if ! declare -p local_step_extra_docker_args >/dev/null 2>&1; then
+    declare -a local_step_extra_docker_args=()
   fi
 
-  if declare -F local_stage_before_build >/dev/null 2>&1; then
-    local_stage_before_build
+  if declare -F local_step_before_build >/dev/null 2>&1; then
+    local_step_before_build
   fi
 
   local -a tooling_args=()
@@ -74,29 +74,29 @@ run_local_stage() {
     )
   fi
 
-  local -a stage_cfg_mount_args=()
-  if [[ -n "${STAGE_CFG_DIR:-}" ]]; then
-    mkdir -p "${STAGE_CFG_DIR}"
-    stage_cfg_mount_args+=(
-      -v "${STAGE_CFG_DIR}:/mnt/stage_cfg"
-      -e STAGE_CFG_DIR=/mnt/stage_cfg
+  local -a step_cfg_mount_args=()
+  if [[ -n "${TARGET_CFG_DIR:-}" ]]; then
+    mkdir -p "${TARGET_CFG_DIR}"
+    step_cfg_mount_args+=(
+      -v "${TARGET_CFG_DIR}:/mnt/step_cfg"
+      -e TARGET_CFG_DIR=/mnt/step_cfg
     )
   fi
-  if [[ -n "${STAGE_ARTIFACTS_DIR:-}" ]]; then
-    mkdir -p "${STAGE_ARTIFACTS_DIR}"
-    stage_cfg_mount_args+=(
-      -v "${STAGE_ARTIFACTS_DIR}:/mnt/stage_artifacts"
-      -e STAGE_ARTIFACTS_DIR=/mnt/stage_artifacts
+  if [[ -n "${TARGET_ARTIFACTS_DIR:-}" ]]; then
+    mkdir -p "${TARGET_ARTIFACTS_DIR}"
+    step_cfg_mount_args+=(
+      -v "${TARGET_ARTIFACTS_DIR}:/mnt/step_artifacts"
+      -e TARGET_ARTIFACTS_DIR=/mnt/step_artifacts
     )
   fi
 
   docker build \
     -f "$dockerfile_path" \
-    -t "$stage_name" \
-    "$stage_dir"
+    -t "$step_name" \
+    "$step_dir"
 
   # Credential isolation: never mount the full host ~/.aws. Profile-based
-  # bindings mount ONLY the generated per-stage config (plus the SSO token
+  # bindings mount ONLY the generated per-step config (plus the SSO token
   # cache, which holds no profile definitions); role-chain bindings carry STS
   # env credentials and need no mounts at all.
   provider_binding_mount_args=()
@@ -109,18 +109,18 @@ run_local_stage() {
     fi
   fi
 
-  docker run --rm --name "$stage_name" \
+  docker run --rm --name "$step_name" \
     --entrypoint sh \
     -v "$PWD:/mnt/source:ro" \
     -v "$(realpath "$origin_cfg_base_dir_path"):/mnt/origin_cfg:ro" \
-    -v "$stage_utils_dir_host:/mnt/stage_utils:ro" \
+    -v "$step_utils_dir_host:/mnt/step_utils:ro" \
     "${provider_binding_mount_args[@]}" \
     -e ATLAS_EXECUTION_CONTEXT_FILE \
-    -e ATLAS_STAGE_UTILS_DIR=/mnt/stage_utils \
-    -e stage_dir="$stage_dir" \
+    -e ATLAS_STEP_UTILS_DIR=/mnt/step_utils \
+    -e step_dir="$step_dir" \
     -e cfg_files \
-    -e STAGE_WRITE_VALUES_JSON \
-    -e STAGE_WRITE_ENV_SH \
+    -e STEP_WRITE_VALUES_JSON \
+    -e STEP_WRITE_ENV_SH \
     -e AWS_PROFILE="${AWS_PROFILE:-}" \
     -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
     -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
@@ -138,9 +138,9 @@ run_local_stage() {
     -e AWS_EC2_METADATA_DISABLED \
     -e GITHUB_WORKSPACE="$github_workspace" \
     "${tooling_args[@]}" \
-    "${stage_cfg_mount_args[@]}" \
-    "${local_stage_extra_docker_args[@]}" \
-    "$stage_name" -lc '
+    "${step_cfg_mount_args[@]}" \
+    "${local_step_extra_docker_args[@]}" \
+    "$step_name" -lc '
       set -e
       mkdir -p "$GITHUB_WORKSPACE"
       cp -a /mnt/source/. "$GITHUB_WORKSPACE"/
@@ -148,9 +148,9 @@ run_local_stage() {
       cd "$GITHUB_WORKSPACE"
 
       if [ "${ATLAS_AWS_ASSERT_ACCESS}" = "true" ]; then
-        python3 "${ATLAS_STAGE_UTILS_DIR}/ctl/assert_aws_access.py"
+        python3 "${ATLAS_STEP_UTILS_DIR}/ctl/assert_aws_access.py"
       fi
 
-      exec "./${stage_dir}/src/stage.sh"
+      exec "./${step_dir}/src/step.sh"
     '
 }

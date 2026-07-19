@@ -22,13 +22,15 @@ ctl_state_backends:
     backend_type: s3
     bucket_name: ${execution_context.params.main_tag}-${execution_context.params.env_type}-ctl-state
     bucket_region: eu-central-1
-    execution_identity_key: ctl_state_env_synchronizer
+    execution_identity_keys:
+      sync: ctl_state_env_synchronizer
   deployments:
     provider: aws
     backend_type: s3
     bucket_name: ${execution_context.params.main_tag}-deployments-ctl-state
     bucket_region: us-east-1
-    execution_identity_key: ctl_state_deployments_synchronizer
+    execution_identity_keys:
+      sync: ctl_state_deployments_synchronizer
 """
 
 
@@ -92,20 +94,20 @@ class CtlStateSkipPolicyTests(unittest.TestCase):
     def test_defaults_to_strict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "")
-            self.assertFalse(common.ctl_allows_agreed_skip_ctl_state_backend_sync(root, "test_ctx"))
+            self.assertFalse(common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx"))
             self.assertFalse(common.ctl_allows_force_skip_ctl_state_backend_sync(root, "test_ctx"))
             self.assertEqual(common.ctl_allowed_execution_access_modes(root, "test_ctx"), {"standard"})
 
     def test_reads_profile_bool(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._ctl_root(tmp, "    allow_agreed_skip_ctl_state_backend_sync: true\n")
-            self.assertTrue(common.ctl_allows_agreed_skip_ctl_state_backend_sync(root, "test_ctx"))
+            root = self._ctl_root(tmp, "    allow_agreed_defer_ctl_state_backend_sync: true\n")
+            self.assertTrue(common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx"))
 
     def test_rejects_non_bool(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._ctl_root(tmp, "    allow_agreed_skip_ctl_state_backend_sync: sometimes\n")
+            root = self._ctl_root(tmp, "    allow_agreed_defer_ctl_state_backend_sync: sometimes\n")
             with self.assertRaisesRegex(RuntimeError, "must be a bool"):
-                common.ctl_allows_agreed_skip_ctl_state_backend_sync(root, "test_ctx")
+                common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx")
 
 
 if __name__ == "__main__":

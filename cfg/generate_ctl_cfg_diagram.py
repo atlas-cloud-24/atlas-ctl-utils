@@ -36,7 +36,7 @@ GROUPS = {
     "target": ("Targets", "target"),
     "source": ("Sources", "source"),
     "identity": ("Execution identities", "identity"),
-    "backend": ("Ctl-state buckets", "backend"),
+    "backend": ("Ctl-state namespaces", "backend"),
 }
 VIEW_GROUP_KINDS = {
     "general": ("fan_out", "workflow", "target"),
@@ -161,9 +161,25 @@ def build_diagram(
     if view not in DIAGRAM_VIEWS:
         raise RuntimeError(f"unknown diagram view {view!r}; available: {list(DIAGRAM_VIEWS)}")
     fan_outs = common.collect_resource(ctl_cfg_root, "fan_outs")
-    workflows = common.collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
-    targets = common.collect_resource(ctl_cfg_root, "targets", entry_depth=2)
-    sources = common.collect_resource(ctl_cfg_root, "stage_sources")
+
+    # §Phase 33: targets/workflows are declared once with an `actions:`
+    # allowlist; rebuild the per-action view this diagram renders from it.
+    def _by_action(flat: dict) -> dict:
+        per_action: dict = {}
+        for name, entry in flat.items():
+            if not isinstance(entry, dict):
+                continue
+            for entry_action in entry.get("actions") or []:
+                per_action.setdefault(entry_action, {})[name] = entry
+        return per_action
+
+    workflows = _by_action(
+        common.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+    )
+    targets = _by_action(
+        common.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+    )
+    sources = common.collect_resource(ctl_cfg_root, "target_sources")
     identities = common.collect_resource(ctl_cfg_root, "execution_identities")
     backends = common.collect_resource(ctl_cfg_root, "ctl_state_backends")
     actions = selected_actions(workflows, targets, [action])
@@ -289,14 +305,17 @@ def build_diagram(
                     label=f"target {action}:{target_key} execution_identity_key",
                 ):
                     edges.add(Edge(source_id, node_id("identity", match), ""))
-            backend_key = target_cfg.get("ctl_state_backend_key")
-            if backend_key is not None:
-                for match in reference_candidates(
-                    backend_key,
-                    set(backends),
-                    label=f"target {action}:{target_key} ctl_state_backend_key",
-                ):
-                    edges.add(Edge(source_id, node_id("backend", match), ""))
+            # Namespace membership is invocation-scoped, not a target property.
+            # A static diagram therefore shows every namespace this target may
+            # use; runtime selectors resolve exactly one before execution.
+            for backend_key in sorted(backends):
+                edges.add(
+                    Edge(
+                        source_id,
+                        node_id("backend", backend_key),
+                        "invocation-selected",
+                    )
+                )
 
     connected_node_ids = {identifier for edge in edges for identifier in (edge.source, edge.target)}
     backend_keys = {
@@ -306,15 +325,26 @@ def build_diagram(
     }
     for backend_key in sorted(backend_keys):
         backend_cfg = backends[backend_key]
-        identity_key = backend_cfg.get("execution_identity_key")
-        if identity_key is None:
-            continue
-        for match in reference_candidates(
-            identity_key,
-            set(identities),
-            label=f"ctl_state_backends.{backend_key}.execution_identity_key",
-        ):
-            edges.add(Edge(node_id("backend", backend_key), node_id("identity", match), "sync identity"))
+        operation_identities = backend_cfg.get("execution_identity_keys") or {}
+        if not isinstance(operation_identities, dict):
+            raise RuntimeError(
+                f"ctl_state_backends.{backend_key}.execution_identity_keys must be a mapping"
+            )
+        for operation, identity_key in sorted(operation_identities.items()):
+            for match in reference_candidates(
+                identity_key,
+                set(identities),
+                label=(
+                    f"ctl_state_backends.{backend_key}.execution_identity_keys.{operation}"
+                ),
+            ):
+                edges.add(
+                    Edge(
+                        node_id("backend", backend_key),
+                        node_id("identity", match),
+                        f"{operation} identity",
+                    )
+                )
 
     connected_node_ids = {identifier for edge in edges for identifier in (edge.source, edge.target)}
     pending_identity_keys = {
@@ -513,9 +543,15 @@ def main() -> int:
         raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
     if not 12 <= args.font_size <= 48:
         raise RuntimeError("--font-size must be between 12 and 48")
-    workflows = common.collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
-    targets = common.collect_resource(ctl_cfg_root, "targets", entry_depth=2)
-    actions = selected_actions(workflows, targets, args.actions)
+    # §Phase 33: available actions come from the flat entries' `actions:` allowlists.
+    available_actions: set[str] = set()
+    for kind in ("workflows", "targets"):
+        for entry in common.collect_resource(ctl_cfg_root, kind, entry_depth=1).values():
+            if isinstance(entry, dict):
+                available_actions.update(entry.get("actions") or [])
+    actions = selected_actions(
+        {action: {} for action in available_actions}, {}, args.actions
+    )
     unsafe_actions = [
         action for action in actions if not ACTION_KEY_RE.fullmatch(action)
     ]

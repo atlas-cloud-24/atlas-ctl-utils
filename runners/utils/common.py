@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -36,11 +36,11 @@ TOOLING_DEFAULT_REPO_URLS = {
     "plt-utils": "https://github.com/atlas-cloud-24/atlas-plt-utils.git",
 }
 RUN_ACTIONS = ("pipeline", "maintenance")
-MAINTENANCE_ACTIONS = ("force-unlock",)
-FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES = (
-    Path("atlas_ctl_adapter/stages/plan/infra/src/stage.sh"),
-    Path("atlas_ctl_adapter/stages/provision/infra/src/stage.sh"),
-    Path("atlas_ctl_adapter/stages/destroy/infra/src/stage.sh"),
+MAINTENANCE_ACTIONS = ("force-unlock", "status-sweep", "history-prune")
+FORCE_UNLOCK_STEP_SCRIPT_CANDIDATES = (
+    Path("atlas_ctl_adapter/steps/plan/infra/src/step.sh"),
+    Path("atlas_ctl_adapter/steps/provision/infra/src/step.sh"),
+    Path("atlas_ctl_adapter/steps/destroy/infra/src/step.sh"),
 )
 FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$?([A-Za-z_][A-Za-z0-9_]*)")
 FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
@@ -61,7 +61,7 @@ CFG_SOURCE_KEYS = ("plt", "guardrails")
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
 RUN_ACTIONS = ("provision", "plan", "destroy", "readonly")
-RUN_TYPES = ("workflow", "target", "sub_workflow", "maintenance", "fan_out")
+RUN_TYPES = ("workflow", "target", "step_sequence", "maintenance", "fan_out")
 # §Phase 30: reserved local-only ctl-state root — never synced, never a locator.
 # Locator segments must start alphanumeric, so "_local" cannot collide.
 LOCAL_ONLY_LOCATOR = ("_local",)
@@ -233,9 +233,9 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
 
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
-    bundles governing ctl behavior: ref_policy, allow_execution_access_modes
+    bundles governing ctl behavior: ref_policy, allowed_execution_access_modes
     (§12), and the ctl-state sync skip permissions
-    (allow_agreed_skip_ctl_state_backend_sync, allow_force_skip_ctl_state_backend_sync)."""
+    (allow_agreed_defer_ctl_state_backend_sync, allow_force_skip_ctl_state_backend_sync)."""
     profiles: dict[str, dict] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
         if not isinstance(section, dict):
@@ -277,51 +277,51 @@ def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
 
 EXECUTION_ACCESS_MODES = ("standard", "agreed_direct", "force_bypass")
 
-# Phase 26 — execution runtime (WHERE a stage's box is produced). CTL selects one
-# runtime for the whole run (always explicit, no default); the stage declares
+# Phase 26 — execution runtime (WHERE a target_run's box is produced). CTL selects one
+# runtime for the whole run (always explicit, no default); the target_run declares
 # which it can run in (a constraint).
 EXECUTION_RUNTIME_MODES = ("local", "ci")
-# Stage box images (stage.yaml runtime.image). CTL owns how each is built/run.
-STAGE_IMAGES = ("infra", "ops")
+# Target run box images (step.yaml runtime.image). CTL owns how each is built/run.
+STEP_IMAGES = ("infra", "ops")
 
 
-def stage_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> set[str]:
-    """Runtimes a stage can run in (§Phase 26); absent = all EXECUTION_RUNTIME_MODES."""
+def step_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> set[str]:
+    """Runtimes a target_run can run in (§Phase 26); absent = all EXECUTION_RUNTIME_MODES."""
     raw = runtime_cfg.get("supported_execution_runtime_modes")
     if raw is None:
         return set(EXECUTION_RUNTIME_MODES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ stage runtime.supported_execution_runtime_modes must be a list of strings: {label}")
+        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes must be a list of strings: {label}")
     runtimes = set(raw)
     unknown = runtimes - set(EXECUTION_RUNTIME_MODES)
     if unknown:
-        raise RuntimeError(f"❌ stage runtime.supported_execution_runtime_modes has unknown runtimes {sorted(unknown)}: {label}")
+        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes has unknown runtimes {sorted(unknown)}: {label}")
     if not runtimes:
-        raise RuntimeError(f"❌ stage runtime.supported_execution_runtime_modes must not be empty: {label}")
+        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes must not be empty: {label}")
     return runtimes
 
 
 def ctl_allowed_execution_runtime_modes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
     """Runtimes the ctl profile authorizes (§Phase 26). Absent = all EXECUTION_RUNTIME_MODES."""
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    raw = policy.get("allow_execution_runtime_modes")
+    raw = policy.get("allowed_execution_runtime_modes")
     if raw is None:
         return set(EXECUTION_RUNTIME_MODES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allow_execution_runtime_modes must be a list of strings")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must be a list of strings")
     runtimes = set(raw)
     unknown = runtimes - set(EXECUTION_RUNTIME_MODES)
     if unknown:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allow_execution_runtime_modes has unknown runtimes {sorted(unknown)}")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes has unknown runtimes {sorted(unknown)}")
     if not runtimes:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allow_execution_runtime_modes must not be empty")
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must not be empty")
     return runtimes
 
 
 def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execution_runtime_mode: str) -> None:
     """Reconcile the selected runtime against the ctl profile (§Phase 26): a known
-    runtime, allowed by the profile. Per-stage `supported_execution_runtime_modes` is enforced in
-    run_stages, where the repo-local stage manifest is loaded."""
+    runtime, allowed by the profile. Per-target_run `supported_execution_runtime_modes` is enforced in
+    run_steps, where the repo-local target_run manifest is loaded."""
     if execution_runtime_mode not in EXECUTION_RUNTIME_MODES:
         raise RuntimeError(f"❌ unknown execution runtime {execution_runtime_mode!r} (known: {sorted(EXECUTION_RUNTIME_MODES)})")
     allowed = ctl_allowed_execution_runtime_modes(ctl_cfg_root, ctl_profile)
@@ -334,25 +334,33 @@ def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execut
 def ctl_allowed_execution_access_modes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
     """Modes the ctl profile authorizes (§12). Absent = {standard} only."""
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    raw = policy.get("allow_execution_access_modes")
+    raw = policy.get("allowed_execution_access_modes")
     if raw is None:
         return {"standard"}
     if not isinstance(raw, list) or not all(isinstance(m, str) for m in raw):
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allow_execution_access_modes must be a list of strings"
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes must be a list of strings"
         )
     modes = set(raw)
     unknown = modes - set(EXECUTION_ACCESS_MODES)
     if unknown:
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allow_execution_access_modes has unknown modes {sorted(unknown)}"
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes has unknown modes {sorted(unknown)}"
         )
     modes.add("standard")  # standard is always permitted
     return modes
 
 
-def ctl_allows_agreed_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
-    return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_agreed_skip_ctl_state_backend_sync")
+def ctl_allows_agreed_defer_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_agreed_defer_ctl_state_backend_sync")
+
+
+def ctl_allows_ctl_state_history_maintenance(
+    ctl_cfg_root: Path, ctl_profile: str
+) -> bool:
+    return ctl_profile_bool(
+        ctl_cfg_root, ctl_profile, "allow_ctl_state_history_maintenance"
+    )
 
 
 def ctl_allows_force_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
@@ -443,6 +451,23 @@ def finalize_common_args(args: argparse.Namespace) -> None:
         value = args.provider_credential.strip()
         args.provider_credential = value or None
     args.execution_access_mode = normalize_execution_access_mode(args)
+    if getattr(args, "status", False):
+        incompatible = [
+            name
+            for name in (
+                "execution_identity_preflight_check_only",
+                "force_skip_execution_identity_preflight_check",
+                "agreed_defer_ctl_state_backend_sync",
+                "force_skip_ctl_state_backend_sync",
+                "reuse_committed",
+            )
+            if getattr(args, name, False)
+        ]
+        if incompatible:
+            raise RuntimeError(
+                "❌ --status is incompatible with: "
+                + ", ".join("--" + name.replace("_", "-") for name in incompatible)
+            )
     if (
         getattr(args, "execution_identity_preflight_check_only", False)
         and getattr(args, "force_skip_execution_identity_preflight_check", False)
@@ -459,6 +484,20 @@ def finalize_common_args(args: argparse.Namespace) -> None:
             "❌ --force-skip-execution-identity-preflight-check is not applicable "
             "with --execution-access-mode force_bypass"
         )
+    # --reuse-committed is an explicit true/false with no default. A normal run
+    # reaches the reuse-vs-rerun decision and must state intent; the exit-early
+    # modes (--status, preflight-only) never do, so it stays optional there and
+    # is rejected outright by the --status incompatibility check above.
+    if hasattr(args, "reuse_committed"):
+        exits_before_execution = getattr(args, "status", False) or getattr(
+            args, "execution_identity_preflight_check_only", False
+        )
+        if args.reuse_committed is None and not exits_before_execution:
+            raise RuntimeError(
+                "❌ --reuse-committed is required (true or false) for a normal run; "
+                "omit it only with --status or "
+                "--execution-identity-preflight-check-only"
+            )
     args.run_id = generate_uuid7()
 
 
@@ -541,8 +580,8 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text)
 
 
-def log_stage_banner(stage_id: str, *, ch: str = "#", min_width: int = 70) -> None:
-    title = f" {stage_id} "
+def log_target_run_banner(target_run_id: str, *, ch: str = "#", min_width: int = 70) -> None:
+    title = f" {target_run_id} "
     width = max(min_width, len(title) + 2)  # ensure it always fits
     line = ch * width
     mid  = title.center(width, ch)
@@ -601,8 +640,8 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ workflow runner requires --workflow")
     if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
-        raise RuntimeError("❌ workflow runner does not accept sub-workflow synthetic target args")
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_identity_key", "affected_target_keys")):
+        raise RuntimeError("❌ workflow runner does not accept step-sequence synthetic target args")
 
 
 def validate_target_args(args: argparse.Namespace) -> None:
@@ -613,36 +652,65 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
-        raise RuntimeError("❌ target runner does not accept sub-workflow synthetic target args")
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_identity_key", "affected_target_keys")):
+        raise RuntimeError("❌ target runner does not accept step-sequence synthetic target args")
 
 
 def validate_maintenance_args(args: argparse.Namespace) -> None:
-    """Validate args for a maintenance run."""
+    """Validate args for one explicit maintenance operation."""
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "sub_workflow", "execution_identity_key", "ctl_state_backend_key", "affected_target_keys")):
-        raise RuntimeError("❌ maintenance runner does not accept sub-workflow synthetic target args")
-    if not getattr(args, "maintenance_action", None):
+    if any(
+        getattr(args, field, None)
+        for field in (
+            "source", "ref", "cfg_file_set", "step_sequence",
+            "execution_identity_key", "affected_target_keys",
+        )
+    ):
+        raise RuntimeError(
+            "❌ maintenance runner does not accept synthetic target args"
+        )
+    action = getattr(args, "maintenance_action", None)
+    if not action:
         raise RuntimeError("❌ --maintenance-action is required for maintenance")
-    if args.maintenance_action == "force-unlock" and not getattr(args, "lock_id", None):
-        raise RuntimeError("❌ --lock-id is required for --maintenance-action=force-unlock")
-    if args.maintenance_action == "force-unlock" and ctl_state_lock_matches(args.ctl_state_local_root, args.lock_id):
+    if action == "force-unlock":
+        if not getattr(args, "lock_id", None):
+            raise RuntimeError(
+                "❌ --lock-id is required for --maintenance-action=force-unlock"
+            )
+        if not getattr(args, "target", None) and not ctl_state_lock_matches(
+            args.ctl_state_local_root, args.lock_id
+        ):
+            raise RuntimeError("❌ --target is required for Terraform force-unlock")
         return
-    if not getattr(args, "target", None):
-        raise RuntimeError("❌ --target is required for maintenance")
+    if getattr(args, "target", None):
+        raise RuntimeError(f"❌ --target is not valid for {action}")
+    if action == "status-sweep":
+        return
+    if action == "history-prune":
+        if not args.prune_run_id and not args.prune_before:
+            raise RuntimeError(
+                "❌ history-prune requires --prune-run-id or --prune-before"
+            )
+        if args.apply_history_prune != args.agree_history_prune:
+            raise RuntimeError(
+                "❌ applying history prune requires both --apply-history-prune "
+                "and --agree-history-prune"
+            )
+        return
+    raise RuntimeError(f"❌ unsupported maintenance action: {action}")
 
 
-def validate_sub_workflow_args(args: argparse.Namespace) -> None:
-    """Validate args for a synthetic repo-local sub_workflow run."""
+def validate_step_sequence_args(args: argparse.Namespace) -> None:
+    """Validate args for a synthetic repo-local step_sequence run."""
     if getattr(args, "workflow", None) or getattr(args, "target", None):
-        raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
+        raise RuntimeError("❌ step_sequence runner does not accept --workflow or --target")
     if getattr(args, "ctl_variants", None):
-        raise RuntimeError("❌ --ctl-variants is not supported for sub_workflow runs")
-    missing = [f for f in ("source", "ref", "cfg_file_set", "sub_workflow") if not getattr(args, f, None)]
+        raise RuntimeError("❌ --ctl-variants is not supported for step_sequence runs")
+    missing = [f for f in ("source", "ref", "cfg_file_set", "step_sequence") if not getattr(args, f, None)]
     if missing:
         raise RuntimeError(
-            "❌ sub_workflow needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
+            "❌ step_sequence needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
         )
     identity_key = getattr(args, "execution_identity_key", None)
     if identity_key is not None and not identity_key.strip():
@@ -651,44 +719,44 @@ def validate_sub_workflow_args(args: argparse.Namespace) -> None:
     if affected_target_keys:
         args.affected_target_keys = normalize_target_keys(affected_target_keys, label="--affected-target-key")
     if args.action in MUTATING_ACTIONS and not getattr(args, "affected_target_keys", None):
-        raise RuntimeError("❌ mutating sub_workflow runs require at least one --affected-target-key")
+        raise RuntimeError("❌ mutating step_sequence runs require at least one --affected-target-key")
 
 
 
 
 
-def validate_stages_have_commits(active_stages: dict, ref_policy: str) -> None:
-    """Validate that all resolved stages and modules have explicit commits when required.
+def validate_target_runs_have_commits(active_target_runs: dict, ref_policy: str) -> None:
+    """Validate that all resolved target_runs and modules have explicit commits when required.
 
     Commit-required policy disallows branch references for executable code. Validation
-    runs after workflow patches and refs have been resolved into active stages.
+    runs after workflow patches and refs have been resolved into active target_runs.
     """
     if not ref_policy_requires_commits(ref_policy):
         return
 
-    stages_without_commit = []
+    target_runs_without_commit = []
     modules_without_commit = []
-    for stage_id, stage_cfg in active_stages.items():
-        if not stage_cfg.get("commit"):
-            stages_without_commit.append(stage_id)
+    for target_run_id, target_run_cfg in active_target_runs.items():
+        if not target_run_cfg.get("commit"):
+            target_runs_without_commit.append(target_run_id)
 
-        raw_modules = stage_cfg.get("modules") or {}
+        raw_modules = target_run_cfg.get("modules") or {}
         if not isinstance(raw_modules, dict):
-            modules_without_commit.append(f"{stage_id}:<invalid-modules>")
+            modules_without_commit.append(f"{target_run_id}:<invalid-modules>")
             continue
 
         for module_name, module_cfg in raw_modules.items():
             if not module_cfg.get("commit"):
-                modules_without_commit.append(f"{stage_id}:{module_name}")
+                modules_without_commit.append(f"{target_run_id}:{module_name}")
 
-    if stages_without_commit or modules_without_commit:
+    if target_runs_without_commit or modules_without_commit:
         details = []
-        if stages_without_commit:
-            details.append(f"Stages missing 'commit': {stages_without_commit}")
+        if target_runs_without_commit:
+            details.append(f"Target runs missing 'commit': {target_runs_without_commit}")
         if modules_without_commit:
             details.append(f"Modules missing 'commit': {modules_without_commit}")
         raise RuntimeError(
-            "❌ ref_policy=commit_required requires all stages and modules to have explicit 'commit' specified.\n"
+            "❌ ref_policy=commit_required requires all target_runs and modules to have explicit 'commit' specified.\n"
             f"   {'; '.join(details)}\n"
             "   Using branch references is not allowed for reproducibility."
         )
@@ -897,7 +965,7 @@ def parse_ctl_variants_arg(value: str) -> list[str]:
         item_label="Ctl variant",
     )
 
-def build_active_stages(
+def build_active_target_runs(
     workflow_cfg: dict,
     inventory_cfg: dict,
     repo_key: str = "repo_url",
@@ -906,177 +974,202 @@ def build_active_stages(
     execution_context: dict[str, object] | None = None,
     require_commit_refs: bool = False,
 ) -> dict:
-    inventory_stage_sources = inventory_cfg.get("stage_sources", {})
-    if not isinstance(inventory_stage_sources, dict):
-        raise RuntimeError("'stage_sources' in inventory must be a mapping: source -> meta")
+    inventory_target_sources = inventory_cfg.get("target_sources", {})
+    if not isinstance(inventory_target_sources, dict):
+        raise RuntimeError("'target_sources' in inventory must be a mapping: source -> meta")
 
-    inventory_stage_targets = inventory_cfg.get("stage_targets", {})
-    if not isinstance(inventory_stage_targets, dict):
-        raise RuntimeError("'stage_targets' in inventory must be a mapping: target -> meta")
+    inventory_targets = inventory_cfg.get("targets", {})
+    if not isinstance(inventory_targets, dict):
+        raise RuntimeError("'targets' in inventory must be a mapping: target -> meta")
 
     refs = refs or {}
     scoped_refs = refs.get("scoped") or {}
     ref_context_values = execution_context or {}
     active = {}
 
-    def normalize_cfg_root(raw_value, *, stage_target: str) -> str:
+    def normalize_cfg_root(raw_value, *, target_key: str) -> str:
         value = raw_value if raw_value is not None else "/"
         if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must be a non-empty string")
+            raise RuntimeError(f"Target run target {target_key!r} cfg_root must be a non-empty string")
         value = value.strip()
         if "\\" in value:
-            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must use forward slashes: {value}")
+            raise RuntimeError(f"Target run target {target_key!r} cfg_root must use forward slashes: {value}")
         if not value.startswith("/"):
-            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must start with /: {value}")
+            raise RuntimeError(f"Target run target {target_key!r} cfg_root must start with /: {value}")
         parts = [part for part in value.split("/") if part]
         if any(part in (".", "..") for part in parts):
-            raise RuntimeError(f"Stage target {stage_target!r} cfg_root must not contain . or ..: {value}")
+            raise RuntimeError(f"Target run target {target_key!r} cfg_root must not contain . or ..: {value}")
         # cfg_root is freed (Phase 2d): any safe path incl. "/" (root) and multi-segment; it no
         # longer must be a single scope segment and is independent of the target's ref/context.
         return "/" + "/".join(parts)
 
-    for st in workflow_cfg.get("stages", []):
+    for st in workflow_cfg.get("target_runs", []):
         if isinstance(st, str):
-            stage_id = st
-            stage_target = st
-            stage_over = {}
+            target_run_id = st
+            target_key = st
+            target_override = {}
         else:
-            stage_id = st.get("id")
-            if not stage_id:
-                raise RuntimeError("Stage entry missing required field 'id'")
-            stage_target = st.get("target")
-            if not stage_target:
-                raise RuntimeError(f"Stage {stage_id!r} has empty 'target'")
-            stage_over = st
+            target_run_id = st.get("id")
+            if not target_run_id:
+                raise RuntimeError("Target run entry missing required field 'id'")
+            target_key = st.get("target")
+            if not target_key:
+                raise RuntimeError(f"Target run {target_run_id!r} has empty 'target'")
+            target_override = st
 
-        if stage_target not in inventory_stage_targets:
+        if target_key not in inventory_targets:
             raise RuntimeError(
-                f"Stage target {stage_target!r} (stage id={stage_id!r}) not found in inventory {workflow_cfg.get('inventory')!r}"
+                f"Target run target {target_key!r} (target_run id={target_run_id!r}) not found in inventory {workflow_cfg.get('inventory')!r}"
             )
 
-        target_cfg = inventory_stage_targets[stage_target]
+        target_cfg = inventory_targets[target_key]
         if not isinstance(target_cfg, dict):
             raise RuntimeError(
-                f"Stage target {stage_target!r} metadata must be a mapping, got: {type(target_cfg).__name__}"
+                f"Target run target {target_key!r} metadata must be a mapping, got: {type(target_cfg).__name__}"
             )
 
-        stage_source = target_cfg.get("source")
-        if not isinstance(stage_source, str) or not stage_source:
-            raise RuntimeError(f"Stage target {stage_target!r} must define non-empty 'source'")
-        if stage_source not in inventory_stage_sources:
+        target_source = target_cfg.get("source")
+        if not isinstance(target_source, str) or not target_source:
+            raise RuntimeError(f"Target run target {target_key!r} must define non-empty 'source'")
+        if target_source not in inventory_target_sources:
             raise RuntimeError(
-                f"Stage target {stage_target!r} references missing source {stage_source!r} in inventory {workflow_cfg.get('inventory')!r}"
+                f"Target run target {target_key!r} references missing source {target_source!r} in inventory {workflow_cfg.get('inventory')!r}"
             )
 
-        source_cfg = inventory_stage_sources[stage_source]
+        source_cfg = inventory_target_sources[target_source]
         if not isinstance(source_cfg, dict):
             raise RuntimeError(
-                f"Stage source {stage_source!r} metadata must be a mapping, got: {type(source_cfg).__name__}"
+                f"Target run source {target_source!r} metadata must be a mapping, got: {type(source_cfg).__name__}"
             )
 
         # Phase 2d: resolve this target's ref context → per-context source/module pins.
         target_ref = target_cfg.get("ref")
-        ctx_stage_refs: dict = {}
+        ctx_target_source_refs: dict = {}
         ctx_module_refs: dict = {}
         if scoped_refs and target_ref:
             ctx = resolve_ref_context(target_ref, ref_context_values)
             ctx_block = scoped_refs.get(ctx)
             if ctx_block is None:
                 raise RuntimeError(
-                    f"Stage target {stage_target!r} ref context {ctx!r} not found in refs.scoped"
+                    f"Target run target {target_key!r} ref context {ctx!r} not found in refs.scoped"
                 )
-            ctx_stage_refs = ctx_block.get("stage_sources") or {}
+            # §Phase 31 3c: a scoped-ref group resolves to one concrete scoped
+            # entry (the member ref_key may carry ${execution_context.*}
+            # placeholders, rendered here before the second lookup).
+            if selector_group_is_group(ctx_block):
+                member_ref = resolve_selector_group_member(
+                    ctx_block, ref_context_values,
+                    value_field="ref_key",
+                    label=f"refs.scoped group {ctx!r}",
+                )
+                concrete_ctx = resolve_ref_context(member_ref, ref_context_values)
+                ctx_block = scoped_refs.get(concrete_ctx)
+                if ctx_block is None:
+                    raise RuntimeError(
+                        f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
+                        f"resolved to {concrete_ctx!r}, which is not in refs.scoped"
+                    )
+                if selector_group_is_group(ctx_block):
+                    raise RuntimeError(
+                        f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
+                        f"{concrete_ctx!r} is itself a group (no nested groups)"
+                    )
+            ctx_target_source_refs = ctx_block.get("target_sources") or {}
             ctx_module_refs = ctx_block.get("modules") or {}
 
-        stage_ref = ctx_stage_refs.get(stage_source) or {}
-        if not isinstance(stage_ref, dict):
+        target_source_ref = ctx_target_source_refs.get(target_source) or {}
+        if not isinstance(target_source_ref, dict):
             raise RuntimeError(
-                f"Stage source refs for {stage_source!r} must be a mapping, got: {type(stage_ref).__name__}"
+                f"Target run source refs for {target_source!r} must be a mapping, got: {type(target_source_ref).__name__}"
             )
 
-        branch = stage_over.get("branch") or stage_ref.get("branch")
-        commit = stage_over.get("commit") or stage_ref.get("commit")
-        # fat target carries the repo-local sub_workflow; a dict stage entry may still override
-        child_workflow = stage_over.get("workflow") or target_cfg.get("sub_workflow")
+        branch = target_override.get("branch") or target_source_ref.get("branch")
+        commit = target_override.get("commit") or target_source_ref.get("commit")
+        # fat target carries the repo-local step_sequence; a dict target_run entry may still override
+        child_step_sequence = target_override.get("step_sequence") or target_cfg.get("step_sequence")
 
         if branch and commit:
             raise RuntimeError(
-                f"Stage {stage_id!r} resolved both branch={branch!r} and commit={commit!r}. "
+                f"Target run {target_run_id!r} resolved both branch={branch!r} and commit={commit!r}. "
                 "Only one ref type may be set."
             )
 
         if require_branch_or_commit and not branch and not commit:
-            raise RuntimeError(f"Stage {stage_id!r} source {stage_source!r} has neither branch nor commit configured")
+            raise RuntimeError(f"Target run {target_run_id!r} source {target_source!r} has neither branch nor commit configured")
         if require_branch_or_commit and require_commit_refs and not commit:
             raise RuntimeError(
-                f"Stage {stage_id!r} ref {target_ref!r} requires an explicit commit (not a branch) for reproducibility"
+                f"Target run {target_run_id!r} ref {target_ref!r} requires an explicit commit (not a branch) for reproducibility"
             )
 
         repo_value = source_cfg.get(repo_key)
         if not repo_value:
             raise RuntimeError(
-                f"Stage {stage_id!r} (target={stage_target!r}, source={stage_source!r}) missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
+                f"Target run {target_run_id!r} (target={target_key!r}, source={target_source!r}) missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
             )
 
         cfg_files = target_cfg.get("cfg_files", [])
         if cfg_files is None:
             cfg_files = []
         if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Stage target {stage_target!r} cfg_files must be a list")
+            raise RuntimeError(f"Target run target {target_key!r} cfg_files must be a list")
 
-        active_stage = {
-            "target": stage_target,
-            "source": stage_source,
+        active_target_run = {
+            "target": target_key,
+            "source": target_source,
             "ref": target_ref,
             "branch": branch,
             "commit": commit,
-            "workflow": child_workflow,
-            "cfg_root": normalize_cfg_root(target_cfg.get("cfg_root", "/"), stage_target=stage_target),
+            "step_sequence": child_step_sequence,
+            "cfg_root": normalize_cfg_root(target_cfg.get("cfg_root", "/"), target_key=target_key),
             "cfg_files": cfg_files,
         }
 
-        execution_identity_key = stage_over.get("execution_identity_key") or target_cfg.get("execution_identity_key")
+        execution_identity_key = target_override.get("execution_identity_key") or target_cfg.get("execution_identity_key")
         if execution_identity_key is not None:
             if not isinstance(execution_identity_key, str) or not execution_identity_key.strip():
-                raise RuntimeError(f"Stage {stage_id!r} execution_identity_key must be a non-empty string")
-            active_stage["execution_identity_key"] = execution_identity_key.strip()
+                raise RuntimeError(f"Target run {target_run_id!r} execution_identity_key must be a non-empty string")
+            active_target_run["execution_identity_key"] = execution_identity_key.strip()
 
-        # State domain: which ctl-state bucket this target's results/lock live in.
-        # Absent (commented in dev cfg) = no domain for this run → sync skippable.
-        ctl_state_backend_key = target_cfg.get("ctl_state_backend_key")
-        if ctl_state_backend_key is not None:
-            if not isinstance(ctl_state_backend_key, str) or not ctl_state_backend_key.strip():
-                raise RuntimeError(f"Stage {stage_id!r} ctl_state_backend_key must be a non-empty string")
-            active_stage["ctl_state_backend_key"] = ctl_state_backend_key.strip()
+        # §Phase 31/32: the declared instance identity must ride on the target_run
+        # so per-target reports and the target-instance locator see it (the
+        # workflow-composition identity reads it from the inventory separately).
+        if target_cfg.get("target_instance_params_unresolved"):
+            raise RuntimeError(
+                f"Target run target {target_key!r} has a members-shaped "
+                "target_instance_params whose dispatch axis is unbound in this run"
+            )
+        instance_params = target_cfg.get("target_instance_params")
+        if instance_params is not None:
+            active_target_run["target_instance_params"] = instance_params
 
         if repo_key == "repo_path":
             repo_path = Path(repo_value).expanduser()
             if not repo_path.is_absolute():
                 raise RuntimeError(
-                    f"Stage {stage_id!r} source {stage_source!r} repo_path must be absolute, got: {repo_value}"
+                    f"Target run {target_run_id!r} source {target_source!r} repo_path must be absolute, got: {repo_value}"
                 )
-            active_stage["repo_path"] = str(repo_path.resolve())
+            active_target_run["repo_path"] = str(repo_path.resolve())
         else:
-            active_stage["repo_url"] = repo_value
-            active_stage["token_type"] = source_cfg.get("token_type")
+            active_target_run["repo_url"] = repo_value
+            active_target_run["token_type"] = source_cfg.get("token_type")
 
         raw_modules = source_cfg.get("modules") or {}
         if raw_modules and not isinstance(raw_modules, dict):
             raise RuntimeError(
-                f"Stage {stage_id!r} source {stage_source!r} modules must be a mapping, got: {type(raw_modules).__name__}"
+                f"Target run {target_run_id!r} source {target_source!r} modules must be a mapping, got: {type(raw_modules).__name__}"
             )
 
         resolved_modules = {}
         for module_name, module_meta in raw_modules.items():
             if not isinstance(module_name, str):
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module names must be strings, got: {type(module_name).__name__}"
+                    f"Target run {target_run_id!r} module names must be strings, got: {type(module_name).__name__}"
                 )
             if module_meta is None:
                 module_meta = {}
             if not isinstance(module_meta, dict):
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
+                    f"Target run {target_run_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
                 )
 
             module_ref = ctx_module_refs.get(module_name) or {}
@@ -1094,28 +1187,28 @@ def build_active_stages(
                 )
             if require_branch_or_commit and not module_branch and not module_commit:
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} has neither branch nor commit configured"
+                    f"Target run {target_run_id!r} module {module_name!r} has neither branch nor commit configured"
                 )
             if require_branch_or_commit and require_commit_refs and not module_commit:
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} ref {target_ref!r} requires an explicit commit"
+                    f"Target run {target_run_id!r} module {module_name!r} ref {target_ref!r} requires an explicit commit"
                 )
 
             dest = module_meta.get("dest")
             if not isinstance(dest, str) or not dest.strip():
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} must define non-empty 'dest'"
+                    f"Target run {target_run_id!r} module {module_name!r} must define non-empty 'dest'"
                 )
             dest_path = Path(dest)
             if dest_path.is_absolute() or ".." in dest_path.parts:
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} dest must stay within the stage repo: {dest}"
+                    f"Target run {target_run_id!r} module {module_name!r} dest must stay within the target_run repo: {dest}"
                 )
 
             module_repo_value = module_meta.get(repo_key)
             if not module_repo_value:
                 raise RuntimeError(
-                    f"Stage {stage_id!r} module {module_name!r} missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
+                    f"Target run {target_run_id!r} module {module_name!r} missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
                 )
 
             resolved_module = {
@@ -1127,7 +1220,7 @@ def build_active_stages(
                 module_repo_path = Path(module_repo_value).expanduser()
                 if not module_repo_path.is_absolute():
                     raise RuntimeError(
-                        f"Stage {stage_id!r} module {module_name!r} repo_path must be absolute, got: {module_repo_value}"
+                        f"Target run {target_run_id!r} module {module_name!r} repo_path must be absolute, got: {module_repo_value}"
                     )
                 resolved_module["repo_path"] = str(module_repo_path.resolve())
             else:
@@ -1137,9 +1230,9 @@ def build_active_stages(
             resolved_modules[module_name] = resolved_module
 
         if resolved_modules:
-            active_stage["modules"] = resolved_modules
+            active_target_run["modules"] = resolved_modules
 
-        active[stage_id] = active_stage
+        active[target_run_id] = active_target_run
 
     return active
 
@@ -1156,7 +1249,7 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     file with a `cfg_file_sets:` key contributes cfg-file-sets wherever it lives. The maps are
     unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
     error (same rule as targets), order-independent. `entry_depth` is how deep the
-    unique entries sit: 1 for flat catalogs (stage_sources/cfg_file_sets),
+    unique entries sit: 1 for flat catalogs (target_sources/cfg_file_sets),
     2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>` and
     `providers.<name>.<section>.<entry>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
@@ -1310,7 +1403,7 @@ def _deep_merge_refs(dst: dict, src: dict, yf: Path, path: str = "") -> None:
 def load_refs_cfg(ctl_cfg_root: Path) -> dict:
     """Collect the content-key `refs` resource (deep tree-merge).
 
-    Returns `{global: {tooling...}, scoped: {<ctx>: {stage_sources, modules}}}`.
+    Returns `{global: {tooling...}, scoped: {<ctx>: {target_sources, modules}}}`.
     `global` = run-level shared pins (the engine/tooling, one version everywhere).
     `scoped` = per-context pins keyed by a flat dotted context. Both optional; in
     dev the refs may be absent entirely → `{}`.
@@ -1352,16 +1445,16 @@ def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = (
     for field, values in (("import_workflow_keys", import_keys), ("target_keys", target_keys)):
         if not isinstance(values, list) or not all(isinstance(value, str) and value for value in values):
             raise RuntimeError(f"❌ workflow {name!r} {field} must be a list of non-empty strings")
-    stages: list = []
+    target_runs: list = []
     for workflow_key in import_keys:
-        stages.extend(expand_workflow_imports(action_workflows, workflow_key, (*_stack, name)))
-    stages.extend(target_keys)
+        target_runs.extend(expand_workflow_imports(action_workflows, workflow_key, (*_stack, name)))
+    target_runs.extend(target_keys)
     seen: set = set()
-    for target_key in stages:
+    for target_key in target_runs:
         if target_key in seen:
             raise RuntimeError(f"❌ workflow {name!r} has duplicate target key {target_key!r} after import expansion")
         seen.add(target_key)
-    return stages
+    return target_runs
 
 
 def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tuple = ()) -> dict:
@@ -1425,6 +1518,16 @@ def run_provider_adapter(execution_context: dict[str, object]):
     return get_provider_adapter(provider.strip())
 
 
+def collect_provider_cfg_findings(
+    ctl_cfg_root: Path, execution_context: dict[str, object]
+) -> list[dict]:
+    """Stage-1 provider cfg well-formedness findings (run once), via the adapter."""
+    adapter = run_provider_adapter(execution_context)
+    return adapter.collect_provider_cfg_findings(
+        ctl_cfg_root, execution_context=execution_context
+    )
+
+
 def execution_identity_is_group(entry: object) -> bool:
     """A group entry selects one concrete member by selectors (§Phase 10)."""
     return isinstance(entry, dict) and "members" in entry
@@ -1460,28 +1563,227 @@ def _validate_execution_identity_group(
         seen.add(member_key)
         # selectors must be the structured match/in form (generic evaluator)
         selector_requirements(member.get("selectors"), label=f"group {group_key} member {member_key}", structured_only=True)
-        concrete = identities.get(member_key)
-        if not isinstance(concrete, dict) or execution_identity_is_group(concrete):
+        if member_key == group_key:
             raise RuntimeError(
-                f"❌ execution identity group {group_key!r} member {member_key!r} must reference a "
-                f"concrete identity (no nested groups): {ctl_cfg_root}"
+                f"❌ execution identity group {group_key!r} references itself: {ctl_cfg_root}"
+            )
+        # §Phase 33: a member may be a concrete identity OR another group (one
+        # dispatch axis per group; deep cycles fail at resolve time).
+        concrete = identities.get(member_key)
+        if not isinstance(concrete, dict):
+            raise RuntimeError(
+                f"❌ execution identity group {group_key!r} member {member_key!r} is not defined "
+                f"in execution_identities: {ctl_cfg_root}"
             )
         if concrete.get("provider") != group_provider:
             raise RuntimeError(
                 f"❌ execution identity group {group_key!r} is provider {group_provider!r} but member "
                 f"{member_key!r} is provider {concrete.get('provider')!r} (groups are provider-homogeneous): {ctl_cfg_root}"
             )
+    # a group resolves exactly one member — reject byte-identical member selectors.
+    reject_duplicate_selectors(
+        {m.get("identity_key"): m.get("selectors") for m in members},
+        label=f"execution identity group {group_key}",
+    )
+    # §Phase 32 per-axis rule: identity dispatch may use only declarable params
+    # axes or the path-encoded ctl.action — never other ctl.* facts.
+    collect_member_dispatch_axes(
+        members, label=f"execution identity group {group_key}"
+    )
+
+
+def selector_group_is_group(entry: object) -> bool:
+    """§Phase 31 3c: a selector-membered group entry in a cfg collection
+    (cfg_file_sets, refs.scoped) — same resolution semantics as execution
+    identity groups: `members` select exactly one concrete value."""
+    return isinstance(entry, dict) and "members" in entry
+
+
+def resolve_selector_group_member(
+    entry: dict,
+    execution_context: dict[str, object],
+    *,
+    value_field: str,
+    label: str,
+    tolerate_none: bool = False,
+) -> str | None:
+    """Resolve a selector-membered group entry to its one matching member's
+    `value_field` (§Phase 31 3c). Mirrors execution-identity group semantics:
+    members are {<value_field>, selectors}; EXACTLY ONE member must match the
+    frozen execution context. The returned value may still carry
+    ${execution_context.*} placeholders — the caller renders them.
+
+    With `tolerate_none=True`, ZERO matches returns None instead of raising (used
+    for an inactive target whose selector axis isn't bound in this run); MORE than
+    one match is always a hard error (a genuine cfg ambiguity)."""
+    members = entry.get("members")
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label}: group members must be a non-empty list")
+    for member in members:
+        if not isinstance(member, dict) or set(member) - {value_field, "selectors"}:
+            raise RuntimeError(
+                f"❌ {label}: group member must be {{{value_field}, selectors}}"
+            )
+        value = member.get(value_field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"❌ {label}: group member {value_field} must be a non-empty string")
+    reject_duplicate_selectors(
+        {m.get(value_field): m.get("selectors") for m in members}, label=label
+    )
+    matches = [
+        member for member in members
+        if selector_matches(
+            member.get("selectors"), execution_context,
+            label=f"{label} member {member.get(value_field)}",
+            structured_only=True,
+        )
+    ]
+    if len(matches) != 1:
+        if tolerate_none and not matches:
+            return None
+        member_values = [member.get(value_field) for member in members]
+        raise RuntimeError(
+            f"❌ {label}: exactly one group member must match the execution context, "
+            f"matched {len(matches)} (members: {member_values})"
+        )
+    return matches[0][value_field].strip()
+
+
+def _selector_param_axes(members: object) -> set[str]:
+    """The params-namespace axes referenced by a member list's selectors
+    (§Phase 32 consumed-axes guard input). Non-params refs (ctl.*) are ignored.
+    (EXECUTION_CONTEXT_ROOT is defined later in the module — reference it at
+    call time, never at import time.)"""
+    prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
+    axes: set[str] = set()
+    for member in members or []:
+        if not isinstance(member, dict):
+            continue
+        try:
+            requirements = selector_requirements(
+                member.get("selectors"), label="consumed-axes scan", structured_only=True
+            )
+        except Exception:
+            continue
+        for ref in requirements:
+            if ref.startswith(prefix):
+                axes.add(ref[len(prefix):])
+    return axes
+
+
+def _template_param_axes(value: object) -> set[str]:
+    """${execution_context.params.X} variables in a raw template string."""
+    if not isinstance(value, str):
+        return set()
+    pattern = (
+        rf"\$\{{{re.escape(EXECUTION_CONTEXT_ROOT)}\.params\.([A-Za-z_][A-Za-z0-9_]*)\}}"
+    )
+    return set(re.findall(pattern, value))
+
+
+def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
+    """§Phase 32 instance-uniqueness rule, field-agnostic: EVERY members-shaped
+    dispatch in target resolution feeds the guard, and the violation test is
+    per-AXIS, never per-field:
+
+    - a params axis → returned (must be declared in target_instance_params
+      unless path-encoded via the namespace);
+    - `ctl.action` → safe (the action is its own ctl-state path segment);
+    - any OTHER ctl.* fact (e.g. ctl.profile) → hard error: it is neither
+      path-encoded nor declarable, so two runs differing only in it would
+      collapse onto one instance path and self-override."""
+    params_prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
+    action_ref = f"{EXECUTION_CONTEXT_ROOT}.ctl.action"
+    axes: set[str] = set()
+    for member in members or []:
+        if not isinstance(member, dict):
+            continue
+        requirements = selector_requirements(
+            member.get("selectors"), label=label, structured_only=True
+        )
+        for ref in requirements:
+            if ref.startswith(params_prefix):
+                axes.add(ref[len(params_prefix):])
+            elif ref != action_ref:
+                raise RuntimeError(
+                    f"❌ {label}: dispatch on {ref!r} is not allowed — target "
+                    "resolution may dispatch only on declarable params axes or "
+                    "the path-encoded ctl.action"
+                )
+    return axes
+
+
+def resolve_list_members(
+    entry: dict,
+    execution_context: dict[str, object] | None,
+    *,
+    value_field: str,
+    label: str,
+    allow_empty: bool = False,
+) -> list | None:
+    """Resolve a members-shaped LIST-valued declaration
+    ({members: [{<value_field>: [...], selectors: {...}}, ...]}) to the ONE
+    matching member's list (§Phase 32 instance schemas, §Phase 33 per-action
+    cfg_files/target_keys). The scalar twin is resolve_selector_group_member.
+    Returns None when no context is available or the dispatch axis is unbound
+    (deferred — the caller decides whether that is an error)."""
+    members = entry.get("members")
+    if set(entry) != {"members"} or not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label}: members-shaped declaration must be {{members: [...]}}")
+    for member in members:
+        if not isinstance(member, dict) or set(member) != {value_field, "selectors"}:
+            raise RuntimeError(f"❌ {label}: each member must be {{{value_field}, selectors}}")
+        if not isinstance(member[value_field], list) or (
+            not member[value_field] and not allow_empty
+        ):
+            raise RuntimeError(f"❌ {label}: member {value_field} must be a non-empty list")
+    if execution_context is None:
+        return None
+    matches = [
+        member for member in members
+        if selector_matches(
+            member["selectors"], execution_context,
+            label=f"{label} member", structured_only=True,
+        )
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"❌ {label}: exactly one member must match the execution context, matched {len(matches)}"
+        )
+    return list(matches[0][value_field])
+
+
+def _resolve_instance_params_members(
+    entry: dict, execution_context: dict[str, object] | None, *, target_name: str
+) -> list[str] | None:
+    return resolve_list_members(
+        entry,
+        execution_context,
+        value_field="params",
+        label=f"target {target_name!r} target_instance_params",
+    )
 
 
 def resolve_execution_identity_entry(
-    identities: dict, identity_key: str, execution_context: dict[str, object]
+    identities: dict,
+    identity_key: str,
+    execution_context: dict[str, object],
+    _stack: tuple = (),
 ) -> tuple[str, dict]:
     """Resolve an execution_identity_key to (concrete_key, concrete_cfg) (§Phase 10).
 
-    A group entry selects EXACTLY ONE concrete member by matching member
-    selectors against the execution context; a concrete entry returns itself.
-    The group's declared provider is checked against the run BEFORE matching, so
-    a wrong-provider run fails precisely rather than as an ambiguous no-match."""
+    A group entry selects EXACTLY ONE member by matching member selectors against
+    the execution context; a concrete entry returns itself. §Phase 33: a member
+    may itself be a GROUP (each group dispatches ONE axis, e.g. ctl.action →
+    account), resolved recursively with cycle detection. The group's declared
+    provider is checked against the run BEFORE matching, so a wrong-provider run
+    fails precisely rather than as an ambiguous no-match."""
+    if identity_key in _stack:
+        raise RuntimeError(
+            f"❌ execution identity group cycle: {' -> '.join([*_stack, identity_key])}"
+        )
     entry = identities.get(identity_key)
     if not isinstance(entry, dict):
         raise RuntimeError(f"❌ execution_identity_key {identity_key!r} is not defined in execution_identities")
@@ -1509,13 +1811,9 @@ def resolve_execution_identity_entry(
             f"context, matched {len(matches)} (members: {member_keys})"
         )
     member_key = matches[0]["identity_key"].strip()
-    concrete = identities.get(member_key)
-    if not isinstance(concrete, dict) or execution_identity_is_group(concrete):
-        raise RuntimeError(
-            f"❌ execution identity group {identity_key!r} member {member_key!r} must resolve to a "
-            "concrete identity (no nested groups)"
-        )
-    return member_key, concrete
+    return resolve_execution_identity_entry(
+        identities, member_key, execution_context, (*_stack, identity_key)
+    )
 
 
 def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
@@ -1600,22 +1898,22 @@ def _require_non_empty_string(value, label: str, path: Path | None = None) -> st
 
 
 def validate_execution_identity_coverage(
-    active_stages: dict,
+    active_target_runs: dict,
     *,
     execution_access_mode: str = "standard",
 ) -> None:
-    """Every stage declares its execution identity, always. The only run without
+    """Every target_run declares its execution identity, always. The only run without
     identities is bypass mode (--execution-access-mode force_bypass + substitute
-    credential), which covers identity-less stages too."""
+    credential), which covers identity-less target_runs too."""
     if execution_access_mode == "force_bypass":
         return
     stages_without_identity = sorted(
-        stage_id for stage_id, stage in active_stages.items()
-        if stage.get("execution_identity_key") is None
+        target_run_id for target_run_id, target_run in active_target_runs.items()
+        if target_run.get("execution_identity_key") is None
     )
     if stages_without_identity:
         raise RuntimeError(
-            "❌ selected stages have no execution_identity_key: "
+            "❌ selected target_runs have no execution_identity_key: "
             + ", ".join(stages_without_identity)
             + "; declare it, or run with --execution-access-mode force_bypass + --provider-credential"
         )
@@ -1736,15 +2034,7 @@ def validate_cross_scope_leaf_conflicts(scopes: list[dict], *, target_path: str,
                 )
 
 
-def _add_workflow_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--ctl-variants",
-        required=False,
-        default=[],
-        dest="ctl_variants",
-        type=parse_ctl_variants_arg,
-        help="Optional comma-separated ctl variant paths under variants/",
-    )
+def _add_workflow_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--workflow",
         required=True,
@@ -1752,7 +2042,7 @@ def _add_workflow_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_target_args(parser: argparse.ArgumentParser) -> None:
+def _add_target_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--target",
         required=True,
@@ -1760,29 +2050,16 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_fan_out_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--ctl-variants",
-        required=False,
-        default=[],
-        dest="ctl_variants",
-        type=parse_ctl_variants_arg,
-        help="Optional comma-separated ctl variant paths for workflow children",
-    )
+def _add_fan_out_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--fan-out",
         required=True,
         dest="fan_out",
         help="declared fan_out key to expand and run",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="print expanded child runner commands and exit",
-    )
 
 
-def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
+def _add_maintenance_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--maintenance-action",
         required=True,
@@ -1797,9 +2074,39 @@ def _add_maintenance_args(parser: argparse.ArgumentParser) -> None:
         "--target",
         help="declared target to operate on; required for Terraform lock force-unlock",
     )
+    parser.add_argument(
+        "--prune-run-id",
+        action="append",
+        default=[],
+        help="run UUIDv7 to include in a history-prune selection; repeatable",
+    )
+    parser.add_argument(
+        "--prune-before",
+        help="prune run history older than this ISO-8601 timestamp",
+    )
+    parser.add_argument(
+        "--prune-kind",
+        choices=["target", "workflow"],
+        help="limit history-prune to one state-owner kind",
+    )
+    parser.add_argument(
+        "--cascade",
+        action="store_true",
+        help="also prune retained workflow runs that reference selected target runs",
+    )
+    parser.add_argument(
+        "--apply-history-prune",
+        action="store_true",
+        help="apply the reported history deletion set",
+    )
+    parser.add_argument(
+        "--agree-history-prune",
+        action="store_true",
+        help="explicitly acknowledge deletion of the reported unversioned object keys",
+    )
 
 
-def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
+def _add_step_sequence_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--source",
         required=True,
@@ -1817,23 +2124,16 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
         help="cfg_file_set for a synthetic target",
     )
     parser.add_argument(
-        "--sub-workflow",
+        "--step-sequence",
         required=True,
-        dest="sub_workflow",
-        help="repo-local sub_workflow to run",
+        dest="step_sequence",
+        help="repo-local step_sequence to run",
     )
     parser.add_argument(
         "--execution-identity-key",
         dest="execution_identity_key",
         default=None,
         help="execution identity key for a synthetic target",
-    )
-    parser.add_argument(
-        "--ctl-state-backend-key",
-        dest="ctl_state_backend_key",
-        default=None,
-        help="state domain for a synthetic target (ctl_state_backends key); "
-        "omit = no domain (sync skippable via the skip triad)",
     )
     parser.add_argument(
         "--affected-target-key",
@@ -1845,40 +2145,89 @@ def _add_sub_workflow_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
-    """Add shared and runner-specific arguments for local runner entrypoints."""
-    parser.add_argument(
-        "--ctl-state-local-root",
+    """Add shared and runner-specific arguments for local runner entrypoints.
+
+    Arguments are placed into titled argparse groups that drive --help
+    presentation: ctl -> execution -> action & selector -> defer / force
+    overrides -> cfg variation -> run modes -> misc, followed by suppressed
+    internal args. Group creation order is the --help section order (it no
+    longer depends on add order). Keep add_bootstrap_common_args (the
+    pre-fetch --help duplicate) with the SAME groups in the SAME order."""
+    ctl_group = parser.add_argument_group(
+        "ctl",
+        "control-plane authority & context: cfg/policy source, governing "
+        "profile, state root — the profile declares what this run is allowed to do",
+    )
+    execution_group = parser.add_argument_group(
+        "execution",
+        "concrete execution choices (access, runtime, params) — the values this "
+        "run actually uses, each honored only within what the ctl profile permits",
+    )
+    selector_group = parser.add_argument_group(
+        "run",
+        "the actual run: lifecycle action, the runner selector, and (for "
+        "workflow/fan-out) whether to reuse committed children",
+    )
+    override_group = parser.add_argument_group(
+        "defer / skip overrides",
+        "authorized escalations; each also requires ctl-profile allowance",
+    )
+    variation_group = parser.add_argument_group(
+        "cfg variation", "optional ctl variants and plt overlays"
+    )
+    mode_group = parser.add_argument_group(
+        "checks & previews",
+        "inspect or preview only; exit without executing targets",
+    )
+    misc_group = parser.add_argument_group("misc")
+    # 1) ctl
+    ctl_group.add_argument(
+        "--ctl-cfg",
         required=True,
-        help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
+        help="git URL@ref or local path to the ctl cfg",
     )
-    parser.add_argument(
-        "--provider-credential",
-        dest="provider_credential",
-        default=None,
-        help="Substitute provider credential (an opaque provider-specific selector, "
-        "e.g. a local profile name); required with and only valid together with "
-        "--execution-access-mode force_bypass",
-    )
-    parser.add_argument(
-        "--plt-overlays",
-        required=False,
-        default=[],
-        dest="plt_overlays",
-        type=parse_overlays_arg,
-        help="Optional comma-separated plt overlay names",
-    )
-    parser.add_argument(
+    ctl_group.add_argument(
         "--ctl-profile",
         required=True,
         help="Ctl profile name (named policy bundle from the ctl_profiles catalog)",
     )
-    parser.add_argument(
-        "--action",
+    ctl_group.add_argument(
+        "--ctl-state-local-root",
         required=True,
-        choices=["provision", "plan", "destroy", "readonly"],
-        help="Lifecycle action (provision|plan|destroy|readonly)",
+        help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
     )
-    parser.add_argument(
+    # 2) execution access mode, then runtime.
+    # Execution access is a provider-neutral MODE (§12): standard (normal),
+    # agreed_direct (approved bootstrap/recovery access from the identity's
+    # direct source), force_bypass (whole-run emergency substitute credential;
+    # identity cfg is not resolved). One typed enum — the value itself carries
+    # the escalation class. Required, no default: the operator states intent.
+    execution_group.add_argument(
+        "--execution-access-mode",
+        choices=EXECUTION_ACCESS_MODES,
+        required=True,
+        dest="execution_access_mode",
+        help="Execution access mode (required, no default): 'standard' normal adapter access; "
+        "'agreed_direct' runs each target_run with its identity's direct_credential_source_key "
+        "profile (account-id + principal checked, no chained roles; requires the ctl profile "
+        "to allow it and every active target to set allow_agreed_direct_execution_access: "
+        "true); 'force_bypass' runs every target_run with the --provider-credential substitute "
+        "credential (identity cfg is not resolved and nothing is checked; requires the "
+        "ctl profile to allow it and --provider-credential)",
+    )
+    # execution runtime (§Phase 26): WHERE CTL produces each target_run's clean box.
+    execution_group.add_argument(
+        "--execution-runtime-mode",
+        choices=EXECUTION_RUNTIME_MODES,
+        required=True,
+        help="Execution runtime (required, no default): 'local' builds a fresh Docker "
+        "box per target_run on this machine; 'ci' runs each target_run on the GitHub Actions "
+        "runner (no Docker-in-Docker). Must be allowed by the ctl profile "
+        "(allowed_execution_runtime_modes) and supported by every active target_run "
+        "(step.yaml runtime.supported_execution_runtime_modes).",
+    )
+    # 3) execution params
+    execution_group.add_argument(
         "--execution-params",
         dest="execution_param",
         action="append",
@@ -1886,52 +2235,58 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         type=parse_selector_arg,
         help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
     )
-    # Execution access is a provider-neutral MODE (§12): standard (normal,
-    # default), agreed_direct (approved bootstrap/recovery access from the
-    # identity's direct source), force_bypass (whole-run emergency substitute
-    # credential; identity cfg is not resolved). One typed enum — the value
-    # itself carries the escalation class.
-    parser.add_argument(
-        "--execution-access-mode",
-        choices=EXECUTION_ACCESS_MODES,
-        default="standard",
-        dest="execution_access_mode",
-        help="Execution access mode: 'standard' (default) normal adapter access; "
-        "'agreed_direct' runs each stage with its identity's direct_credential_source_key "
-        "profile (account-id + principal checked, no chained roles; requires the ctl profile "
-        "to allow it and every active target to set allow_agreed_direct_execution_access: "
-        "true); 'force_bypass' runs every stage with the --provider-credential substitute "
-        "credential (identity cfg is not resolved and nothing is checked; requires the "
-        "ctl profile to allow it and --provider-credential)",
-    )
-    # Execution runtime (§Phase 26): WHERE CTL produces each stage's clean box.
-    # One runtime per run; CTL owns the box, the stage only declares its image.
-    parser.add_argument(
-        "--execution-runtime-mode",
-        choices=EXECUTION_RUNTIME_MODES,
+    # 4) action
+    selector_group.add_argument(
+        "--action",
         required=True,
-        help="Execution runtime (required, no default): 'local' builds a fresh Docker "
-        "box per stage on this machine; 'ci' runs each stage on the GitHub Actions "
-        "runner (no Docker-in-Docker). Must be allowed by the ctl profile "
-        "(allow_execution_runtime_modes) and supported by every active stage "
-        "(stage.yaml runtime.supported_execution_runtime_modes).",
+        choices=["provision", "plan", "destroy", "readonly"],
+        help="Lifecycle action (provision|plan|destroy|readonly)",
     )
-    parser.add_argument(
-        "--agreed-skip-ctl-state-backend-sync",
+    # 5) run-type selector (--workflow / --fan-out / --target / ... and its
+    #    run-specific siblings)
+    if run_type == "workflow":
+        _add_workflow_args(selector_group)
+    elif run_type == "target":
+        _add_target_args(selector_group)
+    elif run_type == "maintenance":
+        _add_maintenance_args(selector_group)
+    elif run_type == "step_sequence":
+        _add_step_sequence_args(selector_group)
+    elif run_type == "fan_out":
+        _add_fan_out_args(selector_group)
+    else:
+        raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
+    # --reuse-committed parametrizes the actual run (reuse committed children vs
+    # re-run), so it lives in the run group — not with the non-executing checks.
+    if run_type in {"workflow", "fan_out"}:
+        selector_group.add_argument(
+            "--reuse-committed",
+            default=None,
+            type=str2bool,
+            metavar="{true,false}",
+            help="Explicit true/false (no default; required for a normal run, "
+            "omit only with --status or --execution-identity-preflight-check-only): "
+            "when true, reuse a workflow child's committed result (skip re-running "
+            "it) only when its committed target instance is current, commit-pinned, "
+            "clean, and matches the current source/cfg commits; when false, always re-run",
+        )
+    # 6) --agreed-* / --force-* overrides
+    override_group.add_argument(
+        "--agreed-defer-ctl-state-backend-sync",
         action="store_true",
-        dest="agreed_skip_ctl_state_backend_sync",
-        help="Skip syncing local ctl-state to the ctl-state backend (backend bucket or "
-        "synchronizer role missing); requires profile allow_agreed_skip_ctl_state_backend_sync "
-        "and every active target to declare the skip_ctl_state_backend_sync key",
+        dest="agreed_defer_ctl_state_backend_sync",
+        help="Agree to defer ctl-state publication while the selected namespace backend is "
+        "absent during bootstrap; requires profile allow_agreed_defer_ctl_state_backend_sync "
+        "and every active target to declare allow_agreed_defer_ctl_state_backend_sync: true",
     )
-    parser.add_argument(
+    override_group.add_argument(
         "--force-skip-ctl-state-backend-sync",
         action="store_true",
         dest="force_skip_ctl_state_backend_sync",
         help="Blanket override: skip ctl-state backend sync for EVERY active target, "
         "ignoring target keys; requires profile allow_force_skip_ctl_state_backend_sync",
     )
-    parser.add_argument(
+    override_group.add_argument(
         "--force-skip-guardrails",
         action="store_true",
         dest="force_skip_guardrails",
@@ -1939,31 +2294,83 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         "allow_force_skip_guardrails",
     )
     if run_type in {"workflow", "target", "fan_out"}:
-        parser.add_argument(
+        override_group.add_argument(
+            "--force-skip-execution-identity-preflight-check",
+            action="store_true",
+            help="Resolve every selected execution identity but skip provider live checks: "
+            "you accept the risk that any target fails MID-RUN on an incorrect "
+            "execution identity that the preflight would have caught up front; "
+            "requires ctl-profile authorization",
+        )
+    # 7) cfg variation
+    if run_type in {"workflow", "fan_out"}:
+        variation_group.add_argument(
+            "--ctl-variants",
+            required=False,
+            default=[],
+            dest="ctl_variants",
+            type=parse_ctl_variants_arg,
+            help="Optional comma-separated ctl variant paths under variants/",
+        )
+    variation_group.add_argument(
+        "--plt-overlays",
+        required=False,
+        default=[],
+        dest="plt_overlays",
+        type=parse_overlays_arg,
+        help="Optional comma-separated plt overlay names",
+    )
+    # 8) run modes
+    if run_type == "fan_out":
+        mode_group.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="print expanded child runner commands and exit",
+        )
+    if run_type in {"workflow", "target", "fan_out"}:
+        mode_group.add_argument(
+            "--status",
+            action="store_true",
+            help="Read and compute current ctl-state status without executing targets",
+        )
+    if run_type in {"workflow", "target", "fan_out"}:
+        mode_group.add_argument(
             "--execution-identity-preflight-check-only",
             action="store_true",
             help="Resolve and live-check every selected execution identity, write the "
-            "preflight artifacts, and exit without state, guardrails, or stages",
+            "preflight artifacts, and exit without state, guardrails, or target_runs",
         )
-        parser.add_argument(
-            "--force-skip-execution-identity-preflight-check",
-            action="store_true",
-            help="Resolve every selected execution identity but skip provider live checks; "
-            "requires ctl-profile authorization",
-        )
-
-    if run_type == "workflow":
-        _add_workflow_args(parser)
-    elif run_type == "target":
-        _add_target_args(parser)
-    elif run_type == "maintenance":
-        _add_maintenance_args(parser)
-    elif run_type == "sub_workflow":
-        _add_sub_workflow_args(parser)
-    elif run_type == "fan_out":
-        _add_fan_out_args(parser)
-    else:
-        raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
+    # misc
+    misc_group.add_argument(
+        "--provider-credential",
+        dest="provider_credential",
+        default=None,
+        help="Substitute provider credential (an opaque provider-specific selector, "
+        "e.g. a local profile name); required with and only valid together with "
+        "--execution-access-mode force_bypass",
+    )
+    # internal, engine-set (hidden from --help) — last
+    parser.add_argument(
+        "--parent-graph-provisions-ctl-state-backend",
+        action="store_true",
+        dest="parent_graph_provisions_ctl_state_backend",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--parent-ctl-state-backend-absence-confirmed",
+        action="store_true",
+        dest="parent_ctl_state_backend_absence_confirmed",
+        help=argparse.SUPPRESS,
+    )
+    # Set by the fan-out runner on its child runs: the fan-out run id recorded
+    # in child run metadata as the batch audit record (§Phase 31 — the fan-out
+    # itself is stateless and owns no run history).
+    parser.add_argument(
+        "--parent-fan-out-run-id",
+        dest="parent_fan_out_run_id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
 def redact_command_argv(argv: list[str]) -> list[str]:
     """Redact opaque credential selectors before command lines reach logs."""
@@ -1994,6 +2401,27 @@ def setup_logging() -> logging.handlers.MemoryHandler:
     return memory_handler
 
 
+KNOWN_ACTIONS = ("provision", "plan", "destroy", "readonly")
+
+
+def entry_actions(entry: dict, *, label: str) -> list[str]:
+    """§Phase 33: the REQUIRED `actions:` allowlist on a target/workflow. A
+    missing or empty list is a hard error — availability is default-CLOSED and
+    must be explicit (never inferred from an optional selector)."""
+    actions = entry.get("actions")
+    if (
+        not isinstance(actions, list)
+        or not actions
+        or not all(isinstance(a, str) and a in KNOWN_ACTIONS for a in actions)
+        or len(set(actions)) != len(actions)
+    ):
+        raise RuntimeError(
+            f"❌ {label} must declare 'actions': a non-empty, duplicate-free "
+            f"subset of {list(KNOWN_ACTIONS)} (availability is default-closed)"
+        )
+    return actions
+
+
 def load_workflow_cfg(
     ctl_cfg_root: Path,
     ctl_profile: str,
@@ -2001,23 +2429,45 @@ def load_workflow_cfg(
     workflow_name: str,
     execution_context: dict[str, object],
 ) -> dict:
-    """Load a content-key workflow: `workflows.<action>.<name>` (imports + selectors).
+    """Load a content-key workflow: `workflows.<name>` (imports + selectors).
 
-    Expands `import_workflow_keys` (ordered, recursive) then the workflow's own `target_keys`; applies
-    `selectors` (intersected through imports) through the generic selector matcher.
-    The workflow name is an opaque key (slashes are cosmetic). `ctl_profile` is retained
-    for the generated workflow metadata.
+    §Phase 33: workflows are declared ONCE with a required `actions:` allowlist;
+    the action gates availability. `target_keys` may be members-shaped (dispatch
+    by `execution_context.ctl.action`) when the apply-family composition differs
+    per action. Expands `import_workflow_keys` (ordered, recursive) then the
+    workflow's own `target_keys`; applies `selectors` (intersected through
+    imports). The workflow name is an opaque key (slashes are cosmetic).
     """
-    workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
-    action_workflows = workflows.get(inventory_name)
-    if not isinstance(action_workflows, dict) or not action_workflows:
-        raise RuntimeError(f"❌ no workflows defined for action {inventory_name!r}")
-    if workflow_name not in action_workflows:
+    workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+    if workflow_name not in workflows:
+        raise RuntimeError(f"❌ workflow {workflow_name!r} not found")
+    resolved_workflows: dict = {}
+    for name, wf in workflows.items():
+        if not isinstance(wf, dict):
+            raise RuntimeError(f"❌ workflow {name!r} must be a mapping")
+        if inventory_name not in entry_actions(wf, label=f"workflow {name!r}"):
+            continue
+        target_keys = wf.get("target_keys")
+        if isinstance(target_keys, dict):
+            target_keys = resolve_list_members(
+                target_keys,
+                execution_context,
+                value_field="target_keys",
+                label=f"workflow {name!r} target_keys",
+            )
+            if target_keys is None:
+                raise RuntimeError(
+                    f"❌ workflow {name!r} members-shaped target_keys did not "
+                    "resolve for this execution context"
+                )
+            wf = {**wf, "target_keys": target_keys}
+        resolved_workflows[name] = wf
+    if workflow_name not in resolved_workflows:
         raise RuntimeError(
-            f"❌ workflow {workflow_name!r} not found for action {inventory_name!r}"
+            f"❌ workflow {workflow_name!r} does not allow action {inventory_name!r}"
         )
 
-    effective_selectors = workflow_effective_selectors(action_workflows, workflow_name)
+    effective_selectors = workflow_effective_selectors(resolved_workflows, workflow_name)
     if not selector_matches(
         effective_selectors,
         execution_context,
@@ -2028,10 +2478,10 @@ def load_workflow_cfg(
             f"runtime selectors {execution_context} (selectors {effective_selectors})"
         )
 
-    stages = expand_workflow_imports(action_workflows, workflow_name)
+    target_runs = expand_workflow_imports(resolved_workflows, workflow_name)
     return {
         "meta": {"name": f"{inventory_name}/{workflow_name}", "action": inventory_name},
-        "stages": stages,
+        "target_runs": target_runs,
     }
 
 
@@ -2107,55 +2557,55 @@ def validate_ctl_variant_meta(
 
 
 
-def get_workflow_stage_id(stage_entry) -> str:
-    """Return the stage id from a workflow stage entry."""
-    if isinstance(stage_entry, str):
-        return stage_entry
-    if isinstance(stage_entry, dict):
-        stage_id = stage_entry.get("id")
-        if isinstance(stage_id, str) and stage_id:
-            return stage_id
-    raise RuntimeError(f"❌ invalid workflow stage entry: {stage_entry!r}")
+def get_workflow_target_run_id(target_run_entry) -> str:
+    """Return the target_run id from a workflow target_run entry."""
+    if isinstance(target_run_entry, str):
+        return target_run_entry
+    if isinstance(target_run_entry, dict):
+        target_run_id = target_run_entry.get("id")
+        if isinstance(target_run_id, str) and target_run_id:
+            return target_run_id
+    raise RuntimeError(f"❌ invalid workflow target_run entry: {target_run_entry!r}")
 
 
-def validate_ctl_variant_stage_patch_entry(raw_stage: dict, variant_label: str) -> tuple[str, dict]:
-    """Validate one ctl variant stage patch entry and return its op plus stage payload."""
-    if not isinstance(raw_stage, dict):
+def validate_ctl_variant_target_run_patch_entry(raw_target_run: dict, variant_label: str) -> tuple[str, dict]:
+    """Validate one ctl variant target_run patch entry and return its op plus target_run payload."""
+    if not isinstance(raw_target_run, dict):
         raise RuntimeError(
             f"❌ ctl variant '{variant_label}' workflow patch entries must be mappings"
         )
 
-    add_before = raw_stage.get("add_before")
-    add_after = raw_stage.get("add_after")
+    add_before = raw_target_run.get("add_before")
+    add_after = raw_target_run.get("add_after")
     op_keys = [key for key, value in (("add_before", add_before), ("add_after", add_after)) if value is not None]
     if len(op_keys) != 1:
         raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' stage patch entry must define exactly one of "
-            f"'add_before' or 'add_after': {raw_stage}"
+            f"❌ ctl variant '{variant_label}' target_run patch entry must define exactly one of "
+            f"'add_before' or 'add_after': {raw_target_run}"
         )
 
-    anchor_stage_id = raw_stage[op_keys[0]]
-    if not isinstance(anchor_stage_id, str) or not anchor_stage_id:
+    anchor_target_run_id = raw_target_run[op_keys[0]]
+    if not isinstance(anchor_target_run_id, str) or not anchor_target_run_id:
         raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' {op_keys[0]} value must be a non-empty stage id"
+            f"❌ ctl variant '{variant_label}' {op_keys[0]} value must be a non-empty target_run id"
         )
 
-    stage_entry = {k: v for k, v in raw_stage.items() if k not in ("add_before", "add_after")}
-    stage_id = stage_entry.get("id")
-    stage_target = stage_entry.get("target")
-    stage_workflow = stage_entry.get("workflow")
-    if not isinstance(stage_id, str) or not stage_id:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' inserted stage must define non-empty 'id'")
-    if not isinstance(stage_target, str) or not stage_target:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'target'")
-    if not isinstance(stage_workflow, str) or not stage_workflow:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' stage '{stage_id}' must define non-empty 'workflow'")
-    if stage_entry.get("branch") and stage_entry.get("commit"):
+    target_run_entry = {k: v for k, v in raw_target_run.items() if k not in ("add_before", "add_after")}
+    target_run_id = target_run_entry.get("id")
+    target_key = target_run_entry.get("target")
+    step_sequence_override = target_run_entry.get("workflow")
+    if not isinstance(target_run_id, str) or not target_run_id:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' inserted target_run must define non-empty 'id'")
+    if not isinstance(target_key, str) or not target_key:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' must define non-empty 'target'")
+    if not isinstance(step_sequence_override, str) or not step_sequence_override:
+        raise RuntimeError(f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' must define non-empty 'workflow'")
+    if target_run_entry.get("branch") and target_run_entry.get("commit"):
         raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' stage '{stage_id}' cannot define both 'branch' and 'commit'"
+            f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' cannot define both 'branch' and 'commit'"
         )
 
-    return op_keys[0], stage_entry
+    return op_keys[0], target_run_entry
 
 
 def apply_ctl_variant_workflow_patch(
@@ -2166,47 +2616,47 @@ def apply_ctl_variant_workflow_patch(
     patch_label: str,
 ) -> dict:
     """Apply add_before/add_after workflow patch entries from one ctl variant patch file."""
-    stages = workflow_cfg.get("stages")
-    if not isinstance(stages, list):
-        raise RuntimeError(f"❌ workflow cfg must contain a 'stages' list before applying ctl variants")
+    target_runs = workflow_cfg.get("target_runs")
+    if not isinstance(target_runs, list):
+        raise RuntimeError(f"❌ workflow cfg must contain a 'target_runs' list before applying ctl variants")
 
-    patch_stages = patch_cfg.get("stages") or []
-    if not isinstance(patch_stages, list):
+    patch_target_runs = patch_cfg.get("target_runs") or []
+    if not isinstance(patch_target_runs, list):
         raise RuntimeError(
-            f"❌ ctl variant patch '{patch_label}' must contain a 'stages' list"
+            f"❌ ctl variant patch '{patch_label}' must contain a 'target_runs' list"
         )
 
-    resolved_stages = list(stages)
-    for raw_stage in patch_stages:
-        op, stage_entry = validate_ctl_variant_stage_patch_entry(raw_stage, variant_label)
-        anchor_stage_id = raw_stage[op]
-        stage_id = stage_entry["id"]
+    resolved_target_runs = list(target_runs)
+    for raw_target_run in patch_target_runs:
+        op, target_run_entry = validate_ctl_variant_target_run_patch_entry(raw_target_run, variant_label)
+        anchor_target_run_id = raw_target_run[op]
+        target_run_id = target_run_entry["id"]
 
-        stage_ids = [get_workflow_stage_id(stage) for stage in resolved_stages]
-        if anchor_stage_id not in stage_ids:
+        target_run_ids = [get_workflow_target_run_id(target_run) for target_run in resolved_target_runs]
+        if anchor_target_run_id not in target_run_ids:
             raise RuntimeError(
                 f"❌ ctl variant '{variant_label}' patch '{patch_label}' references missing anchor "
-                f"stage id '{anchor_stage_id}'"
+                f"target_run id '{anchor_target_run_id}'"
             )
-        if stage_id in stage_ids:
+        if target_run_id in target_run_ids:
             raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' patch '{patch_label}' inserts duplicate stage id '{stage_id}'"
+                f"❌ ctl variant '{variant_label}' patch '{patch_label}' inserts duplicate target_run id '{target_run_id}'"
             )
 
-        anchor_index = stage_ids.index(anchor_stage_id)
+        anchor_index = target_run_ids.index(anchor_target_run_id)
         insert_index = anchor_index if op == "add_before" else anchor_index + 1
-        resolved_stages.insert(insert_index, stage_entry)
+        resolved_target_runs.insert(insert_index, target_run_entry)
         logging.info(
-            "Applied ctl variant '%s': %s stage '%s' %s '%s'",
+            "Applied ctl variant '%s': %s target_run '%s' %s '%s'",
             variant_label,
             op,
-            stage_id,
+            target_run_id,
             "before" if op == "add_before" else "after",
-            anchor_stage_id,
+            anchor_target_run_id,
         )
 
     patched_workflow_cfg = dict(workflow_cfg)
-    patched_workflow_cfg["stages"] = resolved_stages
+    patched_workflow_cfg["target_runs"] = resolved_target_runs
     return patched_workflow_cfg
 
 
@@ -2249,8 +2699,8 @@ def apply_ctl_variants_to_workflow_cfg(
 
     variant_action = variant_source_action(inventory_name)
     variants = load_variants_cfg(ctl_cfg_root).get(variant_action, {})
-    targets = inventory_cfg.get("stage_targets", {})
-    stages = list(workflow_cfg.get("stages") or [])
+    targets = inventory_cfg.get("targets", {})
+    target_runs = list(workflow_cfg.get("target_runs") or [])
 
     for name in ctl_variants:
         v = variants.get(name)
@@ -2300,20 +2750,20 @@ def apply_ctl_variants_to_workflow_cfg(
         anchor = before or after
         if anchor is None:
             raise RuntimeError(f"❌ variant {name!r} must define 'after_target_key' or 'before_target_key'")
-        if anchor not in stages:
+        if anchor not in target_runs:
             logging.info("Variant '%s' anchor '%s' absent from '%s' — skipped", name, anchor, workflow_name)
             continue
-        if target_name in stages:
+        if target_name in target_runs:
             raise RuntimeError(f"❌ variant {name!r} inserts duplicate target {target_name!r}")
-        idx = stages.index(anchor)
-        stages.insert(idx if before else idx + 1, target_name)
+        idx = target_runs.index(anchor)
+        target_runs.insert(idx if before else idx + 1, target_name)
         logging.info(
             "Applied variant '%s': inserted '%s' %s '%s'",
             name, target_name, "before" if before else "after", anchor,
         )
 
     patched = dict(workflow_cfg)
-    patched["stages"] = stages
+    patched["target_runs"] = target_runs
     return patched
 
 
@@ -2330,6 +2780,11 @@ def resolve_cfg_file_set_files(
     cfg_file_set = cfg_file_sets.get(cfg_file_set_key)
     if cfg_file_set is None:
         raise RuntimeError(f"❌ missing cfg_file_set key {cfg_file_set_key!r}: {cfg_file_sets_path}")
+    if selector_group_is_group(cfg_file_set):
+        raise RuntimeError(
+            f"❌ cfg_file_set {cfg_file_set_key!r} is a selector group and cannot be "
+            f"composed via cfg_file_set_keys (groups are target-level indirection only): {cfg_file_sets_path}"
+        )
     if not isinstance(cfg_file_set, dict):
         raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} must be a mapping: {cfg_file_sets_path}")
 
@@ -2347,43 +2802,54 @@ def resolve_cfg_file_set_files(
     return resolved
 
 
-def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
-    """Compose action cfg from stage_sources + cfg_file_sets + targets/<action>/*.yaml.
+def load_inventory_cfg(
+    ctl_cfg_root: Path,
+    inventory_name: str,
+    execution_context: dict[str, object] | None = None,
+) -> dict:
+    """Compose action cfg from target_sources + cfg_file_sets + targets/<action>/*.yaml.
 
     `inventory_name` is the action (provision/plan/destroy/readonly). Layout:
-      - stage_sources.yaml  source repos: source key -> meta
+      - target_sources.yaml  source repos: source key -> meta
       - cfg_file_sets.yaml       config views: cfg-file-set key -> {cfg_root, cfg_file_set_keys, cfg_files}
       - targets/<action>/*.yaml  fat targets (the directory IS the action). Each
             file is a flat `targets:` map; all files for an action merge (duplicate
             names rejected). A target is self-contained:
-              {source_key, ref_key, sub_workflow_key, cfg_file_set_key,
+              {source_key, ref_key, step_sequence_key, cfg_file_set_key,
                [execution_identity_key], [cfg_files], [selectors],
                [required_plt_overlay_keys]}.
 
-    Returns the flat shape build_active_stages consumes ({stage_sources,
-    stage_targets}), where each target carries source + cfg_root + cfg_files
-    (resolved from its cfg_file_set_key) + sub_workflow + execution identity requirement
+    Returns the flat shape build_active_target_runs consumes ({target_sources,
+    targets}), where each target carries source + cfg_root + cfg_files
+    (resolved from its cfg_file_set_key) + step_sequence + execution identity requirement
     (+ selectors /
     requires_plt_overlays when present).
     """
     # global resources + targets are content-key (collected by top-level key)
-    stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
+    target_sources = collect_resource(ctl_cfg_root, "target_sources")
     cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
     cfg_file_sets_path = ctl_cfg_root  # label for include/error messages
-    if not stage_sources:
-        raise RuntimeError(f"❌ no 'stage_sources' defined under: {ctl_cfg_root}")
+    if not target_sources:
+        raise RuntimeError(f"❌ no 'target_sources' defined under: {ctl_cfg_root}")
     if not cfg_file_sets:
         raise RuntimeError(f"❌ no 'cfg_file_sets' defined under: {ctl_cfg_root}")
 
-    all_targets = collect_resource(ctl_cfg_root, "targets", entry_depth=2)
-    stage_targets = all_targets.get(inventory_name)
-    if not isinstance(stage_targets, dict) or not stage_targets:
-        raise RuntimeError(f"❌ no targets defined for action {inventory_name!r}")
+    # §Phase 33: targets are declared ONCE (no action level); each declares a
+    # REQUIRED `actions:` allowlist (default-closed) and the inventory for a run
+    # is the subset allowing this action.
+    all_targets = collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+    targets = {}
+    for target_name, target_def in all_targets.items():
+        if not isinstance(target_def, dict):
+            raise RuntimeError(f"❌ target {target_name!r} must be a mapping")
+        if inventory_name in entry_actions(target_def, label=f"target {target_name!r}"):
+            targets[target_name] = target_def
+    if not targets:
+        raise RuntimeError(f"❌ no targets allow action {inventory_name!r}")
 
     resolved_targets: dict = {}
-    for target_name, target_def in stage_targets.items():
-        if not isinstance(target_def, dict):
-            raise RuntimeError(f"❌ target {target_name!r} must be a mapping (action {inventory_name!r})")
+    for target_name, target_def in targets.items():
+        consumed_group_axes: set[str] = set()
 
         source = target_def.get("source_key")
         if not isinstance(source, str) or not source:
@@ -2403,12 +2869,80 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
             )
         if not isinstance(cfg_file_set, dict):
             raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_name!r} must be a mapping: {cfg_file_sets_path}")
+        # §Phase 31 3c: a group entry resolves to one concrete cfg_file_set per
+        # the frozen execution context (e.g. state_backend -> org). Without a
+        # context (static/inventory-wide tools) the group stays unresolved; it
+        # hard-errors only if such a target is actually materialized.
+        if selector_group_is_group(cfg_file_set):
+            if execution_context is None:
+                cfg_file_set = {"cfg_root": None}
+                cfg_file_set_name = None
+            else:
+                # A domain-specific target DECLARES its domain (`domain: env`);
+                # a domain-generic target (e.g. tfstate_backend) takes it from the
+                # execution context. If the axis isn't bound — a generic target in
+                # a shared inventory that this run doesn't activate — resolution
+                # is deferred (None) instead of failing an unrelated run; a
+                # declared-domain target must still resolve.
+                declared_domain = target_def.get("domain")
+                group_context = execution_context
+                if declared_domain is not None:
+                    group_context = {
+                        **execution_context,
+                        f"{EXECUTION_CONTEXT_ROOT}.params.domain": str(declared_domain),
+                    }
+                # §Phase 32 guard input: the group's selector axes are axes this
+                # target CONSUMES (unless satisfied by a declared domain).
+                # collect_member_dispatch_axes also ENFORCES the per-axis rule
+                # (params or ctl.action only) on every dispatch.
+                group_axes = collect_member_dispatch_axes(
+                    cfg_file_set.get("members"),
+                    label=f"target {target_name!r} cfg_file_set group",
+                )
+                if declared_domain is None:
+                    consumed_group_axes.update(group_axes)
+                concrete_name = resolve_selector_group_member(
+                    cfg_file_set, group_context,
+                    value_field="cfg_file_set_key",
+                    label=f"cfg_file_set group {cfg_file_set_name!r}",
+                    tolerate_none=declared_domain is None,
+                )
+                if concrete_name is None:
+                    cfg_file_set = {"cfg_root": None}
+                    cfg_file_set_name = None
+                else:
+                    cfg_file_set = cfg_file_sets.get(concrete_name)
+                    if not isinstance(cfg_file_set, dict) or selector_group_is_group(cfg_file_set):
+                        raise RuntimeError(
+                            f"❌ cfg_file_set group {cfg_file_set_name!r} member {concrete_name!r} must "
+                            f"reference a concrete cfg_file_set (no nested groups): {cfg_file_sets_path}"
+                        )
+                    cfg_file_set_name = concrete_name
 
-        sub_workflow = target_def.get("sub_workflow_key")
-        if not isinstance(sub_workflow, str) or not sub_workflow:
-            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'sub_workflow_key'")
+        step_sequence = target_def.get("step_sequence_key")
+        if not isinstance(step_sequence, str) or not step_sequence:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'step_sequence_key'")
 
+        # §Phase 33: per-action field variation via inline members dispatched by
+        # execution_context.ctl.action. The resolved value may itself be a NAMED
+        # group (e.g. env_readonly), resolved later by its own axis (two-stage).
         execution_identity_key = target_def.get("execution_identity_key")
+        if isinstance(execution_identity_key, dict):
+            consumed_group_axes.update(
+                collect_member_dispatch_axes(
+                    execution_identity_key.get("members"),
+                    label=f"target {target_name!r} execution_identity_key members",
+                )
+            )
+            if execution_context is None:
+                execution_identity_key = None
+            else:
+                execution_identity_key = resolve_selector_group_member(
+                    execution_identity_key,
+                    execution_context,
+                    value_field="identity_key",
+                    label=f"target {target_name!r} execution_identity_key",
+                )
         if execution_identity_key is not None and (
             not isinstance(execution_identity_key, str) or not execution_identity_key.strip()
         ):
@@ -2417,28 +2951,76 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
             )
 
         extra_files = target_def.get("cfg_files", []) or []
+        if isinstance(extra_files, dict):
+            consumed_group_axes.update(
+                collect_member_dispatch_axes(
+                    extra_files.get("members"),
+                    label=f"target {target_name!r} cfg_files members",
+                )
+            )
+            extra_files = (
+                resolve_list_members(
+                    extra_files,
+                    execution_context,
+                    value_field="cfg_files",
+                    label=f"target {target_name!r} cfg_files",
+                    allow_empty=True,
+                )
+                or []
+            )
         if not isinstance(extra_files, list):
             raise RuntimeError(f"❌ target {target_name!r} cfg_files must be a list")
 
         resolved = {
             "source": source,
             "ref": target_ref.strip(),
-            "sub_workflow": sub_workflow,
+            "step_sequence": step_sequence,
             "cfg_root": cfg_file_set.get("cfg_root", "/"),
             "cfg_files": [
-                *resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
+                *(
+                    resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path)
+                    if cfg_file_set_name is not None
+                    else []
+                ),
                 *extra_files,
             ],
         }
+        if cfg_file_set_name is None:
+            # unresolved cfg_file_set group (no execution context at load time)
+            resolved["cfg_file_set_group_unresolved"] = target_def.get("cfg_file_set_key")
+        # §Phase 31: declared instance identity flows through to the resolved
+        # target (consumed by resolve_run_instance_identity).
+        # §Phase 32: a GENERIC target whose instance axes vary by another axis
+        # dispatches its schema by `members` ({params: [...], selectors: {...}}),
+        # the same pattern as its ref/cfg_file_set groups. Exactly one member
+        # matches; an unbound dispatch axis defers (hard error only if the
+        # target is actually activated in a run).
+        instance_params = target_def.get("target_instance_params")
+        if isinstance(instance_params, dict):
+            # the dispatch axes of the schema itself are consumed axes too
+            consumed_group_axes.update(
+                collect_member_dispatch_axes(
+                    instance_params.get("members"),
+                    label=f"target {target_name!r} target_instance_params members",
+                )
+            )
+            instance_params = _resolve_instance_params_members(
+                instance_params, execution_context, target_name=target_name
+            )
+            if instance_params is None:
+                resolved["target_instance_params_unresolved"] = True
+        if consumed_group_axes:
+            resolved["consumed_group_axes"] = sorted(consumed_group_axes)
+        if instance_params is not None:
+            if not isinstance(instance_params, list) or not all(
+                isinstance(p, str) and p.strip() for p in instance_params
+            ):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} target_instance_params must be a list of non-empty strings"
+                )
+            resolved["target_instance_params"] = [p.strip() for p in instance_params]
         if execution_identity_key is not None:
             resolved["execution_identity_key"] = execution_identity_key.strip()
-        ctl_state_backend_key = target_def.get("ctl_state_backend_key")
-        if ctl_state_backend_key is not None:
-            if not isinstance(ctl_state_backend_key, str) or not ctl_state_backend_key.strip():
-                raise RuntimeError(
-                    f"❌ target {target_name!r} ctl_state_backend_key must be a non-empty string"
-                )
-            resolved["ctl_state_backend_key"] = ctl_state_backend_key.strip()
         if "provisions_ctl_state_bucket" in target_def:
             raise RuntimeError(
                 f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
@@ -2456,17 +3038,18 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
                 raise RuntimeError(
                     f"❌ target {target_name!r} uses removed {legacy_flag}; "
                     "use allow_agreed_direct_execution_access (§12) for access, "
-                    "skip_ctl_state_backend_sync for sync"
+                    "allow_agreed_defer_ctl_state_backend_sync for deferred sync"
                 )
-        # ctl-state sync stays a skip key (an operation opt-in)
-        if "skip_ctl_state_backend_sync" in target_def:
-            expected_ref = "${execution_context.ctl.agreed_skip_ctl_state_backend_sync}"
-            if target_def["skip_ctl_state_backend_sync"] != expected_ref:
+        # Static policy: the target may participate in an explicitly agreed
+        # deferred-sync bootstrap graph. Runtime agreement is a separate CLI fact.
+        if "allow_agreed_defer_ctl_state_backend_sync" in target_def:
+            value = target_def["allow_agreed_defer_ctl_state_backend_sync"]
+            if value is not True:
                 raise RuntimeError(
-                    f"❌ target {target_name!r} skip_ctl_state_backend_sync must be exactly {expected_ref!r} "
-                    "(presence = skip-capable; the VALUE is always the run's ctl decision, never a literal)"
+                    f"❌ target {target_name!r} allow_agreed_defer_ctl_state_backend_sync "
+                    "must be literal true when present"
                 )
-            resolved["skip_ctl_state_backend_sync"] = target_def["skip_ctl_state_backend_sync"]
+            resolved["allow_agreed_defer_ctl_state_backend_sync"] = True
         # allow_agreed_direct_execution_access: does the target opt into DIRECT mode (§12); default False
         if "allow_agreed_direct_execution_access" in target_def:
             target_allows_agreed_direct_execution_access(target_def)  # validate
@@ -2486,8 +3069,8 @@ def load_inventory_cfg(ctl_cfg_root: Path, inventory_name: str) -> dict:
         resolved_targets[target_name] = resolved
 
     return {
-        "stage_sources": stage_sources,
-        "stage_targets": resolved_targets,
+        "target_sources": target_sources,
+        "targets": resolved_targets,
     }
 
 
@@ -2595,12 +3178,12 @@ def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
         if getattr(args, "workflow", None):
             raise RuntimeError("❌ target runner does not accept --workflow")
         raw_name = getattr(args, "target", None)
-    elif run_type == "sub_workflow":
+    elif run_type == "step_sequence":
         if getattr(args, "workflow", None) or getattr(args, "target", None):
-            raise RuntimeError("❌ sub_workflow runner does not accept --workflow or --target")
+            raise RuntimeError("❌ step_sequence runner does not accept --workflow or --target")
         ref = getattr(args, "ref", None)
-        ref_context = resolve_ref_context(ref, args.execution_params) if ref else "sub_workflow"
-        raw_name = f"{ref_context_to_result_path(ref_context)}/{getattr(args, 'source', None) or 'unknown'}/{getattr(args, 'sub_workflow', None) or 'unknown'}"
+        ref_context = resolve_ref_context(ref, args.execution_params) if ref else "step_sequence"
+        raw_name = f"{ref_context_to_result_path(ref_context)}/{getattr(args, 'source', None) or 'unknown'}/{getattr(args, 'step_sequence', None) or 'unknown'}"
     elif run_type == "maintenance":
         maintenance_target = getattr(args, "target", None) or getattr(args, "lock_id", None) or "unknown"
         raw_name = f"{getattr(args, 'maintenance_action', None) or 'maintenance'}/{maintenance_target}"
@@ -2621,26 +3204,41 @@ def setup_run_dirs(
     memory_handler: logging.handlers.MemoryHandler,
     *,
     locator_segments: list[str],
+    parent_fan_out_run_id: str | None = None,
+    instance_segments: list[str] | None = None,
+    instance_address: str | None = None,
+    target_addresses: list[str] | None = None,
+    identity_doc: dict | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Create run directories under the stable ctl result key and setup file logging.
 
-    §Phase 30: results nest under the run's backend locator tree (the local
-    mirror of the backend the run syncs to); `_local` for domain-less runs."""
+    §Phase 31: results nest under the resolved ctl-state NAMESPACE tree
+    (`_local` for stateless/synthetic runs), with the target/workflow instance
+    layer between the key and `runs/`:
+      <root>/<namespace>/<action>/<run_type>/<key>[/instances/<seg>...]/runs/<id>
+    A parameterized instance writes its authoritative identity.yaml
+    (manifest-first ordering, Q2) before any run content."""
     result_name = normalize_result_name(result_name, label="ctl result name")
     ctl_state_dir = Path(ctl_state_local_root).joinpath(*locator_segments) / action / run_type / result_name
+    if instance_segments:
+        ctl_state_dir = ctl_state_dir.joinpath("instances", *instance_segments)
     runs_dir = ctl_state_dir / "runs"
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    if instance_segments and identity_doc is not None:
+        identity_path = ctl_state_dir / "identity.yaml"
+        if not identity_path.exists():
+            write_yaml_file(identity_path, identity_doc)
     logging.info(f"Using ctl_state_dir: {ctl_state_dir}")
     logging.info(f"Using run_dir: {run_dir}")
 
-    # Materialize the pinned ctl stage runtime once, up front — it is a run-scoped
-    # (workspace-scoped) precondition, not a per-stage step. Idempotent thereafter.
-    stage_utils_dir = materialize_stage_utils(run_dir)
-    logging.info(f"Using ctl stage runtime: {stage_utils_dir}")
+    # Materialize the pinned ctl target_run runtime once, up front — it is a run-scoped
+    # (workspace-scoped) precondition, not a per-target_run step. Idempotent thereafter.
+    step_utils_dir = materialize_step_utils(run_dir)
+    logging.info(f"Using ctl target_run runtime: {step_utils_dir}")
 
     # artifacts/ splits into general/ (run-level metadata + logs) and
-    # stages/<stage>/ (per-stage outputs, created when stages run).
+    # target_runs/<target_run>/ (per-target_run outputs, created when target_runs run).
     artifacts_dir = run_dir / "artifacts" / "general"
     os.makedirs(artifacts_dir, exist_ok=True)
 
@@ -2649,9 +3247,9 @@ def setup_run_dirs(
         shutil.rmtree(cfg_dir)
     os.makedirs(cfg_dir)
 
-    stages_source_dir = run_dir / "stages_source"
-    if stages_source_dir.exists():
-        shutil.rmtree(stages_source_dir)
+    target_sources_dir = run_dir / "target_sources"
+    if target_sources_dir.exists():
+        shutil.rmtree(target_sources_dir)
 
     plt_merged_dir = cfg_dir / "plt" / "merged"
     os.makedirs(plt_merged_dir)
@@ -2684,6 +3282,15 @@ def setup_run_dirs(
             "log_path": str(log_file),
             "target_keys": [],
             "mutation_started": False,
+            # §Phase 31: instance identity + namespace facts of this run.
+            **({"ctl_state_namespace": locator_segments[0]}
+               if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
+            **({"instance": list(instance_segments)} if instance_segments else {}),
+            **({"instance_address": instance_address} if instance_address else {}),
+            **({"target_addresses": list(target_addresses)} if target_addresses else {}),
+            # §Phase 31 item 8: the stateless fan-out's batch audit record —
+            # "these runs were one invocation" lives only in child metadata.
+            **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
         },
     )
 
@@ -2694,18 +3301,18 @@ def setup_run_dirs(
 
 
 def setup_run_workspace(run_dir: Path) -> Path:
-    """Materialize the stage runtime and mutable cfg workspace after preflight."""
-    stage_utils_dir = materialize_stage_utils(run_dir)
-    logging.info("Using ctl stage runtime: %s", stage_utils_dir)
+    """Materialize the target_run runtime and mutable cfg workspace after preflight."""
+    step_utils_dir = materialize_step_utils(run_dir)
+    logging.info("Using ctl target_run runtime: %s", step_utils_dir)
 
     cfg_dir = run_dir / "cfg"
     if cfg_dir.exists():
         shutil.rmtree(cfg_dir)
     cfg_dir.mkdir(parents=True)
 
-    stages_source_dir = run_dir / "stages_source"
-    if stages_source_dir.exists():
-        shutil.rmtree(stages_source_dir)
+    target_sources_dir = run_dir / "target_sources"
+    if target_sources_dir.exists():
+        shutil.rmtree(target_sources_dir)
 
     plt_merged_dir = cfg_dir / "plt" / "merged"
     plt_merged_dir.mkdir(parents=True)
@@ -2722,10 +3329,22 @@ def setup_preflight_run_dirs(
     *,
     locator_segments: list[str],
     check_only: bool = True,
+    instance_segments: list[str] | None = None,
+    instance_address: str | None = None,
+    target_addresses: list[str] | None = None,
+    identity_doc: dict | None = None,
+    parent_fan_out_run_id: str | None = None,
 ) -> tuple[Path, Path, Path]:
-    """Create a preflight result without stage tooling or companion cfg."""
+    """Create a preflight result without target_run tooling or companion cfg."""
     result_name = normalize_result_name(result_name, label="ctl result name")
     ctl_state_dir = Path(ctl_state_local_root).joinpath(*locator_segments) / action / run_type / result_name
+    if instance_segments:
+        ctl_state_dir = ctl_state_dir.joinpath("instances", *instance_segments)
+        if identity_doc is not None:
+            identity_path = ctl_state_dir / "identity.yaml"
+            if not identity_path.exists():
+                ctl_state_dir.mkdir(parents=True, exist_ok=True)
+                write_yaml_file(identity_path, identity_doc)
     run_dir = ctl_state_dir / "runs" / run_id
     artifacts_dir = run_dir / "artifacts" / "general"
     logs_dir = artifacts_dir / "logs"
@@ -2763,6 +3382,13 @@ def setup_preflight_run_dirs(
             "target_keys": [],
             "mutation_started": False,
             "execution_identity_preflight_check_only": bool(check_only),
+            # §Phase 31: instance identity + namespace facts of this run.
+            **({"ctl_state_namespace": locator_segments[0]}
+               if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
+            **({"instance": list(instance_segments)} if instance_segments else {}),
+            **({"instance_address": instance_address} if instance_address else {}),
+            **({"target_addresses": list(target_addresses)} if target_addresses else {}),
+            **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
         },
     )
     logging.info("Using preflight run_dir: %s", run_dir)
@@ -2826,11 +3452,11 @@ def normalize_target_keys(values: list[str], *, label: str) -> list[str]:
     return normalized
 
 
-def target_keys_from_active_stages(active_stages: dict) -> list[str]:
+def target_keys_from_active_target_runs(active_target_runs: dict) -> list[str]:
     keys: list[str] = []
     seen: set[str] = set()
-    for stage in active_stages.values():
-        target_key = stage.get("target")
+    for target_run in active_target_runs.values():
+        target_key = target_run.get("target")
         if not isinstance(target_key, str) or not target_key:
             continue
         target_key = normalize_result_name(target_key, label="resolved target key")
@@ -2892,6 +3518,76 @@ def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
     )
 
 
+# ── §Phase 31 Q3/decision 20: committed publication. The multi-object
+#    committed/ slot is replaced by ONE committed.yaml pointer at the instance
+#    dir + an immutable snapshot.yaml under the run. Manifest-last ordering:
+#    the snapshot is written before the pointer is published.
+COMMITTED_POINTER_NAME = "committed.yaml"
+RUN_SNAPSHOT_NAME = "snapshot.yaml"
+
+# Facts denormalized onto committed.yaml so readers (outdate/status) need no
+# second file open; the pointer is still the single publication object.
+# Only facts NOT derivable from the pointer's own path/run_id: everything
+# else (action, run_type, result name/key, instance segments/address,
+# target_keys/addresses) is encoded in the instance dir path or duplicated in
+# child_revisions — never denormalized into the pointer (§Phase 31 minimal files).
+_COMMITTED_FACT_KEYS = (
+    "child_revisions", "source_commit", "cfg_source_commit",
+    "source_state", "ref_policy", "workflow_definition_sha256",
+)
+
+
+def run_snapshot_path(run_dir: Path) -> Path:
+    return Path(run_dir) / RUN_SNAPSHOT_NAME
+
+
+def committed_pointer_path(instance_dir: Path) -> Path:
+    return Path(instance_dir) / COMMITTED_POINTER_NAME
+
+
+def write_run_snapshot(run_dir: Path, payload: dict) -> str:
+    """Write the immutable run snapshot (facts of this run) and return its
+    sha256. Manifest-last: callers write this BEFORE publishing the pointer."""
+    snapshot = dict(payload)
+    snapshot["snapshot_of_run"] = Path(run_dir).name
+    write_yaml_file(run_snapshot_path(run_dir), snapshot)
+    canonical = json.dumps(snapshot, separators=(",", ":"), sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def publish_committed_pointer(run_dir: Path, payload: dict) -> Path:
+    """Publish the instance's committed.yaml pointer to this run's snapshot
+    (§Phase 31). Writes the snapshot first (manifest-last), then the pointer
+    with the denormalized facts + status readers need. The physical
+    conditional write to the backend is the syncer's job; locally this is the
+    authoritative record."""
+    snapshot_sha = write_run_snapshot(run_dir, payload)
+    run_id = Path(run_dir).name
+    # snapshot key is derivable (runs/<run_id>/snapshot.yaml) — not stored.
+    pointer = {
+        "run_id": run_id,
+        "snapshot_sha256": snapshot_sha,
+        "committed_at": payload.get("updated_at") or utc_timestamp(),
+        "status": payload.get("status", "ok"),
+    }
+    for key in _COMMITTED_FACT_KEYS:
+        if payload.get(key) is not None:
+            pointer[key] = payload[key]
+    instance_dir = ctl_state_dir_from_run_dir(run_dir)
+    write_yaml_file(committed_pointer_path(instance_dir), pointer)
+    return committed_pointer_path(instance_dir)
+
+
+def read_committed_pointer(instance_dir: Path) -> dict | None:
+    path = committed_pointer_path(instance_dir)
+    if not path.is_file():
+        return None
+    data = load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ committed.yaml must be a mapping: {path}")
+    return data
+
+
 def rewrite_in_progress_slot_if_present(run_dir: Path, payload: dict) -> None:
     slot_dir = ctl_state_dir_from_run_dir(run_dir) / "in_progress"
     if slot_dir.exists():
@@ -2918,13 +3614,13 @@ def record_run_target_keys(run_dir: Path, target_keys: list[str]) -> None:
             rewrite_in_progress_slot_if_present(run_dir, status)
 
 
-def mark_mutation_started(run_dir: Path, stage_id: str) -> None:
+def mark_mutation_started(run_dir: Path, target_run_id: str) -> None:
     metadata = update_run_metadata(
         run_dir,
         {
             "mutation_started": True,
             "mutation_started_at": utc_timestamp(),
-            "mutation_stage_id": stage_id,
+            "mutation_target_run_id": target_run_id,
         },
     )
     status = load_current_status(run_dir)
@@ -2933,14 +3629,14 @@ def mark_mutation_started(run_dir: Path, stage_id: str) -> None:
             {
                 "mutation_started": True,
                 "mutation_started_at": metadata["mutation_started_at"],
-                "mutation_stage_id": stage_id,
+                "mutation_target_run_id": target_run_id,
                 "updated_at": utc_timestamp(),
             }
         )
         write_current_status(run_dir, status)
         if status.get("status") == "in_progress":
             rewrite_in_progress_slot_if_present(run_dir, status)
-    ctl_state_push(f"mutation started ({stage_id})")
+    ctl_state_push(f"mutation started ({target_run_id})")
 
 
 def tail_log_lines(log_path: str | None, limit: int = 40) -> list[str]:
@@ -2974,8 +3670,8 @@ def print_failure_summary(payload: dict) -> None:
     print("Run failed", file=sys.stderr)
     if payload.get("result_key"):
         print(f"result: {payload['result_key']}", file=sys.stderr)
-    if payload.get("mutation_stage_id"):
-        print(f"stage: {payload['mutation_stage_id']}", file=sys.stderr)
+    if payload.get("mutation_target_run_id"):
+        print(f"target_run: {payload['mutation_target_run_id']}", file=sys.stderr)
     if error.get("summary"):
         print(f"error: {error['summary']}", file=sys.stderr)
     if payload.get("log_path"):
@@ -2985,12 +3681,18 @@ def print_failure_summary(payload: dict) -> None:
 def mark_run_succeeded(run_dir: Path) -> None:
     payload = build_status_payload(run_dir, "ok", {"ctl_state_sync": ctl_state_sync_summary()})
     write_current_status(run_dir, payload)
-    write_state_slot(run_dir, "committed", payload)
+    pointer_path = publish_committed_pointer(run_dir, payload)
     remove_state_slot(run_dir, "in_progress")
     remove_state_slot(run_dir, "failed")
     mark_outdated_for_run(run_dir, include_current_result=False)
-    ctl_state_push("run succeeded")
-    ctl_state_remove_slots(run_dir, ("in_progress", "failed"))
+    metadata = load_run_metadata(run_dir)
+    publish_or_queue_ctl_state_run(
+        run_dir,
+        pointer_path,
+        reason="run succeeded",
+        dependencies=list(metadata.get("target_addresses") or []),
+    )
+    release_mutation_lock_if_held()
 
 
 def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
@@ -3013,39 +3715,8 @@ def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
     write_state_slot(run_dir, "failed", payload)
     remove_state_slot(run_dir, "in_progress")
     mark_outdated_for_run(run_dir, include_current_result=True)
-    ctl_state_push("run failed")
-    ctl_state_remove_slots(run_dir, ("in_progress",))
-    print_failure_summary(payload)
-
-
-# §Phase 30: local-only run marks for the reserved `_local` tree (fan_out and
-# other non-domain records). They write ONLY the run's own STATUS — no state
-# slots, no committed/ result, no outdate pass, no sync: a gate/log record,
-# never ctl-state.
-def mark_local_run_started(run_dir: Path) -> None:
-    write_current_status(run_dir, build_status_payload(run_dir, "in_progress"))
-
-
-def mark_local_run_succeeded(run_dir: Path) -> None:
-    write_current_status(run_dir, build_status_payload(run_dir, "ok"))
-
-
-def mark_local_run_failed(run_dir: Path, exc: BaseException) -> None:
-    metadata = load_run_metadata(run_dir)
-    extracted = extract_error_summary(metadata.get("log_path"), str(exc))
-    payload = build_status_payload(
-        run_dir,
-        "failed",
-        {
-            "error": {
-                "type": type(exc).__name__,
-                "summary": extracted["summary"],
-            },
-            "log_path": metadata.get("log_path"),
-            "tail_lines": extracted["tail_lines"],
-        },
-    )
-    write_current_status(run_dir, payload)
+    publish_or_queue_ctl_state_run(run_dir, None, reason="run failed")
+    release_mutation_lock_if_held()
     print_failure_summary(payload)
 
 
@@ -3063,15 +3734,31 @@ def parse_result_dir(ctl_state_local_root: Path, result_dir: Path) -> dict | Non
     for index in range(len(parts) - 2):
         if parts[index] in RUN_ACTIONS and parts[index + 1] in RUN_TYPES:
             action, run_type = parts[index], parts[index + 1]
-            result_name = "/".join(parts[index + 2:])
+            rest = list(parts[index + 2:])
+            # §Phase 31: strip the optional instance layer from the key.
+            instance_segments: list[str] = []
+            if "instances" in rest:
+                marker = rest.index("instances")
+                after = rest[marker + 1:]
+                if after and after[0].startswith("sha256-"):
+                    instance_segments = [after[0]]
+                else:
+                    instance_segments, _ = split_instance_segments(after)
+                rest = rest[:marker]
+            result_name = "/".join(rest)
             if not result_name:
                 return None
+            address = result_name + (
+                "/" + "/".join(instance_segments) if instance_segments else ""
+            )
             return {
                 "locator": list(parts[:index]),
                 "action": action,
                 "run_type": run_type,
                 "result_name": result_name,
                 "result_key": f"{action}/{run_type}/{result_name}",
+                "instance": instance_segments,
+                "address": address,
             }
     return None
 
@@ -3080,7 +3767,9 @@ def iter_committed_status_paths(ctl_state_local_root: Path):
     root = Path(ctl_state_local_root)
     if not root.is_dir():
         return
-    yield from sorted(root.rglob("committed/STATUS.yaml"))
+    # §Phase 31: the committed record is the committed.yaml pointer at the
+    # instance dir (was committed/STATUS.yaml).
+    yield from sorted(root.rglob(COMMITTED_POINTER_NAME))
 
 
 def load_status_mapping(path: Path) -> dict:
@@ -3091,7 +3780,9 @@ def load_status_mapping(path: Path) -> dict:
 
 
 def status_result_info(ctl_state_local_root: Path, status_path: Path, status: dict) -> dict | None:
-    result_dir = status_path.parent.parent
+    # §Phase 31: committed.yaml lives directly in the instance dir (its parent),
+    # unlike the old committed/STATUS.yaml (parent.parent).
+    result_dir = status_path.parent
     parsed = parse_result_dir(ctl_state_local_root, result_dir)
     if parsed is None:
         return None
@@ -3122,6 +3813,8 @@ def update_committed_manifest(status_path: Path, payload: dict) -> None:
 
 
 def mark_committed_status_outdated(status_path: Path, status: dict, *, reason: str, caused_by: dict | None = None) -> None:
+    # §Phase 31: the outdate marker is written onto the committed.yaml pointer
+    # itself (the target-instance's committed record, Q1c) — no separate slot.
     payload = dict(status)
     payload["status"] = "outdated"
     payload["updated_at"] = utc_timestamp()
@@ -3133,7 +3826,6 @@ def mark_committed_status_outdated(status_path: Path, status: dict, *, reason: s
         outdated["caused_by"] = caused_by
     payload["outdated"] = outdated
     write_yaml_file(status_path, payload)
-    update_committed_manifest(status_path, payload)
 
 
 def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force: bool = False) -> None:
@@ -3163,11 +3855,16 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
         "target_keys": affected_target_keys,
     }
 
-    # §Phase 30: a mutation outdates results in ITS OWN backend tree only —
-    # the same target keys under another locator are a different backend
-    # (e.g. env/bootstrap for dev vs test), not this run's blast radius.
+    # §Phase 31: a mutation outdates results in ITS OWN namespace tree only,
+    # and only for the SAME target-instance addresses (Q1c: sibling ACTIONS of
+    # one instance, never sibling instances — dev's mutation must not touch
+    # test's results even though the target keys match).
     locator = metadata.get("ctl_state_locator") or []
     scan_root = Path(ctl_state_local_root).joinpath(*locator)
+    affected_addresses = {
+        a for a in (metadata.get("target_addresses") or []) if isinstance(a, str)
+    }
+    run_instance = metadata.get("instance") or []
 
     for status_path in iter_committed_status_paths(scan_root):
         status = load_status_mapping(status_path)
@@ -3178,9 +3875,23 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
             continue
         if not include_current_result and info.get("result_key") == current_result_key:
             continue
-        committed_keys = set(status_target_keys(status))
-        if not committed_keys or not committed_keys.intersection(affected):
-            continue
+        if affected_addresses:
+            # instance-aware matching: a candidate target result matches when
+            # its own address is affected; a candidate workflow result matches
+            # when it shares this run's instance (its own sibling actions).
+            candidate_address = info.get("address")
+            candidate_instance = info.get("instance") or []
+            candidate_is_run_sibling = (
+                info.get("result_name") == metadata.get("result_name")
+                and candidate_instance == run_instance
+            )
+            if candidate_address not in affected_addresses and not candidate_is_run_sibling:
+                continue
+        else:
+            # legacy metadata without addresses: match by target-key overlap
+            committed_keys = set(status_target_keys(status))
+            if not committed_keys or not committed_keys.intersection(affected):
+                continue
         mark_committed_status_outdated(
             status_path,
             status,
@@ -3191,12 +3902,12 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
 
 def mark_removed_definitions_outdated(ctl_state_local_root: Path, ctl_cfg_root: Path) -> None:
     try:
-        workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=2)
+        workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
     except Exception as exc:
         logging.warning("Skipping definition_removed scan: failed to load workflows: %s", exc)
         workflows = {}
     try:
-        targets = collect_resource(ctl_cfg_root, "targets", entry_depth=2)
+        targets = collect_resource(ctl_cfg_root, "targets", entry_depth=1)
     except Exception as exc:
         logging.warning("Skipping definition_removed scan: failed to load targets: %s", exc)
         targets = {}
@@ -3210,9 +3921,11 @@ def mark_removed_definitions_outdated(ctl_state_local_root: Path, ctl_cfg_root: 
         action = info.get("action")
         result_name = info.get("result_name")
         if run_type == "workflow":
-            exists = result_name in (workflows.get(action) or {})
+            entry = workflows.get(result_name)
+            exists = isinstance(entry, dict) and action in (entry.get("actions") or [])
         elif run_type == "target":
-            exists = result_name in (targets.get(action) or {})
+            entry = targets.get(result_name)
+            exists = isinstance(entry, dict) and action in (entry.get("actions") or [])
         else:
             continue
         if exists or status.get("status") == "outdated":
@@ -3547,6 +4260,29 @@ def selector_requirements(selectors: dict | None, *, label: str, structured_only
     return requirements
 
 
+def reject_duplicate_selectors(selectors_by_key: dict[str, dict | None], *, label: str) -> None:
+    """Load-time guard for structures where selectors pick EXACTLY ONE entry
+    (namespaces, selector groups): reject two entries whose selectors are
+    byte-identical. This catches literal duplicates before any run, instead of
+    waiting for the resolve-time 'matched 2' error on the first context that
+    happens to hit both. It does NOT detect general selector OVERLAP (that is a
+    predicate-disjointness problem left to the resolve-time exactly-one guard)."""
+    seen: dict[str, str] = {}
+    for key, selectors in selectors_by_key.items():
+        requirements = selector_requirements(
+            selectors, label=f"{label}.{key}", structured_only=True
+        )
+        canonical = json.dumps(
+            {ref: sorted(vals) for ref, vals in requirements.items()}, sort_keys=True
+        )
+        if canonical in seen:
+            raise RuntimeError(
+                f"❌ {label}: {key!r} and {seen[canonical]!r} have identical selectors "
+                f"— they can never resolve to exactly one; make them distinct"
+            )
+        seen[canonical] = key
+
+
 def selector_matches(
     selectors: dict | None,
     execution_context: dict[str, object],
@@ -3558,13 +4294,14 @@ def selector_matches(
 
     Uniform surface: any fully-qualified execution-context path is usable; a
     missing key means no match (the gated entry is simply inactive), never an
-    error here. The miss is logged with the available keys so a typo'd
-    execution input is self-evident.
+    error here. The miss is logged at DEBUG (a gated-inactive member is normal
+    flow, so it must not flood INFO) with the available keys, so a typo'd
+    execution input is still self-evident under --debug.
     """
     requirements = selector_requirements(selectors, label=label, structured_only=structured_only)
     for ref, allowed_values in requirements.items():
         if ref not in execution_context:
-            logging.info("Selector %s: %s", label, execution_context_miss_message(execution_context, ref))
+            logging.debug("Selector %s: %s", label, execution_context_miss_message(execution_context, ref))
             return False
         if str(execution_context[ref]) not in allowed_values:
             return False
@@ -3640,7 +4377,7 @@ def build_execution_context(
     ctl_profile: str | None,
     execution_params: dict[str, str],
     execution_access_mode: str = "standard",
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     execution_runtime_mode: str,
@@ -3662,7 +4399,7 @@ def build_execution_context(
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
     put("ctl", "execution_access_mode", execution_access_mode, label="promoted execution access mode")
-    put("ctl", "agreed_skip_ctl_state_backend_sync", bool(agreed_skip_ctl_state_backend_sync), label="promoted --agreed-skip-ctl-state-backend-sync")
+    put("ctl", "agreed_defer_ctl_state_backend_sync", bool(agreed_defer_ctl_state_backend_sync), label="promoted --agreed-defer-ctl-state-backend-sync")
     put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
     put("ctl", "force_skip_guardrails", bool(force_skip_guardrails), label="promoted --force-skip-guardrails")
     put(
@@ -3748,7 +4485,14 @@ def guard_value_text(value, *, label: str) -> str:
         text = str(value)
         if text:
             return text
-    raise RuntimeError(f"❌ guarded var {label} must resolve to a non-empty scalar value")
+    if isinstance(value, (dict, list)) and value:
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"❌ guarded var {label} must resolve to a YAML/JSON-compatible value"
+            ) from exc
+    raise RuntimeError(f"❌ guarded var {label} must resolve to a non-empty scalar or structure")
 
 
 def guard_value_hash(value, *, label: str) -> str:
@@ -3936,8 +4680,8 @@ def build_plt_guardrail_instance(
             label=f'scope identity {scope["scope_path"]}',
         )
     dimensions = {}
-    rule = composition.get(target_path) or {"scopes": (), "instance_dimensions": ()}
-    for ref in rule["instance_dimensions"]:
+    rule = composition.get(target_path) or {"scopes": (), "guardrail_dimensions": ()}
+    for ref in rule["guardrail_dimensions"]:
         if ref not in execution_context:
             raise RuntimeError(
                 f"❌ instance dimension {ref!r} for target {target_path} has no value in this run"
@@ -4202,7 +4946,7 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guard declaration") ->
         parts = value.split(".")
         if len(parts) != 3 or parts[2] not in CTL_STATE_BACKENDS_GUARDABLE_FIELDS:
             raise RuntimeError(
-                f"❌ {label}: {value!r} must be ctl_state_backends.<domain>."
+                f"❌ {label}: {value!r} must be ctl_state_backends.<namespace>."
                 f"<{'|'.join(CTL_STATE_BACKENDS_GUARDABLE_FIELDS)}>"
             )
         return value
@@ -4216,7 +4960,7 @@ def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guard declaration") ->
     return value
 
 
-def ctl_guard_domain(ref: str) -> str | None:
+def ctl_guard_namespace_key(ref: str) -> str | None:
     if not ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
         return None
     return ref.split(".", 2)[1]
@@ -4383,12 +5127,12 @@ def write_ctl_guardrail_baseline(
 def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
     """Resolve a ctl declaration to its materialized value for this run."""
     if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
-        _, domain, field = ref.split(".")
+        _, namespace_key, field = ref.split(".")
         backends = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
-        entry = backends.get(domain)
+        entry = backends.get(namespace_key)
         if entry is None:
             known = ", ".join(sorted(backends)) or "none"
-            raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown domain {domain!r}; known: {known}")
+            raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown namespace {namespace_key!r}; known: {known}")
         return resolve_runtime_scalar(
             entry[field],
             execution_context,
@@ -4405,7 +5149,6 @@ def verify_ctl_guardrails(
     ctl_cfg_root: Path,
     guardrails_cfg_root: Path,
     execution_context: dict[str, object],
-    ctl_state_backend_key: str | None,
 ) -> None:
     declarations = load_ctl_guard_declarations(ctl_cfg_root)
     if not declarations:
@@ -4424,10 +5167,18 @@ def verify_ctl_guardrails(
                 f"{sorted(entry['axes'])}; expected {sorted(expected_axes)}"
             )
 
+    declared_namespaces = {
+        ctl_guard_namespace_key(declaration["ref"])
+        for declaration in declarations.values()
+        if ctl_guard_namespace_key(declaration["ref"]) is not None
+    }
+    namespace_key = None
+    if declared_namespaces:
+        namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
     active = []
     for declaration in declarations.values():
-        domain = ctl_guard_domain(declaration["ref"])
-        if domain is None or domain == ctl_state_backend_key:
+        declaration_namespace = ctl_guard_namespace_key(declaration["ref"])
+        if declaration_namespace is None or declaration_namespace == namespace_key:
             active.append(declaration)
     for declaration in active:
         ref = declaration["ref"]
@@ -4493,15 +5244,15 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
     return target_dir
 
 
-def required_target_paths_for_stages(active_stages: dict) -> set[str] | None:
-    """Target paths this run's stages consume, from their cfg_roots.
+def required_target_paths_for_target_runs(active_target_runs: dict) -> set[str] | None:
+    """Target paths this run's target_runs consume, from their cfg_roots.
 
     Scopes are independent units: a run merges/renders/guard-verifies only the
-    scopes serving its stages' cfg_roots. Returns None when any stage consumes
+    scopes serving its target_runs' cfg_roots. Returns None when any target_run consumes
     the root ("/") — the deliberate escape hatch meaning every scope."""
     paths: set[str] = set()
-    for stage in active_stages.values():
-        cfg_root = str(stage.get("cfg_root") or "/")
+    for target_run in active_target_runs.values():
+        cfg_root = str(target_run.get("cfg_root") or "/")
         segments = [part for part in cfg_root.split("/") if part]
         if not segments:
             return None
@@ -4595,7 +5346,6 @@ def verify_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
-    ctl_state_backend_key: str | None,
     required_target_paths: set[str] | None = None,
 ) -> None:
     if execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.ctl.force_skip_guardrails"):
@@ -4605,7 +5355,6 @@ def verify_guardrails(
         ctl_cfg_root,
         guardrails_cfg_root,
         execution_context,
-        ctl_state_backend_key,
     )
     logging.info("ctl guardrails: passed")
     verify_plt_guardrails(
@@ -4717,7 +5466,7 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
         label = f"scope_composition[{index}] in {path}"
         if not isinstance(raw_rule, dict):
             raise RuntimeError(f"❌ {label} must be a mapping")
-        unknown = set(raw_rule) - {"target_path", "scopes", "instance_dimensions"}
+        unknown = set(raw_rule) - {"target_path", "scopes", "guardrail_dimensions"}
         if unknown:
             raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
         target_path = normalize_cfg_absolute_path(raw_rule.get("target_path"), label=f"{label}.target_path")
@@ -4732,22 +5481,22 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
             if prefix in prefixes:
                 raise RuntimeError(f"❌ duplicate scope composition prefix {prefix!r}: {label}")
             prefixes.append(prefix)
-        raw_dimensions = raw_rule.get("instance_dimensions") or []
+        raw_dimensions = raw_rule.get("guardrail_dimensions") or []
         if not isinstance(raw_dimensions, list):
-            raise RuntimeError(f"❌ {label}.instance_dimensions must be a list")
+            raise RuntimeError(f"❌ {label}.guardrail_dimensions must be a list")
         dimensions = []
         for raw_ref in raw_dimensions:
-            ref = validate_execution_context_ref(raw_ref, label=f"{label}.instance_dimensions")
+            ref = validate_execution_context_ref(raw_ref, label=f"{label}.guardrail_dimensions")
             if not ref.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
                 raise RuntimeError(
-                    f"❌ {label}.instance_dimensions entries must be params refs: {ref!r}"
+                    f"❌ {label}.guardrail_dimensions entries must be params refs: {ref!r}"
                 )
             if ref in dimensions:
                 raise RuntimeError(f"❌ duplicate instance dimension {ref!r}: {label}")
             dimensions.append(ref)
         rules[target_path] = {
             "scopes": tuple(prefixes),
-            "instance_dimensions": tuple(sorted(dimensions)),
+            "guardrail_dimensions": tuple(sorted(dimensions)),
         }
     return rules
 
@@ -5075,7 +5824,7 @@ def merge_plt_cfg_dirs(
     Scope and overlay activation both use the uniform selectors.match/selectors.in
     execution-context selector model.
     With `required_target_paths` set, only the scopes serving those target
-    paths merge (selective merge: a run composes only the cfg its stages
+    paths merge (selective merge: a run composes only the cfg its target_runs
     consume); None = every active scope."""
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
@@ -5101,7 +5850,7 @@ def merge_plt_cfg_dirs(
             target_path = scope["target_path"]
             if required_target_paths is not None and target_path not in required_target_paths:
                 logging.info(
-                    "Skipping cfg scope %s -> %s (not consumed by this run's stages)",
+                    "Skipping cfg scope %s -> %s (not consumed by this run's target_runs)",
                     scope["scope_path"],
                     target_path,
                 )
@@ -5178,29 +5927,29 @@ def prepare_pipeline_cfg(
     plt_overlays: list[str],
     scope_params: dict[str, str] | None = None,
     execution_context: dict[str, object] | None = None,
-    stage_repo_key: str = "repo_url",
-    require_stage_ref: bool = True,
+    target_repo_key: str = "repo_url",
+    require_target_ref: bool = True,
     require_commit_refs: bool = False,
     refs: dict | None = None,
-    active_stages: dict | None = None,
+    active_target_runs: dict | None = None,
 ) -> tuple[dict, Path]:
     """
-    Merge config dirs, build active stages, and write pipeline_run_cfg.
+    Merge config dirs, build active target_runs, and write pipeline_run_cfg.
 
     Returns:
-        tuple: (active_stages, pipeline_run_cfg_path)
+        tuple: (active_target_runs, pipeline_run_cfg_path)
     """
     source_log_roots = (plt_cfg_root.resolve(),)
     dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
 
-    # Resolve active stages first (needs no plt cfg), so the merge composes only
-    # the scopes this run's stages consume (selective merge by cfg_root).
-    if active_stages is None:
-        active_stages = build_active_stages(
+    # Resolve active target_runs first (needs no plt cfg), so the merge composes only
+    # the scopes this run's target_runs consume (selective merge by cfg_root).
+    if active_target_runs is None:
+        active_target_runs = build_active_target_runs(
             workflow_cfg,
             inventory_cfg,
-            repo_key=stage_repo_key,
-            require_branch_or_commit=require_stage_ref,
+            repo_key=target_repo_key,
+            require_branch_or_commit=require_target_ref,
             refs=refs,
             execution_context=execution_context,
             require_commit_refs=require_commit_refs,
@@ -5215,49 +5964,49 @@ def prepare_pipeline_cfg(
         execution_context=execution_context,
         source_log_roots=source_log_roots,
         dest_log_roots=dest_log_roots,
-        required_target_paths=required_target_paths_for_stages(active_stages),
+        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
     )
 
-    write_stage_flow_artifact(
-        artifacts_dir / "resolved_stages_flow.yaml",
+    write_target_run_flow_artifact(
+        artifacts_dir / "resolved_target_runs_flow.yaml",
         workflow_cfg.get("meta"),
-        active_stages,
+        active_target_runs,
     )
 
     # create and write pipeline_run_cfg
     pipeline_run_cfg = {
         "meta": workflow_cfg.get("meta"),
-        "stages": active_stages
+        "target_runs": active_target_runs
     }
     pipeline_run_cfg_path = artifacts_dir / "pipeline_run_cfg.yaml"
     with pipeline_run_cfg_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(pipeline_run_cfg, f, sort_keys=False)
 
-    return active_stages, pipeline_run_cfg_path
+    return active_target_runs, pipeline_run_cfg_path
 
 
-def write_stage_flow_artifact(path: Path, workflow_meta: dict | None, active_stages: dict) -> None:
-    """Write a compact ordered stage-flow artifact."""
-    stage_flow = {
+def write_target_run_flow_artifact(path: Path, workflow_meta: dict | None, active_target_runs: dict) -> None:
+    """Write a compact ordered target_run-flow artifact."""
+    target_run_flow = {
         "meta": workflow_meta,
-        "stages": [
+        "target_runs": [
             {
-                "id": stage_id,
-                "target": stage.get("target"),
-                "source": stage["source"],
-                "workflow": stage["workflow"],
-                "execution_identity_key": stage.get("execution_identity_key"),
-                "branch": stage.get("branch"),
-                "commit": stage.get("commit"),
+                "id": target_run_id,
+                "target": target_run.get("target"),
+                "source": target_run.get("source"),
+                "workflow": target_run.get("workflow"),
+                "execution_identity_key": target_run.get("execution_identity_key"),
+                "branch": target_run.get("branch"),
+                "commit": target_run.get("commit"),
             }
-            for stage_id, stage in active_stages.items()
+            for target_run_id, target_run in active_target_runs.items()
         ],
     }
     with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(stage_flow, f, sort_keys=False)
+        yaml.safe_dump(target_run_flow, f, sort_keys=False)
 
 
-def write_target_stage_flow_artifact(
+def write_target_flow_artifact(
     ctl_cfg_root: Path,
     artifacts_dir: Path,
     *,
@@ -5267,8 +6016,8 @@ def write_target_stage_flow_artifact(
     workflow_name: str | None,
     ctl_variants: list[str],
     plt_overlays: list[str],
-    stage_repo_key: str,
-    require_stage_ref: bool,
+    target_repo_key: str,
+    require_target_ref: bool,
     require_commit_refs: bool,
     refs: dict | None,
 ) -> None:
@@ -5285,7 +6034,7 @@ def write_target_stage_flow_artifact(
             workflow_name,
             execution_context,
         )
-        target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name)
+        target_inventory_cfg = load_inventory_cfg(ctl_cfg_root, target_inventory_name, execution_context)
         target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             target_workflow_cfg,
@@ -5296,27 +6045,27 @@ def write_target_stage_flow_artifact(
             ctl_variants=ctl_variants,
         )
         validate_workflow_target_selectors(target_workflow_cfg, target_inventory_cfg, execution_context)
-        target_active_stages = build_active_stages(
+        target_active_target_runs = build_active_target_runs(
             target_workflow_cfg,
             target_inventory_cfg,
-            repo_key=stage_repo_key,
-            require_branch_or_commit=require_stage_ref,
+            repo_key=target_repo_key,
+            require_branch_or_commit=require_target_ref,
             refs=refs,
             execution_context=execution_context,
             require_commit_refs=require_commit_refs,
         )
     except Exception as exc:
         logging.warning(
-            "Skipping target_stages_flow.yaml generation for plan/%s: %s",
+            "Skipping target_runs_by_key_flow.yaml generation for plan/%s: %s",
             workflow_name,
             exc,
         )
         return
 
-    write_stage_flow_artifact(
-        artifacts_dir / "target_stages_flow.yaml",
+    write_target_run_flow_artifact(
+        artifacts_dir / "target_runs_by_key_flow.yaml",
         target_workflow_cfg.get("meta"),
-        target_active_stages,
+        target_active_target_runs,
     )
 
 
@@ -5342,13 +6091,13 @@ def write_ctl_cfg_snapshot(
     inventory_name: str,
     workflow_cfg: dict,
     inventory_cfg: dict,
-    active_stages: dict,
+    active_target_runs: dict,
     refs: dict,
     execution_context: dict[str, object],
 ) -> Path:
     """Write a resolved snapshot of the ctl cfg that drove the run to
     run_dir/cfg/ctl/, so the run is self-describing next to cfg/plt/. Vars are
-    resolved against the execution context; active_stages is already resolved."""
+    resolved against the execution context; active_target_runs is already resolved."""
     ctl_dir = run_dir / "cfg" / "ctl"
     if ctl_dir.exists():
         shutil.rmtree(ctl_dir)
@@ -5359,7 +6108,7 @@ def write_ctl_cfg_snapshot(
         ctl_dir / "inventory.yaml",
         resolve_ctl_structure(inventory_cfg, execution_context, label=f"inventory.{inventory_name}"),
     )
-    write_yaml_file(ctl_dir / "active_stages.yaml", active_stages)
+    write_yaml_file(ctl_dir / "active_target_runs.yaml", active_target_runs)
     write_yaml_file(ctl_dir / "refs.yaml", resolve_ctl_structure(refs, execution_context, label="refs"))
     logging.info("Wrote resolved ctl cfg snapshot: %s", ctl_dir)
     return ctl_dir
@@ -5404,7 +6153,7 @@ def write_git_metas(
 
 
 # ---------------------------------------------------------------------------
-# Ctl-state sync: mirror the local ctl-state tree to the domain bucket.
+# Ctl-state sync: mirror the local ctl-state namespace tree to its backend.
 # S3 bucket. Local-first mechanics, remote system of record after final push.
 # ---------------------------------------------------------------------------
 
@@ -5412,8 +6161,8 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
     """Load the optional ctl-state backend registry.
 
     Schema is ``ctl_state_backends``:
-    {domain: {provider, backend_type, bucket_name, bucket_region,
-    [execution_identity_key]}}.
+    {namespace: {selectors, provider, backend_type, bucket_name,
+    bucket_region, execution_identity_keys}}.
     """
     merged: dict = {}
     seen_sources: dict[str, Path] = {}
@@ -5422,190 +6171,1416 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
     for path, section in entries:
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ {section_name} must be a mapping: {path}")
-        for domain, entry in section.items():
-            # Domains are consumer-defined vocabulary (the engine stays cfg-shape
-            # agnostic): any non-empty snake_case key is a valid state domain.
-            if not isinstance(domain, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", domain):
-                raise RuntimeError(f"❌ {section_name} domain must be a snake_case key: {domain!r} in {path}")
-            if domain in merged:
-                raise RuntimeError(f"❌ duplicate {section_name} domain {domain!r}: {path} (first: {seen_sources[domain]})")
+        for namespace_key, entry in section.items():
+            # Namespaces are consumer-defined vocabulary (the engine stays cfg-shape
+            # agnostic): any non-empty snake_case key is a valid state namespace.
+            if not isinstance(namespace_key, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", namespace_key):
+                raise RuntimeError(f"❌ {section_name} namespace must be a snake_case key: {namespace_key!r} in {path}")
+            if namespace_key in merged:
+                raise RuntimeError(f"❌ duplicate {section_name} namespace {namespace_key!r}: {path} (first: {seen_sources[namespace_key]})")
             if not isinstance(entry, dict):
-                raise RuntimeError(f"❌ {section_name}.{domain} must be a mapping: {path}")
-            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity_key"}
+                raise RuntimeError(f"❌ {section_name}.{namespace_key} must be a mapping: {path}")
+            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity_keys", "selectors"}
             unknown = set(entry) - allowed
             if unknown:
-                raise RuntimeError(f"❌ {section_name}.{domain} has unsupported keys {sorted(unknown)}: {path}")
+                raise RuntimeError(f"❌ {section_name}.{namespace_key} has unsupported keys {sorted(unknown)}: {path}")
             provider = entry.get("provider")
             backend_type = entry.get("backend_type")
             for field, value in (("provider", provider), ("backend_type", backend_type)):
                 if not isinstance(value, str) or not value.strip():
-                    raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
+                    raise RuntimeError(f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}")
             for field in ("bucket_name", "bucket_region"):
                 if not isinstance(entry.get(field), str) or not entry[field].strip():
-                    raise RuntimeError(f"❌ {section_name}.{domain}.{field} must be a non-empty string: {path}")
+                    raise RuntimeError(f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}")
             resolved = {
                 "provider": provider.strip(),
                 "backend_type": backend_type.strip(),
                 "bucket_name": entry["bucket_name"].strip(),
                 "bucket_region": entry["bucket_region"].strip(),
             }
-            identity_key = entry.get("execution_identity_key")
-            if identity_key is not None:
-                if not isinstance(identity_key, str) or not identity_key.strip():
+            identity_keys = entry.get("execution_identity_keys")
+            if identity_keys is not None:
+                # §Phase 31 Q5: per-operation access identities (least privilege)
+                if not isinstance(identity_keys, dict) or set(identity_keys) - {"read", "sync", "maintenance"}:
                     raise RuntimeError(
-                        f"❌ {section_name}.{domain}.execution_identity_key must be a non-empty string: {path}"
+                        f"❌ {section_name}.{namespace_key}.execution_identity_keys must be a map with "
+                        f"read/sync/maintenance keys only: {path}"
                     )
-                resolved["execution_identity_key"] = identity_key.strip()
-            merged[domain] = resolved
-            seen_sources[domain] = path
+                cleaned: dict[str, str] = {}
+                for op, key in identity_keys.items():
+                    if not isinstance(key, str) or not key.strip():
+                        raise RuntimeError(
+                            f"❌ {section_name}.{namespace_key}.execution_identity_keys.{op} must be a non-empty string: {path}"
+                        )
+                    cleaned[op] = key.strip()
+                resolved["execution_identity_keys"] = cleaned
+            selectors = entry.get("selectors")
+            if selectors is not None:
+                # §Phase 31: a backend entry IS the namespace — its selectors
+                # resolve exactly one entry per invocation (item 13c collapse).
+                selector_requirements(
+                    selectors, label=f"{section_name}.{namespace_key}.selectors", structured_only=True
+                )
+                resolved["selectors"] = selectors
+            merged[namespace_key] = resolved
+            seen_sources[namespace_key] = path
+    # §Phase 31: namespaces resolve exactly one entry by selectors — reject
+    # byte-identical selectors at load (before the resolve-time exactly-one guard).
+    reject_duplicate_selectors(
+        {k: v.get("selectors") for k, v in merged.items() if v.get("selectors") is not None},
+        label=section_name,
+    )
     return merged or None
+
+
+def require_unique_fan_out_namespace(
+    ctl_cfg_root: Path,
+    children: list[dict],
+    *,
+    action: str,
+    ctl_profile: str,
+    execution_params: dict[str, str],
+    execution_runtime_mode: str,
+) -> str:
+    """§Phase 31 item 3: a fan-out first expands, then resolves the namespace
+    for EVERY child execution context and requires the unique set to contain
+    exactly one member. Cross-namespace expansions are hard errors and must be
+    partitioned into separate invocations. The fan-out runner never names or
+    interprets selector parameters — it only compares resolved keys."""
+    namespace_by_child: dict[str, str] = {}
+    for child in children:
+        child_params = dict(execution_params)
+        child_params.update(child["params"])
+        child_context = build_execution_context(
+            ctl_cfg_root,
+            action=action,
+            ctl_profile=ctl_profile,
+            execution_params=child_params,
+            execution_runtime_mode=execution_runtime_mode,
+        )
+        namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, child_context)
+        namespace_by_child[child["label"]] = namespace_key
+    unique = sorted(set(namespace_by_child.values()))
+    if len(unique) != 1:
+        detail = ", ".join(f"{label} -> {ns}" for label, ns in sorted(namespace_by_child.items()))
+        raise RuntimeError(
+            f"❌ fan-out children resolve {len(unique)} ctl-state namespaces ({detail}); "
+            "one invocation must not cross namespaces — partition the fan-out"
+        )
+    return unique[0]
+
+
+def resolve_ctl_state_namespace(
+    ctl_cfg_root: Path, execution_context: dict[str, object]
+) -> tuple[str, dict]:
+    """Resolve EXACTLY ONE ctl-state namespace from the frozen execution
+    context (§Phase 31 item 3). A namespace IS a ctl_state_backends entry (item
+    13c collapse): its `selectors` select it. Zero or multiple matches are hard
+    errors; the selection is immutable for the whole top-level invocation and is
+    recorded in run metadata by the caller. Returns (namespace_key,
+    backend_entry)."""
+    backends = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
+    if not backends:
+        raise RuntimeError(f"❌ no 'ctl_state_backends' defined under: {ctl_cfg_root}")
+    matches = [
+        key for key, entry in backends.items()
+        if entry.get("selectors") is not None
+        and selector_matches(
+            entry.get("selectors"), execution_context,
+            label=f"ctl_state_backends.{key}.selectors", structured_only=True,
+        )
+    ]
+    if len(matches) != 1:
+        selectable = sorted(k for k, e in backends.items() if e.get("selectors") is not None)
+        raise RuntimeError(
+            f"❌ exactly one ctl-state namespace (backend with selectors) must match the "
+            f"execution context, matched {len(matches)} of {selectable}"
+        )
+    return matches[0], backends[matches[0]]
 
 
 
 _CTL_STATE_SYNCER = None
 _CTL_STATE_SYNC_NOTE: dict[str, str] = {"mode": "disabled"}
+_CTL_STATE_DEFER_CONFIG: dict | None = None
+_CTL_STATE_SYNC_CONFIG: dict | None = None
 
 
-def configure_ctl_state_sync(
+def inspect_selected_graph_ctl_state_backend(
+    selections: list[dict],
     ctl_cfg_root: Path,
-    ctl_profile: str,
-    domain: str | None,
+    *,
+    implementation_key: str,
+    execution_access_mode: str,
+    provider_credential: str | None,
+) -> dict[str, object]:
+    """Find the one backend provisioner and classify the selected backend."""
+    provisioners: list[tuple[dict, str, dict]] = []
+    for selection in selections:
+        for target_run_id, target_run in selection["active_target_runs"].items():
+            if target_run.get("provisions_ctl_state_backend") is True:
+                provisioners.append((selection, target_run_id, target_run))
+    if len(provisioners) != 1:
+        raise RuntimeError(
+            "❌ agreed ctl-state defer requires exactly one backend provisioner "
+            f"in the complete selected graph; found {len(provisioners)}"
+        )
+
+    selection, target_run_id, target_run = provisioners[0]
+    namespace_key, entry = resolve_ctl_state_namespace(
+        ctl_cfg_root, selection["execution_context"]
+    )
+    adapter = get_provider_adapter(entry["provider"])
+    adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
+    bucket_name = str(
+        resolve_runtime_scalar(
+            entry["bucket_name"],
+            selection["execution_context"],
+            label=f"ctl_state_backends.{namespace_key}.bucket_name",
+        )
+    )
+    bucket_region = str(entry["bucket_region"])
+    credential = adapter.resolve_state_backend_probe_credential(
+        target_run,
+        selection["provider_catalogs"],
+        execution_context=selection["execution_context"],
+        implementation_key=implementation_key,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+    )
+    probe = adapter.probe_state_backend(bucket_name, bucket_region, credential)
+    status = probe.get("status")
+    if status not in {"ready", "absent"}:
+        raise RuntimeError(
+            f"❌ ctl-state backend readiness probe for {namespace_key!r} "
+            f"returned {status!r}: {probe.get('detail') or 'no detail'}"
+        )
+    return {
+        "namespace": namespace_key,
+        "bucket_name": bucket_name,
+        "bucket_region": bucket_region,
+        "provisioner_target_run_id": target_run_id,
+        "status": status,
+        "detail": probe.get("detail"),
+    }
+
+
+def _ctl_state_sync_config(
+    ctl_cfg_root: Path,
+    namespace_key: str,
+    entry: dict,
     execution_context: dict[str, object],
     run_dir: Path,
     *,
-    agreed_skip_ctl_state_backend_sync: bool = False,
-    force_skip_ctl_state_backend_sync: bool = False,
-    provisions_ctl_state_backend: bool = False,
-    execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
-    provider_implementation_key: str = "local",
-) -> dict[str, str] | None:
-    """Resolve the run's ctl-state bucket (by domain) and arm the global syncer.
-
-    Routes by the run's single state `domain` (from resolve_run_domain): the
-    bucket name+region come straight from the ctl_state_backends registry — no
-    execution-context involvement. Existence is re-checked at each sync point, so
-    a bucket-creating run mirrors itself at finalization.
-
-    Skip semantics: ctl-state sync may be skipped only when the selected ctl
-    profile, the active target set, and the per-run flag all allow the exception.
-    A declared domain normally syncs; a backend-provisioning target may tolerate
-    a missing bucket at run start only when the per-run skip flag is set.
-    """
-    global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE
-    _CTL_STATE_SYNCER = None
-    _CTL_STATE_SYNC_NOTE = {"mode": "disabled"}
-
-    # Skip actions are permission/target-validated upstream (validate_skip_requests);
-    # here they only select behavior.
-    sync_skip = agreed_skip_ctl_state_backend_sync or force_skip_ctl_state_backend_sync
-
-    buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
-    if buckets is None and domain is None:
-        # Consumer has no ctl-state feature at all: nothing to sync or skip.
-        if sync_skip:
-            logging.info("ctl-state sync skip has no effect: no ctl_state_backends registry defined")
-        return None
-    if domain is not None and buckets is None:
+    execution_access_mode: str,
+    provider_credential: str | None,
+    provider_implementation_key: str,
+) -> dict:
+    metadata = load_run_metadata(run_dir)
+    results_root_value = metadata.get("ctl_state_local_root")
+    if not isinstance(results_root_value, str) or not results_root_value:
+        raise RuntimeError("❌ run metadata is missing ctl_state_local_root")
+    locator = [namespace_key]
+    if metadata.get("ctl_state_locator") != locator:
         raise RuntimeError(
-            f"❌ targets declare ctl_state_backend_key {domain!r} but no ctl_state_backends registry is defined"
+            f"❌ run dirs use locator {metadata.get('ctl_state_locator')!r}, "
+            f"but ctl-state namespace resolves to {locator!r}"
         )
-
-    if force_skip_ctl_state_backend_sync:
-        _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "force_skip"}
-        return None
-
-    if domain is None:
-        # No active target declares a state domain. This is allowed only by an
-        # explicit run-level skip request that was validated against target policy.
-        if not sync_skip:
-            raise RuntimeError(
-                "❌ no active target declares ctl_state_backend_key; pass "
-                "--agreed-skip-ctl-state-backend-sync to run without ctl-state sync "
-                "(or restore the keys)"
-            )
-        _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "no_domain"}
-        return None
-
-    entry = buckets[domain]  # domain existence validated by resolve_run_domain
-    backend_adapter = get_provider_adapter(entry["provider"])
-    backend_adapter.validate_state_backend_entry(domain, entry, ctl_cfg_root)
     bucket_name = str(
         resolve_runtime_scalar(
-            entry["bucket_name"], execution_context, label=f"ctl_state_backends.{domain}.bucket_name"
+            entry["bucket_name"],
+            execution_context,
+            label=f"ctl_state_backends.{namespace_key}.bucket_name",
         )
     )
-    bucket_region = entry["bucket_region"]
-    result = {"domain": domain, "bucket_name": bucket_name, "bucket_region": bucket_region}
+    return {
+        "ctl_cfg_root": Path(ctl_cfg_root),
+        "namespace_key": namespace_key,
+        "entry": entry,
+        "execution_context": execution_context,
+        "run_dir": Path(run_dir),
+        "results_root": Path(results_root_value).joinpath(*locator),
+        "bucket_name": bucket_name,
+        "bucket_region": str(entry["bucket_region"]),
+        "execution_access_mode": execution_access_mode,
+        "provider_credential": provider_credential,
+        "provider_implementation_key": provider_implementation_key,
+    }
 
-    # Resolve the synchronizer credential through the backend's provider
-    # adapter. Identity-bypass runs use the substitute credential; otherwise the
-    # backend's declared identity resolves in DIRECT mode. The chain-mode sync
-    # leg (entry -> runner -> synchronizer role) lands with the member-account
-    # roles implementation (Phase 6).
-    identity_key = entry.get("execution_identity_key")
-    if identity_key is None and execution_access_mode != "force_bypass":
+
+def _ctl_state_run_access_scope(config: dict) -> tuple[list[str], list[str]]:
+    """Return exact object keys and immutable run prefixes for one publication."""
+    results_root = Path(config["results_root"]).resolve()
+    run_dir = Path(config["run_dir"]).resolve()
+    run_prefix = run_dir.relative_to(results_root).as_posix()
+    instance_dir = ctl_state_dir_from_run_dir(run_dir).resolve()
+    instance_prefix = instance_dir.relative_to(results_root).as_posix()
+    keys = [
+        f"{instance_prefix}/identity.yaml",
+        f"{instance_prefix}/committed.yaml",
+    ]
+    metadata = load_run_metadata(run_dir)
+    action = str(metadata.get("action") or "")
+    for address in metadata.get("target_addresses") or []:
+        child_prefix = ctl_state_target_address_prefix(action, str(address))
+        keys.extend(
+            [f"{child_prefix}/identity.yaml", f"{child_prefix}/committed.yaml"]
+        )
+    return sorted(set(keys)), [run_prefix]
+
+
+def _arm_ctl_state_sync(config: dict, *, tolerate_not_ready: bool) -> bool:
+    global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE
+    entry = config["entry"]
+    adapter = get_provider_adapter(entry["provider"])
+    identity_key = (entry.get("execution_identity_keys") or {}).get("sync")
+    if identity_key is None and config["execution_access_mode"] != "force_bypass":
         raise RuntimeError(
-            f"❌ ctl_state_backends.{domain} declares no execution_identity_key; "
-            f"add one, or run with --execution-access-mode force_bypass + --provider-credential"
+            f"❌ ctl_state_backends.{config['namespace_key']} declares no "
+            "execution_identity_keys.sync"
         )
     if identity_key is not None:
         identity_key = str(
             resolve_runtime_scalar(
                 identity_key,
-                execution_context,
-                label=f"ctl_state_backends.{domain}.execution_identity_key",
+                config["execution_context"],
+                label=(
+                    f"ctl_state_backends.{config['namespace_key']}."
+                    "execution_identity_keys.sync"
+                ),
             )
         )
-    synchronizer_credential = backend_adapter.resolve_synchronizer_credential(
+    # Bootstrap target access may be direct, but ctl-state publication switches
+    # to its normal role path as soon as the access role exists.
+    sync_access_mode = (
+        "force_bypass"
+        if config["execution_access_mode"] == "force_bypass"
+        else "standard"
+    )
+    try:
+        object_keys, object_prefixes = _ctl_state_run_access_scope(config)
+        credential = adapter.resolve_ctl_state_credential(
+            identity_key,
+            config["ctl_cfg_root"],
+            execution_context=config["execution_context"],
+            implementation_key=config["provider_implementation_key"],
+            operation="sync",
+            bucket_name=config["bucket_name"],
+            object_keys=object_keys,
+            object_prefixes=object_prefixes,
+            execution_access_mode=sync_access_mode,
+            provider_credential=config["provider_credential"],
+        )
+    except Exception as error:
+        if not tolerate_not_ready:
+            raise
+        _CTL_STATE_SYNC_NOTE = {
+            "mode": "deferred",
+            "reason": "synchronizer_not_ready",
+            "detail": credential_free_preflight_failure_reason(error),
+        }
+        return False
+    syncer = adapter.create_state_syncer(
+        config["results_root"],
+        config["bucket_name"],
+        config["bucket_region"],
+        credential,
+        config["run_dir"],
+        required=not tolerate_not_ready,
+    )
+    if not syncer.ensure_ready("ctl-state publication readiness"):
+        if not tolerate_not_ready:
+            raise RuntimeError(
+                f"❌ ctl-state backend {config['bucket_name']!r} is not ready"
+            )
+        _CTL_STATE_SYNC_NOTE = {
+            "mode": "deferred",
+            "reason": "backend_absent",
+        }
+        return False
+    _CTL_STATE_SYNCER = syncer
+    _CTL_STATE_SYNC_NOTE = syncer.summary()
+    return True
+
+
+def configure_ctl_state_sync(
+    ctl_cfg_root: Path,
+    ctl_profile: str,
+    namespace_key: str | None,
+    execution_context: dict[str, object],
+    run_dir: Path,
+    *,
+    agreed_defer_ctl_state_backend_sync: bool = False,
+    force_skip_ctl_state_backend_sync: bool = False,
+    provisions_ctl_state_backend: bool = False,
+    selected_graph_provisions_ctl_state_backend: bool = False,
+    backend_absence_confirmed: bool = False,
+    execution_access_mode: str = "standard",
+    provider_credential: str | None = None,
+    provider_implementation_key: str = "local",
+) -> dict[str, str] | None:
+    """Arm namespace publication or establish an explicitly proven defer queue."""
+    del ctl_profile, provisions_ctl_state_backend
+    global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE, _CTL_STATE_DEFER_CONFIG, _CTL_STATE_SYNC_CONFIG
+    _CTL_STATE_SYNCER = None
+    _CTL_STATE_DEFER_CONFIG = None
+    _CTL_STATE_SYNC_CONFIG = None
+    _CTL_STATE_SYNC_NOTE = {"mode": "disabled"}
+
+    backends = load_ctl_state_backends_cfg(ctl_cfg_root)
+    if backends is None:
+        if agreed_defer_ctl_state_backend_sync or force_skip_ctl_state_backend_sync:
+            logging.info("ctl-state sync option has no effect: no backend registry")
+        return None
+    if force_skip_ctl_state_backend_sync:
+        _CTL_STATE_SYNC_NOTE = {"mode": "skipped", "reason": "force_skip"}
+        return None
+
+    if namespace_key is None:
+        namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
+    entry = backends[namespace_key]
+    adapter = get_provider_adapter(entry["provider"])
+    adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
+    config = _ctl_state_sync_config(
+        ctl_cfg_root,
+        namespace_key,
+        entry,
+        execution_context,
+        run_dir,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+        provider_implementation_key=provider_implementation_key,
+    )
+    _CTL_STATE_SYNC_CONFIG = config
+
+    if agreed_defer_ctl_state_backend_sync:
+        if not selected_graph_provisions_ctl_state_backend:
+            raise RuntimeError(
+                "❌ agreed ctl-state defer is valid only when the complete selected "
+                "graph contains exactly one backend provisioner"
+            )
+        if not backend_absence_confirmed:
+            raise RuntimeError(
+                "❌ agreed ctl-state defer is not applicable: the provider did not "
+                "confirm that the selected backend was absent at invocation start"
+            )
+        _CTL_STATE_DEFER_CONFIG = config
+        if not _arm_ctl_state_sync(config, tolerate_not_ready=True):
+            return {
+                "namespace": namespace_key,
+                "bucket_name": config["bucket_name"],
+                "bucket_region": config["bucket_region"],
+            }
+    else:
+        _arm_ctl_state_sync(config, tolerate_not_ready=False)
+
+    syncer = _CTL_STATE_SYNCER
+    if syncer is None:
+        raise RuntimeError("❌ ctl-state syncer was not armed")
+    instance_prefix = ctl_state_dir_from_run_dir(run_dir).resolve().relative_to(
+        syncer.results_root
+    ).as_posix()
+    metadata = load_run_metadata(run_dir)
+    child_prefixes = [
+        ctl_state_target_address_prefix(
+            str(metadata.get("action") or ""), str(address)
+        )
+        for address in (metadata.get("target_addresses") or [])
+    ]
+    syncer.hydrate_instance(instance_prefix, child_prefixes)
+    enforce_mutation_lock(
+        syncer,
+        action=str(metadata.get("action") or ""),
+        run_id=str(metadata.get("run_id") or Path(run_dir).name),
+    )
+    syncer.push("run started")
+    _CTL_STATE_SYNC_NOTE = syncer.summary()
+    return {
+        "namespace_key": namespace_key,
+        "bucket_name": config["bucket_name"],
+        "bucket_region": config["bucket_region"],
+    }
+
+
+def _pending_manifest_path(run_dir: Path) -> tuple[Path, Path]:
+    metadata = load_run_metadata(run_dir)
+    local_root = Path(metadata["ctl_state_local_root"])
+    locator = list(metadata.get("ctl_state_locator") or [])
+    namespace_root = local_root.joinpath(*locator)
+    top_level_run_id = (
+        metadata.get("fan_out_run_id")
+        or metadata.get("parent_workflow_run_id")
+        or metadata.get("run_id")
+        or Path(run_dir).name
+    )
+    manifest_dir = namespace_root / "_pending_sync" / str(top_level_run_id)
+    return namespace_root, manifest_dir / "manifest.yaml"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def queue_ctl_state_run(
+    run_dir: Path,
+    pointer_path: Path | None,
+    *,
+    dependencies: list[str] | None = None,
+) -> Path:
+    namespace_root, manifest_path = _pending_manifest_path(run_dir)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = manifest_path.parent / ".lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        manifest = load_yaml(manifest_path) if manifest_path.is_file() else {}
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"❌ pending-sync manifest must be a mapping: {manifest_path}")
+        metadata = load_run_metadata(run_dir)
+        run_rel = Path(run_dir).resolve().relative_to(namespace_root.resolve()).as_posix()
+        instance_dir = ctl_state_dir_from_run_dir(run_dir)
+        identity_path = instance_dir / "identity.yaml"
+        object_paths = [
+            path
+            for path in sorted(Path(run_dir).rglob("*"))
+            if path.is_file()
+        ]
+        if identity_path.is_file():
+            object_paths.append(identity_path)
+        if pointer_path is not None:
+            object_paths.append(pointer_path)
+        hashes = {
+            path.resolve().relative_to(namespace_root.resolve()).as_posix(): _sha256_file(path)
+            for path in dict.fromkeys(object_paths)
+        }
+        entry = {
+            "run_id": Path(run_dir).name,
+            "run_type": metadata.get("run_type"),
+            "owner_address": metadata.get("instance_address") or metadata.get("result_name"),
+            "run_path": run_rel,
+            "identity_path": (
+                identity_path.resolve().relative_to(namespace_root.resolve()).as_posix()
+                if identity_path.is_file()
+                else None
+            ),
+            "pointer_path": (
+                pointer_path.resolve().relative_to(namespace_root.resolve()).as_posix()
+                if pointer_path is not None
+                else None
+            ),
+            "dependencies": list(dependencies or []),
+            "objects": hashes,
+            "status": "pending",
+        }
+        entries = [
+            item for item in (manifest.get("entries") or [])
+            if item.get("run_path") != run_rel
+        ]
+        entries.append(entry)
+        write_yaml_file(
+            manifest_path,
+            {
+                "version": 1,
+                "namespace": (metadata.get("ctl_state_namespace") or (metadata.get("ctl_state_locator") or [None])[0]),
+                "top_level_run_id": manifest_path.parent.name,
+                "status": "pending",
+                "updated_at": utc_timestamp(),
+                "entries": entries,
+            },
+        )
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    return manifest_path
+
+
+def _validate_pending_entry(namespace_root: Path, entry: dict) -> None:
+    for relative_path, expected_sha in (entry.get("objects") or {}).items():
+        path = namespace_root / relative_path
+        if not path.is_file():
+            raise RuntimeError(f"❌ pending ctl-state object is missing: {path}")
+        actual = _sha256_file(path)
+        if actual != expected_sha:
+            raise RuntimeError(
+                f"❌ pending ctl-state object hash changed: {relative_path}"
+            )
+
+
+def drain_pending_ctl_state_sync() -> int:
+    """Drain pending manifests with one fresh, run-scoped credential per entry."""
+    global _CTL_STATE_SYNCER
+    syncer = _CTL_STATE_SYNCER
+    if syncer is None:
+        return 0
+    base_config = _CTL_STATE_DEFER_CONFIG or _CTL_STATE_SYNC_CONFIG
+    pending_root = syncer.results_root / "_pending_sync"
+    if not pending_root.is_dir():
+        return 0
+    drained = 0
+    for manifest_path in sorted(pending_root.glob("*/manifest.yaml")):
+        lock_path = manifest_path.parent / ".lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            manifest = load_yaml(manifest_path) or {}
+            entries = list(manifest.get("entries") or [])
+            for entry in entries:
+                active_syncer = _CTL_STATE_SYNCER
+                if active_syncer is None:
+                    raise RuntimeError("❌ ctl-state syncer disappeared during catch-up")
+                _validate_pending_entry(active_syncer.results_root, entry)
+                if base_config is not None:
+                    entry_config = dict(base_config)
+                    entry_config["run_dir"] = active_syncer.results_root / entry["run_path"]
+                    _arm_ctl_state_sync(entry_config, tolerate_not_ready=False)
+                    active_syncer = _CTL_STATE_SYNCER
+                identity_rel = entry.get("identity_path")
+                if identity_rel:
+                    active_syncer.publish_identity(active_syncer.results_root / identity_rel)
+                active_syncer.push_run(
+                    active_syncer.results_root / entry["run_path"],
+                    f"deferred catch-up {entry['run_id']}",
+                )
+            priority = {"target": 0, "workflow": 1}
+            for entry in sorted(
+                entries,
+                key=lambda item: (
+                    priority.get(str(item.get("run_type")), 2),
+                    str(item.get("run_id")),
+                ),
+            ):
+                pointer_rel = entry.get("pointer_path")
+                if not pointer_rel:
+                    continue
+                active_syncer = _CTL_STATE_SYNCER
+                if base_config is not None:
+                    entry_config = dict(base_config)
+                    entry_config["run_dir"] = active_syncer.results_root / entry["run_path"]
+                    _arm_ctl_state_sync(entry_config, tolerate_not_ready=False)
+                    active_syncer = _CTL_STATE_SYNCER
+                active_syncer.publish_committed_pointer(
+                    active_syncer.results_root / pointer_rel
+                )
+            manifest_path.unlink()
+            drained += len(entries)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_path.unlink(missing_ok=True)
+        try:
+            manifest_path.parent.rmdir()
+        except OSError:
+            pass
+    try:
+        pending_root.rmdir()
+    except OSError:
+        pass
+    if base_config is not None:
+        _arm_ctl_state_sync(base_config, tolerate_not_ready=False)
+    return drained
+
+def retry_deferred_ctl_state_sync() -> bool:
+    global _CTL_STATE_SYNC_NOTE
+    if _CTL_STATE_DEFER_CONFIG is None:
+        return _CTL_STATE_SYNCER is not None
+    if _CTL_STATE_SYNCER is None and not _arm_ctl_state_sync(
+        _CTL_STATE_DEFER_CONFIG, tolerate_not_ready=True
+    ):
+        return False
+    drained = drain_pending_ctl_state_sync()
+    _CTL_STATE_SYNC_NOTE = _CTL_STATE_SYNCER.summary()
+    if drained:
+        logging.info("drained %d deferred ctl-state run(s)", drained)
+    return True
+
+
+def publish_or_queue_ctl_state_run(
+    run_dir: Path,
+    pointer_path: Path | None,
+    *,
+    reason: str,
+    dependencies: list[str] | None = None,
+) -> None:
+    global _CTL_STATE_SYNCER
+    if _CTL_STATE_SYNC_CONFIG is not None and _CTL_STATE_SYNCER is not None:
+        publication_config = dict(_CTL_STATE_SYNC_CONFIG)
+        publication_config["run_dir"] = Path(run_dir)
+        _arm_ctl_state_sync(publication_config, tolerate_not_ready=False)
+    if _CTL_STATE_SYNCER is not None:
+        instance_identity = ctl_state_dir_from_run_dir(run_dir) / "identity.yaml"
+        if instance_identity.is_file():
+            _CTL_STATE_SYNCER.publish_identity(instance_identity)
+        _CTL_STATE_SYNCER.push_run(run_dir, reason)
+        if pointer_path is not None:
+            _CTL_STATE_SYNCER.publish_committed_pointer(pointer_path)
+        return
+    if _CTL_STATE_DEFER_CONFIG is None:
+        return
+    queue_ctl_state_run(run_dir, pointer_path, dependencies=dependencies)
+    retry_deferred_ctl_state_sync()
+
+
+def split_target_instance_address(address: str) -> tuple[str, list[str]]:
+    """Split a path-form instance address into (key, segments): trailing
+    components containing `=` (or a sha256- composition segment) are instance
+    segments; key components never contain `=` (Q1j parse boundary)."""
+    if not isinstance(address, str) or not address:
+        raise RuntimeError("❌ target instance address must be a non-empty string")
+    parts = address.split("/")
+    idx = len(parts)
+    while idx > 0 and ("=" in parts[idx - 1] or parts[idx - 1].startswith("sha256-")):
+        idx -= 1
+    if idx == 0:
+        raise RuntimeError(f"❌ malformed target instance address: {address!r}")
+    target_key = "/".join(parts[:idx])
+    segments = parts[idx:]
+    return normalize_result_name(target_key, label="target instance address"), segments
+
+
+def ctl_state_target_address_prefix(action: str, address: str) -> str:
+    target_key, segments = split_target_instance_address(address)
+    return compose_state_relpath(action, "target", target_key, segments).as_posix()
+
+
+def selection_state_spec(selection: dict) -> dict:
+    action = str(selection["workflow_cfg"]["meta"]["action"])
+    context = selection["execution_context"]
+    target_specs: list[dict] = []
+    for target_run in selection["active_target_runs"].values():
+        target_key = normalize_result_name(
+            target_run["target"], label="status target key"
+        )
+        segments = resolve_target_instance_segments(
+            target_run.get("target_instance_params"),
+            context,
+            label=f"target {target_key}",
+        )
+        target_specs.append(
+            {
+                "kind": "target",
+                "key": target_key,
+                "segments": segments,
+                "address": target_instance_address(target_key, segments),
+                "prefix": compose_state_relpath(
+                    action, "target", target_key, segments
+                ).as_posix(),
+            }
+        )
+    if selection["selection_kind"] == "target":
+        if len(target_specs) != 1:
+            raise RuntimeError("❌ target status selection must resolve one target instance")
+        return target_specs[0]
+    if selection["selection_kind"] != "workflow":
+        raise RuntimeError(
+            f"❌ status does not support selection kind {selection['selection_kind']!r}"
+        )
+    addresses = [item["address"] for item in target_specs]
+    digest = workflow_composition_sha256(addresses)
+    key = normalize_result_name(selection["selection_key"], label="status workflow key")
+    segments = [f"sha256-{digest}"]
+    definition_canonical = json.dumps(
+        selection["workflow_cfg"], separators=(",", ":"), sort_keys=True
+    )
+    return {
+        "kind": "workflow",
+        "key": key,
+        "segments": segments,
+        "address": f"{key}/sha256-{digest}",
+        "prefix": compose_state_relpath(
+            action, "workflow", key, segments
+        ).as_posix(),
+        "target_specs": target_specs,
+        "workflow_definition_sha256": hashlib.sha256(
+            definition_canonical.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def validate_unique_fan_out_materializations(
+    child_selections: list[dict],
+) -> list[dict]:
+    specs = [selection_state_spec(selection) for selection in child_selections]
+    seen: dict[str, int] = {}
+    duplicates: list[str] = []
+    for index, spec in enumerate(specs):
+        address = f"{spec['kind']}:{spec['address']}"
+        if address in seen:
+            duplicates.append(address)
+        else:
+            seen[address] = index
+    if duplicates:
+        raise RuntimeError(
+            "❌ fan-out materializes duplicate state owners: "
+            + ", ".join(sorted(set(duplicates)))
+        )
+    return specs
+
+
+def _committed_pointer_verdict(pointer: dict | None) -> tuple[str, list[str]]:
+    if pointer is None:
+        return "never_ran", ["no committed revision"]
+    if pointer.get("status") == "outdated" or pointer.get("outdated"):
+        outdated = pointer.get("outdated") or {}
+        return "outdated", [str(outdated.get("reason") or "target marker")]
+    return "current", []
+
+
+def compute_target_instance_status(
+    namespace_root: Path, action: str, spec: dict
+) -> dict:
+    instance_dir = namespace_root / spec["prefix"]
+    pointer = read_committed_pointer(instance_dir)
+    verdict, reasons = _committed_pointer_verdict(pointer)
+    lifecycle_candidates: list[tuple[str, str, dict]] = []
+    for lifecycle_action in ("provision", "destroy"):
+        candidate_dir = namespace_root / compose_state_relpath(
+            lifecycle_action, "target", spec["key"], spec["segments"]
+        )
+        candidate = read_committed_pointer(candidate_dir)
+        if candidate:
+            order = str(candidate.get("committed_at") or candidate.get("run_id") or "")
+            lifecycle_candidates.append((order, lifecycle_action, candidate))
+    lifecycle = None
+    if lifecycle_candidates:
+        _, newest_action, newest = max(lifecycle_candidates, key=lambda item: item[0])
+        lifecycle = "destroyed" if newest_action == "destroy" else "active"
+        if lifecycle == "destroyed" and action != "destroy":
+            verdict = "destroyed"
+            reasons = [f"destroyed by {newest.get('run_id')}"]
+    return {
+        "kind": "target",
+        "key": spec["key"],
+        "address": spec["address"],
+        "verdict": verdict,
+        **({"lifecycle": lifecycle} if lifecycle else {}),
+        **({"run_id": pointer.get("run_id")} if pointer else {}),
+        **({"reasons": reasons} if reasons else {}),
+    }
+
+
+def compute_workflow_instance_status(
+    namespace_root: Path, action: str, spec: dict
+) -> dict:
+    pointer = read_committed_pointer(namespace_root / spec["prefix"])
+    verdict, reasons = _committed_pointer_verdict(pointer)
+    children: list[dict] = []
+    recorded = {
+        item.get("address"): item
+        for item in ((pointer or {}).get("child_revisions") or [])
+        if isinstance(item, dict)
+    }
+    for target_spec in spec["target_specs"]:
+        child = compute_target_instance_status(namespace_root, action, target_spec)
+        child_pointer = read_committed_pointer(namespace_root / target_spec["prefix"])
+        expected = recorded.get(target_spec["address"])
+        if child["verdict"] != "current":
+            reasons.append(
+                f"{target_spec['address']}: {child['verdict']}"
+            )
+        elif expected is None:
+            reasons.append(f"{target_spec['address']}: not recorded by workflow")
+        elif (
+            expected.get("run_id") != (child_pointer or {}).get("run_id")
+            or expected.get("snapshot_sha256")
+            != (child_pointer or {}).get("snapshot_sha256")
+        ):
+            reasons.append(f"{target_spec['address']}: committed revision changed")
+        children.append(child)
+    if pointer is not None:
+        if pointer.get("workflow_definition_sha256") != spec[
+            "workflow_definition_sha256"
+        ]:
+            reasons.append("workflow definition changed")
+        pointer_addresses = [
+            str(item.get("address"))
+            for item in (pointer.get("child_revisions") or [])
+            if isinstance(item, dict)
+        ]
+        if pointer_addresses != [
+            item["address"] for item in spec["target_specs"]
+        ]:
+            reasons.append("workflow target order or set changed")
+    if reasons and verdict != "never_ran":
+        verdict = "outdated"
+    return {
+        "kind": "workflow",
+        "key": spec["key"],
+        "address": spec["address"],
+        "verdict": verdict,
+        **({"run_id": pointer.get("run_id")} if pointer else {}),
+        **({"reasons": list(dict.fromkeys(reasons))} if reasons else {}),
+        "children": children,
+    }
+
+
+def _arm_ctl_state_operation(
+    ctl_cfg_root: Path,
+    execution_context: dict[str, object],
+    ctl_state_local_root: Path,
+    *,
+    operation: str,
+    provider_implementation_key: str,
+    execution_access_mode: str,
+    provider_credential: str | None,
+    object_keys: list[str] | tuple[str, ...] = (),
+    object_prefixes: list[str] | tuple[str, ...] = (),
+):
+    namespace_key, entry = resolve_ctl_state_namespace(
+        ctl_cfg_root, execution_context
+    )
+    adapter = get_provider_adapter(entry["provider"])
+    adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
+    bucket_name = str(
+        resolve_runtime_scalar(
+            entry["bucket_name"],
+            execution_context,
+            label=f"ctl_state_backends.{namespace_key}.bucket_name",
+        )
+    )
+    identity_key = (entry.get("execution_identity_keys") or {}).get(operation)
+    if identity_key is None and execution_access_mode != "force_bypass":
+        raise RuntimeError(
+            f"❌ ctl_state_backends.{namespace_key} declares no "
+            f"execution_identity_keys.{operation}"
+        )
+    operation_access_mode = (
+        "force_bypass" if execution_access_mode == "force_bypass" else "standard"
+    )
+    credential = adapter.resolve_ctl_state_credential(
         identity_key,
         ctl_cfg_root,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
+        operation=operation,
+        bucket_name=bucket_name,
+        object_keys=object_keys,
+        object_prefixes=object_prefixes,
+        execution_access_mode=operation_access_mode,
+        provider_credential=provider_credential,
+    )
+    namespace_root = Path(ctl_state_local_root) / namespace_key
+    syncer = adapter.create_state_syncer(
+        namespace_root,
+        bucket_name,
+        str(entry["bucket_region"]),
+        credential,
+        namespace_root,
+        required=True,
+    )
+    if not syncer.ensure_ready(operation):
+        raise RuntimeError(f"❌ ctl-state backend {namespace_key!r} is not ready")
+    enforce_mutation_lock(
+        syncer,
+        action="readonly",
+        run_id=f"{operation}-{generate_uuid7()}",
+    )
+    return namespace_key, namespace_root, syncer
+
+
+def _arm_ctl_state_reader(
+    ctl_cfg_root: Path,
+    selection: dict,
+    ctl_state_local_root: Path,
+    *,
+    provider_implementation_key: str,
+    execution_access_mode: str,
+    provider_credential: str | None,
+):
+    return _arm_ctl_state_operation(
+        ctl_cfg_root,
+        selection["execution_context"],
+        ctl_state_local_root,
+        operation="read",
+        provider_implementation_key=provider_implementation_key,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
 
-    run_metadata = load_run_metadata(run_dir)
-    results_root_value = run_metadata.get("ctl_state_local_root")
-    if not isinstance(results_root_value, str) or not results_root_value:
-        raise RuntimeError("❌ run metadata is missing ctl_state_local_root; cannot sync ctl-state")
 
-    # §Phase 30: the syncer mirrors THIS backend's locator tree only — the local
-    # dir that is 1:1 with the bucket. The run's dirs were created under the
-    # locator resolved pre-run; it must agree with the domain resolved now.
-    locator = validate_locator_segments(
-        backend_adapter.ctl_state_backend_locator(domain, entry, execution_context),
-        label=f"ctl_state_backends.{domain} locator",
+def hydrate_ctl_state_index(syncer) -> list[str]:
+    keys = syncer.list_object_keys()
+    for key in keys:
+        if key.endswith("/committed.yaml") or key.endswith("/snapshot.yaml"):
+            syncer.pull_object(key)
+    return keys
+
+
+def run_ctl_state_status_sweep(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    context = build_execution_context(
+        ctl_cfg_root,
+        action=args.action,
+        ctl_profile=args.ctl_profile,
+        execution_params=args.execution_params,
+        execution_runtime_mode=args.execution_runtime_mode,
     )
-    metadata_locator = run_metadata.get("ctl_state_locator")
-    if metadata_locator != locator:
+    namespace_key, namespace_root, reader = _arm_ctl_state_operation(
+        ctl_cfg_root,
+        context,
+        args.ctl_state_local_root,
+        operation="read",
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=args.execution_access_mode,
+        provider_credential=args.provider_credential,
+    )
+    hydrate_ctl_state_index(reader)
+    results = []
+    cache_paths: list[Path] = []
+    for pointer_path in sorted(namespace_root.rglob("committed.yaml")):
+        info = parse_result_dir(args.ctl_state_local_root, pointer_path.parent)
+        if not info or info.get("run_type") != "workflow":
+            continue
+        pointer = read_committed_pointer(pointer_path.parent) or {}
+        target_specs = []
+        for address in [
+            str(item.get("address"))
+            for item in (pointer.get("child_revisions") or [])
+            if isinstance(item, dict)
+        ]:
+            target_key, segments = split_target_instance_address(address)
+            target_specs.append(
+                {
+                    "kind": "target",
+                    "key": target_key,
+                    "segments": segments,
+                    "address": address,
+                    "prefix": compose_state_relpath(
+                        info["action"], "target", target_key, segments
+                    ).as_posix(),
+                }
+            )
+        spec = {
+            "kind": "workflow",
+            "key": info["result_name"],
+            "segments": info.get("instance") or [],
+            "address": info["address"],
+            "prefix": pointer_path.parent.relative_to(namespace_root).as_posix(),
+            "target_specs": target_specs,
+            "workflow_definition_sha256": pointer.get(
+                "workflow_definition_sha256"
+            ),
+        }
+        computed = compute_workflow_instance_status(
+            namespace_root, info["action"], spec
+        )
+        cache = {
+            "advisory": True,
+            "computed_at": utc_timestamp(),
+            "source": "ctl-state self-consistency sweep",
+            **computed,
+        }
+        cache_path = pointer_path.parent / "status_cache.yaml"
+        write_yaml_file(cache_path, cache)
+        cache_paths.append(cache_path)
+        results.append(computed)
+    if cache_paths:
+        cache_keys = [
+            path.relative_to(namespace_root).as_posix() for path in cache_paths
+        ]
+        _, _, writer = _arm_ctl_state_operation(
+            ctl_cfg_root,
+            context,
+            args.ctl_state_local_root,
+            operation="sync",
+            object_keys=cache_keys,
+            provider_implementation_key=provider_implementation_key,
+            execution_access_mode=args.execution_access_mode,
+            provider_credential=args.provider_credential,
+        )
+        for key, path in zip(cache_keys, cache_paths):
+            writer.put_object(key, path)
+    report = {
+        "operation": "status-sweep",
+        "namespace": namespace_key,
+        "workflow_instances": len(results),
+        "results": results,
+    }
+    print(yaml.safe_dump(report, sort_keys=False).rstrip())
+    return report
+
+def _uuid7_datetime(run_id: str) -> datetime | None:
+    try:
+        parsed = uuid.UUID(run_id)
+    except (ValueError, AttributeError):
+        return None
+    if parsed.version != 7:
+        return None
+    timestamp_ms = parsed.int >> 80
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+
+
+def run_ctl_state_history_prune(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    if not ctl_allows_ctl_state_history_maintenance(
+        ctl_cfg_root, args.ctl_profile
+    ):
         raise RuntimeError(
-            f"❌ run dirs were created under locator {metadata_locator!r} but the run's "
-            f"domain {domain!r} resolves to {locator!r}; selection and state tree disagree"
+            f"❌ ctl profile {args.ctl_profile!r} does not grant "
+            "allow_ctl_state_history_maintenance"
+        )
+    context = build_execution_context(
+        ctl_cfg_root,
+        action=args.action,
+        ctl_profile=args.ctl_profile,
+        execution_params=args.execution_params,
+        execution_runtime_mode=args.execution_runtime_mode,
+    )
+    namespace_key, namespace_root, reader = _arm_ctl_state_operation(
+        ctl_cfg_root,
+        context,
+        args.ctl_state_local_root,
+        operation="read",
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=args.execution_access_mode,
+        provider_credential=args.provider_credential,
+    )
+    keys = hydrate_ctl_state_index(reader)
+    selected_ids = set(args.prune_run_id or [])
+    cutoff = None
+    if args.prune_before:
+        try:
+            cutoff = datetime.fromisoformat(args.prune_before)
+        except ValueError as error:
+            raise RuntimeError("❌ --prune-before must be ISO-8601") from error
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+
+    run_keys: dict[str, list[str]] = {}
+    run_kinds: dict[str, str] = {}
+    for key in keys:
+        match = re.search(r"/(target|workflow)/.+?/runs/([^/]+)/", "/" + key)
+        if not match:
+            continue
+        kind, run_id = match.group(1), match.group(2)
+        run_keys.setdefault(run_id, []).append(key)
+        run_kinds[run_id] = kind
+        when = _uuid7_datetime(run_id)
+        if cutoff is not None and when is not None and when < cutoff:
+            selected_ids.add(run_id)
+    if args.prune_kind:
+        selected_ids = {
+            run_id
+            for run_id in selected_ids
+            if run_kinds.get(run_id) == args.prune_kind
+        }
+    unknown = sorted(selected_ids - set(run_keys))
+    if unknown:
+        raise RuntimeError(
+            "❌ selected prune run ids are not present in this namespace: "
+            + ", ".join(unknown)
         )
 
-    # A declared domain always syncs: the syncer is strict and a missing bucket is
-    # a hard error unless this run provisions it. Existence is re-checked at every
-    # sync point, so a bootstrap run mirrors itself once the bucket exists.
-    syncer = backend_adapter.create_state_syncer(
-        Path(results_root_value).joinpath(*locator),
-        bucket_name,
-        bucket_region,
-        synchronizer_credential,
-        required=True,
-    )
-    _CTL_STATE_SYNCER = syncer
-    bucket_ready = syncer.ensure_ready("run started")
-    if not bucket_ready and not (provisions_ctl_state_backend and sync_skip):
+    current_ids = set()
+    for pointer_path in namespace_root.rglob("committed.yaml"):
+        pointer = read_committed_pointer(pointer_path.parent)
+        if pointer and pointer.get("run_id"):
+            current_ids.add(str(pointer["run_id"]))
+    protected = sorted(selected_ids & current_ids)
+    if protected:
         raise RuntimeError(
-            f"❌ ctl-state backend bucket {bucket_name!r} ({bucket_region}) not found; "
-            f"provision it via the ctl-state backend target first, or pass "
-            f"--agreed-skip-ctl-state-backend-sync for a target/profile that explicitly allows it"
+            "❌ current committed revisions cannot be pruned: "
+            + ", ".join(protected)
         )
-    syncer.push("run started")
-    _CTL_STATE_SYNC_NOTE = syncer.summary()
-    return result
+
+    references: dict[str, set[str]] = {}
+    for snapshot_path in namespace_root.rglob("snapshot.yaml"):
+        snapshot = load_yaml(snapshot_path) or {}
+        workflow_run = str(
+            snapshot.get("snapshot_of_run") or snapshot_path.parent.name
+        )
+        for child in snapshot.get("child_revisions") or []:
+            if isinstance(child, dict) and child.get("run_id"):
+                references.setdefault(str(child["run_id"]), set()).add(workflow_run)
+
+    candidates = set(selected_ids)
+    changed = True
+    while changed:
+        changed = False
+        for run_id in list(candidates):
+            referrers = references.get(run_id, set()) - candidates
+            if not referrers:
+                continue
+            if not args.cascade:
+                raise RuntimeError(
+                    f"❌ run {run_id} is referenced by retained workflow runs: "
+                    + ", ".join(sorted(referrers))
+                )
+            current_referrers = referrers & current_ids
+            if current_referrers:
+                raise RuntimeError(
+                    "❌ cascade would prune current workflow revisions: "
+                    + ", ".join(sorted(current_referrers))
+                )
+            candidates.update(referrers)
+            changed = True
+
+    deletion_keys = sorted(
+        key for run_id in candidates for key in run_keys.get(run_id, [])
+    )
+    maintenance_id = generate_uuid7()
+    report = {
+        "operation": "history-prune",
+        "namespace": namespace_key,
+        "maintenance_id": maintenance_id,
+        "dry_run": not args.apply_history_prune,
+        "selection": {
+            "run_ids": sorted(args.prune_run_id or []),
+            "before": args.prune_before,
+            "kind": args.prune_kind,
+            "cascade": bool(args.cascade),
+        },
+        "candidate_run_ids": sorted(candidates),
+        "object_keys": deletion_keys,
+        "delete_object_versions": False,
+        "created_at": utc_timestamp(),
+    }
+    manifest_path = (
+        namespace_root
+        / "_maintenance"
+        / "history-prune"
+        / maintenance_id
+        / "manifest.yaml"
+    )
+    write_yaml_file(manifest_path, report)
+    manifest_key = manifest_path.relative_to(namespace_root).as_posix()
+    _, _, maintainer = _arm_ctl_state_operation(
+        ctl_cfg_root,
+        context,
+        args.ctl_state_local_root,
+        operation="maintenance",
+        object_keys=[manifest_key, *deletion_keys],
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=args.execution_access_mode,
+        provider_credential=args.provider_credential,
+    )
+    maintainer.put_object(manifest_key, manifest_path)
+    if args.apply_history_prune:
+        maintainer.delete_object_keys(deletion_keys)
+        report["applied_at"] = utc_timestamp()
+        write_yaml_file(manifest_path, report)
+        maintainer.put_object(manifest_key, manifest_path)
+    print(yaml.safe_dump(report, sort_keys=False).rstrip())
+    return report
+
+
+def run_ctl_state_maintenance_command(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    validate_maintenance_args(args)
+    if args.maintenance_action == "status-sweep":
+        return run_ctl_state_status_sweep(
+            ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+        )
+    if args.maintenance_action == "history-prune":
+        return run_ctl_state_history_prune(
+            ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+        )
+    raise RuntimeError(
+        f"❌ {args.maintenance_action!r} is not a ctl-state-only maintenance operation"
+    )
+
+
+
+def run_status_command(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    run_type: str,
+    provider_implementation_key: str = "local",
+) -> dict:
+    if run_type == "fan_out":
+        expansion_context = build_execution_context(
+            ctl_cfg_root,
+            action=args.action,
+            ctl_profile=args.ctl_profile,
+            execution_params=args.execution_params,
+            execution_runtime_mode=args.execution_runtime_mode,
+        )
+        plan = expand_fan_out(ctl_cfg_root, args.fan_out, expansion_context)
+        validate_fan_out_param_collisions(
+            ctl_cfg_root, plan["children"], args.execution_params
+        )
+        require_unique_fan_out_namespace(
+            ctl_cfg_root,
+            plan["children"],
+            action=args.action,
+            ctl_profile=args.ctl_profile,
+            execution_params=args.execution_params,
+            execution_runtime_mode=args.execution_runtime_mode,
+        )
+        selections = []
+        labels = []
+        for child in plan["children"]:
+            params = dict(args.execution_params)
+            params.update(child["params"])
+            selections.append(
+                resolve_pipeline_selection(
+                    ctl_cfg_root,
+                    args.ctl_profile,
+                    params,
+                    args.ctl_ref_policy,
+                    args.action,
+                    child["key"] if child["kind"] == "workflow" else None,
+                    ctl_variants=(
+                        args.ctl_variants if child["kind"] == "workflow" else []
+                    ),
+                    target_repo_key="repo_path",
+                    require_target_ref=False,
+                    execution_runtime_mode=args.execution_runtime_mode,
+                    provider_credential=args.provider_credential,
+                    execution_access_mode=args.execution_access_mode,
+                    target_name=child["key"] if child["kind"] == "target" else None,
+                )
+            )
+            labels.append(child["label"])
+        specs = validate_unique_fan_out_materializations(selections)
+    else:
+        selection = resolve_pipeline_selection(
+            ctl_cfg_root,
+            args.ctl_profile,
+            args.execution_params,
+            args.ctl_ref_policy,
+            args.action,
+            args.workflow if run_type == "workflow" else None,
+            ctl_variants=getattr(args, "ctl_variants", None) or [],
+            target_repo_key="repo_path",
+            require_target_ref=False,
+            execution_runtime_mode=args.execution_runtime_mode,
+            provider_credential=args.provider_credential,
+            execution_access_mode=args.execution_access_mode,
+            target_name=args.target if run_type == "target" else None,
+        )
+        selections = [selection]
+        specs = [selection_state_spec(selection)]
+        labels = [selection["selection_key"]]
+
+    namespace_key, namespace_root, syncer = _arm_ctl_state_reader(
+        ctl_cfg_root,
+        selections[0],
+        args.ctl_state_local_root,
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=args.execution_access_mode,
+        provider_credential=args.provider_credential,
+    )
+    for spec in specs:
+        child_prefixes = [
+            target["prefix"] for target in spec.get("target_specs", [])
+        ]
+        syncer.hydrate_instance(spec["prefix"], child_prefixes)
+        # Lifecycle status needs sibling provision/destroy pointers.
+        target_specs = spec.get("target_specs") or (
+            [spec] if spec["kind"] == "target" else []
+        )
+        for target_spec in target_specs:
+            for lifecycle_action in ("provision", "destroy"):
+                syncer.pull_object(
+                    compose_state_relpath(
+                        lifecycle_action,
+                        "target",
+                        target_spec["key"],
+                        target_spec["segments"],
+                    ).as_posix()
+                    + "/committed.yaml"
+                )
+    results = []
+    for label, spec in zip(labels, specs):
+        computed = (
+            compute_target_instance_status(namespace_root, args.action, spec)
+            if spec["kind"] == "target"
+            else compute_workflow_instance_status(namespace_root, args.action, spec)
+        )
+        computed["selection"] = label
+        results.append(computed)
+    report = {
+        "selection": {
+            "kind": run_type,
+            "key": (
+                args.fan_out
+                if run_type == "fan_out"
+                else args.workflow
+                if run_type == "workflow"
+                else args.target
+            ),
+        },
+        "namespace": namespace_key,
+        "verdict": (
+            "outdated"
+            if any(item["verdict"] in {"outdated", "destroyed"} for item in results)
+            else "never_ran"
+            if any(item["verdict"] == "never_ran" for item in results)
+            else "current"
+        ),
+        "results": results,
+    }
+    print(yaml.safe_dump(report, sort_keys=False).rstrip())
+    return report
+
+
+def pending_ctl_state_manifest_paths(local_root: Path, namespace_key: str) -> list[Path]:
+    root = Path(local_root) / namespace_key / "_pending_sync"
+    return sorted(root.glob("*/manifest.yaml")) if root.is_dir() else []
+
+
+
+_MUTATION_LOCK_HELD: dict | None = None
+
+
+def enforce_mutation_lock(syncer, *, action: str, run_id: str) -> None:
+    """§Phase 31 Q1b: the interim global mutation lock, enforced at the
+    namespace bucket. Mutating runs acquire it exclusively; non-mutating runs
+    check and fail fast with the holder's run id. No syncer (sync skipped or
+    deferred) means no reachable backend — the lock is skipped with a log line
+    (the bootstrap-defer window is single-operator by definition)."""
+    global _MUTATION_LOCK_HELD
+    if syncer is None:
+        logging.info("mutation lock skipped: no armed ctl-state syncer")
+        return
+    existing = syncer.read_mutation_lock()
+    outcome = evaluate_mutation_lock(existing, action=action, run_id=run_id)
+    decision = outcome["decision"]
+    if decision == "blocked":
+        raise RuntimeError(
+            f"❌ ctl-state namespace is locked by run {outcome['holder']!r} "
+            f"(mutation in progress); retry after it completes or expires"
+        )
+    if decision == "proceed":
+        return
+    if decision == "break_and_acquire":
+        logging.warning(
+            "breaking stale mutation lock of run %s", outcome["lock_doc"].get("broke_lock_of")
+        )
+        syncer.delete_mutation_lock()
+    if not syncer.write_mutation_lock(outcome["lock_doc"]):
+        current = syncer.read_mutation_lock() or {}
+        raise RuntimeError(
+            f"❌ ctl-state namespace lock lost to run {current.get('run_id')!r}; "
+            "retry after it completes"
+        )
+    _MUTATION_LOCK_HELD = {"syncer": syncer, "run_id": run_id}
+    logging.info("mutation lock acquired (run %s)", run_id)
+
+
+def release_mutation_lock_if_held(run_id: str | None = None) -> None:
+    global _MUTATION_LOCK_HELD
+    held = _MUTATION_LOCK_HELD
+    if held is None:
+        return
+    if run_id is not None and held["run_id"] != run_id:
+        return
+    try:
+        held["syncer"].delete_mutation_lock()
+        logging.info("mutation lock released (run %s)", held["run_id"])
+    finally:
+        _MUTATION_LOCK_HELD = None
 
 
 def ctl_state_push(reason: str) -> None:
@@ -5613,14 +7588,9 @@ def ctl_state_push(reason: str) -> None:
         _CTL_STATE_SYNCER.push(reason)
 
 
-def ctl_state_remove_slots(run_dir: Path, states: tuple[str, ...]) -> None:
-    """Remove stale remote state-slot prefixes after a local slot transition."""
-    if _CTL_STATE_SYNCER is None:
-        return
-    result_dir = ctl_state_dir_from_run_dir(run_dir)
-    rel_result = result_dir.resolve().relative_to(_CTL_STATE_SYNCER.results_root).as_posix()
-    for state in states:
-        _CTL_STATE_SYNCER.remove_prefix(f"{rel_result}/{state}")
+def ctl_state_publish_committed(pointer_path: Path) -> None:
+    if _CTL_STATE_SYNCER is not None:
+        _CTL_STATE_SYNCER.publish_committed_pointer(pointer_path)
 
 
 def ctl_state_sync_summary() -> dict[str, str]:
@@ -5629,14 +7599,14 @@ def ctl_state_sync_summary() -> dict[str, str]:
     return dict(_CTL_STATE_SYNC_NOTE)
 
 
-def _stage_utils_module(name: str):
-    """Import a stage_utils/ctl python module by file path (shared primitives:
+def _step_utils_module(name: str):
+    """Import a step_utils/ctl python module by file path (shared primitives:
     Resolver, merge_values, cfg-entry refs). The module stays self-contained in
-    stage_utils because it also executes inside stage containers."""
+    step_utils because it also executes inside target_run containers."""
     import importlib.util
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, source_stage_utils_dir() / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, source_step_utils_dir() / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[name] = module
@@ -5647,9 +7617,9 @@ def _stage_utils_module(name: str):
 def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict) -> None:
     """Render one scope: merge all scope YAML for lookups, interpolate,
     normalize cfg-entry refs whole-scope, write back per-file YAML, copy
-    non-YAML verbatim. Engine logic (folded from the former stage-side
+    non-YAML verbatim. Engine logic (folded from the former target_run-side
     render_cfg.py)."""
-    brc = _stage_utils_module("build_runtime_cfg")
+    brc = _step_utils_module("build_runtime_cfg")
     yaml_files = sorted(p for p in scope_dir.rglob("*.yaml") if p.is_file())
     scope_merged: dict = {}
     for path in yaml_files:
@@ -5688,7 +7658,7 @@ def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict) -> None:
 
 def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[str, object]) -> Path:
     """Render merged/ into rendered/ (whole-scope). In-process engine step —
-    no subprocess, no stage costume."""
+    no subprocess, no target_run costume."""
     plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
     if plt_rendered_dir.exists():
         shutil.rmtree(plt_rendered_dir)
@@ -5704,65 +7674,65 @@ def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[
 
 
 def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_rendered_dir: Path, run_dir: Path) -> Path:
-    """Distribute stage input views from the rendered tree (in-process engine
-    step — folded from the former dockerized prepare/cfg stage).
+    """Distribute target_run input views from the rendered tree (in-process engine
+    step — folded from the former dockerized prepare/cfg target_run).
 
     Single derivation chain: rendered/ derives from merged/; each
-    stages/<stage>/input/ view is selected from rendered/ only.
+    target_runs/<target_run>/input/ view is selected from rendered/ only.
     """
-    plt_stages_dir_path = run_dir / "cfg" / "plt" / "stages"
+    plt_targets_dir_path = run_dir / "cfg" / "plt" / "targets"
     cfg = load_yaml(pipeline_run_cfg_path) or {}
-    stages = cfg.get("stages") or {}
-    if not isinstance(stages, dict):
-        raise RuntimeError("pipeline_run_cfg.yaml stages must be a mapping")
-    plt_stages_dir_path.mkdir(parents=True, exist_ok=True)
+    target_runs = cfg.get("target_runs") or {}
+    if not isinstance(target_runs, dict):
+        raise RuntimeError("pipeline_run_cfg.yaml target_runs must be a mapping")
+    plt_targets_dir_path.mkdir(parents=True, exist_ok=True)
 
-    for stage_name, stage_cfg in stages.items():
-        if not isinstance(stage_cfg, dict):
-            raise RuntimeError(f"Stage {stage_name!r} config must be a mapping")
-        cfg_files = stage_cfg.get("cfg_files") or []
+    for target_run_name, target_run_cfg in target_runs.items():
+        if not isinstance(target_run_cfg, dict):
+            raise RuntimeError(f"Target run {target_run_name!r} config must be a mapping")
+        cfg_files = target_run_cfg.get("cfg_files") or []
         if not cfg_files:
             continue
         if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Stage {stage_name!r} cfg_files must be a list")
+            raise RuntimeError(f"Target run {target_run_name!r} cfg_files must be a list")
 
         cfg_root = normalize_cfg_absolute_path(
-            stage_cfg.get("cfg_root", "/"), label=f"stage {stage_name!r} cfg_root", allow_root=False
+            target_run_cfg.get("cfg_root", "/"), label=f"target_run {target_run_name!r} cfg_root", allow_root=False
         )
         if len([part for part in cfg_root.split("/") if part]) != 1:
             raise RuntimeError(
-                f"Stage {stage_name!r} cfg_root must be exactly one top-level scope "
-                f"(a single path segment), not {cfg_root!r} — a stage may not span scopes"
+                f"Target run {target_run_name!r} cfg_root must be exactly one top-level scope "
+                f"(a single path segment), not {cfg_root!r} — a target_run may not span scopes"
             )
-        scope_root = cfg_abs_path_to_dir(plt_rendered_dir, cfg_root, label=f"stage {stage_name!r} cfg_root")
+        scope_root = cfg_abs_path_to_dir(plt_rendered_dir, cfg_root, label=f"target_run {target_run_name!r} cfg_root")
         if not scope_root.is_dir():
-            logging.info("[WARN] cfg root %r not found for stage %r: %s", cfg_root, stage_name, scope_root)
+            logging.info("[WARN] cfg root %r not found for target_run %r: %s", cfg_root, target_run_name, scope_root)
             continue
 
-        stage_input_dir = plt_stages_dir_path / stage_name / "input"
-        stage_input_dir.mkdir(parents=True, exist_ok=True)
+        target_input_dir = plt_targets_dir_path / target_run_name / "input"
+        target_input_dir.mkdir(parents=True, exist_ok=True)
 
         for pattern in cfg_files:
             if not isinstance(pattern, str) or not pattern.strip():
-                raise RuntimeError(f"Stage {stage_name!r} cfg_files entries must be non-empty strings")
+                raise RuntimeError(f"Target run {target_run_name!r} cfg_files entries must be non-empty strings")
             pattern_norm = pattern.strip().lstrip("/")
             if pattern_norm == "*":
                 sources = [p for p in scope_root.iterdir()]
             elif pattern_norm.endswith("/*"):
-                src_dir = cfg_abs_path_to_dir(scope_root, "/" + pattern_norm[:-2], label=f"stage {stage_name!r} cfg_files pattern")
+                src_dir = cfg_abs_path_to_dir(scope_root, "/" + pattern_norm[:-2], label=f"target_run {target_run_name!r} cfg_files pattern")
                 if not src_dir.is_dir():
                     logging.info("[WARN] cfg dir %r not found under %s", pattern_norm, cfg_root)
                     continue
                 sources = [p for p in src_dir.iterdir()]
             else:
-                sources = [cfg_abs_path_to_dir(scope_root, "/" + pattern_norm, label=f"stage {stage_name!r} cfg_files entry")]
+                sources = [cfg_abs_path_to_dir(scope_root, "/" + pattern_norm, label=f"target_run {target_run_name!r} cfg_files entry")]
 
             for src in sources:
                 if not src.exists():
                     logging.info("[WARN] cfg entry does not exist under %s: %s", cfg_root, src)
                     continue
                 rel = src.relative_to(scope_root)
-                dst = stage_input_dir / rel
+                dst = target_input_dir / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if src.is_dir():
                     if dst.exists():
@@ -5771,8 +7741,8 @@ def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_rendered_dir: Path, ru
                 else:
                     shutil.copy2(src, dst)
 
-    logging.info("Prepared stage input cfg views under %s", plt_stages_dir_path)
-    return plt_stages_dir_path
+    logging.info("Prepared target_run input cfg views under %s", plt_targets_dir_path)
+    return plt_targets_dir_path
 
 
 
@@ -5784,9 +7754,9 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def materialize_stage_modules(stage_id: str, stage: dict, repo_path: Path) -> None:
-    """Populate stage-local child modules before setup runs."""
-    modules = stage.get("modules") or {}
+def materialize_target_modules(target_run_id: str, target_run: dict, repo_path: Path) -> None:
+    """Populate target_run-local child modules before setup runs."""
+    modules = target_run.get("modules") or {}
     if not modules:
         return
 
@@ -5797,7 +7767,7 @@ def materialize_stage_modules(stage_id: str, stage: dict, repo_path: Path) -> No
             dest_path.relative_to(repo_path)
         except ValueError as exc:
             raise RuntimeError(
-                f"Stage '{stage_id}' module '{module_name}' dest escapes the stage repo: {module_cfg['dest']}"
+                f"Target run '{target_run_id}' module '{module_name}' dest escapes the target_run repo: {module_cfg['dest']}"
             ) from exc
 
         if dest_path.exists() or dest_path.is_symlink():
@@ -5808,9 +7778,9 @@ def materialize_stage_modules(stage_id: str, stage: dict, repo_path: Path) -> No
             module_src = Path(module_cfg["repo_path"]).expanduser()
             if not module_src.is_dir():
                 raise RuntimeError(
-                    f"Stage '{stage_id}' module '{module_name}' repo_path not found: {module_src}"
+                    f"Target run '{target_run_id}' module '{module_name}' repo_path not found: {module_src}"
                 )
-            # Copy the local working tree snapshot so Dockerized stage runners can read it.
+            # Copy the local working tree snapshot so Dockerized target_run runners can read it.
             shutil.copytree(module_src, dest_path, symlinks=True)
         else:
             git_clone(
@@ -5826,25 +7796,25 @@ def ctl_utils_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def source_stage_utils_dir() -> Path:
-    utils_dir = ctl_utils_root() / "stage_utils"
+def source_step_utils_dir() -> Path:
+    utils_dir = ctl_utils_root() / "step_utils"
     if not utils_dir.is_dir():
-        raise RuntimeError(f"❌ stage utils source dir not found: {utils_dir}")
+        raise RuntimeError(f"❌ step utils source dir not found: {utils_dir}")
     return utils_dir
 
 
-def materialize_stage_utils(run_dir: Path) -> Path:
-    """Copy the ctl-owned stage support scripts into this run's stage_utils area.
+def materialize_step_utils(run_dir: Path) -> Path:
+    """Copy the ctl-owned target_run support scripts into this run's step_utils area.
 
-    Rule: stage_utils/ctl holds only files consumed by stages (host wrappers,
-    in-container setup, the per-stage resolver, access assert, dockerfiles).
+    Rule: step_utils/ctl holds only files consumed by target_runs (host wrappers,
+    in-container setup, the per-target_run resolver, access assert, dockerfiles).
     """
-    utils_dir = run_dir / "stage_utils" / "ctl"
+    utils_dir = run_dir / "step_utils" / "ctl"
     if utils_dir.is_dir():
         return utils_dir
     utils_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(
-        source_stage_utils_dir(),
+        source_step_utils_dir(),
         utils_dir,
         symlinks=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
@@ -5852,9 +7822,9 @@ def materialize_stage_utils(run_dir: Path) -> Path:
     return utils_dir
 
 
-def prepare_stage_repo(
-    stage_id: str,
-    stage: dict,
+def prepare_target_repo(
+    target_run_id: str,
+    target_run: dict,
     run_dir: Path,
     tooling_env: dict[str, str],
     provider_adapter=None,
@@ -5864,40 +7834,40 @@ def prepare_stage_repo(
     execution_access_mode: str = "standard",
     provider_credential: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
-    """Clone/copy a stage repo, materialize child modules, and prepare its execution env."""
-    repo_path = run_dir / "stages_source" / stage_id
+    """Clone/copy a target_run repo, materialize child modules, and prepare its execution env."""
+    repo_path = run_dir / "target_sources" / target_run_id
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
 
-    if "repo_path" in stage:
-        repo_path_value = stage["repo_path"]
+    if "repo_path" in target_run:
+        repo_path_value = target_run["repo_path"]
         if not repo_path_value:
-            raise RuntimeError(f"Stage '{stage_id}' has empty repo_path")
+            raise RuntimeError(f"Target run '{target_run_id}' has empty repo_path")
         repo_src = Path(repo_path_value).expanduser()
         if not repo_src.is_dir():
-            raise RuntimeError(f"Stage '{stage_id}' repo_path not found: {repo_src}")
+            raise RuntimeError(f"Target run '{target_run_id}' repo_path not found: {repo_src}")
         shutil.copytree(repo_src, repo_path, symlinks=True)
     else:
         git_clone(
-            repo_url=stage["repo_url"],
-            branch=stage["branch"],
-            commit=stage["commit"],
+            repo_url=target_run["repo_url"],
+            branch=target_run["branch"],
+            commit=target_run["commit"],
             dest=repo_path,
-            token=os.getenv(stage["token_type"]),
+            token=os.getenv(target_run["token_type"]),
         )
 
-    materialize_stage_modules(stage_id, stage, repo_path)
+    materialize_target_modules(target_run_id, target_run, repo_path)
 
-    stage_env = os.environ.copy()
-    stage_env.update(tooling_env)
-    stage_env["ATLAS_STAGE_UTILS_DIR"] = str(materialize_stage_utils(run_dir).parent)
+    target_env = os.environ.copy()
+    target_env.update(tooling_env)
+    target_env["ATLAS_STEP_UTILS_DIR"] = str(materialize_step_utils(run_dir).parent)
     if provider_adapter is not None:
         if provider_catalogs is None or execution_context is None or provider_implementation_key is None:
-            raise RuntimeError("❌ incomplete provider inputs for stage preparation")
-        provider_adapter.materialize_stage_binding(
-            stage_id,
-            stage,
-            stage_env,
+            raise RuntimeError("❌ incomplete provider inputs for target_run preparation")
+        provider_adapter.materialize_target_binding(
+            target_run_id,
+            target_run,
+            target_env,
             provider_catalogs,
             execution_context=execution_context,
             implementation_key=provider_implementation_key,
@@ -5905,51 +7875,51 @@ def prepare_stage_repo(
             provider_credential=provider_credential,
                 run_dir=run_dir,
         )
-    return repo_path, stage_env
+    return repo_path, target_env
 
 
-def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo_root: Path) -> list[dict]:
+def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_root: Path) -> list[dict]:
     active: list[dict] = []
-    for stage_id in active_ids:
-        entry = action_manifest.get(stage_id)
+    for step_id in active_ids:
+        entry = action_manifest.get(step_id)
         if not isinstance(entry, dict):
-            raise RuntimeError(f"Stage {stage_id!r} not declared in manifest")
-        stage_path = entry.get("path")
-        if not isinstance(stage_path, str) or not stage_path:
-            raise RuntimeError(f"Stage {stage_id!r} manifest entry must define a non-empty path")
+            raise RuntimeError(f"Step {step_id!r} not declared in manifest")
+        step_path = entry.get("path")
+        if not isinstance(step_path, str) or not step_path:
+            raise RuntimeError(f"Step {step_id!r} manifest entry must define a non-empty path")
 
-        stage_meta_path = repo_root / stage_path / "stage.yaml"
-        if not stage_meta_path.is_file():
-            raise RuntimeError(f"Stage metadata not found: {stage_meta_path}")
-        stage_meta = load_yaml(stage_meta_path) or {}
-        runtime_cfg = stage_meta.get("runtime") or {}
+        step_meta_path = repo_root / step_path / "step.yaml"
+        if not step_meta_path.is_file():
+            raise RuntimeError(f"Step metadata not found: {step_meta_path}")
+        step_meta = load_yaml(step_meta_path) or {}
+        runtime_cfg = step_meta.get("runtime") or {}
         if not isinstance(runtime_cfg, dict):
-            raise RuntimeError(f"Stage metadata runtime must be a mapping: {stage_meta_path}")
+            raise RuntimeError(f"Step metadata runtime must be a mapping: {step_meta_path}")
         values_json = runtime_cfg.get("values_json", True)
         env_sh = runtime_cfg.get("env_sh", True)
         if not isinstance(values_json, bool) or not isinstance(env_sh, bool):
-            raise RuntimeError(f"Stage metadata runtime flags must be booleans: {stage_meta_path}")
-        # Phase 26: the stage declares its BOX (image + docker capability), CTL owns
+            raise RuntimeError(f"Step metadata runtime flags must be booleans: {step_meta_path}")
+        # Phase 26: the step declares its BOX (image + docker capability), CTL owns
         # how the box is run. image is required; docker_build defaults false.
         image = runtime_cfg.get("image")
-        if not isinstance(image, str) or image not in STAGE_IMAGES:
+        if not isinstance(image, str) or image not in STEP_IMAGES:
             raise RuntimeError(
-                f"Stage metadata runtime.image must be one of {sorted(STAGE_IMAGES)}: {stage_meta_path}"
+                f"Step metadata runtime.image must be one of {sorted(STEP_IMAGES)}: {step_meta_path}"
             )
         docker_build = runtime_cfg.get("docker_build", False)
         if not isinstance(docker_build, bool):
-            raise RuntimeError(f"Stage metadata runtime.docker_build must be a boolean: {stage_meta_path}")
-        supported_execution_runtime_modes = stage_supported_execution_runtime_modes(runtime_cfg, label=str(stage_meta_path))
-        cfg_files = stage_meta.get("cfg_files", [])
+            raise RuntimeError(f"Step metadata runtime.docker_build must be a boolean: {step_meta_path}")
+        supported_execution_runtime_modes = step_supported_execution_runtime_modes(runtime_cfg, label=str(step_meta_path))
+        cfg_files = step_meta.get("cfg_files", [])
         if cfg_files is None:
             cfg_files = []
         if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Stage metadata cfg_files must be a list: {stage_meta_path}")
+            raise RuntimeError(f"Step metadata cfg_files must be a list: {step_meta_path}")
 
         active.append(
             {
-                "id": stage_id,
-                "path": stage_path,
+                "id": step_id,
+                "path": step_path,
                 "cfg_files": cfg_files,
                 "runtime": {
                     "values_json": values_json,
@@ -5960,42 +7930,42 @@ def _repo_local_active_stages(action_manifest: dict, active_ids: list[str], repo
                 },
                 "env_vars": {
                     "inventory": {},
-                    "stage": stage_meta.get("env_vars", {}),
+                    "step": step_meta.get("env_vars", {}),
                 },
             }
         )
     return active
 
 
-def get_repo_local_stages(repo_path: Path, action: str, workflow_name: str) -> tuple[list[str], list[dict]]:
+def get_repo_local_steps(repo_path: Path, action: str, step_sequence_key: str) -> tuple[list[str], list[dict]]:
     manifest_file = repo_path / ADAPTER_DIR / "manifest.yaml"
     if not manifest_file.is_file():
         raise RuntimeError(f"❌ manifest file not found: {manifest_file}")
-    workflows_file = repo_path / ADAPTER_DIR / "workflows.yaml"
-    if not workflows_file.is_file():
-        raise RuntimeError(f"❌ workflows file not found: {workflows_file}")
+    step_sequences_file = repo_path / ADAPTER_DIR / "step_sequences.yaml"
+    if not step_sequences_file.is_file():
+        raise RuntimeError(f"❌ step_sequences file not found: {step_sequences_file}")
 
     manifest = (load_yaml(manifest_file) or {}).get("manifest", {})
-    workflows = (load_yaml(workflows_file) or {}).get("workflows", {})
+    step_sequences = (load_yaml(step_sequences_file) or {}).get("step_sequences", {})
 
     action_manifest = manifest.get(action)
     if not isinstance(action_manifest, dict) or not action_manifest:
-        raise RuntimeError(f"manifest {manifest_file} declares no stages for action {action!r}")
+        raise RuntimeError(f"manifest {manifest_file} declares no steps for action {action!r}")
 
-    action_workflows = workflows.get(action)
-    if not isinstance(action_workflows, dict) or workflow_name not in action_workflows:
-        raise RuntimeError(f"workflow {action}/{workflow_name} not found in {workflows_file}")
-    workflow = action_workflows[workflow_name]
-    if not isinstance(workflow, dict) or "stages" not in workflow:
-        raise RuntimeError(f"workflow {action}/{workflow_name} must define stages")
+    action_step_sequences = step_sequences.get(action)
+    if not isinstance(action_step_sequences, dict) or step_sequence_key not in action_step_sequences:
+        raise RuntimeError(f"step sequence {action}/{step_sequence_key} not found in {step_sequences_file}")
+    step_sequence = action_step_sequences[step_sequence_key]
+    if not isinstance(step_sequence, dict) or "steps" not in step_sequence:
+        raise RuntimeError(f"step sequence {action}/{step_sequence_key} must define steps")
 
     active_ids: list[str] = []
-    for stage_id in workflow.get("stages", []):
-        if stage_id not in action_manifest:
-            raise RuntimeError(f"Stage {stage_id!r} not declared in manifest for action {action!r}")
-        active_ids.append(stage_id)
+    for step_id in step_sequence.get("steps", []):
+        if step_id not in action_manifest:
+            raise RuntimeError(f"Step {step_id!r} not declared in manifest for action {action!r}")
+        active_ids.append(step_id)
 
-    return active_ids, _repo_local_active_stages(action_manifest, active_ids, repo_path)
+    return active_ids, _repo_local_active_steps(action_manifest, active_ids, repo_path)
 
 
 def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path) -> bool:
@@ -6007,11 +7977,11 @@ def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path)
 
 
 def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]:
-    """Extract tfstate key/uri variable names from standard infra stage scripts."""
+    """Extract tfstate key/uri variable names from standard infra target_run scripts."""
     key_var = None
     uri_var = None
 
-    for rel_path in FORCE_UNLOCK_STAGE_SCRIPT_CANDIDATES:
+    for rel_path in FORCE_UNLOCK_STEP_SCRIPT_CANDIDATES:
         script_path = repo_path / rel_path
         if not script_path.is_file():
             continue
@@ -6040,8 +8010,8 @@ def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]
 
     if not key_var:
         raise RuntimeError(
-            f"❌ force-unlock is not supported for stage repo '{repo_path}'. "
-            "Expected one of atlas_ctl_adapter/stages/{plan,provision,destroy}/infra/src/stage.sh to call './bin/tf.sh infra init $..._tfstate_key'."
+            f"❌ force-unlock is not supported for target_run repo '{repo_path}'. "
+            "Expected one of atlas_ctl_adapter/steps/{plan,provision,destroy}/infra/src/step.sh to call './bin/tf.sh infra init $..._tfstate_key'."
         )
 
     if uri_var is None and key_var.endswith("_key"):
@@ -6050,17 +8020,222 @@ def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]
     return key_var, uri_var
 
 
-def _stage_box_name(stage_id: str, repo_stage_id: str) -> str:
-    """A valid, unique-per-run Docker tag / box name for a stage (§Phase 26)."""
-    raw = f"atlas-{stage_id}-{repo_stage_id}-stage-local"
+def _step_box_name(target_run_id: str, repo_step_id: str) -> str:
+    """A valid, unique-per-run Docker tag / box name for a target_run (§Phase 26)."""
+    raw = f"atlas-{target_run_id}-{repo_step_id}-target_run-local"
     name = re.sub(r"[^a-z0-9._-]+", "-", raw.lower())
     return re.sub(r"-{2,}", "-", name).strip("-")
 
 
-def run_stages(
-    active_stages: dict,
+def git_source_facts(path: Path) -> tuple[str | None, str]:
+    """Return the checked-out commit and reproducibility state of one cfg source."""
+    root = Path(path)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if commit.returncode != 0:
+        return None, "dirty"
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    state = "clean" if status.returncode == 0 and not status.stdout.strip() else "dirty"
+    return commit.stdout.strip(), state
+
+
+def target_run_source_facts(target_run: dict) -> tuple[str | None, str]:
+    commit = target_run.get("commit")
+    repo_path = target_run.get("repo_path")
+    if repo_path:
+        actual_commit, state = git_source_facts(Path(repo_path))
+        return (str(commit).strip() if commit else actual_commit), state
+    return (str(commit).strip() if commit else None), ("clean" if commit else "dirty")
+
+
+def target_instance_dir_for_run(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+) -> tuple[Path, str]:
+    metadata = load_run_metadata(parent_run_dir)
+    target_key = normalize_result_name(
+        target_run.get("target"), label="workflow target key"
+    )
+    segments = resolve_target_instance_segments(
+        target_run.get("target_instance_params"),
+        execution_context,
+        label=f"target {target_key}",
+    )
+    namespace_root = Path(metadata["ctl_state_local_root"]).joinpath(
+        *(metadata.get("ctl_state_locator") or [])
+    )
+    return (
+        namespace_root
+        / compose_state_relpath(
+            str(metadata["action"]), "target", target_key, segments
+        ),
+        target_instance_address(target_key, segments),
+    )
+
+
+def committed_target_revision_if_skippable(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+) -> dict | None:
+    """Return the current committed child revision only under the Q1d contract."""
+    if target_run.get("ref_policy") != "commit_required":
+        return None
+    if target_run.get("source_state") != "clean":
+        return None
+    source_commit = target_run.get("source_commit")
+    cfg_source_commit = target_run.get("cfg_source_commit")
+    if not source_commit or not cfg_source_commit:
+        return None
+    instance_dir, address = target_instance_dir_for_run(
+        parent_run_dir, target_run, execution_context
+    )
+    pointer = read_committed_pointer(instance_dir)
+    if not pointer or pointer.get("status") == "outdated" or pointer.get("outdated"):
+        return None
+    expected = {
+        "source_commit": source_commit,
+        "cfg_source_commit": cfg_source_commit,
+        "source_state": "clean",
+        "ref_policy": "commit_required",
+    }
+    if any(pointer.get(key) != value for key, value in expected.items()):
+        return None
+    snapshot_path = (
+        instance_dir / "runs" / str(pointer.get("run_id") or "") / RUN_SNAPSHOT_NAME
+    )
+    if not snapshot_path.is_file():
+        return None
+    snapshot = load_yaml(snapshot_path) or {}
+    if not isinstance(snapshot, dict):
+        return None
+    canonical = json.dumps(
+        snapshot, separators=(",", ":"), sort_keys=True, default=str
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != pointer.get(
+        "snapshot_sha256"
+    ):
+        return None
+    return {
+        "address": address,
+        "run_id": pointer.get("run_id"),
+        "snapshot_sha256": pointer.get("snapshot_sha256"),
+        "status": pointer.get("status"),
+        "skipped_committed_rerun": True,
+    }
+
+
+def begin_workflow_target_run(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+) -> tuple[Path, str | None]:
+    """Materialize one workflow-selected target as its canonical target run."""
+    parent_metadata = load_run_metadata(parent_run_dir)
+    if parent_metadata.get("run_type") != "workflow":
+        return parent_run_dir, None
+    target_key = normalize_result_name(
+        target_run.get("target"), label="workflow target key"
+    )
+    segments = resolve_target_instance_segments(
+        target_run.get("target_instance_params"),
+        execution_context,
+        label=f"target {target_key}",
+    )
+    address = target_instance_address(target_key, segments)
+    ctl_state_root = Path(parent_metadata["ctl_state_local_root"])
+    locator = list(parent_metadata.get("ctl_state_locator") or [])
+    namespace_root = ctl_state_root.joinpath(*locator)
+    instance_dir = namespace_root / compose_state_relpath(
+        str(parent_metadata["action"]), "target", target_key, segments
+    )
+    # a target instance's identity is fully encoded in its path
+    # (<key>/instances/<seg>/…) — no identity.yaml is written (§minimal files).
+    child_run_id = generate_uuid7()
+    child_run_dir = instance_dir / "runs" / child_run_id
+    write_run_metadata(
+        child_run_dir,
+        {
+            "run_id": child_run_id,
+            "action": parent_metadata["action"],
+            "run_type": "target",
+            "result_name": target_key,
+            "result_key": f"{parent_metadata['action']}/target/{target_key}",
+            "ctl_state_local_root": str(ctl_state_root),
+            "ctl_state_locator": locator,
+            "ctl_state_namespace": parent_metadata.get("ctl_state_namespace"),
+            "ctl_state_dir": str(instance_dir),
+            "run_dir": str(child_run_dir),
+            "log_path": parent_metadata.get("log_path"),
+            "target_keys": [target_key],
+            "instance": segments,
+            "instance_address": address,
+            "parent_workflow_run_id": parent_metadata.get("run_id"),
+            "fan_out_run_id": parent_metadata.get("fan_out_run_id"),
+            "mutation_started": False,
+            **{
+                key: target_run[key]
+                for key in (
+                    "source_commit", "cfg_source_commit", "source_state", "ref_policy"
+                )
+                if target_run.get(key) is not None
+            },
+        },
+    )
+    mark_run_started(child_run_dir)
+    return child_run_dir, address
+
+
+def finish_workflow_target_run(
+    child_run_dir: Path, *, error: BaseException | None = None
+) -> dict | None:
+    """Finalize and publish one workflow child without publishing the workflow."""
+    if error is not None:
+        payload = build_status_payload(
+            child_run_dir, "failed",
+            {"error": {"type": type(error).__name__, "summary": str(error)}},
+        )
+        write_current_status(child_run_dir, payload)
+        write_state_slot(child_run_dir, "failed", payload)
+        remove_state_slot(child_run_dir, "in_progress")
+        publish_or_queue_ctl_state_run(
+            child_run_dir, None, reason="workflow child failed"
+        )
+        return None
+
+    payload = build_status_payload(
+        child_run_dir, "ok", {"ctl_state_sync": ctl_state_sync_summary()}
+    )
+    write_current_status(child_run_dir, payload)
+    pointer_path = publish_committed_pointer(child_run_dir, payload)
+    remove_state_slot(child_run_dir, "in_progress")
+    remove_state_slot(child_run_dir, "failed")
+    publish_or_queue_ctl_state_run(
+        child_run_dir,
+        pointer_path,
+        reason="workflow child succeeded",
+    )
+    pointer = read_committed_pointer(ctl_state_dir_from_run_dir(child_run_dir)) or {}
+    return {
+        "address": payload.get("instance_address") or payload.get("result_name"),
+        "run_id": pointer.get("run_id"),
+        "snapshot_sha256": pointer.get("snapshot_sha256"),
+        "status": pointer.get("status"),
+    }
+
+
+def run_steps(
+    active_target_runs: dict,
     run_dir: Path,
-    plt_stages_dir_path: Path,
+    plt_targets_dir_path: Path,
     execution_context_path: Path,
     inventory_name: str,
     execution_context: dict[str, object],
@@ -6073,22 +8248,35 @@ def run_stages(
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
     execution_access_mode: str = "standard",
     provider_credential: str | None = None,
+    skip_committed_rerun: bool = False,
 ) -> None:
-    """Clone and run all active stages."""
+    """Clone and run all active target runs."""
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
     # Phase 26: CTL owns the execution box. It invokes the ctl-owned runtime
-    # dispatcher (run_stage.sh) — never a per-stage run script — passing the box
-    # spec the stage declared (image / docker_build) plus the active runtime and
-    # tooling source. The stage carries only src/stage.sh + stage.yaml.
-    runtime_dispatcher = str(materialize_stage_utils(run_dir) / "run_stage.sh")
+    # dispatcher (run_step.sh) — never a per-target_run run script — passing the box
+    # spec the target_run declared (image / docker_build) plus the active runtime and
+    # tooling source. The target_run carries only src/step.sh + step.yaml.
+    runtime_dispatcher = str(materialize_step_utils(run_dir) / "run_step.sh")
     tooling_mode = "repo_path" if use_local_tooling_cfg else "repo_url"
     mutation_marked = False
-    for stage_id, stage in active_stages.items():
-        log_stage_banner(f"[{inventory_name}] [{stage_id}]")
-        repo_path, stage_env = prepare_stage_repo(
-            stage_id,
-            stage,
+    child_revisions: list[dict] = []
+    for target_run_id, target_run in active_target_runs.items():
+        log_target_run_banner(f"[{inventory_name}] [{target_run_id}]")
+        if skip_committed_rerun:
+            revision = committed_target_revision_if_skippable(
+                run_dir, target_run, execution_context
+            )
+            if revision is not None:
+                logging.info(
+                    "Skipping committed target instance %s (commits unchanged)",
+                    revision["address"],
+                )
+                child_revisions.append(revision)
+                continue
+        repo_path, target_env = prepare_target_repo(
+            target_run_id,
+            target_run,
             run_dir,
             tooling_env,
             provider_adapter=provider_adapter,
@@ -6099,27 +8287,34 @@ def run_stages(
             provider_credential=provider_credential,
             )
 
-        workflow_name = stage.get("workflow")
-        if not isinstance(workflow_name, str) or not workflow_name:
-            raise RuntimeError(f"❌ stage {stage_id!r} must define a non-empty repo-local workflow")
-        origin_cfg_path = plt_stages_dir_path / stage_id / "input"
+        step_sequence_key = target_run.get("step_sequence")
+        if not isinstance(step_sequence_key, str) or not step_sequence_key:
+            raise RuntimeError(f"❌ target run {target_run_id!r} must define a non-empty step_sequence")
+        origin_cfg_path = plt_targets_dir_path / target_run_id / "input"
         if not origin_cfg_path.is_dir():
-            raise RuntimeError(f"❌ stage input cfg dir not found for stage {stage_id!r}: {origin_cfg_path}")
-        stage_cfg_dir = plt_stages_dir_path / stage_id / "resolved"
-        os.makedirs(stage_cfg_dir, exist_ok=True)
-        stage_artifacts_dir = run_dir / "artifacts" / "stages" / stage_id
-        os.makedirs(stage_artifacts_dir, exist_ok=True)
+            raise RuntimeError(f"❌ target_run input cfg dir not found for target_run {target_run_id!r}: {origin_cfg_path}")
+        target_cfg_dir = plt_targets_dir_path / target_run_id / "resolved"
+        os.makedirs(target_cfg_dir, exist_ok=True)
+        target_state_run_dir, target_instance_address = begin_workflow_target_run(
+            run_dir, target_run, execution_context
+        )
+        target_artifacts_dir = (
+            target_state_run_dir / "artifacts"
+            if target_instance_address is not None
+            else run_dir / "artifacts" / "targets" / target_run_id
+        )
+        os.makedirs(target_artifacts_dir, exist_ok=True)
 
         copied_execution_context = ensure_repo_execution_context(repo_path, execution_context_path)
         try:
-            repo_stage_ids, repo_stages = get_repo_local_stages(repo_path, inventory_name, workflow_name)
+            repo_step_ids, repo_steps = get_repo_local_steps(repo_path, inventory_name, step_sequence_key)
             run_manifest = {
                 "run_id": run_id,
-                "branch": stage.get("branch"),
-                "commit": stage.get("commit"),
+                "branch": target_run.get("branch"),
+                "commit": target_run.get("commit"),
                 "action": inventory_name,
-                "workflow": workflow_name,
-                "active_stages": repo_stage_ids,
+                "step_sequence": step_sequence_key,
+                "active_steps": repo_step_ids,
                 "origin_cfg": str(origin_cfg_path),
                 "execution_context_file": str(execution_context_path),
                 "execution_context_keys": sorted(execution_context),
@@ -6127,55 +8322,66 @@ def run_stages(
             logging.info(json.dumps(run_manifest, indent=4))
 
             if inventory_name in MUTATING_ACTIONS and not mutation_marked:
-                mark_mutation_started(run_dir, stage_id)
+                mark_mutation_started(run_dir, target_run_id)
                 mutation_marked = True
 
-            for repo_stage in repo_stages:
-                repo_stage_id = repo_stage["id"]
-                repo_stage_path = repo_stage["path"]
-                log_stage_banner(f"[{inventory_name}] [{stage_id}] [{repo_stage_id}]", ch="-")
-                repo_stage_runtime = repo_stage.get("runtime", {})
-                supported = set(repo_stage_runtime.get("supported_execution_runtime_modes", EXECUTION_RUNTIME_MODES))
+            for repo_step in repo_steps:
+                repo_step_id = repo_step["id"]
+                repo_step_path = repo_step["path"]
+                log_target_run_banner(f"[{inventory_name}] [{target_run_id}] [{repo_step_id}]", ch="-")
+                repo_step_runtime = repo_step.get("runtime", {})
+                supported = set(repo_step_runtime.get("supported_execution_runtime_modes", EXECUTION_RUNTIME_MODES))
                 if execution_runtime_mode not in supported:
                     raise RuntimeError(
-                        f"❌ execution runtime {execution_runtime_mode!r} not supported by stage "
-                        f"{stage_id}/{repo_stage_id} (supported: {sorted(supported)})"
+                        f"❌ execution runtime {execution_runtime_mode!r} not supported by target_run "
+                        f"{target_run_id}/{repo_step_id} (supported: {sorted(supported)})"
                     )
-                stage_run_cmd = [runtime_dispatcher]
-                repo_stage_env = dict(stage_env)
-                repo_stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
-                repo_stage_env["cfg_files"] = json.dumps(repo_stage.get("cfg_files"))
-                repo_stage_env["STAGE_WRITE_VALUES_JSON"] = (
-                    "true" if repo_stage_runtime.get("values_json", True) else "false"
+                step_run_cmd = [runtime_dispatcher]
+                repo_step_env = dict(target_env)
+                repo_step_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
+                repo_step_env["cfg_files"] = json.dumps(repo_step.get("cfg_files"))
+                repo_step_env["STEP_WRITE_VALUES_JSON"] = (
+                    "true" if repo_step_runtime.get("values_json", True) else "false"
                 )
-                repo_stage_env["STAGE_WRITE_ENV_SH"] = (
-                    "true" if repo_stage_runtime.get("env_sh", True) else "false"
+                repo_step_env["STEP_WRITE_ENV_SH"] = (
+                    "true" if repo_step_runtime.get("env_sh", True) else "false"
                 )
-                repo_stage_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
-                repo_stage_env["STAGE_CFG_DIR"] = str(stage_cfg_dir)
-                repo_stage_env["STAGE_ARTIFACTS_DIR"] = str(stage_artifacts_dir)
+                repo_step_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
+                repo_step_env["TARGET_CFG_DIR"] = str(target_cfg_dir)
+                repo_step_env["TARGET_ARTIFACTS_DIR"] = str(target_artifacts_dir)
                 # Phase 26: CTL owns the box; hand the dispatcher the runtime + the
-                # stage's declared box spec. stage_dir locates src/stage.sh in the repo.
-                repo_stage_env["ATLAS_EXECUTION_RUNTIME_MODE"] = execution_runtime_mode
-                repo_stage_env["ATLAS_STAGE_NAME"] = _stage_box_name(stage_id, repo_stage_id)
-                repo_stage_env["ATLAS_STAGE_IMAGE"] = repo_stage_runtime["image"]
-                repo_stage_env["ATLAS_STAGE_DOCKER_BUILD"] = (
-                    "true" if repo_stage_runtime.get("docker_build", False) else "false"
+                # target_run's declared box spec. step_dir locates src/step.sh in the repo.
+                repo_step_env["ATLAS_EXECUTION_RUNTIME_MODE"] = execution_runtime_mode
+                repo_step_env["ATLAS_STEP_NAME"] = _step_box_name(target_run_id, repo_step_id)
+                repo_step_env["ATLAS_STEP_IMAGE"] = repo_step_runtime["image"]
+                repo_step_env["ATLAS_STEP_DOCKER_BUILD"] = (
+                    "true" if repo_step_runtime.get("docker_build", False) else "false"
                 )
-                repo_stage_env["stage_dir"] = repo_stage_path
-                repo_stage_env["local_stage_tooling_mode"] = tooling_mode
+                repo_step_env["step_dir"] = repo_step_path
+                repo_step_env["local_step_tooling_mode"] = tooling_mode
 
-                logging.info(" ".join(stage_run_cmd))
+                logging.info(" ".join(step_run_cmd))
                 run_and_log(
-                    stage_run_cmd,
+                    step_run_cmd,
                     cwd=repo_path,
-                    env=repo_stage_env,
+                    env=repo_step_env,
                 )
-            ctl_state_push(f"stage {stage_id} completed")
+            ctl_state_push(f"target_run {target_run_id} completed")
+            if target_instance_address is not None:
+                revision = finish_workflow_target_run(target_state_run_dir)
+                if revision is not None:
+                    child_revisions.append(revision)
+        except BaseException as error:
+            if target_instance_address is not None:
+                finish_workflow_target_run(target_state_run_dir, error=error)
+            raise
         finally:
             repo_execution_context_path = repo_path / EXECUTION_CONTEXT_FILENAME
             if copied_execution_context and repo_execution_context_path.is_file():
                 repo_execution_context_path.unlink()
+
+    if child_revisions:
+        update_run_metadata(run_dir, {"child_revisions": child_revisions})
 
 
 def print_run_summary(run_id: str, log_file: Path) -> None:
@@ -6194,12 +8400,12 @@ def run_maintenance(
     ctl_ref_policy: str,
     inventory_name: str,
     maintenance_action: str,
-    stage_target: str,
+    target_key: str,
     lock_id: str,
     run_id: str,
     plt_overlays: list[str],
-    stage_repo_key: str,
-    require_stage_ref: bool,
+    target_repo_key: str,
+    require_target_ref: bool,
     use_local_tooling_cfg: bool,
     provider_implementation_key: str,
     run_dir: Path,
@@ -6208,12 +8414,12 @@ def run_maintenance(
     log_file: Path,
     provider_credential: str | None,
     execution_runtime_mode: str,
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     execution_access_mode: str = "standard",
 ) -> None:
-    """Run a maintenance action against a single stage target."""
+    """Run a maintenance action against a single target_run target."""
     if maintenance_action == "force-unlock" and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir):
         print_run_summary(run_id, log_file)
         return
@@ -6223,7 +8429,7 @@ def run_maintenance(
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
         execution_access_mode=execution_access_mode,
@@ -6231,8 +8437,8 @@ def run_maintenance(
     )
     scope_params = scope_params_from_context(execution_context)
     validate_execution_context_constraints(ctl_cfg_root, execution_context)
-    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
-    maintenance_workflow_cfg = {"stages": [{"target": stage_target}]}
+    inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name, execution_context)
+    maintenance_workflow_cfg = {"target_runs": [{"target": target_key}]}
     validate_target_policy_constraints(ctl_cfg_root, ctl_profile, maintenance_workflow_cfg, inventory_cfg)
     validate_execution_access(
         ctl_cfg_root,
@@ -6240,29 +8446,26 @@ def run_maintenance(
         maintenance_workflow_cfg,
         inventory_cfg,
         execution_context=execution_context,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
-    ctl_state_domain = resolve_run_domain(
-        maintenance_workflow_cfg,
-        inventory_cfg,
-        load_ctl_state_backends_cfg(ctl_cfg_root),
+    ctl_state_namespace_key, _ = resolve_ctl_state_namespace(
+        ctl_cfg_root, execution_context
     )
     verify_ctl_guardrails(
         ctl_cfg_root,
         guardrails_cfg_root,
         execution_context,
-        ctl_state_domain,
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
         ctl_profile,
-        ctl_state_domain,
+        ctl_state_namespace_key,
         execution_context,
         run_dir,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
@@ -6282,19 +8485,19 @@ def run_maintenance(
 
     workflow_cfg = {
         "meta": {
-            "name": f"{ctl_profile}/{inventory_name}/maintenance/{maintenance_action}/{stage_target}",
+            "name": f"{ctl_profile}/{inventory_name}/maintenance/{maintenance_action}/{target_key}",
             "inventory": inventory_name,
         },
-        "stages": [
+        "target_runs": [
             {
-                "id": stage_target,
-                "target": stage_target,
+                "id": target_key,
+                "target": target_key,
             }
         ],
     }
     validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
 
-    active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
+    active_target_runs, pipeline_run_cfg_path = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
@@ -6304,12 +8507,12 @@ def run_maintenance(
         plt_overlays,
         scope_params=scope_params,
         execution_context=execution_context,
-        stage_repo_key=stage_repo_key,
-        require_stage_ref=require_stage_ref,
+        target_repo_key=target_repo_key,
+        require_target_ref=require_target_ref,
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
-    record_run_target_keys(run_dir, target_keys_from_active_stages(active_stages))
+    record_run_target_keys(run_dir, target_keys_from_active_target_runs(active_target_runs))
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
     verify_guardrails(
         ctl_cfg_root,
@@ -6318,15 +8521,16 @@ def run_maintenance(
         plt_rendered_dir,
         execution_context,
         scope_params,
-        ctl_state_domain,
-        required_target_paths=required_target_paths_for_stages(active_stages),
+        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
     )
 
-    validate_stages_have_commits(active_stages, ctl_ref_policy)
+    validate_target_runs_have_commits(active_target_runs, ctl_ref_policy)
     provider_adapter = run_provider_adapter(execution_context)
-    provider_catalogs = provider_adapter.load_runtime_catalogs(ctl_cfg_root)
-    provider_adapter.validate_active_stage_access(
-        active_stages,
+    provider_catalogs = provider_adapter.load_runtime_catalogs(
+        ctl_cfg_root, execution_context=execution_context
+    )
+    provider_adapter.validate_active_target_access(
+        active_target_runs,
         provider_catalogs,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
@@ -6334,7 +8538,7 @@ def run_maintenance(
         provider_credential=provider_credential,
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
-    plt_stages_dir_path = run_cfg_distribution(
+    plt_targets_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path,
         plt_rendered_dir,
         run_dir,
@@ -6342,16 +8546,16 @@ def run_maintenance(
 
     os.chdir(run_dir)
     tooling_env = build_tooling_env(tooling_refs)
-    if len(active_stages) != 1:
+    if len(active_target_runs) != 1:
         raise RuntimeError(
-            f"❌ maintenance action '{maintenance_action}' expected exactly one active stage, got: {list(active_stages)}"
+            f"❌ maintenance action '{maintenance_action}' expected exactly one active target_run, got: {list(active_target_runs)}"
         )
 
-    stage_id, stage = next(iter(active_stages.items()))
-    log_stage_banner(f"[{inventory_name}] [maintenance/{maintenance_action}/{stage_id}]")
-    repo_path, stage_env = prepare_stage_repo(
-        stage_id,
-        stage,
+    target_run_id, target_run = next(iter(active_target_runs.items()))
+    log_target_run_banner(f"[{inventory_name}] [maintenance/{maintenance_action}/{target_run_id}]")
+    repo_path, target_env = prepare_target_repo(
+        target_run_id,
+        target_run,
         run_dir,
         tooling_env,
         provider_adapter=provider_adapter,
@@ -6361,33 +8565,33 @@ def run_maintenance(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
-    assertion_argv = provider_adapter.stage_assertion_argv(materialize_stage_utils(run_dir))
+    assertion_argv = provider_adapter.target_assertion_argv(materialize_step_utils(run_dir))
     if assertion_argv:
-        run_and_log(assertion_argv, cwd=repo_path, env=stage_env)
+        run_and_log(assertion_argv, cwd=repo_path, env=target_env)
 
-    stage_cfg_dir = plt_stages_dir_path / stage_id / "input"
-    if not stage_cfg_dir.is_dir():
-        raise RuntimeError(f"❌ stage input cfg dir not found for stage '{stage_id}': {stage_cfg_dir}")
+    target_cfg_dir = plt_targets_dir_path / target_run_id / "input"
+    if not target_cfg_dir.is_dir():
+        raise RuntimeError(f"❌ target_run input cfg dir not found for target_run '{target_run_id}': {target_cfg_dir}")
 
     if maintenance_action != "force-unlock":
         raise RuntimeError(f"❌ Unsupported maintenance action: {maintenance_action}")
 
     tfstate_key_var, tfstate_uri_var = resolve_force_unlock_tfstate_vars(repo_path)
-    stage_env["GITHUB_WORKSPACE"] = str(repo_path)
-    stage_env["MAINTENANCE_STAGE_CFG_DIR"] = str(stage_cfg_dir)
-    stage_env["TFSTATE_KEY_VAR"] = tfstate_key_var
-    stage_env["LOCK_ID"] = lock_id
+    target_env["GITHUB_WORKSPACE"] = str(repo_path)
+    target_env["MAINTENANCE_TARGET_CFG_DIR"] = str(target_cfg_dir)
+    target_env["TFSTATE_KEY_VAR"] = tfstate_key_var
+    target_env["LOCK_ID"] = lock_id
     execution_context_repo_path = repo_path / EXECUTION_CONTEXT_FILENAME
     shutil.copy2(execution_context_path, execution_context_repo_path)
-    stage_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
+    target_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
 
     maintenance_cmd = [
         "bash",
         "-lc",
         """
 set -euo pipefail
-source "$ATLAS_STAGE_UTILS_DIR/ctl/prepare_stage_runtime.sh"
-prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
+source "$ATLAS_STEP_UTILS_DIR/ctl/prepare_step_runtime.sh"
+prepare_step_runtime "${MAINTENANCE_TARGET_CFG_DIR}"
 ./bin/tf.sh infra init "$TFSTATE_KEY_VAR"
 ./bin/tf.sh infra force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
 """,
@@ -6396,87 +8600,260 @@ prepare_stage_runtime "${MAINTENANCE_STAGE_CFG_DIR}"
     run_and_log(
         maintenance_cmd,
         cwd=repo_path,
-        env=stage_env,
+        env=target_env,
     )
 
     print_run_summary(run_id, log_file)
 
 
-def resolve_run_domain(
-    workflow_cfg: dict,
-    inventory_cfg: dict,
-    ctl_state_backends_cfg: dict | None,
-) -> str | None:
-    """Resolve the run's single ctl-state domain from its active targets.
-
-    One state domain per run: all active targets that declare a
-    `ctl_state_backend_key` must declare the *same* one — that is the run's domain
-    (and it must exist in the ctl_state_backends registry). Targets that omit it
-    (commented in dev cfg) are the skip hatch. A run whose active targets declare
-    *different* domains is a hard error (a run is one state/lock/outdate boundary).
-    Returns the domain key, or None when no active target declares one."""
-    targets = inventory_cfg.get("stage_targets", {})
-    seen: dict[str, str] = {}  # domain -> first target that declared it
-    for entry in workflow_cfg.get("stages", []):
-        target_name = entry if isinstance(entry, str) else entry.get("target")
-        domain = (targets.get(target_name) or {}).get("ctl_state_backend_key")
-        if domain is None:
-            continue
-        seen.setdefault(domain, target_name)
-    if not seen:
-        return None
-    if len(seen) > 1:
-        detail = ", ".join(f"{d} ({t})" for d, t in sorted(seen.items()))
-        raise RuntimeError(
-            f"❌ run spans multiple ctl-state domains [{detail}]; a run is one state "
-            f"domain — split it into separate single-domain runs"
-        )
-    domain = next(iter(seen))
-    if ctl_state_backends_cfg is not None and domain not in ctl_state_backends_cfg:
-        known = ", ".join(sorted(ctl_state_backends_cfg)) or "none"
-        raise RuntimeError(
-            f"❌ ctl_state_backend_key {domain!r} has no ctl_state_backends entry; known domains: {known}"
-        )
-    return domain
+# §Phase 31 Q1g/Q1j — target-instance identity path contract.
+# Names and values in a Hive-style instance segment must match this charset
+# verbatim (no percent-encoding, no sha fallback for targets); the whole
+# instance suffix is capped so it stays well inside the S3 1024-byte key limit.
+INSTANCE_TOKEN_RE = re.compile(r"[a-z0-9_.-]+")
+INSTANCE_SUFFIX_MAX = 128
 
 
-def validate_locator_segments(segments, *, label: str) -> list[str]:
-    """Validate adapter-returned backend locator segments (§Phase 30).
-
-    Segments become local directory components mirrored 1:1 to the backend, so
-    they must be path-safe and start alphanumeric (which also reserves the
-    `_local` root — no adapter segment can collide with it)."""
-    if not isinstance(segments, (list, tuple)) or not segments:
-        raise RuntimeError(f"❌ {label} must return a non-empty list of path segments")
-    validated: list[str] = []
-    for segment in segments:
-        if not isinstance(segment, str) or not LOCATOR_SEGMENT_RE.fullmatch(segment):
-            raise RuntimeError(f"❌ {label} segment {segment!r} is not path-safe")
-        validated.append(segment)
-    return validated
-
-
-def resolve_domain_locator_segments(
-    ctl_cfg_root: Path, domain: str | None, execution_context: dict[str, object]
+def resolve_target_instance_segments(
+    target_instance_params, execution_context: dict[str, object], *, label: str
 ) -> list[str]:
-    """Backend locator for a state domain (§Phase 30): the provider adapter's
-    canonical path segments, unique within that provider's namespace. A
-    domain-less run gets the reserved local-only tree — structurally outside
-    every backend mirror, never synced."""
-    if domain is None:
-        return list(LOCAL_ONLY_LOCATOR)
-    buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
-    if buckets is None or domain not in buckets:
-        known = ", ".join(sorted(buckets or {})) or "none"
+    """Resolve declared target_instance_params to Hive-style path segments in
+    declaration order (§Phase 31 Q1j): `["account=dev", "env_type=dev"]`.
+
+    Empty/absent params => a singleton target (no instances/ layer, `[]`).
+    Each param name and value must match INSTANCE_TOKEN_RE verbatim and be
+    present in the execution context; the joined suffix is capped at
+    INSTANCE_SUFFIX_MAX (hard error, never a sha fallback — Q1g)."""
+    if target_instance_params is None:
+        return []
+    if not isinstance(target_instance_params, list):
+        raise RuntimeError(f"❌ {label}: target_instance_params must be a list")
+    segments: list[str] = []
+    seen: set[str] = set()
+    for param in target_instance_params:
+        if not isinstance(param, str) or not INSTANCE_TOKEN_RE.fullmatch(param):
+            raise RuntimeError(
+                f"❌ {label}: target_instance_params name {param!r} must match [a-z0-9_.-]+"
+            )
+        if param in seen:
+            raise RuntimeError(f"❌ {label}: target_instance_params lists {param!r} twice")
+        seen.add(param)
+        ref = f"{EXECUTION_CONTEXT_ROOT}.params.{param}"
+        if ref not in execution_context:
+            raise RuntimeError(
+                f"❌ {label}: target_instance_params {param!r} is not in the execution context "
+                "(instance identity params must be bound)"
+            )
+        value = str(execution_context[ref])
+        if not INSTANCE_TOKEN_RE.fullmatch(value):
+            raise RuntimeError(
+                f"❌ {label}: instance value {param}={value!r} must match [a-z0-9_.-]+ "
+                "(no percent-encoding; shorten or rename the value)"
+            )
+        segments.append(f"{param}={value}")
+    suffix = "/".join(segments)
+    if len(suffix) > INSTANCE_SUFFIX_MAX:
         raise RuntimeError(
-            f"❌ ctl_state_backend_key {domain!r} has no ctl_state_backends entry; known domains: {known}"
+            f"❌ {label}: instance suffix {suffix!r} exceeds {INSTANCE_SUFFIX_MAX} chars "
+            "(shorten instance param values — no sha fallback for target instances, Q1g)"
         )
-    entry = buckets[domain]
-    adapter = get_provider_adapter(entry["provider"])
-    return validate_locator_segments(
-        adapter.ctl_state_backend_locator(domain, entry, execution_context),
-        label=f"ctl_state_backends.{domain} locator",
-    )
+    return segments
+
+
+# §Phase 31 Q1b — interim global mutation lock (deliberate tech debt, see
+# tech-debt.md "Ctl-state locking"): ONE lock object per namespace at
+# locks/mutation.yaml. Mutating runs acquire it exclusively (conditional
+# create); non-mutating runs only check it and fail fast. Stale locks (past
+# expires_at) may be broken; the breaker records broke_lock_of.
+MUTATION_LOCK_RELPATH = "locks/mutation.yaml"
+MUTATING_ACTIONS = ("provision", "destroy")
+MUTATION_LOCK_TTL_SECONDS = 3600
+
+
+def build_mutation_lock_doc(run_id: str, action: str, *, broke_lock_of: str | None = None) -> dict:
+    now = datetime.now(timezone.utc)
+    doc = {
+        "run_id": run_id,
+        "run_type": "mutation",
+        "action": action,
+        "acquired_at": now.isoformat(),
+        "expires_at": (now + timedelta(seconds=MUTATION_LOCK_TTL_SECONDS)).isoformat(),
+    }
+    if broke_lock_of:
+        doc["broke_lock_of"] = broke_lock_of
+    return doc
+
+
+def mutation_lock_is_stale(lock_doc: dict, *, now: datetime | None = None) -> bool:
+    expires = lock_doc.get("expires_at")
+    if not isinstance(expires, str):
+        return True  # malformed locks are breakable, not deadlocks
+    try:
+        expiry = datetime.fromisoformat(expires)
+    except ValueError:
+        return True
+    return (now or datetime.now(timezone.utc)) >= expiry
+
+
+def evaluate_mutation_lock(
+    existing_lock: dict | None, *, action: str, run_id: str
+) -> dict:
+    """Pure decision logic for the interim global mutation lock (§Phase 31 Q1b).
+
+    Returns {decision, lock_doc?, holder?}: mutating actions ACQUIRE (or BREAK a
+    stale lock, recording broke_lock_of); a live holder blocks them. Non-mutating
+    actions only CHECK: they proceed when free, fail fast with the holder's run
+    id while a mutation runs. The physical conditional write/read is the
+    backend adapter's job."""
+    mutating = action in MUTATING_ACTIONS
+    if existing_lock is None:
+        if mutating:
+            return {"decision": "acquire", "lock_doc": build_mutation_lock_doc(run_id, action)}
+        return {"decision": "proceed"}
+    if mutation_lock_is_stale(existing_lock):
+        if mutating:
+            return {
+                "decision": "break_and_acquire",
+                "lock_doc": build_mutation_lock_doc(
+                    run_id, action, broke_lock_of=str(existing_lock.get("run_id"))
+                ),
+            }
+        return {"decision": "proceed"}
+    holder = str(existing_lock.get("run_id"))
+    return {"decision": "blocked", "holder": holder}
+
+
+def target_instance_address(target_key: str, instance_segments: list[str]) -> str:
+    """The canonical target-instance address (§Phase 31): `<target-key>` for a
+    singleton, `<target-key>/<seg>/<seg>` for a parameterized instance — the
+    SAME path form as the instance dir layout (segments contain `=`, key
+    segments never do, so the split is unambiguous)."""
+    if not instance_segments:
+        return target_key
+    return "/".join([target_key, *instance_segments])
+
+
+def workflow_composition_sha256(target_instance_addresses: list[str]) -> str:
+    """Workflow instance identity (§Phase 31 Q2): SHA-256 over the UTF-8 bytes
+    of a whitespace-free canonical JSON array of the ORDERED resolved
+    target-instance addresses. The digest is a deterministic index — the
+    accompanying identity.yaml records the full addresses and stays the
+    authoritative identity source."""
+    if not isinstance(target_instance_addresses, list) or not target_instance_addresses:
+        raise RuntimeError("❌ workflow composition needs a non-empty ordered address list")
+    for address in target_instance_addresses:
+        if not isinstance(address, str) or not address.strip():
+            raise RuntimeError("❌ workflow composition addresses must be non-empty strings")
+    canonical = json.dumps(list(target_instance_addresses), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_workflow_identity_doc(
+    workflow_key: str, target_instance_addresses: list[str], resolved_params: dict[str, str]
+) -> dict:
+    """The authoritative workflow-instance identity manifest (§Phase 31 Q2):
+    facts only — the digest is never the only identity source."""
+    # the composition sha is the instance DIR NAME — not duplicated here
+    return {
+        "workflow_instance": {
+            "workflow": workflow_key,
+            "targets": list(target_instance_addresses),
+            "resolved_params": dict(resolved_params),
+        }
+    }
+
+
+# §Phase 31 — the central-namespace ctl-state tree. A state owner is a target
+# instance or a workflow instance; fan-outs are stateless (no bucket presence).
+# Structural names never contain `=`, so they can never be mistaken for an
+# instance segment (Q1j parse boundary).
+RESULT_KINDS = ("target", "workflow")
+STATE_STRUCTURAL_NAMES = frozenset({"runs", "committed.yaml", "identity.yaml", "locks"})
+
+
+def compose_state_relpath(
+    action: str, kind: str, key: str, instance_segments: list[str]
+) -> Path:
+    """Compose the namespace-relative instance directory for a state owner
+    (§Phase 31): `<action>/<kind>/<key...>/instances/<seg>/<seg>` — or, for a
+    singleton target, `<action>/<kind>/<key...>` with no instances/ layer. The
+    namespace root is prepended by the caller."""
+    if action not in RUN_ACTIONS:
+        raise RuntimeError(f"❌ unknown action {action!r} composing state path")
+    if kind not in RESULT_KINDS:
+        raise RuntimeError(f"❌ unknown state kind {kind!r} (expected one of {RESULT_KINDS})")
+    key_parts = [p for p in key.split("/") if p]
+    if not key_parts:
+        raise RuntimeError("❌ state key must be non-empty")
+    parts = [action, kind, *key_parts]
+    if instance_segments:
+        parts += ["instances", *instance_segments]
+    return Path(*parts)
+
+
+def parse_state_relpath(namespace_root: Path, state_dir: Path) -> dict | None:
+    """Inverse of compose_state_relpath: parse an instance directory back to its
+    identity (§Phase 31). Returns None when the path is not under the namespace
+    root or does not match the tree shape."""
+    try:
+        rel = Path(state_dir).resolve().relative_to(Path(namespace_root).resolve())
+    except ValueError:
+        return None
+    parts = list(rel.parts)
+    if len(parts) < 3 or parts[0] not in RUN_ACTIONS or parts[1] not in RESULT_KINDS:
+        return None
+    action, kind, rest = parts[0], parts[1], parts[2:]
+    if "instances" in rest:
+        idx = rest.index("instances")
+        key_parts = rest[:idx]
+        after = rest[idx + 1:]
+        if after and after[0].startswith("sha256-"):
+            # workflow composition instance: exactly one sha256-<digest> segment
+            instance_segments = [after[0]]
+        else:
+            instance_segments, _ = split_instance_segments(after)
+    else:
+        # singleton: key runs until the first structural name
+        key_parts = []
+        for part in rest:
+            if part in STATE_STRUCTURAL_NAMES:
+                break
+            key_parts.append(part)
+        instance_segments = []
+    if not key_parts:
+        return None
+    key = "/".join(key_parts)
+    return {
+        "action": action,
+        "kind": kind,
+        "key": key,
+        "instance_segments": instance_segments,
+        "instance": "/".join(instance_segments),
+        "address": "/".join([kind, key, *instance_segments]),
+    }
+
+
+def instance_relpath(instance_segments: list[str]) -> str:
+    """The `instances/<seg>/<seg>` relative path for a target instance, or ''
+    for a singleton target (no instances/ layer, §Phase 31 Q1j)."""
+    if not instance_segments:
+        return ""
+    return "/".join(["instances", *instance_segments])
+
+
+def split_instance_segments(parts: list[str]) -> tuple[list[str], list[str]]:
+    """Split a path fragment that begins after `instances/` into
+    (instance_segments, remaining) using the deterministic `=` boundary
+    (§Phase 31 Q1j): consume leading segments that contain `=`; the first
+    segment without `=` is where structure (`runs`, `committed.yaml`,
+    `identity.yaml`, `locks`) resumes. Structural names never contain `=`."""
+    instance: list[str] = []
+    for i, part in enumerate(parts):
+        if "=" in part:
+            instance.append(part)
+        else:
+            return instance, list(parts[i:])
+    return instance, []
 
 
 def resolve_run_locator_segments(
@@ -6490,16 +8867,25 @@ def resolve_run_locator_segments(
     workflow_name: str | None = None,
     target_name: str | None = None,
     ctl_variants: list[str] | tuple[str, ...] = (),
-    sub_workflow_domain: str | None = None,
 ) -> list[str]:
     """Resolve a run's local ctl-state locator BEFORE its dirs exist (§Phase 30).
 
-    Pure cfg resolution: the run's single state domain (one-domain-per-run) maps
-    through the provider adapter to the backend mirror tree the run lives in.
-    The same domain is re-resolved when the syncer is armed and must agree.
-    fan_out and domain-less runs land under the reserved `_local` tree."""
-    if run_type == "fan_out":
+    Pure cfg resolution: the run's single ctl-state namespace maps through the
+    provider adapter to the backend mirror tree the run lives in. The same
+    namespace is re-resolved when the syncer is armed and must agree. Fan-out
+    and namespace-less runs land under the reserved `_local` tree."""
+    if run_type in ("fan_out", "step_sequence"):
+        # §Phase 31: fan-outs are stateless (local artifacts only) and
+        # step_sequence runs are synthetic dev-loop records — neither has a
+        # bucket presence.
         return list(LOCAL_ONLY_LOCATOR)
+    if run_type == "maintenance" and not target_name:
+        return list(LOCAL_ONLY_LOCATOR)
+    if run_type not in ("target", "workflow", "maintenance"):
+        raise RuntimeError(f"❌ unknown run_type {run_type!r} for locator resolution")
+    # §Phase 31: target/workflow state lives in the ONE resolved ctl-state
+    # namespace tree — the local root scopes by namespace key, the synchronized
+    # relative tree carries no provider locator segments.
     execution_context = build_execution_context(
         ctl_cfg_root,
         action=action,
@@ -6507,30 +8893,96 @@ def resolve_run_locator_segments(
         execution_params=execution_params,
         execution_runtime_mode=execution_runtime_mode,
     )
-    if run_type == "sub_workflow":
-        return resolve_domain_locator_segments(ctl_cfg_root, sub_workflow_domain, execution_context)
-    if run_type in ("target", "maintenance"):
-        if not target_name:
-            # maintenance selected by lock id only — no target, no domain.
-            return list(LOCAL_ONLY_LOCATOR)
-        workflow_cfg: dict = {"stages": [target_name]}
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, action)
-    elif run_type == "workflow":
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, action)
-        workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_profile, action, workflow_name, execution_context)
-        workflow_cfg = apply_ctl_variants_to_workflow_cfg(
-            ctl_cfg_root,
-            workflow_cfg,
-            inventory_cfg,
-            execution_context=execution_context,
-            inventory_name=action,
-            workflow_name=workflow_name,
-            ctl_variants=list(ctl_variants),
+    namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
+    return [namespace_key]
+
+
+def resolve_run_instance_identity(
+    ctl_cfg_root: Path,
+    *,
+    run_type: str,
+    action: str,
+    ctl_profile: str,
+    execution_params: dict[str, str],
+    execution_runtime_mode: str,
+    workflow_name: str | None = None,
+    target_name: str | None = None,
+    ctl_variants: list[str] | tuple[str, ...] = (),
+) -> dict | None:
+    """Resolve a run's target-instance identity BEFORE its dirs exist (§Phase 31 6b).
+
+    target run: the target's declared target_instance_params -> Hive segments;
+    workflow run: the ordered child target-instance addresses -> the sha256
+    composition segment + the authoritative identity doc. Returns
+    {instance_segments, address, target_addresses, identity_doc?} or None for
+    run types without instance identity (fan_out/step_sequence/maintenance)."""
+    if run_type not in ("target", "workflow"):
+        return None
+    execution_context = build_execution_context(
+        ctl_cfg_root,
+        action=action,
+        ctl_profile=ctl_profile,
+        execution_params=execution_params,
+        execution_runtime_mode=execution_runtime_mode,
+    )
+    inventory_cfg = load_inventory_cfg(ctl_cfg_root, action, execution_context)
+    targets = inventory_cfg.get("targets", {})
+
+    def target_segments(name: str) -> list[str]:
+        target_def = targets.get(name) or {}
+        return resolve_target_instance_segments(
+            target_def.get("target_instance_params"),
+            execution_context,
+            label=f"target {name}",
         )
-    else:
-        raise RuntimeError(f"❌ unknown run_type {run_type!r} for locator resolution")
-    domain = resolve_run_domain(workflow_cfg, inventory_cfg, load_ctl_state_backends_cfg(ctl_cfg_root))
-    return resolve_domain_locator_segments(ctl_cfg_root, domain, execution_context)
+
+    if run_type == "target":
+        if not target_name:
+            return None
+        segments = target_segments(target_name)
+        address = target_instance_address(target_name, segments)
+        resolved_params = {
+            key: str(execution_context[f"execution_context.params.{key}"])
+            for key in (targets.get(target_name) or {}).get("target_instance_params", [])
+        }
+        return {
+            "instance_segments": segments,
+            "address": address,
+            "target_addresses": [address],
+            "identity_doc": {
+                "target_instance": {
+                    "target": target_name,
+                    "resolved_params": resolved_params,
+                }
+            },
+        }
+    workflow_cfg = load_workflow_cfg(ctl_cfg_root, ctl_profile, action, workflow_name, execution_context)
+    workflow_cfg = apply_ctl_variants_to_workflow_cfg(
+        ctl_cfg_root,
+        workflow_cfg,
+        inventory_cfg,
+        execution_context=execution_context,
+        inventory_name=action,
+        workflow_name=workflow_name,
+        ctl_variants=list(ctl_variants),
+    )
+    addresses: list[str] = []
+    for entry in workflow_cfg.get("target_runs", []):
+        name = entry if isinstance(entry, str) else entry.get("target")
+        if not name:
+            continue
+        addresses.append(target_instance_address(name, target_segments(name)))
+    if not addresses:
+        raise RuntimeError(f"❌ workflow {workflow_name!r} resolves no target addresses")
+    digest = workflow_composition_sha256(addresses)
+    return {
+        "instance_segments": [f"sha256-{digest}"],
+        "address": f"{workflow_name}/sha256-{digest}",
+        "target_addresses": addresses,
+        "identity_doc": build_workflow_identity_doc(
+            workflow_name, addresses, dict(execution_params)
+        ),
+    }
 
 
 def run_provisions_ctl_state_backend(workflow_cfg: dict, inventory_cfg: dict) -> bool:
@@ -6538,8 +8990,8 @@ def run_provisions_ctl_state_backend(workflow_cfg: dict, inventory_cfg: dict) ->
     (declares provisions_ctl_state_backend: true). Such a run may legitimately start
     before its results bucket exists; every other run must find it already there
     under a `required` sync policy."""
-    targets = inventory_cfg.get("stage_targets", {})
-    for entry in workflow_cfg.get("stages", []):
+    targets = inventory_cfg.get("targets", {})
+    for entry in workflow_cfg.get("target_runs", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
         target_cfg = targets.get(target_name) or {}
         if target_cfg.get("provisions_ctl_state_backend") is True:
@@ -6549,7 +9001,7 @@ def run_provisions_ctl_state_backend(workflow_cfg: dict, inventory_cfg: dict) ->
 
 def active_target_names(workflow_cfg: dict) -> list[str]:
     names: list[str] = []
-    for entry in workflow_cfg.get("stages", []):
+    for entry in workflow_cfg.get("target_runs", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
         if isinstance(target_name, str) and target_name:
             names.append(target_name)
@@ -6558,7 +9010,7 @@ def active_target_names(workflow_cfg: dict) -> list[str]:
 
 def active_targets_missing_key(workflow_cfg: dict, inventory_cfg: dict, skip_key: str) -> list[str]:
     """Targets that do NOT declare the given skip_* key (presence = capability)."""
-    targets = inventory_cfg.get("stage_targets", {})
+    targets = inventory_cfg.get("targets", {})
     missing: list[str] = []
     for target_name in active_target_names(workflow_cfg):
         target_cfg = targets.get(target_name) or {}
@@ -6587,7 +9039,7 @@ def validate_execution_access(
     *,
     execution_context: dict[str, object],
     execution_access_mode: str,
-    agreed_skip_ctl_state_backend_sync: bool,
+    agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
     provider_credential: str | None,
     force_skip_execution_identity_preflight_check: bool = False,
@@ -6621,7 +9073,7 @@ def validate_execution_access(
     # declare a direct credential source
     if execution_access_mode == "agreed_direct":
         identities = load_execution_identities_cfg(ctl_cfg_root)
-        targets = inventory_cfg.get("stage_targets", {})
+        targets = inventory_cfg.get("targets", {})
         for target_name in active_target_names(workflow_cfg):
             target_cfg = targets.get(target_name) or {}
             if not target_allows_agreed_direct_execution_access(target_cfg):
@@ -6648,7 +9100,7 @@ def validate_execution_access(
 
     # ctl-state sync skip (an operation, orthogonal to access mode)
     sync_permission_checks = (
-        ("--agreed-skip-ctl-state-backend-sync", agreed_skip_ctl_state_backend_sync, "allow_agreed_skip_ctl_state_backend_sync", ctl_allows_agreed_skip_ctl_state_backend_sync),
+        ("--agreed-defer-ctl-state-backend-sync", agreed_defer_ctl_state_backend_sync, "allow_agreed_defer_ctl_state_backend_sync", ctl_allows_agreed_defer_ctl_state_backend_sync),
         ("--force-skip-ctl-state-backend-sync", force_skip_ctl_state_backend_sync, "allow_force_skip_ctl_state_backend_sync", ctl_allows_force_skip_ctl_state_backend_sync),
     )
     for arg_name, requested, permission_key, profile_check in sync_permission_checks:
@@ -6674,12 +9126,12 @@ def validate_execution_access(
                 f"but ctl profile {ctl_profile!r} does not grant "
                 "allow_force_skip_execution_identity_preflight_check"
             )
-    if agreed_skip_ctl_state_backend_sync:
-        missing = active_targets_missing_key(workflow_cfg, inventory_cfg, "skip_ctl_state_backend_sync")
+    if agreed_defer_ctl_state_backend_sync:
+        missing = active_targets_missing_key(workflow_cfg, inventory_cfg, "allow_agreed_defer_ctl_state_backend_sync")
         if missing:
             raise RuntimeError(
-                "❌ --agreed-skip-ctl-state-backend-sync was requested, but active targets do not "
-                "declare skip_ctl_state_backend_sync: " + ", ".join(sorted(missing))
+                "❌ --agreed-defer-ctl-state-backend-sync was requested, but active targets do not "
+                "declare allow_agreed_defer_ctl_state_backend_sync: true: " + ", ".join(sorted(missing))
             )
 
 
@@ -6728,13 +9180,31 @@ def validate_target_policy_constraints(
             )
 
 
+def validate_target_policy_constraints_for_target(
+    ctl_cfg_root: Path, ctl_profile: str, target_key: str
+) -> None:
+    """Per-target variant of validate_target_policy_constraints — one target's
+    ref-policy requirement, so the ctl-policy report can attribute it per target."""
+    selected_ref_policy = ctl_ref_policy(ctl_cfg_root, ctl_profile)
+    for constraint in load_target_policy_constraints(ctl_cfg_root):
+        prefix = constraint["target_prefix"]
+        if not target_key.startswith(prefix):
+            continue
+        required_ref_policy = constraint["required_ref_policy"]
+        if selected_ref_policy != required_ref_policy:
+            raise RuntimeError(
+                f"❌ target {target_key!r} under {prefix!r} requires ref_policy "
+                f"{required_ref_policy!r}; ctl profile {ctl_profile!r} uses {selected_ref_policy!r}"
+            )
+
+
 def validate_workflow_target_selectors(
     workflow_cfg: dict,
     inventory_cfg: dict,
     execution_context: dict[str, object],
 ) -> None:
-    targets = inventory_cfg.get("stage_targets", {})
-    for entry in workflow_cfg.get("stages", []):
+    targets = inventory_cfg.get("targets", {})
+    for entry in workflow_cfg.get("target_runs", []):
         target_name = entry if isinstance(entry, str) else entry.get("target")
         target_cfg = targets.get(target_name)
         if target_cfg is None:
@@ -6746,45 +9216,41 @@ def validate_workflow_target_selectors(
                 f"selectors={selectors}"
             )
 
-def build_sub_workflow_cfg(
+def build_step_sequence_cfg(
     ctl_cfg_root: Path,
     action: str,
     *,
     source: str,
     ref: str,
     cfg_file_set_name: str,
-    sub_workflow: str,
+    step_sequence: str,
     execution_identity_key: str | None,
-    ctl_state_backend_key: str | None = None,
 ) -> tuple[dict, dict]:
-    """Build a one-target cfg for a synthetic repo-local sub_workflow run.
+    """Build a one-target cfg for a synthetic repo-local step_sequence run.
 
     The synthetic target is composed directly from CLI args and need not exist
-    in targets/<action>/. --ctl-state-backend-key supplies the state domain the
-    declared targets carry in cfg; omitted = no domain (skip triad applies).
+    in targets/<action>/. Synthetic runs are local-only and do not publish ctl state.
     """
-    stage_sources = collect_resource(ctl_cfg_root, "stage_sources")
+    target_sources = collect_resource(ctl_cfg_root, "target_sources")
     cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
     cfg_file_sets_path = ctl_cfg_root
     cfg_file_set = cfg_file_sets.get(cfg_file_set_name)
     if not isinstance(cfg_file_set, dict):
-        raise RuntimeError(f"❌ sub_workflow cfg_file_set {cfg_file_set_name!r} not found under {cfg_file_sets_path}")
+        raise RuntimeError(f"❌ step_sequence cfg_file_set {cfg_file_set_name!r} not found under {cfg_file_sets_path}")
     resolved = {
         "source": source,
         "ref": ref,
-        "sub_workflow": sub_workflow,
+        "step_sequence": step_sequence,
         "cfg_root": cfg_file_set.get("cfg_root", "/"),
         "cfg_files": resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
     }
     if execution_identity_key:
         resolved["execution_identity_key"] = execution_identity_key
-    if ctl_state_backend_key:
-        resolved["ctl_state_backend_key"] = ctl_state_backend_key
-    name = "sub_workflow"
-    inventory_cfg = {"stage_sources": stage_sources, "stage_targets": {name: resolved}}
+    name = "step_sequence"
+    inventory_cfg = {"target_sources": target_sources, "targets": {name: resolved}}
     workflow_cfg = {
-        "meta": {"name": f"sub_workflow/{source}/{sub_workflow}", "action": action},
-        "stages": [name],
+        "meta": {"name": f"step_sequence/{source}/{step_sequence}", "action": action},
+        "target_runs": [name],
     }
     return workflow_cfg, inventory_cfg
 
@@ -6816,11 +9282,33 @@ def validate_fan_out_param_collisions(
         )
 
 
-def expand_fan_out(ctl_cfg_root: Path, fan_out_key: str) -> dict:
+def load_domain_registry(ctl_cfg_root: Path) -> dict:
+    """The authored domain registry (§Phase 31 Q11): bare conceptual
+    declarations with flat keys. Every `domain` value appearing in cfg is
+    validated against these keys, so a typo'd domain becomes a load error
+    instead of a silent selector no-match."""
+    return collect_resource(ctl_cfg_root, "domains", entry_depth=1)
+
+
+def validate_domain_value(domains: dict, value: object, *, label: str) -> None:
+    if str(value) not in domains:
+        available = ", ".join(sorted(domains)) or "none"
+        raise RuntimeError(f"❌ {label}: unknown domain {value!r}; registry declares: {available}")
+
+
+def expand_fan_out(
+    ctl_cfg_root: Path, fan_out_key: str, execution_context: dict[str, object]
+) -> dict:
     """Expand a fan_out into concrete child runs — pure cfg logic, no execution and
     no state. Each child retains its optional parameter-set and entry keys so
     reports never conflate one declared workflow with its concrete expansions.
-    Each child is one existing workflow/target run; the driver loops the runners."""
+    Each child is one existing workflow/target run; the driver loops the runners.
+
+    §Phase 31: a param-set member is {params, selectors?}. A member whose
+    selectors do not match the frozen execution context is DROPPED before
+    children are built — one fan-out serves every zone, the per-zone member
+    set is resolved, not hardcoded. `domain` params are validated against the
+    domain registry."""
     fan_outs = collect_resource(ctl_cfg_root, "fan_outs", entry_depth=1)
     fan_out = fan_outs.get(fan_out_key)
     if not isinstance(fan_out, dict):
@@ -6830,6 +9318,7 @@ def expand_fan_out(ctl_cfg_root: Path, fan_out_key: str) -> dict:
     if not isinstance(runs, list) or not runs:
         raise RuntimeError(f"❌ fan-out {fan_out_key!r} has no runs")
     param_sets = collect_resource(ctl_cfg_root, "fan_out_param_sets", entry_depth=1)
+    domains = load_domain_registry(ctl_cfg_root)
     children: list[dict] = []
     for i, run in enumerate(runs):
         workflow_key, target_key = run.get("workflow_key"), run.get("target_key")
@@ -6857,9 +9346,30 @@ def expand_fan_out(ctl_cfg_root: Path, fan_out_key: str) -> dict:
             raise RuntimeError(
                 f"❌ fan-out {fan_out_key!r} run[{i}] references unknown fan_out_param_set {param_set_key!r}"
             )
-        for entry_name, params in param_set.items():
-            if not isinstance(params, dict):
-                raise RuntimeError(f"❌ fan_out_param_set {param_set_key!r}.{entry_name} must be a params map")
+        matched_members = 0
+        for entry_name, member in param_set.items():
+            member_label = f"fan_out_param_set {param_set_key!r}.{entry_name}"
+            if not isinstance(member, dict):
+                raise RuntimeError(f"❌ {member_label} must be a mapping")
+            unknown = set(member) - {"params", "selectors"}
+            if unknown:
+                raise RuntimeError(
+                    f"❌ {member_label} has unsupported keys {sorted(unknown)} "
+                    "(a member is params + optional selectors; selectors must NOT "
+                    "sit inside params)"
+                )
+            params = member.get("params")
+            if not isinstance(params, dict) or not params:
+                raise RuntimeError(f"❌ {member_label} params must be a non-empty map")
+            if "selectors" in params:
+                raise RuntimeError(f"❌ {member_label}: selectors must be a member field, not a param")
+            if "domain" in params:
+                validate_domain_value(domains, params["domain"], label=member_label)
+            if not selector_matches(
+                member.get("selectors"), execution_context,
+                label=member_label, structured_only=True,
+            ):
+                continue
             children.append(
                 {
                     "kind": kind,
@@ -6869,6 +9379,13 @@ def expand_fan_out(ctl_cfg_root: Path, fan_out_key: str) -> dict:
                     "fan_out_param_set_key": param_set_key,
                     "fan_out_param_entry_key": entry_name,
                 }
+            )
+            matched_members += 1
+        if matched_members == 0:
+            raise RuntimeError(
+                f"❌ fan-out {fan_out_key!r} run[{i}]: no member of fan_out_param_set "
+                f"{param_set_key!r} matches the execution context (a run entry must "
+                "contribute at least one child)"
             )
     max_parallel = fan_out.get("max_parallel", 1)
     if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1:
@@ -6885,7 +9402,14 @@ PREFLIGHT_RESULT_STATUSES = {
     "failed",
     "force_skipped",
     "not_applicable",
+    "not_evaluated",
 }
+
+
+class ProviderConfigBlockedError(RuntimeError):
+    """A live check could not be evaluated because an upstream cfg defect (e.g. a
+    malformed account id) blocks it. Surfaced per target as 'not_evaluated' with
+    the exact blocking reason — never as a genuine identity failure."""
 PREFLIGHT_SKIPPED_STATUSES = {
     "bypassed",
     "force_skipped",
@@ -6903,31 +9427,40 @@ def resolve_pipeline_selection(
     workflow_name: str | None,
     *,
     ctl_variants: list[str],
-    stage_repo_key: str,
-    require_stage_ref: bool,
+    target_repo_key: str,
+    require_target_ref: bool,
     execution_runtime_mode: str,
     provider_credential: str | None,
     execution_access_mode: str,
     target_name: str | None = None,
-    sub_workflow_run: dict | None = None,
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    step_sequence_run: dict | None = None,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_execution_identity_preflight_check: bool = False,
     enforce_ctl_policy: bool = True,
+    load_provider_catalogs: bool = True,
 ) -> dict:
-    """Resolve a run through active stages without touching state or plt cfg.
+    """Resolve a run through active target_runs without touching state or plt cfg.
 
     Policy-free resolution is used only to produce independent ctl-policy and
     execution-identity preflight artifacts. Callers must enforce both reports
     before executing the returned selection.
+
+    With `load_provider_catalogs=False` the provider adapter and its runtime
+    catalogs are NOT loaded (`provider_adapter`/`provider_catalogs` come back
+    None). The cfg-level result is enough for the provider-independent ctl-policy
+    preflight; call `load_selection_provider_catalogs` afterwards for the
+    execution-identity preflight, which does need catalogs. This split keeps a
+    provider-catalog failure (e.g. a malformed account id) from masquerading as a
+    ctl-policy failure.
     """
     execution_context = build_execution_context(
         ctl_cfg_root,
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
         execution_access_mode=execution_access_mode,
@@ -6940,27 +9473,26 @@ def resolve_pipeline_selection(
         validate_execution_context_constraints(ctl_cfg_root, execution_context)
     require_commit_refs = ref_policy_requires_commits(ctl_ref_policy)
 
-    if sub_workflow_run:
-        workflow_cfg, inventory_cfg = build_sub_workflow_cfg(
+    if step_sequence_run:
+        workflow_cfg, inventory_cfg = build_step_sequence_cfg(
             ctl_cfg_root,
             inventory_name,
-            source=sub_workflow_run["source"],
-            ref=sub_workflow_run["ref"],
-            cfg_file_set_name=sub_workflow_run["cfg_file_set"],
-            sub_workflow=sub_workflow_run["sub_workflow"],
-            execution_identity_key=sub_workflow_run.get("execution_identity_key"),
-            ctl_state_backend_key=sub_workflow_run.get("ctl_state_backend_key"),
+            source=step_sequence_run["source"],
+            ref=step_sequence_run["ref"],
+            cfg_file_set_name=step_sequence_run["cfg_file_set"],
+            step_sequence=step_sequence_run["step_sequence"],
+            execution_identity_key=step_sequence_run.get("execution_identity_key"),
         )
-        selection_kind = "sub_workflow"
-        selection_key = sub_workflow_run["sub_workflow"]
+        selection_kind = "step_sequence"
+        selection_key = step_sequence_run["step_sequence"]
     elif target_name:
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name, execution_context)
         workflow_cfg = {
             "meta": {
                 "name": f"{ctl_profile}/{inventory_name}/{target_name}",
                 "action": inventory_name,
             },
-            "stages": [target_name],
+            "target_runs": [target_name],
         }
         selection_kind = "target"
         selection_key = target_name
@@ -6972,7 +9504,7 @@ def resolve_pipeline_selection(
             workflow_name,
             execution_context,
         )
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name)
+        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name, execution_context)
         workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             workflow_cfg,
@@ -6985,7 +9517,7 @@ def resolve_pipeline_selection(
         selection_kind = "workflow"
         selection_key = workflow_name
 
-    if not sub_workflow_run:
+    if not step_sequence_run:
         validate_workflow_target_selectors(
             workflow_cfg, inventory_cfg, execution_context
         )
@@ -6999,7 +9531,7 @@ def resolve_pipeline_selection(
             workflow_cfg,
             inventory_cfg,
             execution_context=execution_context,
-            agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             execution_access_mode=execution_access_mode,
             provider_credential=provider_credential,
@@ -7010,19 +9542,24 @@ def resolve_pipeline_selection(
         validate_execution_runtime_mode(ctl_cfg_root, ctl_profile, execution_runtime_mode)
 
     refs = load_refs_cfg(ctl_cfg_root)
-    active_stages = build_active_stages(
+    active_target_runs = build_active_target_runs(
         workflow_cfg,
         inventory_cfg,
-        repo_key=stage_repo_key,
-        require_branch_or_commit=require_stage_ref,
+        repo_key=target_repo_key,
+        require_branch_or_commit=require_target_ref,
         refs=refs,
         execution_context=execution_context,
         require_commit_refs=require_commit_refs if enforce_ctl_policy else False,
     )
     if enforce_ctl_policy:
-        validate_stages_have_commits(active_stages, ctl_ref_policy)
-    provider_adapter = run_provider_adapter(execution_context)
-    provider_catalogs = provider_adapter.load_runtime_catalogs(ctl_cfg_root)
+        validate_target_runs_have_commits(active_target_runs, ctl_ref_policy)
+    provider_adapter = None
+    provider_catalogs = None
+    if load_provider_catalogs:
+        provider_adapter = run_provider_adapter(execution_context)
+        provider_catalogs = provider_adapter.load_runtime_catalogs(
+            ctl_cfg_root, execution_context=execution_context
+        )
     return {
         "selection_kind": selection_kind,
         "selection_key": selection_key,
@@ -7032,10 +9569,28 @@ def resolve_pipeline_selection(
         "workflow_cfg": workflow_cfg,
         "inventory_cfg": inventory_cfg,
         "refs": refs,
-        "active_stages": active_stages,
+        "active_target_runs": active_target_runs,
         "provider_adapter": provider_adapter,
         "provider_catalogs": provider_catalogs,
     }
+
+
+def load_selection_provider_catalogs(
+    selection: dict, ctl_cfg_root: Path, *, strict_account_ids: bool = True
+) -> dict:
+    """Attach the provider adapter + runtime catalogs to a selection resolved with
+    `load_provider_catalogs=False`. With `strict_account_ids=False` the catalogs
+    load even with placeholder account ids, so per-target resolution/preflight can
+    report the defect per target (blocked) instead of the load raising."""
+    execution_context = selection["execution_context"]
+    provider_adapter = run_provider_adapter(execution_context)
+    selection["provider_adapter"] = provider_adapter
+    selection["provider_catalogs"] = provider_adapter.load_runtime_catalogs(
+        ctl_cfg_root,
+        execution_context=execution_context,
+        strict_account_ids=strict_account_ids,
+    )
+    return selection
 
 
 def credential_free_preflight_failure_reason(error: BaseException) -> str:
@@ -7048,6 +9603,23 @@ def credential_free_preflight_failure_reason(error: BaseException) -> str:
     # report statuses carry the ❌ mark; the reason text stays plain
     detail = detail.lstrip("❌ ").strip()
     return detail or error.__class__.__name__
+
+
+def target_instance_display(
+    target_run: dict, execution_context: dict[str, object]
+) -> str:
+    """The target-instance identity for a report row: Hive segments joined
+    (`account=dev/env_type=dev`), `<singleton>` when the target has no instance
+    layer, or `<unresolved>` if its instance params don't bind."""
+    try:
+        segments = resolve_target_instance_segments(
+            target_run.get("target_instance_params"),
+            execution_context,
+            label="target instance",
+        )
+    except Exception:
+        return "<unresolved>"
+    return "/".join(segments) if segments else "<singleton>"
 
 
 def aggregate_execution_identity_preflight_status(statuses: list[str]) -> str:
@@ -7067,7 +9639,7 @@ def build_ctl_policy_preflight_report(
     execution_runtime_mode: str,
     execution_access_mode: str,
     provider_credential: str | None,
-    agreed_skip_ctl_state_backend_sync: bool,
+    agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
     force_skip_execution_identity_preflight_check: bool,
 ) -> dict:
@@ -7097,12 +9669,6 @@ def build_ctl_policy_preflight_report(
         ),
     )
     check(
-        "target_policy_constraints",
-        lambda: validate_target_policy_constraints(
-            ctl_cfg_root, ctl_profile, workflow_cfg, inventory_cfg
-        ),
-    )
-    check(
         "execution_access_policy",
         lambda: validate_execution_access(
             ctl_cfg_root,
@@ -7110,7 +9676,7 @@ def build_ctl_policy_preflight_report(
             workflow_cfg,
             inventory_cfg,
             execution_context=execution_context,
-            agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             execution_access_mode=execution_access_mode,
             provider_credential=provider_credential,
@@ -7127,13 +9693,50 @@ def build_ctl_policy_preflight_report(
     )
     check(
         "ref_policy",
-        lambda: validate_stages_have_commits(
-            selection["active_stages"], ctl_ref_policy
+        lambda: validate_target_runs_have_commits(
+            selection["active_target_runs"], ctl_ref_policy
         ),
     )
+    # Per-target policy checks (hybrid: selection-scoped checks above, target-
+    # scoped checks here).
+    targets: list[dict] = []
+    for target_key in sorted(active_target_names(workflow_cfg)):
+        target_checks: list[dict] = []
+
+        def target_check(name: str, validator) -> None:
+            try:
+                validator()
+                target_checks.append({"name": name, "status": "passed"})
+            except Exception as error:
+                target_checks.append(
+                    {
+                        "name": name,
+                        "status": "failed",
+                        "failure_reason": credential_free_preflight_failure_reason(error),
+                    }
+                )
+
+        target_check(
+            "target_policy_constraints",
+            lambda tk=target_key: validate_target_policy_constraints_for_target(
+                ctl_cfg_root, ctl_profile, tk
+            ),
+        )
+        targets.append(
+            {
+                "target_key": target_key,
+                "status": (
+                    "failed"
+                    if any(c["status"] == "failed" for c in target_checks)
+                    else "passed"
+                ),
+                "checks": target_checks,
+            }
+        )
     status = (
         "failed"
         if any(item["status"] == "failed" for item in checks)
+        or any(target["status"] == "failed" for target in targets)
         else "passed"
     )
     return {
@@ -7143,6 +9746,7 @@ def build_ctl_policy_preflight_report(
         },
         "status": status,
         "checks": checks,
+        "targets": targets,
     }
 
 
@@ -7152,28 +9756,27 @@ def wrap_fan_out_preflight_child(
     *,
     effective_params: dict[str, str] | None = None,
 ) -> dict:
-    """Attach concrete params and a parameter-set node when one was expanded."""
-    params = dict(
-        child.get("params") or {}
-        if effective_params is None
-        else effective_params
-    )
+    """Fold the child's own (per-member) params onto its workflow/target node,
+    and wrap it in a parameter-set node when one was expanded. Run-constant params
+    (provider, landing_zone, …) live on the fan-out header, not here."""
+    del effective_params  # per-member params are child["params"]; constants hoist
+    per_member = dict(child.get("params") or {})
     param_set_key = child.get("fan_out_param_set_key")
     entry_key = child.get("fan_out_param_entry_key")
     if param_set_key is None:
-        if not params:
+        if not per_member:
             return report
-        concrete_report = dict(report)
-        concrete_report["params"] = params
-        return concrete_report
+        return {**report, "params": per_member}
+    report_node = dict(report)
+    if per_member:
+        report_node["params"] = per_member
     return {
         "selection": {
             "kind": "fan_out_param_set",
             "key": f"{param_set_key}.{entry_key}",
         },
-        "params": params,
         "status": report["status"],
-        "children": [report],
+        "children": [report_node],
     }
 
 
@@ -7185,17 +9788,15 @@ def build_ctl_state_backend_preflight_result(
     execution_access_mode: str,
     provider_credential: str | None,
     force_skip: bool,
-    agreed_skip_ctl_state_backend_sync: bool,
+    agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
 ) -> dict:
     """Preflight the run's ctl-state backend synchronizer identity.
 
-    Mirrors the sync semantics: force-skip-sync and domain-less runs are
+    Mirrors the sync semantics: force-skip-sync and namespace-less runs are
     not_applicable (sync will not happen); agreed-skip still CHECKS the identity
     (only a missing bucket is tolerated, and only for a provisioning run — noted
     here, never failed; the syncer re-checks the bucket at every sync point)."""
-    workflow_cfg = selection["workflow_cfg"]
-    inventory_cfg = selection["inventory_cfg"]
     buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
     result: dict = {
         "ctl_state_backend": None,
@@ -7205,42 +9806,51 @@ def build_ctl_state_backend_preflight_result(
         "status": "not_applicable",
         "provider_path": [],
     }
+    if not buckets:
+        result["reason"] = "no ctl-state backend registry"
+        return result
     try:
-        domain = resolve_run_domain(workflow_cfg, inventory_cfg, buckets)
+        namespace_key, _ = resolve_ctl_state_namespace(
+            ctl_cfg_root, selection["execution_context"]
+        )
     except Exception as error:
         result["status"] = "failed"
         result["failure_reason"] = credential_free_preflight_failure_reason(error)
         return result
-    result["ctl_state_backend"] = domain
-    if domain is None:
-        result["reason"] = "no active target declares a state domain"
-        return result
+    result["ctl_state_backend"] = namespace_key
     if force_skip_ctl_state_backend_sync:
         result["reason"] = "ctl-state sync force-skipped for this run"
         return result
-    entry = buckets[domain]
+    if agreed_defer_ctl_state_backend_sync:
+        result["reason"] = (
+            "ctl-state sync readiness is validated once for the complete selected graph"
+        )
+        return result
+    entry = buckets[namespace_key]
     result["provider"] = entry.get("provider")
-    identity_key = entry.get("execution_identity_key")
+    identity_key = (entry.get("execution_identity_keys") or {}).get("sync")
     if identity_key is None:
         if execution_access_mode == "force_bypass":
             result["reason"] = "identity bypass: synchronizer uses the substitute credential"
             return result
         result["status"] = "failed"
-        result["failure_reason"] = f"ctl_state_backends.{domain} declares no execution_identity_key"
+        result["failure_reason"] = (
+            f"ctl_state_backends.{namespace_key} declares no execution_identity_keys.sync"
+        )
         return result
     identity_key = str(
         resolve_runtime_scalar(
             identity_key,
             selection["execution_context"],
-            label=f"ctl_state_backends.{domain}.execution_identity_key",
+            label=f"ctl_state_backends.{namespace_key}.execution_identity_keys.sync",
         )
     )
-    # the sync leg resolves the synchronizer in DIRECT mode (bypass runs keep bypass)
-    sync_access_mode = "force_bypass" if execution_access_mode == "force_bypass" else "agreed_direct"
+    # Ctl-state publication always uses its normal operation role path.
+    sync_access_mode = "force_bypass" if execution_access_mode == "force_bypass" else "standard"
     provider_adapter = selection["provider_adapter"]
     try:
         checked = provider_adapter.preflight_execution_identity(
-            f"ctl_state_backend/{domain}",
+            f"ctl_state_backend/{namespace_key}",
             {"execution_identity_key": identity_key},
             selection["provider_catalogs"],
             execution_context=selection["execution_context"],
@@ -7257,9 +9867,7 @@ def build_ctl_state_backend_preflight_result(
         result["failure_reason"] = credential_free_preflight_failure_reason(error)
         return result
     checked = dict(checked)
-    checked["ctl_state_backend"] = domain
-    if agreed_skip_ctl_state_backend_sync and run_provisions_ctl_state_backend(workflow_cfg, inventory_cfg):
-        checked["reason"] = "bucket may be absent; this run provisions it (agreed sync skip)"
+    checked["ctl_state_backend"] = namespace_key
     return checked
 
 
@@ -7271,29 +9879,29 @@ def build_execution_identity_preflight_report(
     provider_credential: str | None,
     force_skip: bool,
     ctl_cfg_root: Path | None = None,
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
 ) -> dict:
     """Run one adapter preflight per selected target and aggregate every result.
 
     When `ctl_cfg_root` is provided, the run's ctl-state backend synchronizer is
     checked as one more result row (same aggregate rules)."""
-    active_stages = selection["active_stages"]
+    active_target_runs = selection["active_target_runs"]
     provider_adapter = selection["provider_adapter"]
     catalogs = selection["provider_catalogs"]
     execution_context = selection["execution_context"]
 
-    target_stages: dict[str, tuple[str, dict]] = {}
-    for stage_id, stage in active_stages.items():
-        target_key = stage.get("target") or stage_id
-        target_stages.setdefault(target_key, (stage_id, stage))
+    target_runs_by_key: dict[str, tuple[str, dict]] = {}
+    for target_run_id, target_run in active_target_runs.items():
+        target_key = target_run.get("target") or target_run_id
+        target_runs_by_key.setdefault(target_key, (target_run_id, target_run))
 
     results: list[dict] = []
-    for target_key, (stage_id, stage) in target_stages.items():
+    for target_key, (target_run_id, target_run) in target_runs_by_key.items():
         try:
             result = provider_adapter.preflight_execution_identity(
-                stage_id,
-                stage,
+                target_run_id,
+                target_run,
                 catalogs,
                 execution_context=execution_context,
                 implementation_key=implementation_key,
@@ -7305,7 +9913,7 @@ def build_execution_identity_preflight_report(
                 raise RuntimeError("provider preflight returned a non-mapping result")
         except Exception as error:
             result = {
-                "execution_identity_key": stage.get("execution_identity_key"),
+                "execution_identity_key": target_run.get("execution_identity_key"),
                 "provider": execution_context.get(
                     f"{EXECUTION_CONTEXT_ROOT}.params.provider"
                 ),
@@ -7326,6 +9934,7 @@ def build_execution_identity_preflight_report(
             }
         result = dict(result)
         result["target_key"] = target_key
+        result["instance"] = target_instance_display(target_run, execution_context)
         results.append(result)
 
     if ctl_cfg_root is not None:
@@ -7337,7 +9946,7 @@ def build_execution_identity_preflight_report(
                 execution_access_mode=execution_access_mode,
                 provider_credential=provider_credential,
                 force_skip=force_skip,
-                agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+                agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
                 force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             )
         )
@@ -7358,118 +9967,398 @@ def build_execution_identity_preflight_report(
 def _preflight_status_tag(status: str) -> str:
     if status in PREFLIGHT_SKIPPED_STATUSES:
         return "[ skipped ⏭ ]"
+    if status == "not_evaluated":
+        return "[ not evaluated ⚠️ ]"
     marks = {"passed": "✅", "failed": "❌"}
     mark = marks.get(status)
     return f"[ {status} {mark} ]" if mark else f"[ {status} ]"
 
 
-def _preflight_text_lines(report: dict, *, indent: str = "") -> list[str]:
+# ── report rendering as a `tree`-style ASCII tree ──────────────────────────
+# Every report is converted to nodes {"label", "children"} then rendered with
+# └──/├──/│ connectors. Node labels already carry the status tag.
+def _node(label: str, children: list | None = None) -> dict:
+    return {"label": label, "children": children or []}
+
+
+def _tree_child_lines(children: list, prefix: str) -> list[str]:
+    lines: list[str] = []
+    for index, child in enumerate(children):
+        last = index == len(children) - 1
+        lines.append(prefix + ("└── " if last else "├── ") + child["label"])
+        lines.extend(
+            _tree_child_lines(child["children"], prefix + ("    " if last else "│   "))
+        )
+    return lines
+
+
+def _render_tree(root: dict) -> list[str]:
+    return [root["label"]] + _tree_child_lines(root["children"], "")
+
+
+def _report_node_label(report: dict) -> str:
     selection = report["selection"]
-    lines = [
-        f"{indent}{selection['kind']}: {selection['key']} {_preflight_status_tag(report['status'])}"
-    ]
-    child_indent = indent + "  "
+    label = f"{selection['kind']}: {selection['key']}"
     params = report.get("params") or {}
     if params:
-        rendered_params = ", ".join(
-            f"{key}={value}" for key, value in sorted(params.items())
-        )
-        lines.append(f"{child_indent}params: {rendered_params}")
-    for child in report.get("children", []):
-        lines.extend(_preflight_text_lines(child, indent=child_indent))
+        label += "  (" + ", ".join(f"{k}={v}" for k, v in sorted(params.items())) + ")"
+    return f"{label} {_preflight_status_tag(report['status'])}"
+
+
+def _nested_report_node(report: dict, leaf_builder) -> dict:
+    node = _node(_report_node_label(report))
     if report.get("failure_reason"):
-        lines.append(f"{child_indent}error: {report['failure_reason']}")
+        # a not_evaluated node did not fail here — it just could not be checked
+        label = "not evaluated" if report.get("status") == "not_evaluated" else "error"
+        node["children"].append(_node(f"{label}: {report['failure_reason']}"))
+    for child in report.get("children", []):
+        node["children"].append(_nested_report_node(child, leaf_builder))
+    node["children"].extend(leaf_builder(report))
+    return node
+
+
+def _identity_result_nodes(report: dict) -> list[dict]:
+    nodes: list[dict] = []
     for result in report.get("results", []):
-        identity_key = result.get("execution_identity_key") or "<unresolved>"
-        # container rows carry ONLY passed/failed; the identity row keeps the
-        # raw status (bypassed/force-skipped/not-applicable count as passed)
-        row_status = "failed" if result["status"] == "failed" else "passed"
+        status = result["status"]
+        tag = _preflight_status_tag
         if "ctl_state_backend" in result:
-            domain = result.get("ctl_state_backend") or "<none>"
-            lines.append(
-                f"{child_indent}ctl_state_backend: {domain} "
-                f"{_preflight_status_tag(result['status'])}"
-            )
+            children: list[dict] = []
             if result.get("execution_identity_key"):
-                lines.append(
-                    f"{child_indent}  execution_identity: {identity_key} "
-                    f"{_preflight_status_tag(result['status'])}"
+                children.append(
+                    _node(
+                        f"execution_identity: {result['execution_identity_key']} {tag(status)}"
+                    )
                 )
-        else:
-            lines.append(
-                f"{child_indent}target: {result['target_key']} {_preflight_status_tag(row_status)}"
+            if result.get("reason"):
+                children.append(_node(f"reason: {result['reason']}"))
+            nodes.append(
+                _node(
+                    f"ctl_state_backend: {result.get('ctl_state_backend') or '<none>'} {tag(status)}",
+                    children,
+                )
             )
-            lines.append(
-                f"{child_indent}  execution_identity: {identity_key} "
-                f"{_preflight_status_tag(result['status'])}"
+            continue
+        # container row carries only passed/failed/not_evaluated; the identity
+        # row keeps the raw status (bypassed/skipped/not-applicable count as passed)
+        row_status = status if status in ("failed", "not_evaluated") else "passed"
+        identity_key = result.get("execution_identity_key") or "<unresolved>"
+        identity_children: list[dict] = []
+        for path_node in result.get("provider_path") or []:
+            display = (
+                path_node.get("display")
+                or path_node.get("cfg_key")
+                or path_node.get("node_type")
+                or "path"
+            )
+            pchildren = (
+                [_node(f"error: {path_node['failure_reason']}")]
+                if path_node.get("failure_reason")
+                else []
+            )
+            identity_children.append(
+                _node(f"{display} {tag(path_node.get('status', status))}", pchildren)
             )
         if result.get("reason"):
-            reason_indent = (
-                child_indent + "  "
-                if "ctl_state_backend" in result
-                and not result.get("execution_identity_key")
-                else child_indent + "    "
-            )
             reason = result["reason"]
-            if (
-                "ctl_state_backend" not in result
-                and result["status"] in PREFLIGHT_SKIPPED_STATUSES
-            ):
+            if status in PREFLIGHT_SKIPPED_STATUSES:
                 reason = "execution identity was skipped for this run"
-            lines.append(f"{reason_indent}reason: {reason}")
-        for node in result.get("provider_path") or []:
-            display = node.get("display") or node.get("cfg_key") or node.get("node_type") or "path"
-            lines.append(
-                f"{child_indent}    {display} {_preflight_status_tag(node.get('status', result['status']))}"
-            )
-            if node.get("failure_reason"):
-                lines.append(
-                    f"{child_indent}      error: {node['failure_reason']}"
-                )
+            identity_children.append(_node(f"reason: {reason}"))
         if result.get("failure_reason"):
-            lines.append(
-                f"{child_indent}    error: {result['failure_reason']}"
-            )
-    return lines
+            identity_children.append(_node(f"error: {result['failure_reason']}"))
+        if result.get("blocked"):
+            identity_children.append(_node(f"blocked: {result['blocked']}"))
+        identity_node = _node(
+            f"execution_identity: {identity_key} {tag(status)}", identity_children
+        )
+        # the identity is checked FOR this instance, so nest it under the instance
+        if result.get("instance"):
+            target_children = [_node(f"instance: {result['instance']}", [identity_node])]
+        else:
+            target_children = [identity_node]
+        nodes.append(
+            _node(f"target: {result['target_key']} {tag(row_status)}", target_children)
+        )
+    return nodes
 
 
-def _ctl_policy_preflight_text_lines(
-    report: dict, *, indent: str = ""
-) -> list[str]:
-    selection = report["selection"]
-    lines = [
-        f"{indent}{selection['kind']}: {selection['key']} {_preflight_status_tag(report['status'])}"
-    ]
-    child_indent = indent + "  "
-    params = report.get("params") or {}
-    if params:
-        rendered_params = ", ".join(
-            f"{key}={value}" for key, value in sorted(params.items())
+def _preflight_text_lines(report: dict) -> list[str]:
+    return _render_tree(_nested_report_node(report, _identity_result_nodes))
+
+
+def _policy_check_nodes(report: dict) -> list[dict]:
+    tag = _preflight_status_tag
+
+    def check_node(check: dict) -> dict:
+        children = (
+            [_node(f"error: {check['failure_reason']}")]
+            if check.get("failure_reason")
+            else []
         )
-        lines.append(f"{child_indent}params: {rendered_params}")
-    for child in report.get("children", []):
-        lines.extend(_ctl_policy_preflight_text_lines(child, indent=child_indent))
-    if report.get("failure_reason"):
-        lines.append(f"{child_indent}error: {report['failure_reason']}")
-    for check in report.get("checks", []):
-        lines.append(
-            f"{child_indent}check: {check['name']} {_preflight_status_tag(check['status'])}"
-        )
-        if check.get("failure_reason"):
-            lines.append(
-                f"{child_indent}  error: {check['failure_reason']}"
+        return _node(f"check: {check['name']} {tag(check['status'])}", children)
+
+    nodes = [check_node(check) for check in report.get("checks", [])]
+    for target in report.get("targets", []):
+        nodes.append(
+            _node(
+                f"target: {target['target_key']} {tag(target['status'])}",
+                [check_node(check) for check in target.get("checks", [])],
             )
-    return lines
+        )
+    return nodes
+
+
+def _ctl_policy_preflight_text_lines(report: dict) -> list[str]:
+    return _render_tree(_nested_report_node(report, _policy_check_nodes))
 
 
 def write_ctl_policy_preflight_artifacts(
     artifacts_dir: Path, report: dict
 ) -> None:
-    text_path = artifacts_dir / "ctl_policy_preflight.txt"
+    text_path = artifacts_dir / "ctl_policy_validation.txt"
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text(
         "\n".join(_ctl_policy_preflight_text_lines(report)) + "\n",
         encoding="utf-8",
+    )
+
+
+def build_cfg_validation_report(findings: list[dict]) -> dict:
+    """General cfg validation (run once): a flat list of cfg-path-keyed
+    well-formedness findings. Failed if any finding failed."""
+    status = "failed" if any(f.get("status") == "failed" for f in findings) else "passed"
+    return {"kind": "cfg_validation", "status": status, "findings": list(findings)}
+
+
+def _cfg_validation_text_lines(report: dict) -> list[str]:
+    root = _node(f"cfg validation {_preflight_status_tag(report['status'])}")
+    for finding in report.get("findings", []):
+        children = (
+            [_node(f"error: {finding['error']}")] if finding.get("error") else []
+        )
+        root["children"].append(
+            _node(
+                f"{finding['cfg_path']} {_preflight_status_tag(finding['status'])}",
+                children,
+            )
+        )
+    return _render_tree(root)
+
+
+def write_cfg_validation_artifacts(artifacts_dir: Path, report: dict) -> None:
+    text_path = artifacts_dir / "cfg_validation.txt"
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.write_text(
+        "\n".join(_cfg_validation_text_lines(report)) + "\n", encoding="utf-8"
+    )
+
+
+def collect_target_consumed_axes(
+    target_key: str,
+    inventory_target: dict,
+    *,
+    refs: dict,
+    execution_identities: dict,
+    execution_context: dict[str, object],
+) -> set[str]:
+    """§Phase 32 guard: statically derive the params-namespace axes a target
+    consumes at its three resolution chokepoints — ref template / ref group,
+    cfg_file_set + instance-schema group selectors (recorded at inventory load),
+    and identity group selectors + account_key template."""
+    consumed: set[str] = set(inventory_target.get("consumed_group_axes") or [])
+    raw_ref = inventory_target.get("ref")
+    consumed |= _template_param_axes(raw_ref)
+    scoped_refs = (refs or {}).get("scoped") or {}
+    ref_entry = scoped_refs.get(raw_ref)
+    if selector_group_is_group(ref_entry):
+        consumed |= _selector_param_axes(ref_entry.get("members"))
+        try:
+            member_template = resolve_selector_group_member(
+                ref_entry, execution_context,
+                value_field="ref_key",
+                label=f"target {target_key!r} ref group",
+                tolerate_none=True,
+            )
+        except Exception:
+            member_template = None
+        consumed |= _template_param_axes(member_template)
+    identity_key = inventory_target.get("execution_identity_key")
+    identity_entry = (execution_identities or {}).get(identity_key)
+    # §Phase 33: groups may nest (one dispatch axis per level) — gather every
+    # level's selector axes while walking to the concrete identity.
+    seen: set = set()
+    while (
+        isinstance(identity_entry, dict)
+        and "members" in identity_entry
+        and identity_key not in seen
+    ):
+        seen.add(identity_key)
+        consumed |= _selector_param_axes(identity_entry.get("members"))
+        next_key = None
+        for member in identity_entry["members"]:
+            if isinstance(member, dict) and selector_matches(
+                member.get("selectors"), execution_context,
+                label=f"consumed-axes scan {identity_key}", structured_only=True,
+            ):
+                next_key = member.get("identity_key")
+                break
+        if not next_key:
+            identity_entry = None
+            break
+        identity_key = next_key
+        identity_entry = (execution_identities or {}).get(identity_key)
+    if isinstance(identity_entry, dict):
+        consumed |= _template_param_axes(identity_entry.get("account_key"))
+    return consumed
+
+
+def instance_axis_exclusions(ctl_cfg_root: Path | None) -> set[str]:
+    """Axes that are NEVER instance axes: the provider dispatch key and the
+    namespace axes (already encoded in the ctl-state bucket choice, e.g.
+    landing_zone) — derived from the ctl_state_backends selectors, not a
+    hand-list."""
+    excluded = {"provider"}
+    if ctl_cfg_root is None:
+        return excluded
+    try:
+        for entry in load_ctl_state_backends_cfg(ctl_cfg_root).values():
+            if isinstance(entry, dict):
+                excluded |= _selector_param_axes([entry])
+    except Exception:
+        pass
+    return excluded
+
+
+def build_target_cfg_validation_report(
+    selection: dict,
+    *,
+    implementation_key: str,
+    execution_access_mode: str,
+    provider_credential: str | None,
+    ctl_cfg_root: Path | None = None,
+) -> dict:
+    """Per-target cfg reference resolution: does each target's identity/account
+    resolve in cfg (account-id format is stage-1's concern, so placeholders pass
+    here). Includes the §Phase 32 instance-axes guard: declared < consumed →
+    ERROR (self-override risk); declared > consumed → WARN (unused axis)."""
+    active_target_runs = selection["active_target_runs"]
+    provider_adapter = selection["provider_adapter"]
+    catalogs = selection["provider_catalogs"]
+    execution_context = selection["execution_context"]
+    by_key: dict[str, tuple[str, dict]] = {}
+    for target_run_id, target_run in active_target_runs.items():
+        by_key.setdefault(target_run.get("target") or target_run_id, (target_run_id, target_run))
+    results: list[dict] = []
+    for target_key, (target_run_id, target_run) in by_key.items():
+        try:
+            result = provider_adapter.resolve_target_cfg_references(
+                target_run_id,
+                target_run,
+                catalogs,
+                execution_context=execution_context,
+                implementation_key=implementation_key,
+                execution_access_mode=execution_access_mode,
+                provider_credential=provider_credential,
+            )
+        except Exception as error:
+            result = {
+                "status": "failed",
+                "rows": [],
+                "failure_reason": credential_free_preflight_failure_reason(error),
+            }
+        result = dict(result)
+        result["target_key"] = target_key
+        result["instance"] = target_instance_display(target_run, execution_context)
+        # §Phase 32 instance-axes guard
+        inventory_target = (selection["inventory_cfg"].get("targets") or {}).get(
+            target_key
+        )
+        if isinstance(inventory_target, dict):
+            consumed = collect_target_consumed_axes(
+                target_key,
+                inventory_target,
+                refs=selection.get("refs") or {},
+                execution_identities=(catalogs or {}).get("execution_identities") or {},
+                execution_context=execution_context,
+            ) - instance_axis_exclusions(ctl_cfg_root)
+            declared = set(target_run.get("target_instance_params") or [])
+            rows = result.setdefault("rows", [])
+            for axis in sorted(consumed - declared):
+                rows.append(
+                    {
+                        "name": f"instance_axis {axis}: consumed but not declared",
+                        "status": "failed",
+                    }
+                )
+                result["status"] = "failed"
+                result.setdefault(
+                    "failure_reason",
+                    "target varies by an undeclared axis — add it to "
+                    "target_instance_params or runs will self-override",
+                )
+            for axis in sorted(declared - consumed):
+                rows.append(
+                    {
+                        "name": f"instance_axis {axis}: declared but not consumed",
+                        "status": "warning",
+                    }
+                )
+        results.append(result)
+    status = aggregate_execution_identity_preflight_status(
+        [str(result["status"]) for result in results]
+    )
+    return {
+        "selection": {
+            "kind": selection["selection_kind"],
+            "key": selection["selection_key"],
+        },
+        "status": status,
+        "results": results,
+    }
+
+
+def _target_cfg_result_nodes(report: dict) -> list[dict]:
+    tag = _preflight_status_tag
+    nodes: list[dict] = []
+    for result in report.get("results", []):
+        children: list[dict] = []
+        if result.get("instance"):
+            children.append(_node(f"instance: {result['instance']}"))
+        for row in result.get("rows", []):
+            children.append(_node(f"{row['name']} {tag(row['status'])}"))
+        if result.get("failure_reason"):
+            children.append(_node(f"error: {result['failure_reason']}"))
+        nodes.append(
+            _node(f"target: {result['target_key']} {tag(result['status'])}", children)
+        )
+    return nodes
+
+
+def _target_cfg_validation_text_lines(report: dict) -> list[str]:
+    return _render_tree(_nested_report_node(report, _target_cfg_result_nodes))
+
+
+def write_target_cfg_validation_artifacts(artifacts_dir: Path, report: dict) -> None:
+    text_path = artifacts_dir / "target_cfg_validation.txt"
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.write_text(
+        "\n".join(_target_cfg_validation_text_lines(report)) + "\n", encoding="utf-8"
+    )
+
+
+def assert_target_cfg_validation_accepted(report: dict) -> None:
+    if report.get("status") != "failed":
+        return
+    failures = [
+        str(result.get("target_key", "<unknown>"))
+        for result in report.get("results", [])
+        if result.get("status") == "failed"
+    ]
+    for child in report.get("children", []):
+        if child.get("status") == "failed":
+            failures.append(str(child.get("selection", {}).get("key", "<unknown>")))
+    raise RuntimeError(
+        "❌ target cfg validation failed for: " + ", ".join(failures or ["selected run"])
     )
 
 
@@ -7518,6 +10407,89 @@ def assert_execution_identity_preflight_accepted(report: dict) -> None:
     )
 
 
+def build_selection_validation_reports(
+    selection: dict,
+    *,
+    ctl_cfg_root: Path,
+    ctl_profile: str,
+    ctl_ref_policy: str,
+    execution_runtime_mode: str,
+    execution_access_mode: str,
+    provider_credential: str | None,
+    implementation_key: str,
+    force_skip_execution_identity_preflight_check: bool,
+    agreed_defer_ctl_state_backend_sync: bool,
+    force_skip_ctl_state_backend_sync: bool,
+) -> dict:
+    """Build the three per-selection validation reports (ctl-policy, target-cfg,
+    execution-identity) for a selection resolved with load_provider_catalogs=
+    False. Catalogs are loaded LENIENTLY, so a placeholder account id becomes a
+    per-target 'blocked' row rather than a crash. Shared by the single runners
+    and the fan-out so all three stay in lockstep. (General cfg_validation is
+    run ONCE by the caller — it is not per-selection.)"""
+    # ctl-policy is provider-INDEPENDENT (each check try-wrapped) — it always
+    # produces real results, even if the provider catalog load below fails.
+    policy_report = build_ctl_policy_preflight_report(
+        selection,
+        ctl_cfg_root=ctl_cfg_root,
+        ctl_profile=ctl_profile,
+        ctl_ref_policy=ctl_ref_policy,
+        execution_runtime_mode=execution_runtime_mode,
+        execution_access_mode=execution_access_mode,
+        provider_credential=provider_credential,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        force_skip_execution_identity_preflight_check=(
+            force_skip_execution_identity_preflight_check
+        ),
+    )
+    selection_ref = {
+        "kind": selection["selection_kind"],
+        "key": selection["selection_key"],
+    }
+    try:
+        selection = load_selection_provider_catalogs(
+            selection, ctl_cfg_root, strict_account_ids=False
+        )
+        target_cfg_report = build_target_cfg_validation_report(
+            selection,
+            implementation_key=implementation_key,
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+            ctl_cfg_root=ctl_cfg_root,
+        )
+        identity_report = build_execution_identity_preflight_report(
+            selection,
+            implementation_key=implementation_key,
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+            force_skip=force_skip_execution_identity_preflight_check,
+            ctl_cfg_root=ctl_cfg_root,
+            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
+            force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        )
+    except Exception as error:
+        reason = credential_free_preflight_failure_reason(error)
+        target_cfg_report = {
+            "selection": selection_ref,
+            "status": "failed",
+            "results": [],
+            "failure_reason": reason,
+        }
+        identity_report = {
+            "selection": selection_ref,
+            "status": "failed",
+            "results": [],
+            "failure_reason": reason,
+        }
+    return {
+        "selection": selection,
+        "policy": policy_report,
+        "target_cfg": target_cfg_report,
+        "identity": identity_report,
+    }
+
+
 def resolve_and_preflight_execution_identities(
     ctl_cfg_root: Path,
     ctl_profile: str,
@@ -7527,20 +10499,22 @@ def resolve_and_preflight_execution_identities(
     workflow_name: str | None,
     *,
     ctl_variants: list[str],
-    stage_repo_key: str,
-    require_stage_ref: bool,
+    target_repo_key: str,
+    require_target_ref: bool,
     provider_implementation_key: str,
     execution_runtime_mode: str,
     provider_credential: str | None,
     execution_access_mode: str,
     artifacts_dir: Path,
     target_name: str | None = None,
-    sub_workflow_run: dict | None = None,
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    step_sequence_run: dict | None = None,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_execution_identity_preflight_check: bool = False,
 ) -> tuple[dict, dict]:
+    """Single-runner (workflow/target/step_sequence) preflight: the same four
+    validation reports the fan-out produces, for this one selection."""
     selection = resolve_pipeline_selection(
         ctl_cfg_root,
         ctl_profile,
@@ -7549,22 +10523,26 @@ def resolve_and_preflight_execution_identities(
         inventory_name,
         workflow_name,
         ctl_variants=ctl_variants,
-        stage_repo_key=stage_repo_key,
-        require_stage_ref=require_stage_ref,
+        target_repo_key=target_repo_key,
+        require_target_ref=require_target_ref,
         execution_runtime_mode=execution_runtime_mode,
         provider_credential=provider_credential,
         execution_access_mode=execution_access_mode,
         target_name=target_name,
-        sub_workflow_run=sub_workflow_run,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        step_sequence_run=step_sequence_run,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
         force_skip_execution_identity_preflight_check=(
             force_skip_execution_identity_preflight_check
         ),
         enforce_ctl_policy=False,
+        load_provider_catalogs=False,
     )
-    policy_report = build_ctl_policy_preflight_report(
+    cfg_report = build_cfg_validation_report(
+        collect_provider_cfg_findings(ctl_cfg_root, selection["execution_context"])
+    )
+    reports = build_selection_validation_reports(
         selection,
         ctl_cfg_root=ctl_cfg_root,
         ctl_profile=ctl_profile,
@@ -7572,27 +10550,23 @@ def resolve_and_preflight_execution_identities(
         execution_runtime_mode=execution_runtime_mode,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+        implementation_key=provider_implementation_key,
         force_skip_execution_identity_preflight_check=(
             force_skip_execution_identity_preflight_check
         ),
-    )
-    report = build_execution_identity_preflight_report(
-        selection,
-        implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
-        force_skip=force_skip_execution_identity_preflight_check,
-        ctl_cfg_root=ctl_cfg_root,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
     )
-    write_ctl_policy_preflight_artifacts(artifacts_dir, policy_report)
-    write_execution_identity_preflight_artifacts(artifacts_dir, report)
-    assert_ctl_policy_preflight_accepted(policy_report)
-    assert_execution_identity_preflight_accepted(report)
-    return selection, report
+    write_cfg_validation_artifacts(artifacts_dir, cfg_report)
+    write_target_cfg_validation_artifacts(artifacts_dir, reports["target_cfg"])
+    write_ctl_policy_preflight_artifacts(artifacts_dir, reports["policy"])
+    write_execution_identity_preflight_artifacts(artifacts_dir, reports["identity"])
+    # cfg_validation is a whole-cfg health view: always written, never blocking.
+    # A run is gated only by the SCOPED reports — what it actually touches.
+    assert_target_cfg_validation_accepted(reports["target_cfg"])
+    assert_ctl_policy_preflight_accepted(reports["policy"])
+    assert_execution_identity_preflight_accepted(reports["identity"])
+    return reports["selection"], reports["identity"]
 
 
 def run_pipeline(
@@ -7607,8 +10581,8 @@ def run_pipeline(
     run_id: str,
     plt_overlays: list[str],
     ctl_variants: list[str],
-    stage_repo_key: str,
-    require_stage_ref: bool,
+    target_repo_key: str,
+    require_target_ref: bool,
     use_local_tooling_cfg: bool,
     provider_implementation_key: str,
     run_dir: Path,
@@ -7618,18 +10592,21 @@ def run_pipeline(
     provider_credential: str | None,
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
     target_name: str | None = None,
-    sub_workflow_run: dict | None = None,
-    agreed_skip_ctl_state_backend_sync: bool = False,
+    step_sequence_run: dict | None = None,
+    agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     execution_access_mode: str = "standard",
     force_skip_execution_identity_preflight_check: bool = False,
+    skip_committed_rerun: bool = False,
+    parent_graph_provisions_ctl_state_backend: bool = False,
+    parent_ctl_state_backend_absence_confirmed: bool = False,
     preflight_selection: dict | None = None,
 ) -> None:
     """
-    Run a declared workflow, declared target, or synthetic repo-local sub_workflow.
+    Run a declared workflow, declared target, or synthetic repo-local step_sequence.
 
-    The caller passes stage repo settings and pre-created run/log directories.
+    The caller passes target_run repo settings and pre-created run/log directories.
     """
     if preflight_selection is None:
         selection, _ = resolve_and_preflight_execution_identities(
@@ -7640,16 +10617,16 @@ def run_pipeline(
             inventory_name,
             workflow_name,
             ctl_variants=ctl_variants,
-            stage_repo_key=stage_repo_key,
-            require_stage_ref=require_stage_ref,
+            target_repo_key=target_repo_key,
+            require_target_ref=require_target_ref,
             provider_implementation_key=provider_implementation_key,
             execution_runtime_mode=execution_runtime_mode,
             provider_credential=provider_credential,
             execution_access_mode=execution_access_mode,
             artifacts_dir=artifacts_dir,
             target_name=target_name,
-            sub_workflow_run=sub_workflow_run,
-            agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+            step_sequence_run=step_sequence_run,
+            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             force_skip_guardrails=force_skip_guardrails,
             force_skip_execution_identity_preflight_check=(
@@ -7660,17 +10637,29 @@ def run_pipeline(
         selection = preflight_selection
     execution_context = selection["execution_context"]
     scope_params = selection["scope_params"]
+    if selection.get("selection_kind") == "workflow":
+        definition_canonical = json.dumps(
+            selection["workflow_cfg"], separators=(",", ":"), sort_keys=True
+        )
+        update_run_metadata(
+            run_dir,
+            {
+                "workflow_definition_sha256": hashlib.sha256(
+                    definition_canonical.encode("utf-8")
+                ).hexdigest()
+            },
+        )
     require_commit_refs = selection["require_commit_refs"]
     workflow_cfg = selection["workflow_cfg"]
     inventory_cfg = selection["inventory_cfg"]
     refs = selection["refs"]
-    active_stages = selection["active_stages"]
+    active_target_runs = selection["active_target_runs"]
     provider_adapter = selection["provider_adapter"]
     provider_catalogs = selection["provider_catalogs"]
 
     # Preserve the runtime binding contract after the live gate passes.
-    provider_adapter.validate_active_stage_access(
-        active_stages,
+    provider_adapter.validate_active_target_access(
+        active_target_runs,
         provider_catalogs,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
@@ -7678,28 +10667,52 @@ def run_pipeline(
         provider_credential=provider_credential,
     )
 
-    # Ctl-state sync: resolve the run's single state domain from its active
-    # targets (one-domain-per-run; hard error if they disagree), then arm the
-    # syncer for that domain's bucket. Done after the target is known so a missing
-    # bucket is tolerated only for the ctl-state bootstrap target.
-    ctl_state_domain = resolve_run_domain(
-        workflow_cfg, inventory_cfg, load_ctl_state_backends_cfg(ctl_cfg_root)
+    selected_graph_provisions_backend = parent_graph_provisions_ctl_state_backend
+    backend_absence_confirmed = parent_ctl_state_backend_absence_confirmed
+    if agreed_defer_ctl_state_backend_sync and not selected_graph_provisions_backend:
+        graph_probe = inspect_selected_graph_ctl_state_backend(
+            [selection],
+            ctl_cfg_root,
+            implementation_key=provider_implementation_key,
+            execution_access_mode=execution_access_mode,
+            provider_credential=provider_credential,
+        )
+        selected_graph_provisions_backend = True
+        backend_absence_confirmed = graph_probe["status"] == "absent"
+        if not backend_absence_confirmed:
+            raise RuntimeError(
+                "❌ --agreed-defer-ctl-state-backend-sync is not applicable: "
+                "the selected backend already exists"
+            )
+    update_run_metadata(
+        run_dir,
+        {
+            "selected_graph_provisions_ctl_state_backend": selected_graph_provisions_backend,
+            "ctl_state_backend_absence_confirmed_at_start": backend_absence_confirmed,
+        },
+    )
+
+    # Resolve the run's namespace and arm publication only after the graph-level
+    # defer gate has frozen its provider-classified readiness fact.
+    ctl_state_namespace_key, _ = resolve_ctl_state_namespace(
+        ctl_cfg_root, execution_context
     )
     verify_ctl_guardrails(
         ctl_cfg_root,
         guardrails_cfg_root,
         execution_context,
-        ctl_state_domain,
     )
     configure_ctl_state_sync(
         ctl_cfg_root,
         ctl_profile,
-        ctl_state_domain,
+        ctl_state_namespace_key,
         execution_context,
         run_dir,
-        agreed_skip_ctl_state_backend_sync=agreed_skip_ctl_state_backend_sync,
+        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         provisions_ctl_state_backend=run_provisions_ctl_state_backend(workflow_cfg, inventory_cfg),
+        selected_graph_provisions_ctl_state_backend=selected_graph_provisions_backend,
+        backend_absence_confirmed=backend_absence_confirmed,
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
         provider_implementation_key=provider_implementation_key,
@@ -7715,7 +10728,7 @@ def run_pipeline(
     logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
 
     # Prepare pipeline config
-    active_stages, pipeline_run_cfg_path = prepare_pipeline_cfg(
+    active_target_runs, pipeline_run_cfg_path = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
@@ -7725,14 +10738,14 @@ def run_pipeline(
         plt_overlays,
         scope_params=scope_params,
         execution_context=execution_context,
-        stage_repo_key=stage_repo_key,
-        require_stage_ref=require_stage_ref,
+        target_repo_key=target_repo_key,
+        require_target_ref=require_target_ref,
         require_commit_refs=require_commit_refs,
         refs=refs,
-        active_stages=active_stages,
+        active_target_runs=active_target_runs,
     )
     # Single derivation chain: render the merged tree, then verify guards
-    # against rendered values, then distribute stage input views from it.
+    # against rendered values, then distribute target_run input views from it.
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
     verify_guardrails(
         ctl_cfg_root,
@@ -7741,23 +10754,22 @@ def run_pipeline(
         plt_rendered_dir,
         execution_context,
         scope_params,
-        ctl_state_domain,
-        required_target_paths=required_target_paths_for_stages(active_stages),
+        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
     )
 
-    if sub_workflow_run:
-        target_keys = sub_workflow_run.get("affected_target_keys") or []
+    if step_sequence_run:
+        target_keys = step_sequence_run.get("affected_target_keys") or []
         if inventory_name in MUTATING_ACTIONS and not target_keys:
-            raise RuntimeError("❌ mutating sub_workflow runs require affected_target_keys")
+            raise RuntimeError("❌ mutating step_sequence runs require affected_target_keys")
     else:
-        target_keys = target_keys_from_active_stages(active_stages)
+        target_keys = target_keys_from_active_target_runs(active_target_runs)
     record_run_target_keys(run_dir, target_keys)
     run_metadata = load_run_metadata(run_dir)
     ctl_state_local_root_value = run_metadata.get("ctl_state_local_root")
     if isinstance(ctl_state_local_root_value, str) and ctl_state_local_root_value:
         mark_removed_definitions_outdated(Path(ctl_state_local_root_value), ctl_cfg_root)
 
-    write_target_stage_flow_artifact(
+    write_target_flow_artifact(
         ctl_cfg_root,
         artifacts_dir,
         ctl_profile=ctl_profile,
@@ -7766,8 +10778,8 @@ def run_pipeline(
         workflow_name=workflow_name,
         ctl_variants=ctl_variants,
         plt_overlays=plt_overlays,
-        stage_repo_key=stage_repo_key,
-        require_stage_ref=require_stage_ref,
+        target_repo_key=target_repo_key,
+        require_target_ref=require_target_ref,
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
@@ -7783,21 +10795,46 @@ def run_pipeline(
         inventory_name=inventory_name,
         workflow_cfg=workflow_cfg,
         inventory_cfg=inventory_cfg,
-        active_stages=active_stages,
+        active_target_runs=active_target_runs,
         refs=refs,
         execution_context=execution_context,
     )
 
-    # Distribute stage input views from the rendered tree
-    plt_stages_dir_path = run_cfg_distribution(
+    # Distribute target_run input views from the rendered tree
+    plt_targets_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path, plt_rendered_dir, run_dir
     )
     # Prepared snapshot: cfg layers + run-level metadata are immutable from here.
     ctl_state_push("preparation complete")
 
-    # Run stages
-    run_stages(
-        active_stages, run_dir, plt_stages_dir_path, execution_context_path,
+    # Freeze the commit facts used by the opt-in committed-rerun gate.
+    cfg_source_commit, cfg_source_state = git_source_facts(plt_cfg_root)
+    for target_run in active_target_runs.values():
+        source_commit, target_source_state = target_run_source_facts(target_run)
+        target_run["source_commit"] = source_commit
+        target_run["cfg_source_commit"] = cfg_source_commit
+        target_run["source_state"] = (
+            "clean"
+            if target_source_state == "clean" and cfg_source_state == "clean"
+            else "dirty"
+        )
+        target_run["ref_policy"] = ctl_ref_policy
+    if load_run_metadata(run_dir).get("run_type") == "target":
+        only_target = next(iter(active_target_runs.values()), None)
+        if only_target:
+            update_run_metadata(
+                run_dir,
+                {
+                    key: only_target[key]
+                    for key in (
+                        "source_commit", "cfg_source_commit", "source_state", "ref_policy"
+                    )
+                },
+            )
+
+    # Run target runs
+    run_steps(
+        active_target_runs, run_dir, plt_targets_dir_path, execution_context_path,
         inventory_name, execution_context, run_id,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
@@ -7807,6 +10844,7 @@ def run_pipeline(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
         execution_runtime_mode=execution_runtime_mode,
+        skip_committed_rerun=skip_committed_rerun,
     )
 
     print_run_summary(run_id, log_file)

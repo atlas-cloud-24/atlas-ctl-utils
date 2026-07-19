@@ -77,8 +77,8 @@ class PreflightPolicyTests(unittest.TestCase):
                 common.finalize_common_args(args)
 
     def test_force_skip_requires_profile_permission(self):
-        workflow = {"stages": ["target"]}
-        inventory = {"stage_targets": {"target": {}}}
+        workflow = {"target_runs": ["target"]}
+        inventory = {"targets": {"target": {}}}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
@@ -95,7 +95,7 @@ class PreflightPolicyTests(unittest.TestCase):
                     inventory,
                     execution_context={},
                     execution_access_mode="standard",
-                    agreed_skip_ctl_state_backend_sync=False,
+                    agreed_defer_ctl_state_backend_sync=False,
                     force_skip_ctl_state_backend_sync=False,
                     provider_credential=None,
                     force_skip_execution_identity_preflight_check=True,
@@ -105,16 +105,16 @@ class PreflightPolicyTests(unittest.TestCase):
 class PreflightArtifactTests(unittest.TestCase):
     def test_report_is_deterministic_and_target_scoped(self):
         class Adapter:
-            def preflight_execution_identity(self, stage_id, stage, catalogs, **kwargs):
-                del stage_id, catalogs, kwargs
+            def preflight_execution_identity(self, target_run_id, target_run, catalogs, **kwargs):
+                del target_run_id, catalogs, kwargs
                 return {
-                    "execution_identity_key": stage["execution_identity_key"],
+                    "execution_identity_key": target_run["execution_identity_key"],
                     "provider": "fixture",
                     "access_mode": "standard",
                     "status": "passed",
                     "provider_path": [
                         {
-                            "display": f"principal: {stage['execution_identity_key']}",
+                            "display": f"principal: {target_run['execution_identity_key']}",
                             "status": "passed",
                         }
                     ],
@@ -123,7 +123,7 @@ class PreflightArtifactTests(unittest.TestCase):
         selection = {
             "selection_kind": "workflow",
             "selection_key": "example/workflow",
-            "active_stages": {
+            "active_target_runs": {
                 "one": {"target": "target/one", "execution_identity_key": "identity_one"},
                 "two": {"target": "target/two", "execution_identity_key": "identity_two"},
             },
@@ -198,21 +198,21 @@ class PreflightArtifactTests(unittest.TestCase):
         selection = {
             "selection_kind": "workflow",
             "selection_key": "landing_zone/bootstrap",
-            "workflow_cfg": {"stages": ["target"]},
-            "inventory_cfg": {"stage_targets": {"target": {}}},
+            "workflow_cfg": {"target_runs": ["target"]},
+            "inventory_cfg": {"targets": {"target": {}}},
             "execution_context": {},
-            "active_stages": {},
+            "active_target_runs": {},
         }
         with mock.patch.object(
             common,
-            "validate_target_policy_constraints",
+            "validate_target_policy_constraints_for_target",
             side_effect=RuntimeError("commit-required policy"),
         ), mock.patch.object(
             common, "validate_execution_access"
         ), mock.patch.object(
             common, "validate_execution_runtime_mode"
         ), mock.patch.object(
-            common, "validate_stages_have_commits"
+            common, "validate_target_runs_have_commits"
         ):
             policy_report = common.build_ctl_policy_preflight_report(
                 selection,
@@ -222,20 +222,25 @@ class PreflightArtifactTests(unittest.TestCase):
                 execution_runtime_mode="local",
                 execution_access_mode="standard",
                 provider_credential=None,
-                agreed_skip_ctl_state_backend_sync=False,
+                agreed_defer_ctl_state_backend_sync=False,
                 force_skip_ctl_state_backend_sync=False,
                 force_skip_execution_identity_preflight_check=False,
             )
         self.assertEqual(policy_report["status"], "failed")
-        failed_checks = {
-            check["name"]: check
-            for check in policy_report["checks"]
-            if check["status"] == "failed"
+        # target_policy_constraints is now a per-target check (hybrid report)
+        failed_targets = {
+            target["target_key"]: target
+            for target in policy_report["targets"]
+            if target["status"] == "failed"
         }
-        self.assertIn("target_policy_constraints", failed_checks)
+        self.assertIn("target", failed_targets)
+        target_checks = {
+            check["name"]: check for check in failed_targets["target"]["checks"]
+        }
+        self.assertIn("target_policy_constraints", target_checks)
         self.assertIn(
             "commit-required policy",
-            failed_checks["target_policy_constraints"]["failure_reason"],
+            target_checks["target_policy_constraints"]["failure_reason"],
         )
 
     def test_fan_out_report_keeps_parameter_set_entries_distinct(self):
@@ -310,7 +315,8 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_set: non_prod_accounts.test [ failed \u274c ]", rendered
         )
         self.assertEqual(rendered.count("workflow: env/bootstrap"), 2)
-        self.assertIn("params: account=dev, env_type=dev", rendered)
+        # per-member params fold inline onto the workflow line
+        self.assertIn("(account=dev, env_type=dev)", rendered)
         self.assertIn("required_role: oxygen-test-deploy [ failed \u274c ]", rendered)
 
     def test_unparameterized_fan_out_child_has_no_set_wrapper(self):
@@ -353,13 +359,12 @@ class PreflightArtifactTests(unittest.TestCase):
             },
         )
         rendered = "\n".join(common._preflight_text_lines(wrapped))
+        # An unparameterized child has no per-member params, so nothing folds onto
+        # its workflow line; run-constant params live on the fan-out header instead.
         self.assertIn(
             "workflow: landing_zone/org_state/bootstrap [ passed ✅ ]", rendered
         )
-        self.assertIn(
-            "params: landing_zone=live, main_tag=oxygen, region=eu-west-2",
-            rendered,
-        )
+        self.assertNotIn("(landing_zone=", rendered)
         self.assertNotIn("fan_out_param_set:", rendered)
 
     def test_fan_out_params_cannot_override_cli_execution_params(self):
@@ -426,8 +431,8 @@ class PreflightArtifactTests(unittest.TestCase):
             self.assertTrue(artifacts_dir.is_dir())
             self.assertTrue(log_file.is_file())
             self.assertFalse((run_dir / "cfg").exists())
-            self.assertFalse((run_dir / "stages_source").exists())
-            self.assertFalse((run_dir / "stage_utils").exists())
+            self.assertFalse((run_dir / "target_sources").exists())
+            self.assertFalse((run_dir / "step_utils").exists())
 
     def test_command_log_redacts_provider_credential(self):
         rendered = common.redact_command_argv(
@@ -454,7 +459,7 @@ class AwsPreflightTests(unittest.TestCase):
             "credential_sources": {},
             "account_registry": {},
             "ctl_role_chain": {"runner_role_key": "runner"},
-            "stage_roles": {},
+            "target_roles": {},
         }
 
     def test_direct_live_check_asserts_exact_caller(self):
@@ -473,12 +478,12 @@ class AwsPreflightTests(unittest.TestCase):
             "Arn": "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_DevDeployAccess_hash/session",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_stage_aws_access", return_value=resolved
+            aws_adapter, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
             aws_adapter, "assert_profile_caller", return_value=caller
         ) as assertion:
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "dev"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
@@ -504,14 +509,14 @@ class AwsPreflightTests(unittest.TestCase):
                 "arn:aws:iam::111111111111:role/ctl-runner",
                 "arn:aws:iam::222222222222:role/prod-deploy",
             ],
-            "stage_role_key": "prod_deploy",
+            "target_role_key": "prod_deploy",
             "role_name": "prod-deploy",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_stage_aws_access", return_value=resolved
+            aws_adapter, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(aws_adapter, "assert_profile_caller") as assertion:
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
@@ -541,7 +546,7 @@ class AwsPreflightTests(unittest.TestCase):
                 "arn:aws:iam::111111111111:role/ctl-runner",
                 "arn:aws:iam::222222222222:role/prod-deploy",
             ],
-            "stage_role_key": "prod_deploy",
+            "target_role_key": "prod_deploy",
             "role_name": "prod-deploy",
         }
         entry = {
@@ -557,7 +562,7 @@ class AwsPreflightTests(unittest.TestCase):
             ({"AWS_ACCESS_KEY_ID": "two"}, {"Arn": "final"}),
         ]
         with mock.patch.object(
-            aws_adapter, "resolve_stage_aws_access", return_value=resolved
+            aws_adapter, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
             aws_adapter, "assert_profile_caller", return_value=entry
         ), mock.patch.object(
@@ -566,7 +571,7 @@ class AwsPreflightTests(unittest.TestCase):
             aws_adapter, "_run_aws_json", return_value=final
         ):
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
@@ -591,7 +596,7 @@ class AwsPreflightTests(unittest.TestCase):
                 "arn:aws:iam::111111111111:role/ctl-runner",
                 "arn:aws:iam::222222222222:role/prod-deploy",
             ],
-            "stage_role_key": "prod_deploy",
+            "target_role_key": "prod_deploy",
             "role_name": "prod-deploy",
         }
         wrong_final = {
@@ -599,7 +604,7 @@ class AwsPreflightTests(unittest.TestCase):
             "Arn": "arn:aws:sts::222222222222:assumed-role/wrong-role/session",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_stage_aws_access", return_value=resolved
+            aws_adapter, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
             aws_adapter,
             "assert_profile_caller",
@@ -615,7 +620,7 @@ class AwsPreflightTests(unittest.TestCase):
             aws_adapter, "_run_aws_json", return_value=wrong_final
         ):
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
@@ -627,11 +632,11 @@ class AwsPreflightTests(unittest.TestCase):
     def test_static_error_still_fails_when_live_check_is_skipped(self):
         with mock.patch.object(
             aws_adapter,
-            "resolve_stage_aws_access",
-            side_effect=RuntimeError("missing stage role"),
+            "resolve_target_aws_access",
+            side_effect=RuntimeError("missing target_run role"),
         ):
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
@@ -639,16 +644,16 @@ class AwsPreflightTests(unittest.TestCase):
                 live_check=False,
             )
         self.assertEqual(result["status"], "failed")
-        self.assertIn("missing stage role", result["failure_reason"])
+        self.assertIn("missing target_run role", result["failure_reason"])
 
     def test_bypass_result_redacts_substitute_credential(self):
         with mock.patch.object(
             aws_adapter,
-            "resolve_stage_aws_access",
+            "resolve_target_aws_access",
             return_value={"identity_bypass": "true"},
         ):
             result = aws_adapter.preflight_execution_identity(
-                "stage",
+                "target_run",
                 {"execution_identity_key": "env_dev_deploy"},
                 self.catalogs(),
                 execution_context={},

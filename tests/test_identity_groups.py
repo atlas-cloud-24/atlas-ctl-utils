@@ -70,7 +70,7 @@ class IdentityGroupLoadValidationTests(unittest.TestCase):
     def test_valid_group_loads(self):
         ids = self._load(
             "execution_identities:\n"
-            "  c_dev: { provider: aws, account_key: dev, ctl_stage_role_key: r, direct_credential_source_key: s }\n"
+            "  c_dev: { provider: aws, account_key: dev, ctl_target_role_key: r, direct_credential_source_key: s }\n"
             "  g:\n"
             "    provider: aws\n"
             "    members:\n"

@@ -23,14 +23,14 @@ class ResolveCtlStructureTests(unittest.TestCase):
     def test_resolves_nested_placeholders_only(self):
         raw = {
             "meta": {"name": "commit_required/provision/env/core", "action": "provision"},
-            "stages": [
+            "target_runs": [
                 {"target": "env/core/baseline", "ref": "env/${execution_context.params.env_type}"},
             ],
             "literal": "no-placeholder",
             "count": 3,
         }
         resolved = common.resolve_ctl_structure(raw, CTX, label="workflow")
-        self.assertEqual(resolved["stages"][0]["ref"], "env/dev")
+        self.assertEqual(resolved["target_runs"][0]["ref"], "env/dev")
         self.assertEqual(resolved["literal"], "no-placeholder")
         self.assertEqual(resolved["count"], 3)
 
@@ -48,21 +48,21 @@ class WriteCtlCfgSnapshotTests(unittest.TestCase):
                 ctl_profile="commit_required",
                 ctl_profile_policy_cfg={"ref_policy": "commit", "allow_skip_ctl_state_sync": False},
                 inventory_name="provision",
-                workflow_cfg={"meta": {"action": "provision"}, "stages": ["env/core/baseline"]},
-                inventory_cfg={"stage_targets": {"env/core/baseline": {"ref_key": "env/${execution_context.params.env_type}"}}},
-                active_stages={"env/core/baseline": {"branch": "main", "commit": "abc123"}},
+                workflow_cfg={"meta": {"action": "provision"}, "target_runs": ["env/core/baseline"]},
+                inventory_cfg={"targets": {"env/core/baseline": {"ref_key": "env/${execution_context.params.env_type}"}}},
+                active_target_runs={"env/core/baseline": {"branch": "main", "commit": "abc123"}},
                 refs={"global": {"tooling": {"commit": "def456"}}},
                 execution_context=CTX,
             )
             self.assertEqual(ctl_dir, run_dir / "cfg" / "ctl")
             inventory = yaml.safe_load((ctl_dir / "inventory.yaml").read_text())
             self.assertEqual(
-                inventory["stage_targets"]["env/core/baseline"]["ref_key"], "env/dev"
+                inventory["targets"]["env/core/baseline"]["ref_key"], "env/dev"
             )
             profile = yaml.safe_load((ctl_dir / "profile.yaml").read_text())
             self.assertEqual(profile["ctl_profile"], "commit_required")
             self.assertEqual(profile["policy"]["allow_skip_ctl_state_sync"], False)
-            active = yaml.safe_load((ctl_dir / "active_stages.yaml").read_text())
+            active = yaml.safe_load((ctl_dir / "active_target_runs.yaml").read_text())
             self.assertEqual(active["env/core/baseline"]["commit"], "abc123")
 
 

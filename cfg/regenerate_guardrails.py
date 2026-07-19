@@ -37,14 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
     parser.add_argument("--execution-context", action="append", type=key_value, default=[])
     parser.add_argument("--var", action="append", dest="vars", help="Ctl mode declaration ref; repeatable.")
-    parser.add_argument("--ctl-state-backend-key", help="Ctl mode backend variation to regenerate.")
     parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
     if args.mode == "plt":
         if args.vars:
             parser.error("--var is not valid with --mode plt")
-        if args.ctl_state_backend_key:
-            parser.error("--ctl-state-backend-key is not valid with --mode plt")
     elif args.keep_artifacts:
         parser.error("--keep-artifacts is only valid with --mode plt")
     return args
@@ -169,36 +166,28 @@ def run_ctl(args: argparse.Namespace) -> int:
     if unknown:
         raise RuntimeError(f"unknown ctl guard declarations: {unknown}")
 
-    requested_domains = {
-        common.ctl_guard_domain(ref)
+    selected_namespace, _ = common.resolve_ctl_state_namespace(
+        ctl_cfg_root, execution_context
+    )
+    requested_namespaces = {
+        common.ctl_guard_namespace_key(ref)
         for ref in requested_refs
-        if common.ctl_guard_domain(ref) is not None
+        if common.ctl_guard_namespace_key(ref) is not None
     }
-    if args.ctl_state_backend_key:
-        mismatched = sorted(
-            domain for domain in requested_domains if domain != args.ctl_state_backend_key
-        ) if args.vars else []
-        if mismatched:
-            raise RuntimeError(
-                f"--var refs select backends {mismatched}, not {args.ctl_state_backend_key!r}"
-            )
-        backend_key = args.ctl_state_backend_key
-    elif len(requested_domains) == 1:
-        backend_key = next(iter(requested_domains))
-    elif requested_domains:
+    mismatched = sorted(requested_namespaces - {selected_namespace}) if args.vars else []
+    if mismatched:
         raise RuntimeError(
-            "--ctl-state-backend-key is required when regenerating multiple backend declarations"
+            f"--var refs select namespaces {mismatched}, but execution context "
+            f"selects {selected_namespace!r}"
         )
-    else:
-        backend_key = None
 
     active = []
     for ref in requested_refs:
-        domain = common.ctl_guard_domain(ref)
-        if domain is None or domain == backend_key:
+        declaration_namespace = common.ctl_guard_namespace_key(ref)
+        if declaration_namespace is None or declaration_namespace == selected_namespace:
             active.append(declarations[ref])
     if not active:
-        raise RuntimeError("no ctl guard declarations match this backend variation")
+        raise RuntimeError("no ctl guard declarations match the selected namespace")
 
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-regenerate-ctl-guardrails-"))
     try:

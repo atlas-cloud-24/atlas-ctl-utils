@@ -31,7 +31,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ctl-cfg-root", required=True)
     parser.add_argument("--ctl-profile", required=True)
     parser.add_argument("--execution-runtime-mode", required=True, choices=common.EXECUTION_RUNTIME_MODES)
-    parser.add_argument("--ctl-state-backend-key", required=True)
     parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
     parser.add_argument("--keep-artifacts", action="store_true")
     return parser.parse_args()
@@ -80,7 +79,6 @@ def main() -> int:
             rendered_dir,
             execution_context,
             scope_params,
-            args.ctl_state_backend_key,
         )
         print(f"OK: full bound plt cfg valid for params {scope_params or '{}'}")
     finally:

@@ -2,7 +2,7 @@
 
 The engine core (runners/utils/common.py and the engine cfg tools) must carry
 no AWS vocabulary: no provider-named CLI arguments, field validation, branches,
-ARN construction, subprocess invocations, stage env handling, or user-facing
+ARN construction, subprocess invocations, target_run env handling, or user-facing
 errors. AWS lives only in utils/providers/aws.py, its tests, providers.aws.*
 cfg, and labelled documentation examples.
 """
@@ -56,12 +56,14 @@ class ProviderBoundaryTests(unittest.TestCase):
             "validate_catalog",
             "validate_execution_identity",
             "load_runtime_catalogs",
-            "validate_active_stage_access",
+            "collect_provider_cfg_findings",
+            "resolve_target_cfg_references",
+            "validate_active_target_access",
             "preflight_execution_identity",
-            "materialize_stage_binding",
-            "stage_assertion_argv",
+            "materialize_target_binding",
+            "target_assertion_argv",
             "validate_state_backend_entry",
-            "resolve_synchronizer_credential",
+            "resolve_ctl_state_credential",
             "create_state_syncer",
             "normalize_provider_credential",
         ):
@@ -76,33 +78,33 @@ class ContractWrapperTests(unittest.TestCase):
             "credential_sources": {},
             "account_registry": {},
             "ctl_role_chain": None,
-            "stage_roles": {},
+            "target_roles": {},
         }
-        stages = {"stage": {}}
-        aws_adapter.validate_active_stage_access(
-            stages,
+        target_runs = {"target_run": {}}
+        aws_adapter.validate_active_target_access(
+            target_runs,
             catalogs,
             execution_context={},
             implementation_key="local",
             execution_access_mode="force_bypass",
             provider_credential="substitute",
         )
-        stage_env: dict[str, str] = {}
-        aws_adapter.materialize_stage_binding(
-            "stage",
+        target_env: dict[str, str] = {}
+        aws_adapter.materialize_target_binding(
+            "target_run",
             {},
-            stage_env,
+            target_env,
             catalogs,
             execution_context={},
             implementation_key="local",
             execution_access_mode="force_bypass",
             provider_credential="substitute",
         )
-        self.assertEqual(stage_env.get("AWS_PROFILE"), "substitute")
+        self.assertEqual(target_env.get("AWS_PROFILE"), "substitute")
 
 
 class CtlRoleChainLoaderTests(unittest.TestCase):
-    def test_rejects_removed_stage_role_key(self):
+    def test_rejects_removed_target_role_key(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -111,9 +113,9 @@ class CtlRoleChainLoaderTests(unittest.TestCase):
                 "providers:\n  aws:\n    ctl_role_chain:\n"
                 "      entry_credential_source_key: ctl_entry\n"
                 "      runner_role_key: ctl_runner\n"
-                "      stage_role_key: ctl_stage\n"
+                "      target_role_key: ctl_target\n"
             )
-            with self.assertRaisesRegex(RuntimeError, "stage_role_key is removed"):
+            with self.assertRaisesRegex(RuntimeError, "target_role_key is removed"):
                 aws_adapter.load_aws_ctl_role_chain_cfg(root)
 
 
@@ -136,7 +138,7 @@ class ProfileBindingTests(unittest.TestCase):
                 "[wanted]\naws_access_key_id = AKIAWANTED\n[other]\naws_access_key_id = AKIAOTHER\n"
             )
             binding_dir = tmp_path / "binding"
-            stage_env: dict[str, str] = {}
+            target_env: dict[str, str] = {}
             env_override = {
                 "AWS_CONFIG_FILE": str(config),
                 "AWS_SHARED_CREDENTIALS_FILE": str(credentials),
@@ -144,7 +146,7 @@ class ProfileBindingTests(unittest.TestCase):
             original = {key: os.environ.get(key) for key in env_override}
             os.environ.update(env_override)
             try:
-                aws_adapter.materialize_profile_binding(binding_dir, "wanted", stage_env)
+                aws_adapter.materialize_profile_binding(binding_dir, "wanted", target_env)
             finally:
                 for key, value in original.items():
                     if value is None:
@@ -159,7 +161,7 @@ class ProfileBindingTests(unittest.TestCase):
             self.assertNotIn("other", generated_config)
             self.assertIn("[wanted]", generated_credentials)
             self.assertNotIn("AKIAOTHER", generated_credentials)
-            self.assertEqual(stage_env["ATLAS_PROVIDER_BINDING_DIR"], str(binding_dir))
+            self.assertEqual(target_env["ATLAS_PROVIDER_BINDING_DIR"], str(binding_dir))
 
 
 if __name__ == "__main__":
@@ -217,7 +219,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
             (root / "ctl_profiles.yaml").write_text(
                 "ctl_profiles:\n"
                 "  strict: { ref_policy: commit_required }\n"
-                "  boot: { ref_policy: commit_required, allow_execution_access_modes: [standard, agreed_direct] }\n"
+                "  boot: { ref_policy: commit_required, allowed_execution_access_modes: [standard, agreed_direct] }\n"
             )
             self.assertEqual(common.ctl_allowed_execution_access_modes(root, "strict"), {"standard"})
             self.assertEqual(common.ctl_allowed_execution_access_modes(root, "boot"), {"standard", "agreed_direct"})

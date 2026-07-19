@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${ATLAS_STAGE_UTILS_DIR:?must be set}"
-if [[ ! -d "$ATLAS_STAGE_UTILS_DIR" ]]; then
-  echo "❌ ATLAS_STAGE_UTILS_DIR not found: $ATLAS_STAGE_UTILS_DIR"
+: "${ATLAS_STEP_UTILS_DIR:?must be set}"
+if [[ ! -d "$ATLAS_STEP_UTILS_DIR" ]]; then
+  echo "❌ ATLAS_STEP_UTILS_DIR not found: $ATLAS_STEP_UTILS_DIR"
   exit 1
 fi
 
@@ -72,12 +72,12 @@ echo "ext_dir_path=$ext_dir_path"
 echo "------------------------------------------------------"
 
 echo "=== 🗂️ Prepare cfg ==="
-stage_write_values_json="${STAGE_WRITE_VALUES_JSON:-true}"
-stage_write_env_sh="${STAGE_WRITE_ENV_SH:-true}"
+step_write_values_json="${STEP_WRITE_VALUES_JSON:-true}"
+step_write_env_sh="${STEP_WRITE_ENV_SH:-true}"
 values_json_out="-"
-stage_env_out="-"
+step_env_out="-"
 
-if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]; then
+if [[ "$step_write_values_json" == "true" || "$step_write_env_sh" == "true" ]]; then
   mkdir -p runtime
   : "${ATLAS_EXECUTION_CONTEXT_FILE:?must be set}"
   execution_context_file="$ATLAS_EXECUTION_CONTEXT_FILE"
@@ -87,48 +87,48 @@ if [[ "$stage_write_values_json" == "true" || "$stage_write_env_sh" == "true" ]]
     exit 1
   fi
 
-  if [[ "$stage_write_values_json" == "true" ]]; then
+  if [[ "$step_write_values_json" == "true" ]]; then
     values_json_out="runtime/values.json"
   fi
-  if [[ "$stage_write_env_sh" == "true" ]]; then
-    stage_env_out="runtime/env.sh"
+  if [[ "$step_write_env_sh" == "true" ]]; then
+    step_env_out="runtime/env.sh"
   fi
 
-  python3 "${ATLAS_STAGE_UTILS_DIR}/ctl/build_runtime_cfg.py" \
+  python3 "${ATLAS_STEP_UTILS_DIR}/ctl/build_runtime_cfg.py" \
     --origin-cfg-dir origin_cfg \
     --cfg-files "$cfg_files" \
     --values-json-out "$values_json_out" \
-    --stage-env-out "$stage_env_out" \
+    --step-env-out "$step_env_out" \
     --execution-context-file "$execution_context_file"
 
   echo "✅ cfg artifacts generated:"
-  if [[ "$stage_write_values_json" == "true" ]]; then
+  if [[ "$step_write_values_json" == "true" ]]; then
     echo "  - runtime/values.json"
   fi
-  if [[ "$stage_write_env_sh" == "true" ]]; then
+  if [[ "$step_write_env_sh" == "true" ]]; then
     echo "  - runtime/env.sh"
   fi
 
-  if [[ "$stage_write_values_json" == "true" ]]; then
-    export STAGE_VALUES_JSON="$(realpath runtime/values.json)"
+  if [[ "$step_write_values_json" == "true" ]]; then
+    export STEP_VALUES_JSON="$(realpath runtime/values.json)"
   else
-    unset STAGE_VALUES_JSON || true
+    unset STEP_VALUES_JSON || true
   fi
 
-  if [[ -n "${STAGE_CFG_DIR:-}" ]]; then
-    # STAGE_CFG_DIR is the stage's resolved/ layer: flat final consumables.
-    mkdir -p "${STAGE_CFG_DIR}"
-    rm -f "${STAGE_CFG_DIR}/values.json" "${STAGE_CFG_DIR}/env.sh"
-    if [[ "$stage_write_values_json" == "true" ]]; then
-      cp runtime/values.json "${STAGE_CFG_DIR}/values.json"
+  if [[ -n "${TARGET_CFG_DIR:-}" ]]; then
+    # TARGET_CFG_DIR is the step's resolved/ layer: flat final consumables.
+    mkdir -p "${TARGET_CFG_DIR}"
+    rm -f "${TARGET_CFG_DIR}/values.json" "${TARGET_CFG_DIR}/env.sh"
+    if [[ "$step_write_values_json" == "true" ]]; then
+      cp runtime/values.json "${TARGET_CFG_DIR}/values.json"
     fi
-    if [[ "$stage_write_env_sh" == "true" ]]; then
-      cp runtime/env.sh "${STAGE_CFG_DIR}/env.sh"
+    if [[ "$step_write_env_sh" == "true" ]]; then
+      cp runtime/env.sh "${TARGET_CFG_DIR}/env.sh"
     fi
-    chmod -R a+rwX "${STAGE_CFG_DIR}"
+    chmod -R a+rwX "${TARGET_CFG_DIR}"
   fi
 else
-  unset STAGE_VALUES_JSON || true
+  unset STEP_VALUES_JSON || true
   echo "ℹ️ cfg runtime artifacts skipped"
 fi
 echo "------------------------------------------------------"

@@ -103,7 +103,7 @@ def make_composed_plt_tree(
         "scope_composition:\n"
         "- target_path: /env\n"
         "  scopes: [/env, /account]\n"
-        "  instance_dimensions:\n"
+        "  guardrail_dimensions:\n"
         "  - execution_context.params.landing_zone\n",
     )
     write(
@@ -136,6 +136,27 @@ def make_composed_plt_tree(
     return plt
 
 
+class GuardValueTests(unittest.TestCase):
+    def test_structured_guard_value_uses_canonical_json(self):
+        first = {"roles": {"deploy": {"policies": ["b", "a"]}}, "enabled": True}
+        second = {"enabled": True, "roles": {"deploy": {"policies": ["b", "a"]}}}
+
+        self.assertEqual(
+            common.guard_value_text(first, label="first"),
+            common.guard_value_text(second, label="second"),
+        )
+        self.assertEqual(
+            common.guard_value_text(first, label="first"),
+            '{"enabled":true,"roles":{"deploy":{"policies":["b","a"]}}}',
+        )
+
+    def test_structured_guard_value_rejects_empty_collections(self):
+        for value in ({}, []):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "non-empty scalar or structure"):
+                    common.guard_value_text(value, label="empty")
+
+
 class CtlGuardrailTests(unittest.TestCase):
     def _write_baseline(
         self, root: Path, ref: str, value: str, axes: dict[str, str] | None = None
@@ -152,7 +173,7 @@ class CtlGuardrailTests(unittest.TestCase):
             self._write_baseline(root, ref, "oxygen")
 
             common.verify_ctl_guardrails(
-                root, root / "guardrails", {ref: "oxygen"}, None
+                root, root / "guardrails", {ref: "oxygen"}
             )
 
     def test_ctl_guardrails_reject_changed_resolved_value(self):
@@ -164,7 +185,7 @@ class CtlGuardrailTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "guarded ctl var .*main_tag.* changed"):
                 common.verify_ctl_guardrails(
-                    root, root / "guardrails", {ref: "argon"}, None
+                    root, root / "guardrails", {ref: "argon"}
                 )
 
     def test_ctl_guardrails_reject_ctl_namespace_ref(self):
@@ -186,6 +207,8 @@ class CtlGuardrailTests(unittest.TestCase):
             write(
                 root / "ctl_state.yaml",
                 "ctl_state_backends:\n  org:\n"
+                "    selectors:\n      match:\n"
+                "        execution_context.params.landing_zone: live\n"
                 "    provider: aws\n    backend_type: s3\n"
                 "    bucket_name: \x24{execution_context.params.main_tag}-"
                 "\x24{execution_context.params.landing_zone}-org-ctl-state\n"
@@ -193,22 +216,21 @@ class CtlGuardrailTests(unittest.TestCase):
             )
             write(root / "guardrails.yaml", ctl_declarations_yaml(ref, [axis]))
             self._write_baseline(root, ref, "oxygen-live-org-ctl-state", {axis: "live"})
-            self._write_baseline(root, ref, "oxygen-canary-org-ctl-state", {axis: "canary"})
 
-            for landing_zone in ("live", "canary"):
-                common.verify_ctl_guardrails(
-                    root,
-                    root / "guardrails",
-                    {
-                        "execution_context.params.main_tag": "oxygen",
-                        axis: landing_zone,
-                    },
-                    "org",
-                )
+            common.verify_ctl_guardrails(
+                root,
+                root / "guardrails",
+                {
+                    "execution_context.params.main_tag": "oxygen",
+                    axis: "live",
+                },
+            )
 
             write(
                 root / "ctl_state.yaml",
                 "ctl_state_backends:\n  org:\n"
+                "    selectors:\n      match:\n"
+                "        execution_context.params.landing_zone: live\n"
                 "    provider: aws\n    backend_type: s3\n"
                 "    bucket_name: \x24{execution_context.params.main_tag}-evil-org-ctl-state\n"
                 "    bucket_region: eu-west-2\n",
@@ -218,7 +240,6 @@ class CtlGuardrailTests(unittest.TestCase):
                     root,
                     root / "guardrails",
                     {"execution_context.params.main_tag": "oxygen", axis: "live"},
-                    "org",
                 )
 
     def test_ctl_guardrails_reject_baseline_axes_different_from_declaration(self):
@@ -232,7 +253,7 @@ class CtlGuardrailTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "has axes .* expected"):
                 common.verify_ctl_guardrails(
-                    root, root / "guardrails", {ref: "oxygen"}, None
+                    root, root / "guardrails", {ref: "oxygen"}
                 )
 
     def test_ctl_guardrails_reject_registry_ref_with_bad_field(self):

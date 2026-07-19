@@ -165,13 +165,13 @@ def resolve_cfg_entry_refs(root: dict, lookup_root: dict | None = None):
 def resolve_cfg_path(origin_cfg_dir: Path, key: str) -> Path:
     key_path = Path(key)
     if key_path.is_absolute():
-        raise RuntimeError(f"cfg path must be relative to the stage cfg root: {key}")
+        raise RuntimeError(f"cfg path must be relative to the step cfg root: {key}")
 
     resolved = (origin_cfg_dir / key_path).resolve()
     try:
         resolved.relative_to(origin_cfg_dir)
     except ValueError as exc:
-        raise RuntimeError(f"cfg path escapes the stage cfg root: {key}") from exc
+        raise RuntimeError(f"cfg path escapes the step cfg root: {key}") from exc
     return resolved
 
 
@@ -335,7 +335,7 @@ class Resolver:
         return value
 
 
-def build_stage_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
+def build_step_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
     merged: dict = {}
     merged_files: list[str] = []
     for cfg_file in iter_cfg_files(origin_cfg_dir, cfg_files):
@@ -369,13 +369,13 @@ def shell_value(value) -> str:
     return str(value)
 
 
-def write_stage_env(path: Path, values: dict, values_json_path: Path | None) -> None:
+def write_step_env(path: Path, values: dict, values_json_path: Path | None) -> None:
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
     ]
     if values_json_path is not None:
-        lines.append(f"export STAGE_VALUES_JSON={shlex.quote(str(values_json_path.resolve()))}")
+        lines.append(f"export STEP_VALUES_JSON={shlex.quote(str(values_json_path.resolve()))}")
     for key in sorted(values):
         lines.append(f"export {key}={shlex.quote(shell_value(values[key]))}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -396,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--origin-cfg-dir", required=True)
     parser.add_argument("--cfg-files", required=True, type=parse_cfg_files)
     parser.add_argument("--values-json-out", required=True)
-    parser.add_argument("--stage-env-out", required=True)
+    parser.add_argument("--step-env-out", required=True)
     parser.add_argument("--execution-context-file", required=True)
     return parser
 
@@ -408,18 +408,18 @@ def main() -> int:
     origin_cfg_dir = Path(args.origin_cfg_dir).resolve()
     cfg_files = args.cfg_files
     values_json_out_arg = args.values_json_out
-    stage_env_out_arg = args.stage_env_out
+    step_env_out_arg = args.step_env_out
     values_json_out = None if values_json_out_arg == "-" else Path(values_json_out_arg).resolve()
-    stage_env_out = None if stage_env_out_arg == "-" else Path(stage_env_out_arg).resolve()
+    step_env_out = None if step_env_out_arg == "-" else Path(step_env_out_arg).resolve()
 
     execution_context_file = Path(args.execution_context_file).resolve()
     env_ctx, execution_context_nested = load_execution_context(execution_context_file)
 
-    stage_values, merged_files = build_stage_values(origin_cfg_dir, cfg_files, env_ctx)
+    step_values, merged_files = build_step_values(origin_cfg_dir, cfg_files, env_ctx)
     # Nested merge + aliases: the whole context under ONE reserved key; the
     # engine never invents flat leaves (flat names exist only via payload aliases).
-    stage_env_values = dict(stage_values)
-    stage_env_values[EXECUTION_CONTEXT_ROOT] = execution_context_nested
+    step_env_values = dict(step_values)
+    step_env_values[EXECUTION_CONTEXT_ROOT] = execution_context_nested
 
     if values_json_out is not None:
         values_json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -432,7 +432,7 @@ def main() -> int:
                         "execution_context_keys": sorted(env_ctx),
                         "merged_files": merged_files,
                     },
-                    "values": stage_env_values,
+                    "values": step_env_values,
                 },
                 indent=2,
                 sort_keys=True,
@@ -440,10 +440,10 @@ def main() -> int:
             encoding="utf-8",
         )
 
-    if stage_env_out is not None:
-        stage_env_out.parent.mkdir(parents=True, exist_ok=True)
-        write_stage_env(stage_env_out, stage_env_values, values_json_out)
-        stage_env_out.chmod(0o755)
+    if step_env_out is not None:
+        step_env_out.parent.mkdir(parents=True, exist_ok=True)
+        write_step_env(step_env_out, step_env_values, values_json_out)
+        step_env_out.chmod(0o755)
     return 0
 
 

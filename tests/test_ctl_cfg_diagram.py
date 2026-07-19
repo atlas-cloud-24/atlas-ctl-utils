@@ -29,22 +29,21 @@ def make_cfg(root: Path) -> Path:
     write(
         cfg / "not-workflows.yaml",
         "workflows:\n"
-        "  provision:\n"
-        "    deploy:\n"
-        "      target_keys: [app]\n",
+        "  deploy:\n"
+        "    actions: [provision]\n"
+        "    target_keys: [app]\n",
     )
     write(
         cfg / "anything.yaml",
         "targets:\n"
-        "  provision:\n"
-        "    app:\n"
-        "      source_key: app-source\n"
-        "      execution_identity_key: deploy-group\n"
-        "      ctl_state_backend_key: env\n",
+        "  app:\n"
+        "    actions: [provision]\n"
+        "    source_key: app-source\n"
+        "    execution_identity_key: deploy-group\n"
     )
     write(
         cfg / "catalog-a.yaml",
-        "stage_sources:\n"
+        "target_sources:\n"
         "  app-source:\n"
         "    repo_url: https://example.test/app.git\n",
     )
@@ -69,7 +68,7 @@ def make_cfg(root: Path) -> Path:
         "    provider: aws\n"
         "    backend_type: s3\n"
         "    bucket_name: example-env-ctl-state\n"
-        "    execution_identity_key: sync-${execution_context.params.account}\n",
+        "    execution_identity_keys:\n      sync: sync-${execution_context.params.account}\n",
     )
     return cfg
 
@@ -128,10 +127,10 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 view="ctl_state_buckets",
             )
             self.assertIn("Targets", ctl_state)
-            self.assertIn("Ctl-state buckets", ctl_state)
+            self.assertIn("Ctl-state namespaces", ctl_state)
             self.assertNotIn("Execution identities", ctl_state)
             self.assertIn(
-                edge("target", "provision:app", "backend", "env"),
+                edge("target", "provision:app", "backend", "env", "invocation-selected"),
                 ctl_state,
             )
             self.assertNotIn("sync-dev", ctl_state)
@@ -181,12 +180,11 @@ class CtlCfgDiagramTests(unittest.TestCase):
             write(
                 cfg / "anything.yaml",
                 "targets:\n"
-                "  provision:\n"
-                "    app:\n"
-                "      source_key: app-source\n"
-                "      execution_identity_key: runtime-${execution_context.params.account}\n"
-                "      ctl_state_backend_key: env\n",
-            )
+                "  app:\n"
+                "    actions: [provision]\n"
+                "    source_key: app-source\n"
+                "    execution_identity_key: runtime-${execution_context.params.account}\n"
+                    )
             write(
                 cfg / "extra.yaml",
                 "execution_identities:\n"
@@ -216,7 +214,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
     def test_missing_reference_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(Path(tmp))
-            (cfg / "catalog-a.yaml").write_text("stage_sources: {}\n", encoding="utf-8")
+            (cfg / "catalog-a.yaml").write_text("target_sources: {}\n", encoding="utf-8")
 
             with self.assertRaisesRegex(RuntimeError, "references missing key 'app-source'"):
                 diagram.build_diagram(
@@ -230,9 +228,9 @@ class CtlCfgDiagramTests(unittest.TestCase):
             cfg = make_cfg(Path(tmp))
             write(
                 cfg / "plan.yaml",
-                "workflows:\n  plan:\n    deploy:\n      target_keys: [app]\n"
-                "targets:\n  plan:\n    app:\n      source_key: app-source\n"
-                "      execution_identity_key: deploy-group\n      ctl_state_backend_key: env\n",
+                "workflows:\n  inspect:\n    actions: [plan]\n    target_keys: [inspect-app]\n"
+                "targets:\n  inspect-app:\n    actions: [plan]\n    source_key: app-source\n"
+                "    execution_identity_key: deploy-group\n",
             )
             rendered = diagram.build_diagram(
                 cfg,
@@ -240,7 +238,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 view="general",
             )
 
-            self.assertIn("plan<br/>deploy", rendered)
+            self.assertIn("plan<br/>inspect", rendered)
             self.assertNotIn("provision<br/>deploy", rendered)
             self.assertNotIn("sync-prod", rendered)
 
@@ -249,11 +247,10 @@ class CtlCfgDiagramTests(unittest.TestCase):
             cfg = make_cfg(Path(tmp))
             write(
                 cfg / "destroy.yaml",
-                "workflows:\n  destroy:\n    remove:\n      target_keys: [remove-app]\n"
-                "targets:\n  destroy:\n    remove-app:\n      source_key: app-source\n"
-                "      execution_identity_key: deploy-group\n"
-                "      ctl_state_backend_key: env\n",
-            )
+                "workflows:\n  remove:\n    actions: [destroy]\n    target_keys: [remove-app]\n"
+                "targets:\n  remove-app:\n    actions: [destroy]\n    source_key: app-source\n"
+                "    execution_identity_key: deploy-group\n"
+                    )
 
             rendered = diagram.build_diagram(
                 cfg,
