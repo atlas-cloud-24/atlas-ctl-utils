@@ -23,12 +23,23 @@ import yaml
 from utils import common
 
 
-def _registry_account_id(account_registry: dict[str, str] | None, account_key: str, *, label: str) -> str:
+def _registry_account_id(
+    account_registry: dict[str, str] | None,
+    account_key: str,
+    *,
+    label: str,
+    require_concrete: bool = True,
+) -> str:
     if account_registry is None:
         raise RuntimeError(f"❌ AWS account registry is required for {label}")
     account_id = account_registry.get(account_key)
     if account_id is None:
         raise RuntimeError(f"❌ AWS account registry has no key {account_key!r} ({label})")
+    if require_concrete and not re.fullmatch(r"\d{12}", account_id):
+        raise common.ProviderConfigBlockedError(
+            f"providers.aws.accounts_registry.{account_key}.account_id must be a "
+            f"12-digit account id ({label})"
+        )
     return account_id
 
 AWS_CREDENTIAL_ENV_VARS = (
@@ -73,7 +84,7 @@ def normalize_optional_aws_profile(value: str | None) -> str | None:
 # provider names or sections.
 _AWS_PROVIDER_CATALOG_SECTIONS = {
     "credential_sources",
-    "accounts",
+    "accounts_registry",
     "target_roles",
     "ctl_state_roles",
     "ctl_role_chain",
@@ -125,7 +136,7 @@ def load_aws_account_registry_cfg(
     then the caller's concern (stage-1 cfg validation / per-target resolution),
     not the whole catalog load's.
     """
-    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts", {})
+    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts_registry", {})
     registry: dict[str, str] = {}
 
     def validate_account_id(value: object, label: str, *, selected: bool) -> str:
@@ -154,7 +165,7 @@ def load_aws_account_registry_cfg(
         if has_static:
             registry[account_key] = validate_account_id(
                 account_cfg.get("account_id"),
-                f"providers.aws.accounts.{account_key}.account_id",
+                f"providers.aws.accounts_registry.{account_key}.account_id",
                 selected=True,
             )
             continue
@@ -162,12 +173,12 @@ def load_aws_account_registry_cfg(
         members = account_cfg.get("members")
         if not isinstance(members, list) or not members:
             raise RuntimeError(
-                f"❌ providers.aws.accounts.{account_key}.members must be a non-empty list"
+                f"❌ providers.aws.accounts_registry.{account_key}.members must be a non-empty list"
             )
         matches: list[str] = []
         branch_account_ids: list[str] = []
         for index, member in enumerate(members):
-            label = f"providers.aws.accounts.{account_key}.members[{index}]"
+            label = f"providers.aws.accounts_registry.{account_key}.members[{index}]"
             if not isinstance(member, dict):
                 raise RuntimeError(f"❌ {label} must be a mapping")
             unknown_member = sorted(set(member) - {"selectors", "account_id"})
@@ -192,18 +203,18 @@ def load_aws_account_registry_cfg(
         })
         if duplicates:
             raise RuntimeError(
-                f"❌ providers.aws.accounts.{account_key}.members resolve duplicate "
+                f"❌ providers.aws.accounts_registry.{account_key}.members resolve duplicate "
                 f"physical account ids across selector branches: {duplicates}"
             )
         if execution_context is None:
             continue
         if len(matches) != 1:
             raise RuntimeError(
-                f"❌ providers.aws.accounts.{account_key} must resolve exactly one member; "
+                f"❌ providers.aws.accounts_registry.{account_key} must resolve exactly one member; "
                 f"matched {len(matches)}"
             )
         registry[account_key] = validate_account_id(
-            matches[0], f"providers.aws.accounts.{account_key}.resolved.account_id", selected=True
+            matches[0], f"providers.aws.accounts_registry.{account_key}.resolved.account_id", selected=True
         )
     return registry
 
@@ -228,21 +239,25 @@ def collect_provider_cfg_findings(
         # registry — one finding under the accounts cfg path.
         return [
             {
-                "cfg_path": "providers.aws.accounts",
+                "cfg_path": "providers.aws.accounts_registry",
                 "status": "failed",
                 "error": common.credential_free_preflight_failure_reason(error),
+                "structural": True,
             }
         ]
     for account_key, account_id in sorted(registry.items()):
-        cfg_path = f"providers.aws.accounts.{account_key}.account_id"
+        cfg_path = f"providers.aws.accounts_registry.{account_key}.account_id"
         if re.fullmatch(r"\d{12}", account_id):
-            findings.append({"cfg_path": cfg_path, "status": "passed"})
+            findings.append(
+                {"cfg_path": cfg_path, "status": "passed", "structural": False}
+            )
         else:
             findings.append(
                 {
                     "cfg_path": cfg_path,
                     "status": "failed",
                     "error": f"{cfg_path} must be a 12-digit account id",
+                    "structural": False,
                 }
             )
     return findings
@@ -411,7 +426,7 @@ def _validate_profile_expect(
     if "account_id" in expect_cfg:
         raise RuntimeError(
             f"❌ AWS credential source {credential_source_key!r}.{implementation_key}.expect.account_id is deprecated; "
-            "put account IDs in providers.aws.accounts keyed by execution identity account_key"
+            "put account IDs in providers.aws.accounts_registry keyed by execution identity account_key"
         )
     if "account_key" in expect_cfg:
         common._require_non_empty_string(
@@ -721,15 +736,11 @@ def resolve_target_aws_access(
     # the resolving identity's account facet.
     context["identity.account_key"] = account_key
     expected_account_id = _registry_account_id(
-        account_registry, account_key, label=f"execution identity {identity_key!r}"
+        account_registry,
+        account_key,
+        label=f"execution identity {identity_key!r}",
+        require_concrete=require_valid_account_id,
     )
-    if require_valid_account_id and not re.fullmatch(r"\d{12}", expected_account_id):
-        # The account resolves in cfg but its id is a placeholder/malformed — a
-        # live check cannot proceed. Blocked (not a genuine identity failure);
-        # the exact cfg defect is reported per target.
-        raise common.ProviderConfigBlockedError(
-            f"providers.aws.accounts.{account_key}.account_id must be a 12-digit account id"
-        )
 
     resolved: dict[str, str] = {
         "provider": "aws",
@@ -790,6 +801,7 @@ def resolve_target_aws_access(
             declared_account_id = _registry_account_id(
                 account_registry, str(direct_expect_account_key).strip(),
                 label=f"credential source {direct_source_key!r} expect.account_key",
+                require_concrete=require_valid_account_id,
             )
             if declared_account_id != expected_account_id:
                 raise RuntimeError(
@@ -843,6 +855,7 @@ def resolve_target_aws_access(
     resolved["entry_account_id"] = _registry_account_id(
         account_registry, str(entry_account_key).strip(),
         label=f"entry credential source {entry_source_key!r}",
+        require_concrete=require_valid_account_id,
     )
     entry_principal = _resolve_expect_principal(
         entry_expect, context,
@@ -863,7 +876,12 @@ def resolve_target_aws_access(
             role_cfg["role_name"], context, label=f"providers.aws.target_roles.{role_key}.role_name"
         )
         role_account_key = role_cfg.get("account_key", default_account_key)
-        role_account_id = _registry_account_id(account_registry, role_account_key, label=label)
+        role_account_id = _registry_account_id(
+            account_registry,
+            role_account_key,
+            label=label,
+            require_concrete=require_valid_account_id,
+        )
         return role_name, f"arn:aws:iam::{role_account_id}:role/{role_name}"
 
     _, runner_role_arn = _chain_role_arn(
@@ -987,9 +1005,11 @@ def resolve_target_cfg_references(
     execution_access_mode: str = "standard",
     provider_credential: str | None = None,
 ) -> dict:
-    """Static per-target cfg reference resolution (no live calls, account-id
-    format left to stage-1 cfg validation): does this target's identity and
-    account resolve in cfg? Returns rows for the identity and account refs."""
+    """Resolve every cfg binding reachable from one target without live calls.
+
+    Unlike whole-cfg health reporting, selected account bindings must already
+    be concrete because this report gates execution.
+    """
     del target_run_id
     try:
         resolved = resolve_target_aws_access(
@@ -1004,7 +1024,6 @@ def resolve_target_cfg_references(
             ctl_role_chain=catalogs["ctl_role_chain"],
             target_roles=catalogs["target_roles"],
             validate_local_credential=False,
-            require_valid_account_id=False,
         )
     except Exception as error:
         return {
@@ -1321,11 +1340,6 @@ def validate_active_target_run_aws_access(
         if resolved is None:
             continue
         if resolved.get("identity_bypass") == "true":
-            logging.info(
-                "Using the substitute provider credential for target_run %s (bypass): profile=%s",
-                target_run_id,
-                resolved["profile_name"],
-            )
             continue
         account_key = resolved["account_key"]
         account_id = resolved["expected_account_id"]
@@ -1498,11 +1512,6 @@ def configure_target_aws_env(
                 run_dir / "provider_binding" / target_run_id, resolved["profile_name"], target_env
             )
         target_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"] = "true"
-        logging.info(
-            "Resolved substitute-credential access for target_run %s (bypass): profile=%s",
-            target_run_id,
-            resolved["profile_name"],
-        )
         return
 
     target_env["ATLAS_AWS_ACCOUNT_KEY"] = resolved["account_key"]
@@ -1899,9 +1908,9 @@ class CtlStateSyncer:
 # ---------------------------------------------------------------------------
 
 def validate_catalog(ctl_cfg_root: Path) -> None:
-    """Validate the complete providers.aws.* subtree."""
+    """Validate the complete providers.aws.* structure without requiring bindings."""
     load_aws_credential_sources_cfg(ctl_cfg_root)
-    load_aws_account_registry_cfg(ctl_cfg_root)
+    load_aws_account_registry_cfg(ctl_cfg_root, strict_selected=False)
     load_aws_ctl_role_chain_cfg(ctl_cfg_root)
     load_aws_target_roles_cfg(ctl_cfg_root)
     load_aws_ctl_state_roles_cfg(ctl_cfg_root)
@@ -1942,20 +1951,20 @@ def load_runtime_catalogs(
     ctl_cfg_root: Path,
     *,
     execution_context: dict[str, object] | None = None,
-    strict_account_ids: bool = True,
 ) -> dict:
-    """Load the run-scoped AWS catalogs bundle (opaque to the engine core).
+    """Load structurally valid runtime catalogs without requiring all bindings.
 
-    With `strict_account_ids=False` the registry loads even with placeholder
-    account ids, so per-target resolution/preflight can report the defect per
-    target (blocked) rather than the whole load raising up front."""
+    Concrete account ids are enforced later while resolving the selected
+    target runs. This keeps unrelated placeholders visible to whole-cfg health
+    reporting without allowing them to block an otherwise valid selection.
+    """
     return {
         "execution_identities": common.load_execution_identities_cfg(ctl_cfg_root),
         "credential_sources": load_aws_credential_sources_cfg(ctl_cfg_root),
         "account_registry": load_aws_account_registry_cfg(
             ctl_cfg_root,
             execution_context=execution_context,
-            strict_selected=strict_account_ids,
+            strict_selected=False,
         ),
         "ctl_role_chain": load_aws_ctl_role_chain_cfg(ctl_cfg_root),
         "target_roles": load_aws_target_roles_cfg(ctl_cfg_root),
@@ -2250,7 +2259,9 @@ def resolve_ctl_state_credential(
     identities = common.load_execution_identities_cfg(ctl_cfg_root)
     credential_sources = load_aws_credential_sources_cfg(ctl_cfg_root)
     account_registry = load_aws_account_registry_cfg(
-        ctl_cfg_root, execution_context=execution_context
+        ctl_cfg_root,
+        execution_context=execution_context,
+        strict_selected=False,
     )
     ctl_role_chain = load_aws_ctl_role_chain_cfg(ctl_cfg_root)
     target_roles = load_aws_target_roles_cfg(ctl_cfg_root)

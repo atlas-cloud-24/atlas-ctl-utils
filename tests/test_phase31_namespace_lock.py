@@ -125,7 +125,7 @@ class WorkflowCompositionTests(unittest.TestCase):
         c = common.workflow_composition_sha256(["y", "x"])
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
-        self.assertEqual(len(a), 64)
+        self.assertEqual(len(a), 8)
 
     def test_identity_doc_facts_only(self):
         doc = common.build_workflow_identity_doc(

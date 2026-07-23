@@ -61,8 +61,28 @@ class RuntimePrimitivesTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unknown execution runtime"):
                 common.validate_execution_runtime_mode(root, "open", "teleport")
 
+    def test_ctl_ref_policy_validates_against_closed_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ctl_profiles.yaml").write_text(
+                "ctl_profiles:\n"
+                "  strict: { ref_policy: commit_required }\n"
+                "  loose: { ref_policy: local_dirty_allowed }\n"
+                "  typo: { ref_policy: commit_requird }\n"
+                "  empty: { ref_policy: '' }\n"
+            )
+            # both known values resolve
+            self.assertEqual(common.ctl_ref_policy(root, "strict"), "commit_required")
+            self.assertEqual(common.ctl_ref_policy(root, "loose"), "local_dirty_allowed")
+            # a typo fails loud instead of silently degrading to permissive
+            with self.assertRaisesRegex(RuntimeError, "unknown ref_policy"):
+                common.ctl_ref_policy(root, "typo")
+            # empty is still caught by the non-empty guard
+            with self.assertRaisesRegex(RuntimeError, "non-empty ref_policy"):
+                common.ctl_ref_policy(root, "empty")
+
     def test_step_box_name_valid_and_unique(self):
-        a = common._step_box_name("landing_zone/org/stack_sets", "provision/infra")
+        a = common._step_box_name("landing_zone/org/baseline", "provision/infra")
         b = common._step_box_name("env/ops/app", "provision/ecr")
         for name in (a, b):
             self.assertRegex(name, r"^[a-z0-9._-]+$")

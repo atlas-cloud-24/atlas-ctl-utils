@@ -22,7 +22,7 @@ class AccountRegistryTests(unittest.TestCase):
     def _root(self, body: str):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        write(root / "accounts.yaml", "providers:\n  aws:\n    accounts:\n" + body)
+        write(root / "accounts_registry.yaml", "providers:\n  aws:\n    accounts_registry:\n" + body)
         return temporary, root
 
     def test_selector_member_resolves_exactly_one_account(self):
@@ -70,6 +70,123 @@ class AccountRegistryTests(unittest.TestCase):
                 root,
                 execution_context={"execution_context.params.landing_zone": "live"},
             )
+
+    def test_catalog_reports_placeholder_as_concrete_binding_failure(self):
+        temporary, root = self._root(
+            "      management:\n"
+            "        account_id: <live-management-account-id>\n"
+        )
+        with temporary:
+            aws.validate_catalog(root)
+            findings = aws.collect_provider_cfg_findings(
+                root, execution_context={}
+            )
+        self.assertEqual(findings[0]["status"], "failed")
+        self.assertFalse(findings[0]["structural"])
+        self.assertIn("12-digit account id", findings[0]["error"])
+
+    def test_runtime_catalog_allows_unrelated_placeholder_but_selected_access_is_strict(
+        self,
+    ):
+        temporary, root = self._root(
+            "      management:\n"
+            "        members:\n"
+            "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
+            "          account_id: <live-management-account-id>\n"
+            "      dev:\n"
+            "        account_id: '111111111111'\n"
+        )
+        with temporary:
+            context = {
+                "execution_context.params.provider": "aws",
+                "execution_context.params.landing_zone": "live",
+            }
+            catalogs = aws.load_runtime_catalogs(root, execution_context=context)
+            self.assertEqual(
+                catalogs["account_registry"]["management"],
+                "<live-management-account-id>",
+            )
+            catalogs["execution_identities"] = {
+                "dev_direct": {
+                    "provider": "aws",
+                    "account_key": "dev",
+                    "direct_credential_source_key": "dev",
+                },
+                "management_direct": {
+                    "provider": "aws",
+                    "account_key": "management",
+                    "direct_credential_source_key": "management",
+                },
+            }
+            catalogs["credential_sources"] = {
+                key: {
+                    "local": {
+                        "profile_name": key,
+                        "expect": {"account_key": account_key, "role_name": "Admin"},
+                    }
+                }
+                for key, account_key in (
+                    ("dev", "dev"),
+                    ("management", "management"),
+                )
+            }
+
+            dev_cfg_result = aws.resolve_target_cfg_references(
+                "dev",
+                {"execution_identity_key": "dev_direct"},
+                catalogs,
+                execution_context=context,
+                implementation_key="local",
+                execution_access_mode="agreed_direct",
+            )
+            self.assertEqual(dev_cfg_result["status"], "passed")
+
+            management_cfg_result = aws.resolve_target_cfg_references(
+                "management",
+                {"execution_identity_key": "management_direct"},
+                catalogs,
+                execution_context=context,
+                implementation_key="local",
+                execution_access_mode="agreed_direct",
+            )
+            self.assertEqual(management_cfg_result["status"], "failed")
+            self.assertIn(
+                "12-digit account id",
+                management_cfg_result["failure_reason"],
+            )
+
+            with mock.patch.object(
+                aws,
+                "resolve_configured_profile_account_id",
+                return_value="111111111111",
+            ):
+                aws.validate_active_target_access(
+                    {"dev": {"execution_identity_key": "dev_direct"}},
+                    catalogs,
+                    execution_context=context,
+                    implementation_key="local",
+                    execution_access_mode="agreed_direct",
+                )
+            self.assertEqual(
+                catalogs["validated_account_registry"],
+                {"dev": "111111111111"},
+            )
+
+            with self.assertRaisesRegex(
+                common.ProviderConfigBlockedError,
+                r"accounts_registry\.management\.account_id must be a 12-digit account id",
+            ):
+                aws.validate_active_target_access(
+                    {
+                        "management": {
+                            "execution_identity_key": "management_direct"
+                        }
+                    },
+                    catalogs,
+                    execution_context=context,
+                    implementation_key="local",
+                    execution_access_mode="agreed_direct",
+                )
 
     def test_duplicate_physical_id_across_branches_is_rejected(self):
         temporary, root = self._root(
@@ -163,6 +280,91 @@ class ConditionalPointerTests(unittest.TestCase):
             self.assertEqual(args[args.index("--if-match") + 1], '"etag-1"')
 
 
+class ForceUnlockDispatchTests(unittest.TestCase):
+    def test_target_selects_terraform_lock(self):
+        self.assertEqual(common.force_unlock_resource_kind("env/static/public_dns"), "terraform")
+
+    def test_missing_target_selects_ctl_state_lock(self):
+        self.assertEqual(common.force_unlock_resource_kind(None), "ctl_state")
+
+
+class ForceUnlockBindingTests(unittest.TestCase):
+    def _repo(self, stack_dir: str, state_key: str):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        step_path = "atlas_ctl_adapter/steps/destroy/public_dns"
+        write(
+            root / "atlas_ctl_adapter/manifest.yaml",
+            """manifest:
+  destroy:
+    destroy/public_dns:
+      path: atlas_ctl_adapter/steps/destroy/public_dns
+""",
+        )
+        write(
+            root / "atlas_ctl_adapter/step_sequences.yaml",
+            """step_sequences:
+  destroy:
+    public_dns:
+      steps:
+      - destroy/public_dns
+""",
+        )
+        write(
+            root / step_path / "step.yaml",
+            """id: destroy/public_dns
+cfg_files:
+- general.yaml
+- tfstate.yaml
+runtime:
+  image: infra
+""",
+        )
+        write(
+            root / step_path / "src/step.sh",
+            f"./bin/tf.sh {stack_dir} init {state_key}\n",
+        )
+        (root / stack_dir).mkdir(parents=True)
+        return temporary, root
+
+    def test_selected_sequence_resolves_nested_terraform_project(self):
+        temporary, root = self._repo(
+            "infra/public_dns", "plt_static_public_dns_tfstate_key"
+        )
+        with temporary:
+            self.assertEqual(
+                common.resolve_force_unlock_tfstate_binding(
+                    root, "destroy", "public_dns"
+                ),
+                (
+                    "infra/public_dns",
+                    "plt_static_public_dns_tfstate_key",
+                    ["general.yaml", "tfstate.yaml"],
+                ),
+            )
+
+    def test_selected_sequence_rejects_multiple_state_bindings(self):
+        temporary, root = self._repo("infra/public_dns", "public_dns_tfstate_key")
+        with temporary:
+            (root / "infra/other").mkdir(parents=True)
+            script = (
+                root
+                / "atlas_ctl_adapter/steps/destroy/public_dns/src/step.sh"
+            )
+            script.write_text(
+                "./bin/tf.sh infra/public_dns init public_dns_tfstate_key\n"
+                "./bin/tf.sh infra/other init other_tfstate_key\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "exactly one Terraform state binding"
+            ):
+                common.resolve_force_unlock_tfstate_binding(
+                    root, "destroy", "public_dns"
+                )
+
+
+
 class _MemorySyncer:
     def __init__(self, keys=()):
         self.keys = list(keys)
@@ -227,11 +429,11 @@ class HistoryPruneTests(unittest.TestCase):
             namespace = root / "live"
             target_run = "old-target-run"
             workflow_run = "old-workflow-run"
-            target_key = f"provision/target/app/runs/{target_run}/STATUS.yaml"
-            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/snapshot.yaml"
+            target_key = f"provision/target/app/runs/{target_run}/RUN.yaml"
+            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
-                "snapshot_of_run: old-workflow-run\n"
+                "run_id: old-workflow-run\n"
                 "child_revisions:\n"
                 "- run_id: old-target-run\n",
             )
@@ -248,11 +450,11 @@ class HistoryPruneTests(unittest.TestCase):
             namespace = root / "live"
             target_run = "old-target-run"
             workflow_run = "old-workflow-run"
-            target_key = f"provision/target/app/runs/{target_run}/STATUS.yaml"
-            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/snapshot.yaml"
+            target_key = f"provision/target/app/runs/{target_run}/RUN.yaml"
+            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
-                "snapshot_of_run: old-workflow-run\n"
+                "run_id: old-workflow-run\n"
                 "child_revisions:\n"
                 "- run_id: old-target-run\n",
             )

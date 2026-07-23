@@ -37,13 +37,11 @@ TOOLING_DEFAULT_REPO_URLS = {
 }
 RUN_ACTIONS = ("pipeline", "maintenance")
 MAINTENANCE_ACTIONS = ("force-unlock", "status-sweep", "history-prune")
-FORCE_UNLOCK_STEP_SCRIPT_CANDIDATES = (
-    Path("atlas_ctl_adapter/steps/plan/infra/src/step.sh"),
-    Path("atlas_ctl_adapter/steps/provision/infra/src/step.sh"),
-    Path("atlas_ctl_adapter/steps/destroy/infra/src/step.sh"),
+FORCE_UNLOCK_INIT_RE = re.compile(
+    r"(?m)^\s*\./bin/tf\.sh\s+"
+    r"(?P<stack_dir>[A-Za-z0-9_.\/-]+)\s+"
+    r"init(?:-upgrade)?\s+\$?(?P<state_key>[A-Za-z_][A-Za-z0-9_]*)\b"
 )
-FORCE_UNLOCK_KEY_RE = re.compile(r"\./bin/tf\.sh\s+infra\s+init\s+\$?([A-Za-z_][A-Za-z0-9_]*)")
-FORCE_UNLOCK_URI_RE = re.compile(r'echo\s+"Using\s+\$([A-Za-z_][A-Za-z0-9_]*)"')
 
 SERVICE_ID = "atlas-ctl-orchestrator-local"
 CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
@@ -53,10 +51,6 @@ EXECUTION_CONTEXT_FILENAME = "execution_context.yaml"
 
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 PLT_GUARDRAILS_DIRNAME = "__guardrails__"
-PLT_GUARDRAIL_POLICIES_KEY = "plt_guardrail_policies"
-PLT_GUARDRAIL_BASELINES_KEY = "plt_guardrail_baselines"
-CTL_GUARDRAIL_DECLARATIONS_KEY = "ctl_guardrail_declarations"
-CTL_GUARDRAIL_BASELINES_KEY = "ctl_guardrail_baselines"
 CFG_SOURCE_KEYS = ("plt", "guardrails")
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
 MUTATING_ACTIONS = ("provision", "destroy")
@@ -259,12 +253,27 @@ def ctl_profile_policy(ctl_cfg_root: Path, ctl_profile: str) -> dict:
     return profiles[ctl_profile]
 
 
+# The closed set of ref_policy values. The engine branches strict-vs-permissive
+# on `commit_required` (ref_policy_requires_commits); every other value is the
+# permissive path. Validating against this set at load makes a typo fail loud
+# instead of silently degrading to permissive (the unsafe direction).
+REF_POLICY_COMMIT_REQUIRED = "commit_required"
+REF_POLICY_LOCAL_DIRTY_ALLOWED = "local_dirty_allowed"
+REF_POLICIES = frozenset({REF_POLICY_COMMIT_REQUIRED, REF_POLICY_LOCAL_DIRTY_ALLOWED})
+
+
 def ctl_ref_policy(ctl_cfg_root: Path, ctl_profile: str) -> str:
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     ref_policy = policy.get("ref_policy")
     if not isinstance(ref_policy, str) or not ref_policy.strip():
         raise RuntimeError(f"❌ ctl profile {ctl_profile!r} must define non-empty ref_policy")
-    return ref_policy.strip()
+    ref_policy = ref_policy.strip()
+    if ref_policy not in REF_POLICIES:
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} has unknown ref_policy {ref_policy!r}; "
+            f"expected one of {sorted(REF_POLICIES)}"
+        )
+    return ref_policy
 
 
 def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
@@ -371,6 +380,29 @@ def ctl_allows_force_skip_guardrails(ctl_cfg_root: Path, ctl_profile: str) -> bo
     return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_force_skip_guardrails")
 
 
+def ctl_allows_force_skip_full_cfg_validation_gate(
+    ctl_cfg_root: Path, ctl_profile: str
+) -> bool:
+    return ctl_profile_bool(
+        ctl_cfg_root,
+        ctl_profile,
+        "allow_force_skip_full_cfg_validation_gate",
+    )
+
+
+def validate_force_skip_full_cfg_validation_gate_policy(
+    ctl_cfg_root: Path, ctl_profile: str, requested: bool
+) -> None:
+    if requested and not ctl_allows_force_skip_full_cfg_validation_gate(
+        ctl_cfg_root, ctl_profile
+    ):
+        raise RuntimeError(
+            "❌ --force-skip-full-cfg-validation-gate was requested, but ctl "
+            f"profile {ctl_profile!r} does not grant "
+            "allow_force_skip_full_cfg_validation_gate"
+        )
+
+
 def ctl_allows_force_skip_execution_identity_preflight_check(
     ctl_cfg_root: Path, ctl_profile: str
 ) -> bool:
@@ -382,7 +414,26 @@ def ctl_allows_force_skip_execution_identity_preflight_check(
 
 
 def ref_policy_requires_commits(ref_policy: str) -> bool:
-    return ref_policy == "commit_required"
+    return ref_policy == REF_POLICY_COMMIT_REQUIRED
+
+
+def validate_reuse_committed_ref_policy(
+    reuse_committed: bool | None, ref_policy: str, ctl_profile: str
+) -> None:
+    """Fail loud on a --reuse-committed=true that can never reuse.
+
+    The reuse gate only reuses a committed result when ref_policy is
+    commit_required (a clean, commit-pinned source). Under any other policy
+    (e.g. local_dirty_allowed) reuse is structurally impossible, so
+    --reuse-committed true would be a silent no-op — every run re-executes.
+    Reject it instead of silently ignoring the flag."""
+    if reuse_committed and not ref_policy_requires_commits(ref_policy):
+        raise RuntimeError(
+            f"❌ --reuse-committed true cannot reuse under ctl profile {ctl_profile!r} "
+            f"(ref_policy {ref_policy!r}): reuse requires ref_policy 'commit_required' "
+            "(a clean, commit-pinned source). Pass --reuse-committed false, or use a "
+            "commit_required profile."
+        )
 
 
 def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
@@ -451,23 +502,7 @@ def finalize_common_args(args: argparse.Namespace) -> None:
         value = args.provider_credential.strip()
         args.provider_credential = value or None
     args.execution_access_mode = normalize_execution_access_mode(args)
-    if getattr(args, "status", False):
-        incompatible = [
-            name
-            for name in (
-                "execution_identity_preflight_check_only",
-                "force_skip_execution_identity_preflight_check",
-                "agreed_defer_ctl_state_backend_sync",
-                "force_skip_ctl_state_backend_sync",
-                "reuse_committed",
-            )
-            if getattr(args, name, False)
-        ]
-        if incompatible:
-            raise RuntimeError(
-                "❌ --status is incompatible with: "
-                + ", ".join("--" + name.replace("_", "-") for name in incompatible)
-            )
+    # §Phase 50: --status is gone from the run parsers (status is standalone).
     if (
         getattr(args, "execution_identity_preflight_check_only", False)
         and getattr(args, "force_skip_execution_identity_preflight_check", False)
@@ -486,17 +521,15 @@ def finalize_common_args(args: argparse.Namespace) -> None:
         )
     # --reuse-committed is an explicit true/false with no default. A normal run
     # reaches the reuse-vs-rerun decision and must state intent; the exit-early
-    # modes (--status, preflight-only) never do, so it stays optional there and
-    # is rejected outright by the --status incompatibility check above.
+    # preflight-only mode never does, so it stays optional there.
     if hasattr(args, "reuse_committed"):
-        exits_before_execution = getattr(args, "status", False) or getattr(
+        exits_before_execution = getattr(
             args, "execution_identity_preflight_check_only", False
         )
         if args.reuse_committed is None and not exits_before_execution:
             raise RuntimeError(
                 "❌ --reuse-committed is required (true or false) for a normal run; "
-                "omit it only with --status or "
-                "--execution-identity-preflight-check-only"
+                "omit it only with --execution-identity-preflight-check-only"
             )
     args.run_id = generate_uuid7()
 
@@ -2293,6 +2326,15 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Skip ctl + plt guardrail verification for this run; requires profile "
         "allow_force_skip_guardrails",
     )
+    override_group.add_argument(
+        "--force-skip-full-cfg-validation-gate",
+        action="store_true",
+        dest="force_skip_full_cfg_validation_gate",
+        help="Keep the full cfg-validation report but do not let unrelated failed "
+        "findings block this run; complete cfg structure and every selected-run "
+        "dependency remain mandatory; requires profile "
+        "allow_force_skip_full_cfg_validation_gate",
+    )
     if run_type in {"workflow", "target", "fan_out"}:
         override_group.add_argument(
             "--force-skip-execution-identity-preflight-check",
@@ -2327,12 +2369,8 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             action="store_true",
             help="print expanded child runner commands and exit",
         )
-    if run_type in {"workflow", "target", "fan_out"}:
-        mode_group.add_argument(
-            "--status",
-            action="store_true",
-            help="Read and compute current ctl-state status without executing targets",
-        )
+    # §Phase 50: status is no longer a mode on the run runners — it is the
+    # standalone read-only status.py (its own slim parser). Removed here.
     if run_type in {"workflow", "target", "fan_out"}:
         mode_group.add_argument(
             "--execution-identity-preflight-check-only",
@@ -3209,6 +3247,7 @@ def setup_run_dirs(
     instance_address: str | None = None,
     target_addresses: list[str] | None = None,
     identity_doc: dict | None = None,
+    execution_access_mode: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Create run directories under the stable ctl result key and setup file logging.
 
@@ -3237,8 +3276,10 @@ def setup_run_dirs(
     step_utils_dir = materialize_step_utils(run_dir)
     logging.info(f"Using ctl target_run runtime: {step_utils_dir}")
 
-    # artifacts/ splits into general/ (run-level metadata + logs) and
-    # target_runs/<target_run>/ (per-target_run outputs, created when target_runs run).
+    # artifacts/ splits into general/ (run-level validation reports + metadata)
+    # and target_runs/<target_run>/ (per-target_run outputs, created when target_runs run).
+    # Logs are a top-level run concern (run_dir/logs/), sibling of cfg/ — not buried
+    # under artifacts/.
     artifacts_dir = run_dir / "artifacts" / "general"
     os.makedirs(artifacts_dir, exist_ok=True)
 
@@ -3254,7 +3295,7 @@ def setup_run_dirs(
     plt_merged_dir = cfg_dir / "plt" / "merged"
     os.makedirs(plt_merged_dir)
 
-    logs_dir = artifacts_dir / "logs"
+    logs_dir = run_dir / "logs"
     os.makedirs(logs_dir, exist_ok=True)
     logs_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
     log_file = logs_dir / f"{SERVICE_ID}_{logs_run_id}.log"
@@ -3282,6 +3323,11 @@ def setup_run_dirs(
             "log_path": str(log_file),
             "target_keys": [],
             "mutation_started": False,
+            # Degraded-mode audit: the access mode is persisted structurally (not
+            # only in the logged command) so an audit of committed run records can
+            # tell which runs ran profile-only/bypass. force_bypass == degraded.
+            **({"execution_access_mode": execution_access_mode}
+               if execution_access_mode else {}),
             # §Phase 31: instance identity + namespace facts of this run.
             **({"ctl_state_namespace": locator_segments[0]}
                if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
@@ -3334,6 +3380,7 @@ def setup_preflight_run_dirs(
     target_addresses: list[str] | None = None,
     identity_doc: dict | None = None,
     parent_fan_out_run_id: str | None = None,
+    execution_access_mode: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
     result_name = normalize_result_name(result_name, label="ctl result name")
@@ -3347,7 +3394,8 @@ def setup_preflight_run_dirs(
                 write_yaml_file(identity_path, identity_doc)
     run_dir = ctl_state_dir / "runs" / run_id
     artifacts_dir = run_dir / "artifacts" / "general"
-    logs_dir = artifacts_dir / "logs"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     logs_run_id = (
@@ -3382,6 +3430,9 @@ def setup_preflight_run_dirs(
             "target_keys": [],
             "mutation_started": False,
             "execution_identity_preflight_check_only": bool(check_only),
+            # Degraded-mode audit (see setup_run_dirs): force_bypass == degraded.
+            **({"execution_access_mode": execution_access_mode}
+               if execution_access_mode else {}),
             # §Phase 31: instance identity + namespace facts of this run.
             **({"ctl_state_namespace": locator_segments[0]}
                if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
@@ -3477,7 +3528,9 @@ def build_status_payload(run_dir: Path, status: str, extra: dict | None = None) 
 
 
 def current_status_path(run_dir: Path) -> Path:
-    return Path(run_dir) / "STATUS.yaml"
+    # §consolidated: status is merged INTO RUN.yaml (was a separate STATUS.yaml).
+    # RUN.yaml is written at start (in_progress) and updated with the outcome.
+    return Path(run_dir) / RUN_METADATA_FILENAME
 
 
 def load_current_status(run_dir: Path) -> dict:
@@ -3500,6 +3553,17 @@ def remove_state_slot(run_dir: Path, state: str) -> None:
         shutil.rmtree(slot_dir)
 
 
+def cleanup_run_workspace(run_dir: Path) -> None:
+    """Drop the run's target_sources workspace (the materialized repo checkout +
+    .terraform provider cache). It is used only DURING the run and is fully
+    reproducible from the pinned source_commit/cfg_source_commit in RUN.yaml;
+    nothing reads it after the run. Called before ctl-state sync so run history
+    never carries hundreds of MB of build cache."""
+    ts = Path(run_dir) / "target_sources"
+    if ts.exists():
+        shutil.rmtree(ts, ignore_errors=True)
+
+
 def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
     slot_dir = ctl_state_dir_from_run_dir(run_dir) / state
     slot_payload = dict(payload)
@@ -3511,7 +3575,7 @@ def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
         {
             "run_id": run_dir.name,
             "run_path": f"runs/{run_dir.name}",
-            "status_path": f"runs/{run_dir.name}/STATUS.yaml",
+            "status_path": f"runs/{run_dir.name}/RUN.yaml",
             "artifacts_path": f"runs/{run_dir.name}/artifacts",
             "updated_at": slot_payload["updated_at"],
         },
@@ -3523,7 +3587,6 @@ def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
 #    dir + an immutable snapshot.yaml under the run. Manifest-last ordering:
 #    the snapshot is written before the pointer is published.
 COMMITTED_POINTER_NAME = "committed.yaml"
-RUN_SNAPSHOT_NAME = "snapshot.yaml"
 
 # Facts denormalized onto committed.yaml so readers (outdate/status) need no
 # second file open; the pointer is still the single publication object.
@@ -3537,21 +3600,19 @@ _COMMITTED_FACT_KEYS = (
 )
 
 
-def run_snapshot_path(run_dir: Path) -> Path:
-    return Path(run_dir) / RUN_SNAPSHOT_NAME
-
-
 def committed_pointer_path(instance_dir: Path) -> Path:
     return Path(instance_dir) / COMMITTED_POINTER_NAME
 
 
 def write_run_snapshot(run_dir: Path, payload: dict) -> str:
-    """Write the immutable run snapshot (facts of this run) and return its
-    sha256. Manifest-last: callers write this BEFORE publishing the pointer."""
-    snapshot = dict(payload)
-    snapshot["snapshot_of_run"] = Path(run_dir).name
-    write_yaml_file(run_snapshot_path(run_dir), snapshot)
-    canonical = json.dumps(snapshot, separators=(",", ":"), sort_keys=True, default=str)
+    """§consolidated: the run's RUN.yaml IS the snapshot — no separate
+    snapshot.yaml. Write the frozen record (this run's payload) to RUN.yaml and
+    return its sha256. Self-contained (does not assume write_current_status ran):
+    RUN.yaml on disk always equals the hashed content, and the reuse-committed
+    check re-reads RUN.yaml and verifies this digest. RUN.yaml must not change
+    after commit or that verification breaks."""
+    write_yaml_file(Path(run_dir) / RUN_METADATA_FILENAME, payload)
+    canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -3686,6 +3747,7 @@ def mark_run_succeeded(run_dir: Path) -> None:
     remove_state_slot(run_dir, "failed")
     mark_outdated_for_run(run_dir, include_current_result=False)
     metadata = load_run_metadata(run_dir)
+    cleanup_run_workspace(run_dir)
     publish_or_queue_ctl_state_run(
         run_dir,
         pointer_path,
@@ -3715,6 +3777,7 @@ def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
     write_state_slot(run_dir, "failed", payload)
     remove_state_slot(run_dir, "in_progress")
     mark_outdated_for_run(run_dir, include_current_result=True)
+    cleanup_run_workspace(run_dir)
     publish_or_queue_ctl_state_run(run_dir, None, reason="run failed")
     release_mutation_lock_if_held()
     print_failure_summary(payload)
@@ -3805,7 +3868,7 @@ def update_committed_manifest(status_path: Path, payload: dict) -> None:
     manifest = {
         "run_id": payload.get("run_id"),
         "run_path": payload.get("run_path") or (f"runs/{payload.get('run_id')}" if payload.get("run_id") else None),
-        "status_path": payload.get("status_path") or (f"runs/{payload.get('run_id')}/STATUS.yaml" if payload.get("run_id") else None),
+        "status_path": payload.get("status_path") or (f"runs/{payload.get('run_id')}/RUN.yaml" if payload.get("run_id") else None),
         "artifacts_path": payload.get("artifacts_path") or (f"runs/{payload.get('run_id')}/artifacts" if payload.get("run_id") else None),
         "updated_at": payload.get("updated_at"),
     }
@@ -3887,6 +3950,20 @@ def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force:
             )
             if candidate_address not in affected_addresses and not candidate_is_run_sibling:
                 continue
+            # §Phase 50.9: never outdate a result THIS run graph just committed
+            # on its OWN action. A workflow provision commits its child target
+            # provision pointers, then sweeps — without this guard it re-marks
+            # its own fresh output stale (the child's own earlier sweep had
+            # protected that pointer, but only via its own result_key, which the
+            # workflow-level sweep does not match). Cross-action supersession
+            # (this provision outdating the sibling DESTROY pointer) still fires,
+            # because that pointer's action differs from this run's action.
+            if (
+                not include_current_result
+                and info.get("action") == action
+                and candidate_address in affected_addresses
+            ):
+                continue
         else:
             # legacy metadata without addresses: match by target-key overlap
             committed_keys = set(status_target_keys(status))
@@ -3966,6 +4043,11 @@ def ctl_state_lock_matches(ctl_state_local_root: Path, lock_id: str | None) -> b
         return False
     metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
     return metadata.get("run_id") == lock_id
+
+
+def force_unlock_resource_kind(target_key: str | None) -> str:
+    """Return the resource kind selected by the optional maintenance target."""
+    return "terraform" if target_key else "ctl_state"
 
 
 def format_ctl_state_lock_error(ctl_state_local_root: Path, metadata: dict, *, reason: str) -> str:
@@ -4188,6 +4270,7 @@ def selector_expected_values(expected, *, label: str) -> list[str]:
 
 EXECUTION_CONTEXT_ROOT = "execution_context"
 EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params")
+EXECUTION_CONTEXT_PARAMS_PREFIX = f"{EXECUTION_CONTEXT_ROOT}.params."
 EXECUTION_CONTEXT_REF_RE = re.compile(
     rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})\.[A-Za-z_][A-Za-z0-9_]*$"
 )
@@ -4380,6 +4463,7 @@ def build_execution_context(
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
+    force_skip_full_cfg_validation_gate: bool = False,
     execution_runtime_mode: str,
     force_skip_execution_identity_preflight_check: bool = False,
 ) -> dict[str, object]:
@@ -4402,6 +4486,12 @@ def build_execution_context(
     put("ctl", "agreed_defer_ctl_state_backend_sync", bool(agreed_defer_ctl_state_backend_sync), label="promoted --agreed-defer-ctl-state-backend-sync")
     put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
     put("ctl", "force_skip_guardrails", bool(force_skip_guardrails), label="promoted --force-skip-guardrails")
+    put(
+        "ctl",
+        "force_skip_full_cfg_validation_gate",
+        bool(force_skip_full_cfg_validation_gate),
+        label="promoted --force-skip-full-cfg-validation-gate",
+    )
     put(
         "ctl",
         "force_skip_execution_identity_preflight_check",
@@ -4475,764 +4565,6 @@ def write_execution_context_artifact(run_dir: Path, execution_context: dict[str,
 
 
 
-GUARD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-def guard_value_text(value, *, label: str) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (str, int, float)):
-        text = str(value)
-        if text:
-            return text
-    if isinstance(value, (dict, list)) and value:
-        try:
-            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"❌ guarded var {label} must resolve to a YAML/JSON-compatible value"
-            ) from exc
-    raise RuntimeError(f"❌ guarded var {label} must resolve to a non-empty scalar or structure")
-
-
-def guard_value_hash(value, *, label: str) -> str:
-    return hashlib.sha256(guard_value_text(value, label=label).encode("utf-8")).hexdigest()
-
-
-def guard_entry(value, *, label: str) -> dict[str, str]:
-    """Baseline entry for a guarded value: plaintext + its sha256.
-
-    The value makes baselines/diffs reviewable and errors readable; the hash
-    stays the comparison primitive and doubles as the entry's self-integrity
-    check (a hand-edited value with a stale hash is rejected at load)."""
-    text = guard_value_text(value, label=label)
-    return {"value": text, "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()}
-
-
-def validate_guard_hash(raw_hash, *, label: str) -> str:
-    if not isinstance(raw_hash, str) or not GUARD_HASH_RE.fullmatch(raw_hash):
-        raise RuntimeError(f"❌ {label} must be a lowercase sha256 hex string")
-    return raw_hash
-
-
-def merge_guarded_vars(dst: dict[str, dict[str, str]], raw_guarded_vars, *, origin: Path) -> None:
-    if raw_guarded_vars is None:
-        return
-    if not isinstance(raw_guarded_vars, dict):
-        raise RuntimeError(f"❌ guarded_vars must be a mapping: {origin}")
-    for var_name, raw_entry in raw_guarded_vars.items():
-        if not isinstance(var_name, str) or not var_name.strip():
-            raise RuntimeError(f"❌ guarded_vars keys must be non-empty strings: {origin}")
-        if var_name in dst:
-            raise RuntimeError(f"❌ duplicate guarded var {var_name!r}: {origin}")
-        label = f"guarded_vars.{var_name}"
-        if not isinstance(raw_entry, dict) or set(raw_entry) != {"value", "hash"}:
-            raise RuntimeError(f"❌ {label} must be a mapping with exactly value + hash: {origin}")
-        value = raw_entry["value"]
-        if not isinstance(value, str) or not value:
-            raise RuntimeError(f"❌ {label}.value must be a non-empty string: {origin}")
-        entry_hash = validate_guard_hash(raw_entry["hash"], label=f"{label}.hash")
-        computed = hashlib.sha256(value.encode("utf-8")).hexdigest()
-        if computed != entry_hash:
-            raise RuntimeError(
-                f"❌ {label} is self-inconsistent: value {value!r} hashes to {computed}, "
-                f"but hash says {entry_hash} (regenerate the baseline): {origin}"
-            )
-        dst[var_name] = {"value": value, "hash": entry_hash}
-
-
-def plt_guardrail_policy_sources(plt_cfg_root: Path) -> list[Path]:
-    """Discover guardrail cfg files; paths organize content but carry no semantics."""
-    sources = []
-    file_path = plt_cfg_root / PLT_GUARDRAILS_FILENAME
-    dir_path = plt_cfg_root / PLT_GUARDRAILS_DIRNAME
-    if file_path.is_file():
-        sources.append(file_path)
-    if dir_path.is_dir():
-        sources.extend(sorted(path for path in dir_path.rglob("*.yaml") if path.is_file()))
-    return sources
-
-
-def load_plt_guardrail_policies(plt_cfg_root: Path) -> dict[str, dict]:
-    """Structurally merge named plt guardrail policies from content keys."""
-    policies = {}
-    origins = {}
-    for path in plt_guardrail_policy_sources(plt_cfg_root):
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict):
-            raise RuntimeError(f"❌ guardrail cfg must contain a mapping: {path}")
-        unknown = set(data) - {PLT_GUARDRAIL_POLICIES_KEY}
-        if unknown:
-            raise RuntimeError(f"❌ guardrail cfg has unsupported collections {sorted(unknown)}: {path}")
-        raw_policies = data.get(PLT_GUARDRAIL_POLICIES_KEY)
-        if not isinstance(raw_policies, dict) or not raw_policies:
-            raise RuntimeError(f"❌ {PLT_GUARDRAIL_POLICIES_KEY} must be a non-empty mapping: {path}")
-        for raw_name, raw_policy in raw_policies.items():
-            if not isinstance(raw_name, str) or not raw_name.strip():
-                raise RuntimeError(f"❌ guardrail policy names must be non-empty strings: {path}")
-            name = raw_name.strip()
-            if name in policies:
-                raise RuntimeError(
-                    f"❌ duplicate plt guardrail policy {name!r}: {path} (also defined in {origins[name]})"
-                )
-            label = f"{PLT_GUARDRAIL_POLICIES_KEY}.{name} in {path}"
-            if not isinstance(raw_policy, dict):
-                raise RuntimeError(f"❌ {label} must be a mapping")
-            unknown = set(raw_policy) - {"match_target_path", "selectors", "protected_vars"}
-            if unknown:
-                raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
-            target_path = normalize_cfg_absolute_path(
-                raw_policy.get("match_target_path"),
-                label=f"{label}.match_target_path",
-            )
-            selectors = raw_policy.get("selectors") or {}
-            selector_requirements(selectors, label=f"{label}.selectors", structured_only=True)
-            raw_vars = raw_policy.get("protected_vars")
-            if (
-                not isinstance(raw_vars, list)
-                or not raw_vars
-                or not all(isinstance(var, str) and var.strip() for var in raw_vars)
-            ):
-                raise RuntimeError(f"❌ {label}.protected_vars must be a non-empty list")
-            protected_vars = []
-            for raw_var in raw_vars:
-                var = raw_var.strip()
-                if "." in var:
-                    raise RuntimeError(f"❌ {label}.protected_vars currently supports top-level vars only: {var!r}")
-                if var in protected_vars:
-                    raise RuntimeError(f"❌ duplicate protected var {var!r}: {label}")
-                protected_vars.append(var)
-            policies[name] = {
-                "name": name,
-                "match_target_path": target_path,
-                "selectors": selectors,
-                "protected_vars": tuple(protected_vars),
-                "origin": path,
-            }
-            origins[name] = path
-    return policies
-
-
-def active_plt_guardrail_policies(
-    policies: dict[str, dict],
-    target_path: str,
-    execution_context: dict[str, object],
-) -> list[dict]:
-    active = []
-    for policy in policies.values():
-        if policy["match_target_path"] != target_path:
-            continue
-        if selector_matches(
-            policy["selectors"],
-            execution_context,
-            label=f'plt guardrail policy {policy["name"]!r}',
-            structured_only=True,
-        ):
-            active.append(policy)
-    return sorted(active, key=lambda policy: policy["name"])
-
-
-def protected_vars_for_policies(policies: list[dict], *, target_path: str) -> list[str]:
-    owners = {}
-    for policy in policies:
-        for var in policy["protected_vars"]:
-            previous = owners.get(var)
-            if previous is not None:
-                raise RuntimeError(
-                    f"❌ protected var {var!r} for target {target_path} is declared by both "
-                    f'policies {previous!r} and {policy["name"]!r}'
-                )
-            owners[var] = policy["name"]
-    return sorted(owners)
-
-
-def _resolved_identity_refs(
-    selectors: dict,
-    execution_context: dict[str, object],
-    *,
-    label: str,
-) -> dict[str, str]:
-    requirements = selector_requirements(selectors, label=label, structured_only=True)
-    resolved = {}
-    for ref, allowed in requirements.items():
-        if ref not in execution_context:
-            raise RuntimeError(f"❌ {label}: {execution_context_miss_message(execution_context, ref)}")
-        value = guard_value_text(execution_context[ref], label=f"{label}.{ref}")
-        if value not in allowed:
-            raise RuntimeError(f"❌ {label}: resolved value {value!r} is outside selector values {sorted(allowed)}")
-        resolved[ref] = value
-    return dict(sorted(resolved.items()))
-
-
-def build_plt_guardrail_instance(
-    target_path: str,
-    scopes: list[dict],
-    composition: dict[str, dict],
-    execution_context: dict[str, object],
-) -> dict:
-    if not scopes:
-        raise RuntimeError(f"❌ cannot build plt guardrail instance without scopes: {target_path}")
-    scope_identities = {}
-    for scope in sorted(scopes, key=lambda item: item["scope_path"]):
-        scope_identities[scope["scope_path"]] = _resolved_identity_refs(
-            scope.get("selectors") or {},
-            execution_context,
-            label=f'scope identity {scope["scope_path"]}',
-        )
-    dimensions = {}
-    rule = composition.get(target_path) or {"scopes": (), "guardrail_dimensions": ()}
-    for ref in rule["guardrail_dimensions"]:
-        if ref not in execution_context:
-            raise RuntimeError(
-                f"❌ instance dimension {ref!r} for target {target_path} has no value in this run"
-            )
-        dimensions[ref] = guard_value_text(
-            execution_context[ref],
-            label=f"instance dimension {ref} for target {target_path}",
-        )
-    instance = {
-        "target_path": target_path,
-        "scopes": scope_identities,
-    }
-    if dimensions:
-        instance["dimensions"] = dict(sorted(dimensions.items()))
-    return instance
-
-
-def normalize_plt_guardrail_instance(raw_instance, *, label: str) -> dict:
-    if not isinstance(raw_instance, dict):
-        raise RuntimeError(f"❌ {label} must be a mapping")
-    required = {"target_path", "scopes"}
-    allowed = required | {"dimensions"}
-    if not required.issubset(raw_instance) or set(raw_instance) - allowed:
-        raise RuntimeError(f"❌ {label} must contain target_path and scopes, with optional dimensions")
-    target_path = normalize_cfg_absolute_path(
-        raw_instance["target_path"],
-        label=f"{label}.target_path",
-    )
-    raw_scopes = raw_instance["scopes"]
-    if not isinstance(raw_scopes, dict) or not raw_scopes:
-        raise RuntimeError(f"❌ {label}.scopes must be a non-empty mapping")
-    scopes = {}
-    for raw_scope_path, raw_identity in raw_scopes.items():
-        scope_path = normalize_cfg_absolute_path(
-            raw_scope_path,
-            label=f"{label}.scopes path",
-            allow_root=True,
-        )
-        if not isinstance(raw_identity, dict):
-            raise RuntimeError(f"❌ {label}.scopes.{scope_path} must be a mapping")
-        identity = {}
-        for ref, value in raw_identity.items():
-            ref = validate_execution_context_ref(ref, label=f"{label}.scopes.{scope_path}")
-            identity[ref] = guard_value_text(value, label=f"{label}.scopes.{scope_path}.{ref}")
-        scopes[scope_path] = dict(sorted(identity.items()))
-    raw_dimensions = raw_instance.get("dimensions", {})
-    if not isinstance(raw_dimensions, dict):
-        raise RuntimeError(f"❌ {label}.dimensions must be a mapping")
-    if "dimensions" in raw_instance and not raw_dimensions:
-        raise RuntimeError(f"❌ {label}.dimensions must be omitted when empty")
-    dimensions = {}
-    for ref, value in raw_dimensions.items():
-        ref = validate_execution_context_ref(ref, label=f"{label}.dimensions")
-        dimensions[ref] = guard_value_text(value, label=f"{label}.dimensions.{ref}")
-    normalized = {"target_path": target_path, "scopes": dict(sorted(scopes.items()))}
-    if dimensions:
-        normalized["dimensions"] = dict(sorted(dimensions.items()))
-    return normalized
-
-
-def plt_guardrail_instance_identity(instance: dict) -> tuple:
-    return (
-        instance["target_path"],
-        tuple(
-            (scope_path, tuple(sorted(identity.items())))
-            for scope_path, identity in sorted(instance["scopes"].items())
-        ),
-        tuple(sorted(instance.get("dimensions", {}).items())),
-    )
-
-
-def guard_baseline_identity(
-    scope_path: str,
-    axes: dict[str, str],
-) -> tuple[str, tuple[tuple[str, str], ...]]:
-    return scope_path, tuple(sorted(axes.items()))
-
-
-def resolve_guard_axes(
-    matching_declarations: list[dict],
-    execution_context: dict[str, object],
-    *,
-    scope_path: str,
-) -> dict[str, str]:
-    refs = sorted({axis for declaration in matching_declarations for axis in declaration.get("baseline_axes", ())})
-    axes = {}
-    for ref in refs:
-        if ref not in execution_context:
-            raise RuntimeError(f"❌ baseline axis {ref!r} for scope {scope_path} has no value in this run")
-        axes[ref] = guard_value_text(execution_context[ref], label=f"baseline axis {ref} for scope {scope_path}")
-    return axes
-
-
-def normalize_plt_protected_values(raw_values, *, label: str) -> dict[str, str]:
-    if not isinstance(raw_values, dict) or not raw_values:
-        raise RuntimeError(f"❌ {label} must be a non-empty mapping")
-    values = {}
-    for raw_name, raw_value in raw_values.items():
-        if not isinstance(raw_name, str) or not raw_name.strip():
-            raise RuntimeError(f"❌ {label} keys must be non-empty strings")
-        name = raw_name.strip()
-        if name in values:
-            raise RuntimeError(f"❌ duplicate protected value {name!r}: {label}")
-        values[name] = guard_value_text(raw_value, label=f"{label}.{name}")
-    return dict(sorted(values.items()))
-
-
-def load_plt_guardrail_baselines(
-    guardrails_cfg_root: Path,
-) -> dict[tuple, dict[str, object]]:
-    """Load content-addressed rendered-target baselines from the guardrail repo."""
-    result = {}
-    for path in sorted(guardrails_cfg_root.rglob("*.yaml")):
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict) or PLT_GUARDRAIL_BASELINES_KEY not in data:
-            continue
-        entries = data[PLT_GUARDRAIL_BASELINES_KEY]
-        if not isinstance(entries, list):
-            raise RuntimeError(f"❌ {PLT_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
-        for index, raw in enumerate(entries):
-            label = f"{PLT_GUARDRAIL_BASELINES_KEY}[{index}] in {path}"
-            if not isinstance(raw, dict) or set(raw) != {"instance", "protected_values"}:
-                raise RuntimeError(f"❌ {label} must contain exactly instance + protected_values")
-            instance = normalize_plt_guardrail_instance(raw["instance"], label=f"{label}.instance")
-            values = normalize_plt_protected_values(
-                raw["protected_values"],
-                label=f"{label}.protected_values",
-            )
-            identity = plt_guardrail_instance_identity(instance)
-            if identity in result:
-                raise RuntimeError(f"❌ duplicate plt guardrail baseline identity {identity!r}: {path}")
-            result[identity] = {
-                "instance": instance,
-                "protected_values": values,
-                "origin": path,
-            }
-    return result
-
-
-def plt_guardrail_baseline_file(root: Path, target_path: str) -> Path:
-    normalized = normalize_cfg_absolute_path(
-        target_path,
-        label="plt guardrail target_path",
-        allow_root=True,
-    )
-    rel = normalized.lstrip("/") or "_root"
-    path = (root / "invariants" / "plt" / f"{rel}.yaml").resolve()
-    try:
-        path.relative_to(root.resolve())
-    except ValueError as exc:
-        raise RuntimeError(f"❌ plt guardrail output escapes guardrail cfg root: {path}") from exc
-    return path
-
-
-def write_plt_guardrail_baseline(
-    root: Path,
-    *,
-    instance: dict,
-    protected_values: dict[str, object],
-) -> Path:
-    """Replace one canonical rendered-target instance in the conventional target file."""
-    instance = normalize_plt_guardrail_instance(instance, label="plt guardrail instance")
-    values = normalize_plt_protected_values(
-        protected_values,
-        label="plt guardrail protected_values",
-    )
-    path = plt_guardrail_baseline_file(root, instance["target_path"])
-    entries = []
-    if path.is_file():
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict) or set(data) != {PLT_GUARDRAIL_BASELINES_KEY}:
-            raise RuntimeError(
-                f"❌ generated plt guardrail file must contain only "
-                f"{PLT_GUARDRAIL_BASELINES_KEY}: {path}"
-            )
-        entries = data[PLT_GUARDRAIL_BASELINES_KEY]
-        if not isinstance(entries, list):
-            raise RuntimeError(f"❌ {PLT_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
-
-    identity = plt_guardrail_instance_identity(instance)
-    replacement = {"instance": instance, "protected_values": values}
-    kept = []
-    replaced = False
-    for index, raw in enumerate(entries):
-        if not isinstance(raw, dict) or set(raw) != {"instance", "protected_values"}:
-            raise RuntimeError(f"❌ invalid generated plt guardrail entry [{index}]: {path}")
-        raw_instance = normalize_plt_guardrail_instance(
-            raw["instance"],
-            label=f"existing plt guardrail instance [{index}] in {path}",
-        )
-        if plt_guardrail_instance_identity(raw_instance) == identity:
-            if replaced:
-                raise RuntimeError(f"❌ duplicate generated plt guardrail identity in {path}")
-            kept.append(replacement)
-            replaced = True
-        else:
-            kept.append(raw)
-    if not replaced:
-        kept.append(replacement)
-    kept.sort(
-        key=lambda entry: plt_guardrail_instance_identity(
-            normalize_plt_guardrail_instance(entry["instance"], label=f"instance in {path}")
-        )
-    )
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = yaml.safe_dump({PLT_GUARDRAIL_BASELINES_KEY: kept}, sort_keys=False)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        handle.write(rendered)
-        temporary_path = Path(handle.name)
-    os.replace(temporary_path, path)
-    return path
-
-
-def verify_plt_protected_value(
-    var_name: str,
-    value,
-    expected: str,
-    *,
-    label: str,
-) -> None:
-    actual = guard_value_text(value, label=label)
-    if actual != expected:
-        raise RuntimeError(
-            f"❌ protected plt var {var_name!r} changed: expected {expected!r}, got {actual!r}"
-        )
-
-
-def verify_guarded_value(
-    owner: str,
-    var_name: str,
-    value,
-    expected: dict[str, str],
-    *,
-    label: str,
-) -> None:
-    actual = guard_entry(value, label=f"{owner}.{var_name}")
-    if actual["hash"] != expected["hash"]:
-        raise RuntimeError(
-            f"❌ guarded {owner} var {var_name!r} changed: "
-            f"expected {expected['value']!r} ({expected['hash']}), "
-            f"got {actual['value']!r} ({actual['hash']})"
-        )
-
-
-CTL_STATE_BACKENDS_GUARD_PREFIX = "ctl_state_backends."
-EXECUTION_CONTEXT_PARAMS_PREFIX = "execution_context.params."
-CTL_STATE_BACKENDS_GUARDABLE_FIELDS = ("bucket_name", "bucket_region")
-
-
-def validate_ctl_guard_ref(ref: str, *, label: str = "ctl guard declaration") -> str:
-    if not isinstance(ref, str) or not ref.strip():
-        raise RuntimeError(f"❌ {label}: guard ref must be a non-empty string")
-    value = ref.strip()
-    if value.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
-        parts = value.split(".")
-        if len(parts) != 3 or parts[2] not in CTL_STATE_BACKENDS_GUARDABLE_FIELDS:
-            raise RuntimeError(
-                f"❌ {label}: {value!r} must be ctl_state_backends.<namespace>."
-                f"<{'|'.join(CTL_STATE_BACKENDS_GUARDABLE_FIELDS)}>"
-            )
-        return value
-    value = validate_execution_context_ref(value, label=label)
-    _, namespace, _ = value.split(".", 2)
-    if namespace == "ctl":
-        raise RuntimeError(
-            f"❌ {label}: {value!r} guards an {EXECUTION_CONTEXT_ROOT}.ctl.* value; "
-            "per-run control switches cannot be guarded"
-        )
-    return value
-
-
-def ctl_guard_namespace_key(ref: str) -> str | None:
-    if not ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
-        return None
-    return ref.split(".", 2)[1]
-
-
-def load_ctl_guard_declarations(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
-    """Load ctl guard declarations; generated values never live in ctl cfg."""
-    declarations = {}
-    for path, section in collect_top_level_sections(ctl_cfg_root, CTL_GUARDRAIL_DECLARATIONS_KEY):
-        if not isinstance(section, list):
-            raise RuntimeError(f"❌ {CTL_GUARDRAIL_DECLARATIONS_KEY} must be a list: {path}")
-        for index, raw in enumerate(section):
-            label = f"{CTL_GUARDRAIL_DECLARATIONS_KEY}[{index}] in {path}"
-            if not isinstance(raw, dict) or not {"ref"}.issubset(raw) or set(raw) - {"ref", "baseline_axes"}:
-                raise RuntimeError(f"❌ {label} must contain ref and optional baseline_axes")
-            ref = validate_ctl_guard_ref(raw["ref"], label=label)
-            raw_axes = raw.get("baseline_axes", [])
-            if not isinstance(raw_axes, list) or any(not isinstance(axis, str) for axis in raw_axes):
-                raise RuntimeError(f"❌ {label}.baseline_axes must be a list of execution-context refs")
-            axes = []
-            for axis in raw_axes:
-                axis = validate_execution_context_ref(axis, label=f"{label}.baseline_axes")
-                if not axis.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
-                    raise RuntimeError(f"❌ {label}.baseline_axes entries must be params refs")
-                if axis in axes:
-                    raise RuntimeError(f"❌ duplicate baseline axis {axis!r}: {label}")
-                axes.append(axis)
-            if ref in declarations:
-                raise RuntimeError(f"❌ duplicate ctl guard declaration {ref!r}: {path}")
-            declarations[ref] = {
-                "ref": ref,
-                "baseline_axes": tuple(sorted(axes)),
-                "origin": path,
-            }
-    return declarations
-
-
-def ctl_guard_baseline_identity(
-    ref: str,
-    axes: dict[str, str],
-) -> tuple[str, tuple[tuple[str, str], ...]]:
-    return ref, tuple(sorted(axes.items()))
-
-
-def load_ctl_guardrail_baselines(
-    guardrails_cfg_root: Path,
-) -> dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, object]]:
-    baselines = {}
-    for path in sorted(guardrails_cfg_root.rglob("*.yaml")):
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict) or CTL_GUARDRAIL_BASELINES_KEY not in data:
-            continue
-        entries = data[CTL_GUARDRAIL_BASELINES_KEY]
-        if not isinstance(entries, list):
-            raise RuntimeError(f"❌ {CTL_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
-        for index, raw in enumerate(entries):
-            label = f"{CTL_GUARDRAIL_BASELINES_KEY}[{index}] in {path}"
-            required = {"ref", "value", "hash"}
-            allowed = required | {"axes"}
-            if not isinstance(raw, dict) or not required.issubset(raw) or set(raw) - allowed:
-                raise RuntimeError(
-                    f"❌ {label} must contain ref, value, hash, and optional non-empty axes"
-                )
-            ref = validate_ctl_guard_ref(raw["ref"], label=label)
-            raw_axes = raw.get("axes", {})
-            if not isinstance(raw_axes, dict):
-                raise RuntimeError(f"❌ {label}.axes must be a mapping")
-            if "axes" in raw and not raw_axes:
-                raise RuntimeError(f"❌ {label}.axes must be omitted when empty")
-            axes = {}
-            for axis, value in raw_axes.items():
-                axis = validate_execution_context_ref(axis, label=f"{label}.axes")
-                if not axis.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
-                    raise RuntimeError(f"❌ {label}.axes keys must be params refs")
-                axes[axis] = guard_value_text(value, label=f"{label}.axes.{axis}")
-            guarded = {}
-            merge_guarded_vars(
-                guarded,
-                {ref: {"value": raw["value"], "hash": raw["hash"]}},
-                origin=path,
-            )
-            identity = ctl_guard_baseline_identity(ref, axes)
-            if identity in baselines:
-                raise RuntimeError(f"❌ duplicate ctl guardrail baseline identity {identity!r}: {path}")
-            baselines[identity] = {
-                "ref": ref,
-                "axes": axes,
-                "value": guarded[ref]["value"],
-                "hash": guarded[ref]["hash"],
-                "origin": path,
-            }
-    return baselines
-
-
-def ctl_guardrail_baseline_file(root: Path) -> Path:
-    return root.resolve() / "invariants" / "ctl" / "guardrails.yaml"
-
-
-def write_ctl_guardrail_baseline(
-    root: Path,
-    *,
-    ref: str,
-    axes: dict[str, str],
-    value,
-) -> Path:
-    """Replace one resolved ctl baseline identity atomically."""
-    path = ctl_guardrail_baseline_file(root)
-    entries = []
-    if path.is_file():
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict) or set(data) != {CTL_GUARDRAIL_BASELINES_KEY}:
-            raise RuntimeError(
-                f"❌ generated ctl guardrail file must contain only {CTL_GUARDRAIL_BASELINES_KEY}: {path}"
-            )
-        entries = data[CTL_GUARDRAIL_BASELINES_KEY]
-        if not isinstance(entries, list):
-            raise RuntimeError(f"❌ {CTL_GUARDRAIL_BASELINES_KEY} must be a list: {path}")
-
-    identity = ctl_guard_baseline_identity(ref, axes)
-    guarded = guard_entry(value, label=ref)
-    replacement = {"ref": ref}
-    if axes:
-        replacement["axes"] = dict(sorted(axes.items()))
-    replacement.update(guarded)
-    kept = []
-    replaced = False
-    for raw in entries:
-        if not isinstance(raw, dict):
-            raise RuntimeError(f"❌ invalid generated ctl guardrail entry: {path}")
-        raw_axes_cfg = raw.get("axes", {})
-        if not isinstance(raw_axes_cfg, dict) or ("axes" in raw and not raw_axes_cfg):
-            raise RuntimeError(f"❌ invalid generated ctl guardrail axes: {path}")
-        raw_axes = {
-            str(key): guard_value_text(axis_value, label=f"axes.{key}")
-            for key, axis_value in raw_axes_cfg.items()
-        }
-        raw_identity = ctl_guard_baseline_identity(str(raw.get("ref") or ""), raw_axes)
-        if raw_identity == identity:
-            if replaced:
-                raise RuntimeError(f"❌ duplicate generated ctl guardrail identity in {path}")
-            kept.append(replacement)
-            replaced = True
-        else:
-            kept.append(raw)
-    if not replaced:
-        kept.append(replacement)
-    kept.sort(
-        key=lambda entry: ctl_guard_baseline_identity(
-            str(entry["ref"]),
-            {str(key): str(axis_value) for key, axis_value in dict(entry.get("axes", {})).items()},
-        )
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rendered = yaml.safe_dump({CTL_GUARDRAIL_BASELINES_KEY: kept}, sort_keys=False)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
-    ) as handle:
-        handle.write(rendered)
-        temporary_path = Path(handle.name)
-    os.replace(temporary_path, path)
-    return path
-
-
-def resolve_ctl_guard_value(ref: str, ctl_cfg_root: Path, execution_context: dict[str, object]):
-    """Resolve a ctl declaration to its materialized value for this run."""
-    if ref.startswith(CTL_STATE_BACKENDS_GUARD_PREFIX):
-        _, namespace_key, field = ref.split(".")
-        backends = load_ctl_state_backends_cfg(ctl_cfg_root) or {}
-        entry = backends.get(namespace_key)
-        if entry is None:
-            known = ", ".join(sorted(backends)) or "none"
-            raise RuntimeError(f"❌ ctl guarded var {ref!r}: unknown namespace {namespace_key!r}; known: {known}")
-        return resolve_runtime_scalar(
-            entry[field],
-            execution_context,
-            label=f"ctl guarded var {ref}",
-        )
-    if ref not in execution_context:
-        raise RuntimeError(
-            f"❌ ctl guarded var {ref!r}: {execution_context_miss_message(execution_context, ref)}"
-        )
-    return execution_context[ref]
-
-
-def verify_ctl_guardrails(
-    ctl_cfg_root: Path,
-    guardrails_cfg_root: Path,
-    execution_context: dict[str, object],
-) -> None:
-    declarations = load_ctl_guard_declarations(ctl_cfg_root)
-    if not declarations:
-        return
-    baselines = load_ctl_guardrail_baselines(guardrails_cfg_root)
-    for entry in baselines.values():
-        declaration = declarations.get(entry["ref"])
-        if declaration is None:
-            raise RuntimeError(
-                f"❌ ctl baseline {entry['ref']!r} in {entry['origin']} has no declaration"
-            )
-        expected_axes = set(declaration["baseline_axes"])
-        if set(entry["axes"]) != expected_axes:
-            raise RuntimeError(
-                f"❌ ctl baseline {entry['ref']!r} in {entry['origin']} has axes "
-                f"{sorted(entry['axes'])}; expected {sorted(expected_axes)}"
-            )
-
-    declared_namespaces = {
-        ctl_guard_namespace_key(declaration["ref"])
-        for declaration in declarations.values()
-        if ctl_guard_namespace_key(declaration["ref"]) is not None
-    }
-    namespace_key = None
-    if declared_namespaces:
-        namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
-    active = []
-    for declaration in declarations.values():
-        declaration_namespace = ctl_guard_namespace_key(declaration["ref"])
-        if declaration_namespace is None or declaration_namespace == namespace_key:
-            active.append(declaration)
-    for declaration in active:
-        ref = declaration["ref"]
-        axes = resolve_guard_axes(
-            [declaration],
-            execution_context,
-            scope_path=f"ctl guard {ref}",
-        )
-        identity = ctl_guard_baseline_identity(ref, axes)
-        baseline = baselines.get(identity)
-        if baseline is None:
-            raise RuntimeError(
-                f"❌ ctl guard {ref!r} has no baseline for axes {axes} in {guardrails_cfg_root}"
-            )
-        value = resolve_ctl_guard_value(ref, ctl_cfg_root, execution_context)
-        verify_guarded_value("ctl", ref, value, baseline, label=ref)
-
-
-def load_rendered_cfg_top_level_values(rendered_dir: Path, var_name: str) -> list[tuple[Path, object]]:
-    values: list[tuple[Path, object]] = []
-    for path in sorted(rendered_dir.rglob("*.yaml")):
-        if path.name in SCOPE_META_SKIP_FILENAMES or PLT_GUARDRAILS_DIRNAME in path.parts:
-            continue
-        data = load_yaml(path) or {}
-        if not isinstance(data, dict) or var_name not in data:
-            continue
-        values.append((path, data[var_name]))
-    return values
-
-
-def read_rendered_guard_value(rendered_target_dir: Path, var_name: str, *, label: str):
-    """Read one guarded top-level value from a rendered scope target dir.
-
-    Requires presence, cross-file agreement, and a fully-resolved value —
-    a leftover ${...} placeholder is a hard error, never hashed.
-    """
-    values = load_rendered_cfg_top_level_values(rendered_target_dir, var_name)
-    if not values:
-        raise RuntimeError(f"❌ {label} guarded var {var_name!r} was not found in {rendered_target_dir}")
-    first_path, first_value = values[0]
-    first_text = guard_value_text(first_value, label=f"{label}.{var_name} at {first_path}")
-    for path, value in values[1:]:
-        value_text = guard_value_text(value, label=f"{label}.{var_name} at {path}")
-        if value_text != first_text:
-            raise RuntimeError(
-                f"❌ {label} guarded var {var_name!r} has multiple active values: "
-                f"{first_path}={first_text!r}, {path}={value_text!r}"
-            )
-    if "${" in first_text:
-        raise RuntimeError(
-            f"❌ {label} guarded var {var_name!r} is not fully resolved after render: {first_text!r}"
-        )
-    return first_value
-
 
 def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
     target_rel = target_path.lstrip("/")
@@ -5245,11 +4577,7 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
 
 
 def required_target_paths_for_target_runs(active_target_runs: dict) -> set[str] | None:
-    """Target paths this run's target_runs consume, from their cfg_roots.
-
-    Scopes are independent units: a run merges/renders/guard-verifies only the
-    scopes serving its target_runs' cfg_roots. Returns None when any target_run consumes
-    the root ("/") — the deliberate escape hatch meaning every scope."""
+    """Return the top-level PLT target paths consumed by target runs."""
     paths: set[str] = set()
     for target_run in active_target_runs.values():
         cfg_root = str(target_run.get("cfg_root") or "/")
@@ -5260,6 +4588,20 @@ def required_target_paths_for_target_runs(active_target_runs: dict) -> set[str] 
     return paths
 
 
+def verify_ctl_guardrails(
+    ctl_cfg_root: Path,
+    guardrails_cfg_root: Path,
+    execution_context: dict[str, object],
+) -> None:
+    from utils import guardrails
+
+    guardrails.verify_ctl_guardrails(
+        ctl_cfg_root,
+        guardrails_cfg_root,
+        execution_context,
+    )
+
+
 def verify_plt_guardrails(
     plt_cfg_root: Path,
     guardrails_cfg_root: Path,
@@ -5268,75 +4610,17 @@ def verify_plt_guardrails(
     scope_params: dict[str, str],
     required_target_paths: set[str] | None = None,
 ) -> None:
-    """Verify composed rendered targets against collection-driven baselines."""
-    policies = load_plt_guardrail_policies(plt_cfg_root)
-    if not policies:
-        return
-    if not discover_cfg_meta_paths(plt_cfg_root):
-        raise RuntimeError(f"❌ plt guardrail policies exist but no cfg scopes found under: {plt_cfg_root}")
+    from utils import guardrails
 
-    baselines = load_plt_guardrail_baselines(guardrails_cfg_root)
-    all_policy_vars = collections.defaultdict(set)
-    for policy in policies.values():
-        all_policy_vars[policy["match_target_path"]].update(policy["protected_vars"])
-    for entry in baselines.values():
-        target_path = entry["instance"]["target_path"]
-        origin = entry["origin"]
-        extra = sorted(set(entry["protected_values"]) - all_policy_vars.get(target_path, set()))
-        if extra:
-            raise RuntimeError(
-                f"❌ baseline values {extra} in {origin} have no plt guardrail policy "
-                f"for target {target_path}"
-            )
-
-    active_scopes = discover_active_cfg_scopes(
+    guardrails.verify_plt_guardrails(
         plt_cfg_root,
-        scope_params=scope_params,
-        execution_context=execution_context,
+        plt_cfg_root,
+        guardrails_cfg_root,
+        plt_rendered_dir,
+        execution_context,
+        scope_params,
+        required_target_paths,
     )
-    scopes_by_target = collections.defaultdict(list)
-    for scope in active_scopes:
-        if required_target_paths is not None and scope["target_path"] not in required_target_paths:
-            continue
-        scopes_by_target[scope["target_path"]].append(scope)
-    composition = load_scope_composition(plt_cfg_root)
-
-    for target_path, scopes in sorted(scopes_by_target.items()):
-        matching = active_plt_guardrail_policies(policies, target_path, execution_context)
-        names = protected_vars_for_policies(matching, target_path=target_path)
-        if not names:
-            continue
-        instance = build_plt_guardrail_instance(
-            target_path,
-            scopes,
-            composition,
-            execution_context,
-        )
-        entry = baselines.get(plt_guardrail_instance_identity(instance))
-        if entry is None:
-            raise RuntimeError(
-                f"❌ protected vars {names} for target instance {instance} have no baseline in "
-                f"{guardrails_cfg_root}; run regenerate_guardrails.py for this instance"
-            )
-        baseline = entry["protected_values"]
-        origin = entry["origin"]
-        missing = sorted(set(names) - set(baseline))
-        if missing:
-            raise RuntimeError(
-                f"❌ protected vars {missing} for target instance {instance} have no baseline values"
-            )
-        extra = sorted(set(baseline) - set(names))
-        if extra:
-            raise RuntimeError(
-                f"❌ baseline values {extra} in {origin} have no active policy for instance {instance}"
-            )
-        target_dir = rendered_scope_target_dir(plt_rendered_dir, target_path)
-        if not target_dir.is_dir():
-            raise RuntimeError(f"❌ rendered target dir not found for instance {instance}: {target_dir}")
-        label = f"plt target {target_path} instance={instance}"
-        for name in names:
-            value = read_rendered_guard_value(target_dir, name, label=label)
-            verify_plt_protected_value(name, value, baseline[name], label=f"{label}.{name}")
 
 
 def verify_guardrails(
@@ -5348,7 +4632,9 @@ def verify_guardrails(
     scope_params: dict[str, str],
     required_target_paths: set[str] | None = None,
 ) -> None:
-    if execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.ctl.force_skip_guardrails"):
+    if execution_context.get(
+        f"{EXECUTION_CONTEXT_ROOT}.ctl.force_skip_guardrails"
+    ):
         logging.info("guardrails: force-skipped")
         return
     verify_ctl_guardrails(
@@ -5357,7 +4643,10 @@ def verify_guardrails(
         execution_context,
     )
     logging.info("ctl guardrails: passed")
-    verify_plt_guardrails(
+    from utils import guardrails
+
+    guardrails.verify_plt_guardrails(
+        ctl_cfg_root,
         plt_cfg_root,
         guardrails_cfg_root,
         plt_rendered_dir,
@@ -5466,7 +4755,7 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
         label = f"scope_composition[{index}] in {path}"
         if not isinstance(raw_rule, dict):
             raise RuntimeError(f"❌ {label} must be a mapping")
-        unknown = set(raw_rule) - {"target_path", "scopes", "guardrail_dimensions"}
+        unknown = set(raw_rule) - {"target_path", "scopes"}
         if unknown:
             raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
         target_path = normalize_cfg_absolute_path(raw_rule.get("target_path"), label=f"{label}.target_path")
@@ -5481,22 +4770,8 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
             if prefix in prefixes:
                 raise RuntimeError(f"❌ duplicate scope composition prefix {prefix!r}: {label}")
             prefixes.append(prefix)
-        raw_dimensions = raw_rule.get("guardrail_dimensions") or []
-        if not isinstance(raw_dimensions, list):
-            raise RuntimeError(f"❌ {label}.guardrail_dimensions must be a list")
-        dimensions = []
-        for raw_ref in raw_dimensions:
-            ref = validate_execution_context_ref(raw_ref, label=f"{label}.guardrail_dimensions")
-            if not ref.startswith(EXECUTION_CONTEXT_PARAMS_PREFIX):
-                raise RuntimeError(
-                    f"❌ {label}.guardrail_dimensions entries must be params refs: {ref!r}"
-                )
-            if ref in dimensions:
-                raise RuntimeError(f"❌ duplicate instance dimension {ref!r}: {label}")
-            dimensions.append(ref)
         rules[target_path] = {
             "scopes": tuple(prefixes),
-            "guardrail_dimensions": tuple(sorted(dimensions)),
         }
     return rules
 
@@ -5580,7 +4855,6 @@ def load_scope_candidate(
 
     selectors = meta_cfg.get("selectors") or {}
     if not selector_matches(selectors, execution_context, label=str(meta_path), structured_only=True):
-        logging.info("Skipping inactive cfg scope %s for execution context %s", meta_path, execution_context)
         return None
 
     nested = find_nested_cfg_meta(scope_root, exclude=meta_path)
@@ -6998,7 +6272,15 @@ def compute_workflow_instance_status(
             item["address"] for item in spec["target_specs"]
         ]:
             reasons.append("workflow target order or set changed")
-    if reasons and verdict != "never_ran":
+    all_destroyed = bool(children) and all(
+        child["verdict"] == "destroyed" for child in children
+    )
+    if all_destroyed and verdict != "never_ran":
+        # The whole composition is torn down — mirror the target-level rule
+        # (newest event = destroy reads `destroyed`, not `outdated`). A PARTIAL
+        # teardown or revision/definition drift still reads `outdated` below.
+        verdict = "destroyed"
+    elif reasons and verdict != "never_ran":
         verdict = "outdated"
     return {
         "kind": "workflow",
@@ -7095,10 +6377,21 @@ def _arm_ctl_state_reader(
     )
 
 
+def _resolve_local_ctl_state_scope(
+    ctl_cfg_root: Path, execution_context: dict[str, object], ctl_state_local_root: Path
+) -> tuple[str, Path]:
+    """§Phase 42 `local` scope: the namespace resolves from cfg alone, so the
+    local view needs no credentials and makes no bucket calls. Reads the tree
+    exactly as it is — the ONLY way to see a force-skipped run, which exists
+    locally and can never reach the bucket."""
+    namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
+    return namespace_key, Path(ctl_state_local_root) / namespace_key
+
+
 def hydrate_ctl_state_index(syncer) -> list[str]:
     keys = syncer.list_object_keys()
     for key in keys:
-        if key.endswith("/committed.yaml") or key.endswith("/snapshot.yaml"):
+        if key.endswith("/committed.yaml") or key.endswith("/RUN.yaml"):
             syncer.pull_object(key)
     return keys
 
@@ -7114,88 +6407,76 @@ def run_ctl_state_status_sweep(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
+        force_skip_full_cfg_validation_gate=(
+            args.force_skip_full_cfg_validation_gate
+        ),
         execution_runtime_mode=args.execution_runtime_mode,
     )
+    # §Phase 42: the sweep is a QUERY over bucket truth (its only output, an
+    # advisory status_cache.yaml, belongs to the bucket). It hydrates every
+    # pointer in the namespace, so running it against the real local root would
+    # clobber local-only records wholesale — it works in a throwaway root and
+    # pushes the caches from there.
+    with tempfile.TemporaryDirectory(prefix="atlas-ctl-state-sweep-") as scratch:
+        return _run_ctl_state_status_sweep_in(
+            ctl_cfg_root,
+            args,
+            context,
+            Path(scratch),
+            provider_implementation_key=provider_implementation_key,
+        )
+
+
+def _run_ctl_state_status_sweep_in(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    context: dict[str, object],
+    ctl_state_root: Path,
+    *,
+    provider_implementation_key: str,
+) -> dict:
     namespace_key, namespace_root, reader = _arm_ctl_state_operation(
         ctl_cfg_root,
         context,
-        args.ctl_state_local_root,
+        ctl_state_root,
         operation="read",
         provider_implementation_key=provider_implementation_key,
         execution_access_mode=args.execution_access_mode,
         provider_credential=args.provider_credential,
     )
     hydrate_ctl_state_index(reader)
-    results = []
-    cache_paths: list[Path] = []
-    for pointer_path in sorted(namespace_root.rglob("committed.yaml")):
-        info = parse_result_dir(args.ctl_state_local_root, pointer_path.parent)
-        if not info or info.get("run_type") != "workflow":
-            continue
-        pointer = read_committed_pointer(pointer_path.parent) or {}
-        target_specs = []
-        for address in [
-            str(item.get("address"))
-            for item in (pointer.get("child_revisions") or [])
-            if isinstance(item, dict)
-        ]:
-            target_key, segments = split_target_instance_address(address)
-            target_specs.append(
-                {
-                    "kind": "target",
-                    "key": target_key,
-                    "segments": segments,
-                    "address": address,
-                    "prefix": compose_state_relpath(
-                        info["action"], "target", target_key, segments
-                    ).as_posix(),
-                }
-            )
-        spec = {
-            "kind": "workflow",
-            "key": info["result_name"],
-            "segments": info.get("instance") or [],
-            "address": info["address"],
-            "prefix": pointer_path.parent.relative_to(namespace_root).as_posix(),
-            "target_specs": target_specs,
-            "workflow_definition_sha256": pointer.get(
-                "workflow_definition_sha256"
-            ),
-        }
-        computed = compute_workflow_instance_status(
-            namespace_root, info["action"], spec
-        )
-        cache = {
-            "advisory": True,
-            "computed_at": utc_timestamp(),
-            "source": "ctl-state self-consistency sweep",
-            **computed,
-        }
-        cache_path = pointer_path.parent / "status_cache.yaml"
-        write_yaml_file(cache_path, cache)
-        cache_paths.append(cache_path)
-        results.append(computed)
-    if cache_paths:
-        cache_keys = [
-            path.relative_to(namespace_root).as_posix() for path in cache_paths
-        ]
-        _, _, writer = _arm_ctl_state_operation(
-            ctl_cfg_root,
-            context,
-            args.ctl_state_local_root,
-            operation="sync",
-            object_keys=cache_keys,
-            provider_implementation_key=provider_implementation_key,
-            execution_access_mode=args.execution_access_mode,
-            provider_credential=args.provider_credential,
-        )
-        for key, path in zip(cache_keys, cache_paths):
-            writer.put_object(key, path)
+    # §Phase 50.10: ONE lean root-level map (advisory, bucket-owned), replacing
+    # the old per-workflow-instance verbose docs. Flat address -> verdict over
+    # every target and workflow instance, lifecycle-collapsed.
+    instances = compute_namespace_status_map(namespace_root)
+    # §Phase 50.10: same self-describing shape status.py --write-cache emits, so
+    # a reader never has to guess which view / when produced this snapshot.
+    cache = {
+        "advisory": True,
+        "source": "ctl-state self-consistency sweep",
+        "namespace": namespace_key,
+        "scope": "remote",
+        "computed_at": utc_timestamp(),
+        "instances": instances,
+    }
+    cache_path = namespace_root / "status_cache.yaml"
+    write_yaml_file(cache_path, cache)
+    cache_key = cache_path.relative_to(namespace_root).as_posix()
+    _, _, writer = _arm_ctl_state_operation(
+        ctl_cfg_root,
+        context,
+        ctl_state_root,
+        operation="sync",
+        object_keys=[cache_key],
+        provider_implementation_key=provider_implementation_key,
+        execution_access_mode=args.execution_access_mode,
+        provider_credential=args.provider_credential,
+    )
+    writer.put_object(cache_key, cache_path)
     report = {
         "operation": "status-sweep",
         "namespace": namespace_key,
-        "workflow_instances": len(results),
-        "results": results,
+        "instances": instances,
     }
     print(yaml.safe_dump(report, sort_keys=False).rstrip())
     return report
@@ -7229,6 +6510,9 @@ def run_ctl_state_history_prune(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
+        force_skip_full_cfg_validation_gate=(
+            args.force_skip_full_cfg_validation_gate
+        ),
         execution_runtime_mode=args.execution_runtime_mode,
     )
     namespace_key, namespace_root, reader = _arm_ctl_state_operation(
@@ -7289,10 +6573,10 @@ def run_ctl_state_history_prune(
         )
 
     references: dict[str, set[str]] = {}
-    for snapshot_path in namespace_root.rglob("snapshot.yaml"):
+    for snapshot_path in namespace_root.rglob(RUN_METADATA_FILENAME):
         snapshot = load_yaml(snapshot_path) or {}
         workflow_run = str(
-            snapshot.get("snapshot_of_run") or snapshot_path.parent.name
+            snapshot.get("run_id") or snapshot_path.parent.name
         )
         for child in snapshot.get("child_revisions") or []:
             if isinstance(child, dict) and child.get("run_id"):
@@ -7376,6 +6660,36 @@ def run_ctl_state_maintenance_command(
     provider_implementation_key: str = "local",
 ) -> dict:
     validate_maintenance_args(args)
+    context = build_execution_context(
+        ctl_cfg_root,
+        action=args.action,
+        ctl_profile=args.ctl_profile,
+        execution_params=args.execution_params,
+        execution_access_mode=args.execution_access_mode,
+        agreed_defer_ctl_state_backend_sync=args.agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=args.force_skip_ctl_state_backend_sync,
+        force_skip_guardrails=args.force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=(
+            args.force_skip_full_cfg_validation_gate
+        ),
+        execution_runtime_mode=args.execution_runtime_mode,
+        force_skip_execution_identity_preflight_check=getattr(
+            args, "force_skip_execution_identity_preflight_check", False
+        ),
+    )
+    validate_force_skip_full_cfg_validation_gate_policy(
+        ctl_cfg_root,
+        args.ctl_profile,
+        args.force_skip_full_cfg_validation_gate,
+    )
+    cfg_report = build_cfg_validation_report(
+        collect_provider_cfg_findings(ctl_cfg_root, context)
+    )
+    apply_full_cfg_validation_gate(
+        cfg_report, force_skip=args.force_skip_full_cfg_validation_gate
+    )
+    logging.info("\n%s", "\n".join(_cfg_validation_text_lines(cfg_report)))
+    assert_full_cfg_validation_gate_accepted(cfg_report)
     if args.maintenance_action == "status-sweep":
         return run_ctl_state_status_sweep(
             ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
@@ -7388,6 +6702,21 @@ def run_ctl_state_maintenance_command(
         f"❌ {args.maintenance_action!r} is not a ctl-state-only maintenance operation"
     )
 
+
+
+def _compute_status_results(
+    namespace_root: Path, action: str, labels: list[str], specs: list[dict]
+) -> list[dict]:
+    results = []
+    for label, spec in zip(labels, specs):
+        computed = (
+            compute_target_instance_status(namespace_root, action, spec)
+            if spec["kind"] == "target"
+            else compute_workflow_instance_status(namespace_root, action, spec)
+        )
+        computed["selection"] = label
+        results.append(computed)
+    return results
 
 
 def run_status_command(
@@ -7439,6 +6768,12 @@ def run_status_command(
                     provider_credential=args.provider_credential,
                     execution_access_mode=args.execution_access_mode,
                     target_name=child["key"] if child["kind"] == "target" else None,
+                    # §Phase 50: a status read needs only the cfg-level state
+                    # spec (prefix/segments); it enforces no mutate policy and
+                    # loads no provider catalogs (which would validate account
+                    # ids a read never uses).
+                    enforce_ctl_policy=False,
+                    load_provider_catalogs=False,
                 )
             )
             labels.append(child["label"])
@@ -7458,48 +6793,61 @@ def run_status_command(
             provider_credential=args.provider_credential,
             execution_access_mode=args.execution_access_mode,
             target_name=args.target if run_type == "target" else None,
+            # §Phase 50: cfg-level state spec only — no mutate policy, no
+            # provider catalogs (a read never uses account ids).
+            enforce_ctl_policy=False,
+            load_provider_catalogs=False,
         )
         selections = [selection]
         specs = [selection_state_spec(selection)]
         labels = [selection["selection_key"]]
 
-    namespace_key, namespace_root, syncer = _arm_ctl_state_reader(
-        ctl_cfg_root,
-        selections[0],
-        args.ctl_state_local_root,
-        provider_implementation_key=provider_implementation_key,
-        execution_access_mode=args.execution_access_mode,
-        provider_credential=args.provider_credential,
-    )
-    for spec in specs:
-        child_prefixes = [
-            target["prefix"] for target in spec.get("target_specs", [])
-        ]
-        syncer.hydrate_instance(spec["prefix"], child_prefixes)
-        # Lifecycle status needs sibling provision/destroy pointers.
-        target_specs = spec.get("target_specs") or (
-            [spec] if spec["kind"] == "target" else []
+    # §Phase 42: a query must NEVER mutate local ctl-state. `remote` hydrates
+    # into an auto-generated throwaway root (an implementation detail — never a
+    # CLI argument) so pull_object's unconditional overwrite lands there instead
+    # of clobbering a local-only pointer; `local` never touches the bucket.
+    if args.status == "local":
+        namespace_key, namespace_root = _resolve_local_ctl_state_scope(
+            ctl_cfg_root,
+            selections[0]["execution_context"],
+            args.ctl_state_local_root,
         )
-        for target_spec in target_specs:
-            for lifecycle_action in ("provision", "destroy"):
-                syncer.pull_object(
-                    compose_state_relpath(
-                        lifecycle_action,
-                        "target",
-                        target_spec["key"],
-                        target_spec["segments"],
-                    ).as_posix()
-                    + "/committed.yaml"
+        results = _compute_status_results(namespace_root, args.action, labels, specs)
+    else:
+        with tempfile.TemporaryDirectory(
+            prefix="atlas-ctl-state-remote-"
+        ) as scratch_root:
+            namespace_key, namespace_root, syncer = _arm_ctl_state_reader(
+                ctl_cfg_root,
+                selections[0],
+                Path(scratch_root),
+                provider_implementation_key=provider_implementation_key,
+                execution_access_mode=args.execution_access_mode,
+                provider_credential=args.provider_credential,
+            )
+            for spec in specs:
+                child_prefixes = [
+                    target["prefix"] for target in spec.get("target_specs", [])
+                ]
+                syncer.hydrate_instance(spec["prefix"], child_prefixes)
+                # Lifecycle status needs sibling provision/destroy pointers.
+                target_specs = spec.get("target_specs") or (
+                    [spec] if spec["kind"] == "target" else []
                 )
-    results = []
-    for label, spec in zip(labels, specs):
-        computed = (
-            compute_target_instance_status(namespace_root, args.action, spec)
-            if spec["kind"] == "target"
-            else compute_workflow_instance_status(namespace_root, args.action, spec)
-        )
-        computed["selection"] = label
-        results.append(computed)
+                for target_spec in target_specs:
+                    for lifecycle_action in ("provision", "destroy"):
+                        syncer.pull_object(
+                            compose_state_relpath(
+                                lifecycle_action,
+                                "target",
+                                target_spec["key"],
+                                target_spec["segments"],
+                            ).as_posix()
+                            + "/committed.yaml"
+                        )
+            results = _compute_status_results(
+                namespace_root, args.action, labels, specs
+            )
     report = {
         "selection": {
             "kind": run_type,
@@ -7512,6 +6860,9 @@ def run_status_command(
             ),
         },
         "namespace": namespace_key,
+        # Which scope produced this view — local and bucket history legitimately
+        # differ (a force-skipped run is local-only, permanently).
+        "scope": args.status,
         "verdict": (
             "outdated"
             if any(item["verdict"] in {"outdated", "destroyed"} for item in results)
@@ -7523,6 +6874,366 @@ def run_status_command(
     }
     print(yaml.safe_dump(report, sort_keys=False).rstrip())
     return report
+
+
+def _workflow_instance_verdict(
+    namespace_root: Path, key: str, segments: list[str]
+) -> str | None:
+    """Reconciled verdict for ONE workflow instance (§Phase 50.10), or None when
+    the instance holds no reconciled state and must not appear in the map.
+
+    Only a DEPLOYABLE COMPOSITION — a key that has ever been provisioned — owns a
+    reconciled verdict. A destroy-only key (a pure teardown) creates nothing and
+    owns no state, so it returns None and gets no row: its effect is already
+    recorded on the TARGET rows it destroyed (and on the provision composition's
+    own row). Teardown runs still persist for audit — that is run history, not
+    reconciled status.
+
+    For a deployable composition the newest of its provision/destroy pointers
+    wins: a destroy newest (torn down via its own key) reads `destroyed`, else the
+    verdict is projected from its child target markers."""
+    candidates: list[tuple[str, str, Path, dict]] = []
+    provision_pointer: dict | None = None
+    for lifecycle_action in ("provision", "destroy"):
+        candidate_dir = namespace_root / compose_state_relpath(
+            lifecycle_action, "workflow", key, segments
+        )
+        pointer = read_committed_pointer(candidate_dir)
+        if pointer:
+            order = str(pointer.get("committed_at") or pointer.get("run_id") or "")
+            candidates.append((order, lifecycle_action, candidate_dir, pointer))
+            if lifecycle_action == "provision":
+                provision_pointer = pointer
+    # A pure teardown (destroy-only key) owns no reconciled state → no row.
+    if provision_pointer is None:
+        return None
+    _, newest_action, newest_dir, pointer = max(candidates, key=lambda item: item[0])
+    if newest_action == "destroy":
+        return "destroyed"
+    target_specs = []
+    for item in pointer.get("child_revisions") or []:
+        if not isinstance(item, dict):
+            continue
+        child_key, child_segments = split_target_instance_address(
+            str(item.get("address"))
+        )
+        target_specs.append(
+            {
+                "kind": "target",
+                "key": child_key,
+                "segments": child_segments,
+                "address": str(item.get("address")),
+                "prefix": compose_state_relpath(
+                    "provision", "target", child_key, child_segments
+                ).as_posix(),
+            }
+        )
+    spec = {
+        "kind": "workflow",
+        "key": key,
+        "segments": segments,
+        "address": "/".join([key, *segments]),
+        "prefix": newest_dir.relative_to(namespace_root).as_posix(),
+        "target_specs": target_specs,
+        "workflow_definition_sha256": pointer.get("workflow_definition_sha256"),
+    }
+    return compute_workflow_instance_status(namespace_root, "provision", spec)["verdict"]
+
+
+def compute_namespace_status_map(namespace_root: Path) -> dict[str, str]:
+    """§Phase 50.10: a flat `address -> verdict` map over EVERY target and
+    workflow instance under the namespace root, lifecycle-collapsed to one row
+    per instance. Targets read their own event-driven marker (via the
+    provision-perspective compute, which also folds a newer destroy into
+    `destroyed`); a workflow row is a derived projection over child markers and
+    exists only for a DEPLOYABLE COMPOSITION (a key ever provisioned). Pure
+    teardowns (destroy-only workflow keys) own no reconciled state and never
+    appear — their effect shows on the target rows. Fan-outs own no state and
+    never appear. Verdict vocab: current | outdated | destroyed | never_ran (a
+    target `status: ok` marker reads as `current`)."""
+    namespace_root = Path(namespace_root)
+    if not namespace_root.is_dir():
+        return {}
+    targets: set[tuple[str, tuple[str, ...]]] = set()
+    workflows: set[tuple[str, tuple[str, ...]]] = set()
+    for pointer_path in namespace_root.rglob("committed.yaml"):
+        parsed = parse_state_relpath(namespace_root, pointer_path.parent)
+        if parsed is None:
+            continue
+        instance = (parsed["key"], tuple(parsed["instance_segments"]))
+        if parsed["kind"] == "target":
+            targets.add(instance)
+        elif parsed["kind"] == "workflow":
+            workflows.add(instance)
+    rows: dict[str, str] = {}
+    for key, seg in targets:
+        segments = list(seg)
+        address = target_instance_address(key, segments)
+        spec = {
+            "kind": "target",
+            "key": key,
+            "segments": segments,
+            "address": address,
+            "prefix": compose_state_relpath(
+                "provision", "target", key, segments
+            ).as_posix(),
+        }
+        rows[f"target/{address}"] = compute_target_instance_status(
+            namespace_root, "provision", spec
+        )["verdict"]
+    for key, seg in workflows:
+        verdict = _workflow_instance_verdict(namespace_root, key, list(seg))
+        if verdict is None:
+            continue
+        address = "/".join([key, *seg])
+        rows[f"workflow/{address}"] = verdict
+    return dict(sorted(rows.items()))
+
+
+def add_status_args(parser: argparse.ArgumentParser) -> None:
+    """§Phase 50: the slim, read-only status parser. Only what a read needs —
+    namespace + breadth + scope (+ dir for local, dev substitute for remote).
+    No runtime-mode, no access-mode enum, no reuse/force/defer. --ctl-profile
+    stays: a read still consults its ref_policy (§Phase 50.7). Titled groups
+    drive --help, mirroring the run runners; keep add_bootstrap_status_args (the
+    pre-fetch --help duplicate) in sync with the SAME groups in the SAME order."""
+    ctl_group = parser.add_argument_group(
+        "ctl",
+        "cfg/policy source and governing profile; a read consults only the "
+        "profile's ref_policy (tooling/cfg pinning + dirty-vs-committed gate)",
+    )
+    query_group = parser.add_argument_group(
+        "query",
+        "what to read: the namespace/instance selectors, the breadth (whole "
+        "namespace or one owner), and the optional lifecycle view",
+    )
+    scope_group = parser.add_argument_group(
+        "scope",
+        "where to read from: the local tree (offline, no credentials) or the "
+        "authoritative bucket (hydrated into an auto temp). NEITHER mutates "
+        "local ctl-state",
+    )
+    # 1) ctl
+    ctl_group.add_argument(
+        "--ctl-cfg", required=True, help="git URL@ref or local path to the ctl cfg"
+    )
+    ctl_group.add_argument(
+        "--ctl-profile",
+        required=True,
+        help="Ctl profile name; a read consults its ref_policy only (§Phase 50.7)",
+    )
+    # 2) query — selectors, breadth, lifecycle view
+    query_group.add_argument(
+        "--execution-params",
+        dest="execution_param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        type=parse_selector_arg,
+        help="Execution param key=value; repeatable. Namespace selectors "
+        "(provider, landing_zone) always; instance selectors (account, env_type, "
+        "region) only for a targeted query",
+    )
+    breadth = query_group.add_mutually_exclusive_group(required=True)
+    breadth.add_argument(
+        "--all",
+        action="store_true",
+        help="whole-namespace: every target and workflow instance",
+    )
+    breadth.add_argument("--target", metavar="NAME", help="one declared target instance")
+    breadth.add_argument(
+        "--workflow", metavar="NAME", help="one declared workflow instance"
+    )
+    breadth.add_argument(
+        "--fan-out",
+        dest="fan_out",
+        metavar="NAME",
+        help="status of the targets/workflows a fan-out expands to",
+    )
+    query_group.add_argument(
+        "--action",
+        default=None,
+        choices=["provision", "destroy"],
+        help="lifecycle view; required for a targeted query, ignored by --all",
+    )
+    # 3) scope — where to read, and the local dir / dev substitute
+    scope_group.add_argument(
+        "--scope",
+        required=True,
+        choices=("local", "remote"),
+        help="'local' reads the dir offline (no bucket, no credentials) — the "
+        "only way to see force-skipped runs; 'remote' is the authoritative "
+        "bucket view (hydrated into an auto temp, discarded)",
+    )
+    scope_group.add_argument(
+        "--ctl-state-local-root",
+        default=None,
+        metavar="DIR",
+        help="required for --scope local (the ctl-state tree to read); not "
+        "valid for --scope remote (remote uses an auto temp)",
+    )
+    scope_group.add_argument(
+        "--provider-credential",
+        dest="provider_credential",
+        default=None,
+        metavar="PROFILE",
+        help="dev/emergency substitute credential for --scope remote when no "
+        "ctl-state read chain exists yet; passing it skips identity resolution "
+        "(the read's force-bypass — same arg the run runners use)",
+    )
+    scope_group.add_argument(
+        "--write-cache",
+        action="store_true",
+        help="also persist the computed map as an advisory, self-dated "
+        "status_cache.yaml at the namespace root under --ctl-state-local-root "
+        "(requires --all — the cache is a whole-namespace map). Default: "
+        "print only, write nothing. Never touches committed pointers.",
+    )
+
+
+def finalize_status_args(args: argparse.Namespace) -> None:
+    """Normalize + validate the slim status args, and synthesize the internal
+    values the shared resolvers still expect (a read has ONE operation, so the
+    access mode collapses to standard-chain, or the dev substitute)."""
+    args.execution_params = selectors_to_map(
+        args.execution_param, label="execution param"
+    )
+    args.status = args.scope
+    write_cache = getattr(args, "write_cache", False)
+    if write_cache and not args.all:
+        raise RuntimeError(
+            "❌ --write-cache requires --all: the status cache is a "
+            "whole-namespace map"
+        )
+    if args.scope == "local":
+        if not args.ctl_state_local_root:
+            raise RuntimeError("❌ --scope local requires --ctl-state-local-root")
+        if args.provider_credential:
+            raise RuntimeError(
+                "❌ --provider-credential is not valid with --scope local "
+                "(local reads the dir — no bucket, no credentials)"
+            )
+        args.ctl_state_local_root = normalize_ctl_state_local_root(
+            args.ctl_state_local_root
+        )
+    else:
+        # remote reads pointers from the bucket into a throwaway temp, so it
+        # needs no local root — UNLESS --write-cache, where the local root is the
+        # cache write target (the derived map lands there; local pointers are
+        # never read or clobbered).
+        if write_cache:
+            if not args.ctl_state_local_root:
+                raise RuntimeError(
+                    "❌ --write-cache with --scope remote requires "
+                    "--ctl-state-local-root (the cache write target)"
+                )
+            args.ctl_state_local_root = normalize_ctl_state_local_root(
+                args.ctl_state_local_root
+            )
+        elif args.ctl_state_local_root:
+            raise RuntimeError(
+                "❌ --ctl-state-local-root is not valid with --scope remote "
+                "(remote hydrates into an auto temp; only --write-cache uses it)"
+            )
+        else:
+            args.ctl_state_local_root = None
+    if args.provider_credential:
+        args.execution_access_mode = "force_bypass"
+        args.provider_credential = args.provider_credential.strip() or None
+    else:
+        args.execution_access_mode = "standard"
+        args.provider_credential = None
+    # inert for a read (no box is built) but required by the shared context
+    # builders / selection resolvers.
+    args.execution_runtime_mode = "local"
+    args.ctl_variants = []
+    if not args.all and args.action is None:
+        raise RuntimeError(
+            "❌ a targeted status (--target/--workflow/--fan-out) requires "
+            "--action provision|destroy"
+        )
+
+
+def run_status_all_command(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    """§Phase 50 whole-namespace status: resolve the namespace from the axes,
+    then read every instance — local walks the dir offline; remote hydrates the
+    whole namespace into a throwaway temp (never the local tree) and reads that.
+    Prints a flat map. Read-only by default; --write-cache additionally persists
+    the map as an advisory, self-dated status_cache.yaml at the namespace root
+    (an additive file — it never touches committed pointers)."""
+    execution_context = build_execution_context(
+        ctl_cfg_root,
+        action=args.action,
+        ctl_profile=args.ctl_profile,
+        execution_params=args.execution_params,
+        execution_access_mode=args.execution_access_mode,
+        execution_runtime_mode=args.execution_runtime_mode,
+    )
+    namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
+    if args.status == "local":
+        namespace_root = Path(args.ctl_state_local_root) / namespace_key
+        instances = compute_namespace_status_map(namespace_root)
+    else:
+        with tempfile.TemporaryDirectory(
+            prefix="atlas-ctl-state-remote-all-"
+        ) as scratch_root:
+            _, namespace_root, syncer = _arm_ctl_state_operation(
+                ctl_cfg_root,
+                execution_context,
+                Path(scratch_root),
+                operation="read",
+                provider_implementation_key=provider_implementation_key,
+                execution_access_mode=args.execution_access_mode,
+                provider_credential=args.provider_credential,
+            )
+            hydrate_ctl_state_index(syncer)
+            instances = compute_namespace_status_map(namespace_root)
+    report = {
+        "namespace": namespace_key,
+        "scope": args.status,
+        "computed_at": utc_timestamp(),
+        "instances": instances,
+    }
+    if getattr(args, "write_cache", False):
+        cache = {"advisory": True, "source": "status runner", **report}
+        cache_path = (
+            Path(args.ctl_state_local_root) / namespace_key / "status_cache.yaml"
+        )
+        write_yaml_file(cache_path, cache)
+        report = {**report, "cache_written": cache_path.as_posix()}
+    print(yaml.safe_dump(report, sort_keys=False).rstrip())
+    return report
+
+
+def run_status(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    """§Phase 50 status dispatcher: whole-namespace (--all) or targeted."""
+    if args.all:
+        return run_status_all_command(
+            ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+        )
+    run_type = (
+        "workflow"
+        if args.workflow
+        else "fan_out"
+        if args.fan_out
+        else "target"
+    )
+    return run_status_command(
+        ctl_cfg_root,
+        args,
+        run_type=run_type,
+        provider_implementation_key=provider_implementation_key,
+    )
 
 
 def pending_ctl_state_manifest_paths(local_root: Path, namespace_key: str) -> list[Path]:
@@ -7976,48 +7687,53 @@ def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path)
     return True
 
 
-def resolve_force_unlock_tfstate_vars(repo_path: Path) -> tuple[str, str | None]:
-    """Extract tfstate key/uri variable names from standard infra target_run scripts."""
-    key_var = None
-    uri_var = None
+def resolve_force_unlock_tfstate_binding(
+    repo_path: Path, action: str, step_sequence_key: str
+) -> tuple[str, str, list[str]]:
+    """Resolve one Terraform project, state-key variable, and cfg-file set."""
+    _, repo_steps = get_repo_local_steps(repo_path, action, step_sequence_key)
+    bindings: dict[tuple[str, str], list[str]] = {}
 
-    for rel_path in FORCE_UNLOCK_STEP_SCRIPT_CANDIDATES:
-        script_path = repo_path / rel_path
+    for repo_step in repo_steps:
+        script_path = repo_path / repo_step["path"] / "src" / "step.sh"
         if not script_path.is_file():
-            continue
-
+            raise RuntimeError(f"❌ Step script not found: {script_path}")
         content = script_path.read_text(encoding="utf-8")
-        key_match = FORCE_UNLOCK_KEY_RE.search(content)
-        uri_match = FORCE_UNLOCK_URI_RE.search(content)
-
-        if key_match:
-            candidate = key_match.group(1)
-            if key_var and candidate != key_var:
+        for match in FORCE_UNLOCK_INIT_RE.finditer(content):
+            stack_dir = match.group("stack_dir")
+            stack_path = Path(stack_dir)
+            if stack_path.is_absolute() or ".." in stack_path.parts:
                 raise RuntimeError(
-                    f"❌ Conflicting tfstate key variables found for force-unlock in '{repo_path}': "
-                    f"'{key_var}' vs '{candidate}'"
+                    "❌ force-unlock Terraform project must be a safe relative "
+                    f"path: {stack_dir!r} in {script_path}"
                 )
-            key_var = candidate
-
-        if uri_match:
-            candidate = uri_match.group(1)
-            if uri_var and candidate != uri_var:
+            if not (repo_path / stack_path).is_dir():
                 raise RuntimeError(
-                    f"❌ Conflicting tfstate uri variables found for force-unlock in '{repo_path}': "
-                    f"'{uri_var}' vs '{candidate}'"
+                    "❌ force-unlock Terraform project does not exist: "
+                    f"{stack_dir!r} from {script_path}"
                 )
-            uri_var = candidate
+            binding = (stack_dir, match.group("state_key"))
+            cfg_files = bindings.setdefault(binding, [])
+            for cfg_file in repo_step["cfg_files"]:
+                if cfg_file not in cfg_files:
+                    cfg_files.append(cfg_file)
 
-    if not key_var:
+    if not bindings:
         raise RuntimeError(
-            f"❌ force-unlock is not supported for target_run repo '{repo_path}'. "
-            "Expected one of atlas_ctl_adapter/steps/{plan,provision,destroy}/infra/src/step.sh to call './bin/tf.sh infra init $..._tfstate_key'."
+            f"❌ force-unlock is not supported for target_run repo {str(repo_path)!r}: "
+            f"selected step sequence {action!r}/{step_sequence_key!r} has no step "
+            "calling ./bin/tf.sh <terraform-project> init <tfstate-key-variable>"
         )
-
-    if uri_var is None and key_var.endswith("_key"):
-        uri_var = f"{key_var[:-4]}_uri"
-
-    return key_var, uri_var
+    if len(bindings) != 1:
+        rendered = ", ".join(
+            f"{stack_dir}:{state_key}" for stack_dir, state_key in sorted(bindings)
+        )
+        raise RuntimeError(
+            "❌ force-unlock requires exactly one Terraform state binding for "
+            f"{action!r}/{step_sequence_key!r}; found: {rendered}"
+        )
+    binding = next(iter(bindings))
+    return binding[0], binding[1], bindings[binding] or ["*"]
 
 
 def _step_box_name(target_run_id: str, repo_step_id: str) -> str:
@@ -8110,7 +7826,7 @@ def committed_target_revision_if_skippable(
     if any(pointer.get(key) != value for key, value in expected.items()):
         return None
     snapshot_path = (
-        instance_dir / "runs" / str(pointer.get("run_id") or "") / RUN_SNAPSHOT_NAME
+        instance_dir / "runs" / str(pointer.get("run_id") or "") / RUN_METADATA_FILENAME
     )
     if not snapshot_path.is_file():
         return None
@@ -8230,6 +7946,35 @@ def finish_workflow_target_run(
         "snapshot_sha256": pointer.get("snapshot_sha256"),
         "status": pointer.get("status"),
     }
+
+
+def populate_workflow_child_slice(
+    child_run_dir: Path,
+    target_run: dict,
+    target_run_id: str,
+    plt_targets_dir_path: Path,
+    execution_context: dict[str, object],
+) -> None:
+    """§Phase 49: make a workflow-child target run self-contained AT THE TARGET
+    LEVEL — its own rendered cfg (input + resolved), frozen execution context,
+    and the source refs it ran against — so a target result is independently
+    inspectable without walking to the parent workflow run. Workflow-WIDE
+    artifacts (whole-workflow plan, resolved flow, orchestrator logs) stay under
+    the parent run, which the child references by `parent_workflow_run_id`.
+    Additive: it only writes into the child run dir, never the workflow run."""
+    write_execution_context_artifact(child_run_dir, execution_context)
+    cfg_dst = child_run_dir / "cfg"
+    for view in ("input", "resolved"):
+        src = plt_targets_dir_path / target_run_id / view
+        if src.is_dir():
+            shutil.copytree(src, cfg_dst / view, dirs_exist_ok=True)
+    source_refs = {
+        key: target_run[key]
+        for key in ("source", "ref", "branch", "commit", "step_sequence")
+        if target_run.get(key) is not None
+    }
+    if source_refs:
+        write_yaml_file(child_run_dir / "target_sources" / "source_refs.yaml", source_refs)
 
 
 def run_steps(
@@ -8368,6 +8113,16 @@ def run_steps(
                 )
             ctl_state_push(f"target_run {target_run_id} completed")
             if target_instance_address is not None:
+                # §Phase 49: fill the child's target-level slice (cfg, execution
+                # context, source refs) now that resolved cfg exists — before the
+                # child pointer is published.
+                populate_workflow_child_slice(
+                    target_state_run_dir,
+                    target_run,
+                    target_run_id,
+                    plt_targets_dir_path,
+                    execution_context,
+                )
                 revision = finish_workflow_target_run(target_state_run_dir)
                 if revision is not None:
                     child_revisions.append(revision)
@@ -8417,10 +8172,15 @@ def run_maintenance(
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
+    force_skip_full_cfg_validation_gate: bool = False,
     execution_access_mode: str = "standard",
 ) -> None:
     """Run a maintenance action against a single target_run target."""
-    if maintenance_action == "force-unlock" and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir):
+    if (
+        maintenance_action == "force-unlock"
+        and force_unlock_resource_kind(target_key) == "ctl_state"
+        and force_unlock_ctl_state_lock(ctl_state_local_root, lock_id, run_dir)
+    ):
         print_run_summary(run_id, log_file)
         return
 
@@ -8432,6 +8192,7 @@ def run_maintenance(
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
         execution_access_mode=execution_access_mode,
         execution_runtime_mode=execution_runtime_mode,
     )
@@ -8451,6 +8212,14 @@ def run_maintenance(
         execution_access_mode=execution_access_mode,
         provider_credential=provider_credential,
     )
+    cfg_report = build_cfg_validation_report(
+        collect_provider_cfg_findings(ctl_cfg_root, execution_context)
+    )
+    apply_full_cfg_validation_gate(
+        cfg_report, force_skip=force_skip_full_cfg_validation_gate
+    )
+    write_cfg_validation_artifacts(artifacts_dir, cfg_report)
+    assert_full_cfg_validation_gate_accepted(cfg_report)
     ctl_state_namespace_key, _ = resolve_ctl_state_namespace(
         ctl_cfg_root, execution_context
     )
@@ -8576,9 +8345,22 @@ def run_maintenance(
     if maintenance_action != "force-unlock":
         raise RuntimeError(f"❌ Unsupported maintenance action: {maintenance_action}")
 
-    tfstate_key_var, tfstate_uri_var = resolve_force_unlock_tfstate_vars(repo_path)
+    step_sequence_key = target_run.get("step_sequence")
+    if not isinstance(step_sequence_key, str) or not step_sequence_key:
+        raise RuntimeError(
+            f"❌ target run {target_run_id!r} must define a non-empty step_sequence"
+        )
+    tf_stack_dir, tfstate_key_var, maintenance_cfg_files = (
+        resolve_force_unlock_tfstate_binding(
+            repo_path, inventory_name, step_sequence_key
+        )
+    )
     target_env["GITHUB_WORKSPACE"] = str(repo_path)
     target_env["MAINTENANCE_TARGET_CFG_DIR"] = str(target_cfg_dir)
+    target_env["MAINTENANCE_CFG_FILES_JSON"] = json.dumps(
+        maintenance_cfg_files, separators=(",", ":")
+    )
+    target_env["TF_STACK_DIR"] = tf_stack_dir
     target_env["TFSTATE_KEY_VAR"] = tfstate_key_var
     target_env["LOCK_ID"] = lock_id
     execution_context_repo_path = repo_path / EXECUTION_CONTEXT_FILENAME
@@ -8591,9 +8373,9 @@ def run_maintenance(
         """
 set -euo pipefail
 source "$ATLAS_STEP_UTILS_DIR/ctl/prepare_step_runtime.sh"
-prepare_step_runtime "${MAINTENANCE_TARGET_CFG_DIR}"
-./bin/tf.sh infra init "$TFSTATE_KEY_VAR"
-./bin/tf.sh infra force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
+prepare_step_runtime "${MAINTENANCE_TARGET_CFG_DIR}" "${MAINTENANCE_CFG_FILES_JSON}"
+./bin/tf.sh "$TF_STACK_DIR" init "$TFSTATE_KEY_VAR"
+./bin/tf.sh "$TF_STACK_DIR" force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
 """,
     ]
     logging.info("bash -lc <force-unlock-script>")
@@ -8736,16 +8518,17 @@ def target_instance_address(target_key: str, instance_segments: list[str]) -> st
 def workflow_composition_sha256(target_instance_addresses: list[str]) -> str:
     """Workflow instance identity (§Phase 31 Q2): SHA-256 over the UTF-8 bytes
     of a whitespace-free canonical JSON array of the ORDERED resolved
-    target-instance addresses. The digest is a deterministic index — the
-    accompanying identity.yaml records the full addresses and stays the
-    authoritative identity source."""
+    target-instance addresses, TRUNCATED to 8 hex chars. The digest is a
+    deterministic index over a tiny per-namespace set (distinct workflow
+    compositions), so 32 bits is ample; the accompanying identity.yaml records
+    the full addresses and stays the authoritative identity source."""
     if not isinstance(target_instance_addresses, list) or not target_instance_addresses:
         raise RuntimeError("❌ workflow composition needs a non-empty ordered address list")
     for address in target_instance_addresses:
         if not isinstance(address, str) or not address.strip():
             raise RuntimeError("❌ workflow composition addresses must be non-empty strings")
     canonical = json.dumps(list(target_instance_addresses), separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
 
 
 def build_workflow_identity_doc(
@@ -9112,6 +8895,15 @@ def validate_execution_access(
         raise RuntimeError(
             f"❌ --force-skip-guardrails was requested, but ctl profile {ctl_profile!r} does not grant allow_force_skip_guardrails"
         )
+    validate_force_skip_full_cfg_validation_gate_policy(
+        ctl_cfg_root,
+        ctl_profile,
+        bool(
+            execution_context.get(
+                f"{EXECUTION_CONTEXT_ROOT}.ctl.force_skip_full_cfg_validation_gate"
+            )
+        ),
+    )
     if force_skip_execution_identity_preflight_check:
         if execution_access_mode == "force_bypass":
             raise RuntimeError(
@@ -9437,6 +9229,7 @@ def resolve_pipeline_selection(
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
+    force_skip_full_cfg_validation_gate: bool = False,
     force_skip_execution_identity_preflight_check: bool = False,
     enforce_ctl_policy: bool = True,
     load_provider_catalogs: bool = True,
@@ -9463,6 +9256,7 @@ def resolve_pipeline_selection(
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
         execution_access_mode=execution_access_mode,
         execution_runtime_mode=execution_runtime_mode,
         force_skip_execution_identity_preflight_check=(
@@ -9575,20 +9369,20 @@ def resolve_pipeline_selection(
     }
 
 
-def load_selection_provider_catalogs(
-    selection: dict, ctl_cfg_root: Path, *, strict_account_ids: bool = True
-) -> dict:
+def load_selection_provider_catalogs(selection: dict, ctl_cfg_root: Path) -> dict:
     """Attach the provider adapter + runtime catalogs to a selection resolved with
-    `load_provider_catalogs=False`. With `strict_account_ids=False` the catalogs
-    load even with placeholder account ids, so per-target resolution/preflight can
-    report the defect per target (blocked) instead of the load raising."""
+    `load_provider_catalogs=False`.
+
+    Runtime catalogs are structurally validated but permit unresolved concrete
+    provider values. The adapter validates concrete values reachable from the
+    selected target runs during target-cfg and execution-identity preflight.
+    """
     execution_context = selection["execution_context"]
     provider_adapter = run_provider_adapter(execution_context)
     selection["provider_adapter"] = provider_adapter
     selection["provider_catalogs"] = provider_adapter.load_runtime_catalogs(
         ctl_cfg_root,
         execution_context=execution_context,
-        strict_account_ids=strict_account_ids,
     )
     return selection
 
@@ -9623,11 +9417,33 @@ def target_instance_display(
 
 
 def aggregate_execution_identity_preflight_status(statuses: list[str]) -> str:
-    """Container (fan-out/workflow/target) statuses are ONLY passed/failed:
-    any failed child fails the container; everything else (passed, bypassed,
-    force-skipped, not-applicable) counts as passed. The per-identity rows keep
-    their raw statuses."""
-    return "failed" if any(status == "failed" for status in statuses) else "passed"
+    """Container (fan-out/workflow/target) status rolls up its children without
+    ever a false green OR a false 'nothing checked':
+
+    - any `failed` child                         → failed;
+    - else no `not_evaluated` child              → passed;
+    - else a block is present, and:
+        - at least one GENUINE `passed` child    → partial (honest mixed state);
+        - no genuine pass (only blocks + neutral
+          non-checks)                            → not_evaluated (fully blocked).
+
+    A `not_evaluated` child is blocked upstream (e.g. a malformed account id) so
+    it could not be checked. Deliberate non-checks (bypassed, force-skipped,
+    not-applicable, skipped) are NEUTRAL — they neither block nor count as a
+    verification: a container of blocked-plus-skipped is `not_evaluated`, not
+    `partial` (only a real `passed` sibling makes it partial). Neither `partial`
+    nor `not_evaluated` fails the run — only `failed` gates; these are honest
+    summaries. The per-identity rows keep their own raw statuses."""
+    if any(status == "failed" for status in statuses):
+        return "failed"
+    if not any(status == "not_evaluated" for status in statuses):
+        return "passed"
+    # a block is present; `partial` requires a GENUINE pass alongside it —
+    # deliberate non-checks (skipped/force_skipped/not_applicable/bypassed) are
+    # neutral, NOT verifications, so blocked + only-neutral is fully not_evaluated.
+    if any(status == "passed" for status in statuses):
+        return "partial"
+    return "not_evaluated"
 
 
 def build_ctl_policy_preflight_report(
@@ -9969,6 +9785,8 @@ def _preflight_status_tag(status: str) -> str:
         return "[ skipped ⏭ ]"
     if status == "not_evaluated":
         return "[ not evaluated ⚠️ ]"
+    if status == "partial":
+        return "[ partial ⚠️ ]"
     marks = {"passed": "✅", "failed": "❌"}
     mark = marks.get(status)
     return f"[ {status} {mark} ]" if mark else f"[ {status} ]"
@@ -10130,8 +9948,60 @@ def build_cfg_validation_report(findings: list[dict]) -> dict:
     return {"kind": "cfg_validation", "status": status, "findings": list(findings)}
 
 
+def apply_full_cfg_validation_gate(
+    report: dict, *, force_skip: bool
+) -> dict:
+    """Annotate whether whole-cfg findings gate this run.
+
+    Structural and unclassified findings are never skippable. The force flag only
+    accepts failed
+    concrete bindings outside the selected run; selected bindings are enforced
+    independently by target_cfg_validation.
+    """
+    unskippable_failure = any(
+        finding.get("status") == "failed" and finding.get("structural") is not False
+        for finding in report.get("findings", [])
+    )
+    if force_skip and report.get("status") == "failed" and not unskippable_failure:
+        report["gate"] = {
+            "status": "force_skipped",
+            "reason": "unrelated full-cfg failures were accepted for this run",
+        }
+    else:
+        report["gate"] = {"status": report.get("status", "failed")}
+    return report
+
+
+def assert_full_cfg_validation_gate_accepted(report: dict) -> None:
+    gate_status = (report.get("gate") or {}).get(
+        "status", report.get("status", "failed")
+    )
+    if gate_status != "failed":
+        return
+    failures = [
+        str(finding.get("cfg_path", "<unknown>"))
+        for finding in report.get("findings", [])
+        if finding.get("status") == "failed"
+    ]
+    raise RuntimeError(
+        "❌ full cfg validation failed for: "
+        + ", ".join(failures or ["unknown cfg path"])
+    )
+
+
 def _cfg_validation_text_lines(report: dict) -> list[str]:
     root = _node(f"cfg validation {_preflight_status_tag(report['status'])}")
+    gate = report.get("gate") or {}
+    if gate:
+        gate_children = (
+            [_node(f"reason: {gate['reason']}")] if gate.get("reason") else []
+        )
+        root["children"].append(
+            _node(
+                f"full cfg validation gate {_preflight_status_tag(gate['status'])}",
+                gate_children,
+            )
+        )
     for finding in report.get("findings", []):
         children = (
             [_node(f"error: {finding['error']}")] if finding.get("error") else []
@@ -10237,9 +10107,9 @@ def build_target_cfg_validation_report(
     provider_credential: str | None,
     ctl_cfg_root: Path | None = None,
 ) -> dict:
-    """Per-target cfg reference resolution: does each target's identity/account
-    resolve in cfg (account-id format is stage-1's concern, so placeholders pass
-    here). Includes the §Phase 32 instance-axes guard: declared < consumed →
+    """Per-target cfg resolution requires every selected identity/account binding
+    to be concrete. Whole-cfg health remains non-blocking for unrelated values.
+    Includes the §Phase 32 instance-axes guard: declared < consumed →
     ERROR (self-override risk); declared > consumed → WARN (unused axis)."""
     active_target_runs = selection["active_target_runs"]
     provider_adapter = selection["provider_adapter"]
@@ -10448,9 +10318,7 @@ def build_selection_validation_reports(
         "key": selection["selection_key"],
     }
     try:
-        selection = load_selection_provider_catalogs(
-            selection, ctl_cfg_root, strict_account_ids=False
-        )
+        selection = load_selection_provider_catalogs(selection, ctl_cfg_root)
         target_cfg_report = build_target_cfg_validation_report(
             selection,
             implementation_key=implementation_key,
@@ -10511,6 +10379,7 @@ def resolve_and_preflight_execution_identities(
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
+    force_skip_full_cfg_validation_gate: bool = False,
     force_skip_execution_identity_preflight_check: bool = False,
 ) -> tuple[dict, dict]:
     """Single-runner (workflow/target/step_sequence) preflight: the same four
@@ -10533,6 +10402,7 @@ def resolve_and_preflight_execution_identities(
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
         force_skip_execution_identity_preflight_check=(
             force_skip_execution_identity_preflight_check
         ),
@@ -10541,6 +10411,9 @@ def resolve_and_preflight_execution_identities(
     )
     cfg_report = build_cfg_validation_report(
         collect_provider_cfg_findings(ctl_cfg_root, selection["execution_context"])
+    )
+    apply_full_cfg_validation_gate(
+        cfg_report, force_skip=force_skip_full_cfg_validation_gate
     )
     reports = build_selection_validation_reports(
         selection,
@@ -10561,8 +10434,9 @@ def resolve_and_preflight_execution_identities(
     write_target_cfg_validation_artifacts(artifacts_dir, reports["target_cfg"])
     write_ctl_policy_preflight_artifacts(artifacts_dir, reports["policy"])
     write_execution_identity_preflight_artifacts(artifacts_dir, reports["identity"])
-    # cfg_validation is a whole-cfg health view: always written, never blocking.
-    # A run is gated only by the SCOPED reports — what it actually touches.
+    # Full cfg health is always rendered. The authorized force flag skips only
+    # this aggregate gate; structural and selected-run validation still block.
+    assert_full_cfg_validation_gate_accepted(cfg_report)
     assert_target_cfg_validation_accepted(reports["target_cfg"])
     assert_ctl_policy_preflight_accepted(reports["policy"])
     assert_execution_identity_preflight_accepted(reports["identity"])
@@ -10596,6 +10470,7 @@ def run_pipeline(
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
+    force_skip_full_cfg_validation_gate: bool = False,
     execution_access_mode: str = "standard",
     force_skip_execution_identity_preflight_check: bool = False,
     skip_committed_rerun: bool = False,
@@ -10629,6 +10504,9 @@ def run_pipeline(
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             force_skip_guardrails=force_skip_guardrails,
+            force_skip_full_cfg_validation_gate=(
+                force_skip_full_cfg_validation_gate
+            ),
             force_skip_execution_identity_preflight_check=(
                 force_skip_execution_identity_preflight_check
             ),

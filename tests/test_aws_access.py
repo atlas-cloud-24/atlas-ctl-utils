@@ -468,6 +468,25 @@ class AwsAccessResolutionTests(unittest.TestCase):
                     execution_access_mode="agreed_direct",
                 )
 
+    def test_chain_blocks_placeholder_entry_account(self):
+        account_registry = dict(self.account_registry)
+        account_registry["ctl_plane"] = "<live-ctl-plane-account-id>"
+        with self.assertRaisesRegex(
+            common.ProviderConfigBlockedError,
+            r"accounts_registry\.ctl_plane\.account_id must be a 12-digit account id",
+        ):
+            aws_adapter.resolve_target_aws_access(
+                {"execution_identity_key": "env_deploy"},
+                self.identities,
+                self.credential_sources,
+                execution_context=self.context,
+                implementation_key="local",
+                account_registry=account_registry,
+                ctl_role_chain=self.ctl_role_chain,
+                target_roles=self.target_roles,
+                validate_local_credential=False,
+            )
+
     def test_chain_resolution_requires_entry_account_key(self):
         sources = dict(self.credential_sources)
         sources["ctl_entry"] = {
@@ -584,6 +603,33 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
 
 class CallerIdentityAssertionTests(unittest.TestCase):
+    @mock.patch.dict(
+        os.environ,
+        {
+            "AWS_PROFILE": "private-profile",
+            "ATLAS_AWS_PROFILE_ONLY_ACCESS": "true",
+        },
+        clear=True,
+    )
+    def test_profile_only_success_output_contains_no_identity_details(self):
+        caller = {
+            "Account": "111111111111",
+            "Arn": "arn:aws:iam::111111111111:user/private-user",
+        }
+        with (
+            mock.patch.object(
+                assert_aws_access, "get_caller_identity", return_value=caller
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            self.assertEqual(assert_aws_access.main(), 0)
+
+        output.assert_called_once_with("AWS access validation passed")
+        rendered = str(output.call_args)
+        self.assertNotIn("private-profile", rendered)
+        self.assertNotIn("111111111111", rendered)
+        self.assertNotIn("private-user", rendered)
+
     def test_exactly_one_principal_expectation_is_required(self):
         caller = {
             "Account": "111111111111",

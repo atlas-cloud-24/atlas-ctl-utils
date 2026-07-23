@@ -9,7 +9,8 @@ Adapter contract (module-level callables):
 
     validate_catalog(ctl_cfg_root)
     validate_execution_identity(identity_key, identity_cfg, ctl_cfg_root)
-    load_runtime_catalogs(ctl_cfg_root, *, execution_context) -> opaque catalogs bundle
+    load_runtime_catalogs(ctl_cfg_root, *, execution_context) ->
+        structurally valid opaque catalogs bundle; concrete bindings may remain unresolved
     validate_active_target_access(active_target_runs, catalogs, *, execution_context,
         implementation_key, execution_access_mode, provider_credential)
     preflight_execution_identity(target_run_id, target_run, catalogs, *, execution_context,

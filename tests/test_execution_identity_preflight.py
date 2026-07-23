@@ -14,6 +14,31 @@ from utils import common
 from utils.providers import aws as aws_adapter
 
 
+class PreflightRollupTests(unittest.TestCase):
+    """Container status ladder: failed > (partial | not_evaluated) > passed —
+    a container is NEVER a false green, and mixed passed/blocked is `partial`,
+    not `not_evaluated` (which is reserved for fully-blocked containers)."""
+
+    def test_status_ladder(self):
+        f = common.aggregate_execution_identity_preflight_status
+        self.assertEqual(f(["passed", "passed"]), "passed")
+        self.assertEqual(f([]), "passed")
+        self.assertEqual(f(["force_skipped", "passed"]), "passed")
+        self.assertEqual(f(["passed", "failed"]), "failed")
+        self.assertEqual(f(["failed", "not_evaluated"]), "failed")
+        self.assertEqual(f(["not_evaluated", "not_evaluated"]), "not_evaluated")
+        self.assertEqual(f(["passed", "not_evaluated"]), "partial")
+        self.assertEqual(f(["passed", "force_skipped", "not_evaluated"]), "partial")
+        # a block + only NEUTRAL non-checks (skipped backend row) is fully
+        # not_evaluated — NOT partial (no genuine pass to make it mixed)
+        self.assertEqual(f(["not_evaluated", "skipped"]), "not_evaluated")
+        self.assertEqual(f(["not_evaluated", "force_skipped"]), "not_evaluated")
+        self.assertEqual(f(["passed", "skipped"]), "passed")
+
+    def test_partial_tag_renders(self):
+        self.assertEqual(common._preflight_status_tag("partial"), "[ partial ⚠️ ]")
+
+
 class PreflightPolicyTests(unittest.TestCase):
     def test_force_skip_profile_permission_defaults_false(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -23,6 +48,7 @@ class PreflightPolicyTests(unittest.TestCase):
   strict: {ref_policy: commit_required}
   debug:
     ref_policy: commit_required
+    allow_force_skip_full_cfg_validation_gate: true
     allow_force_skip_execution_identity_preflight_check: true
 """
             )
@@ -36,6 +62,34 @@ class PreflightPolicyTests(unittest.TestCase):
                     root, "debug"
                 )
             )
+
+            self.assertFalse(
+                common.ctl_allows_force_skip_full_cfg_validation_gate(
+                    root, "strict"
+                )
+            )
+            self.assertTrue(
+                common.ctl_allows_force_skip_full_cfg_validation_gate(
+                    root, "debug"
+                )
+            )
+
+    def test_full_cfg_validation_gate_flag_is_on_every_execution_runner(self):
+        for run_type in (
+            "target", "workflow", "fan_out", "step_sequence", "maintenance"
+        ):
+            with self.subTest(run_type=run_type):
+                parser = argparse.ArgumentParser()
+                common.add_common_args(parser, run_type=run_type)
+                action = next(
+                    item
+                    for item in parser._actions
+                    if "--force-skip-full-cfg-validation-gate"
+                    in item.option_strings
+                )
+                self.assertEqual(
+                    action.dest, "force_skip_full_cfg_validation_gate"
+                )
 
     def test_check_only_and_force_skip_are_mutually_exclusive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,6 +154,80 @@ class PreflightPolicyTests(unittest.TestCase):
                     provider_credential=None,
                     force_skip_execution_identity_preflight_check=True,
                 )
+
+
+    def test_full_cfg_validation_gate_skip_requires_profile_permission(self):
+        workflow = {"target_runs": ["target"]}
+        inventory = {"targets": {"target": {}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ctl_profiles.yaml").write_text(
+                "ctl_profiles:\n  strict: {ref_policy: commit_required}\n"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "allow_force_skip_full_cfg_validation_gate",
+            ):
+                common.validate_execution_access(
+                    root,
+                    "strict",
+                    workflow,
+                    inventory,
+                    execution_context={
+                        "execution_context.ctl.force_skip_full_cfg_validation_gate": True
+                    },
+                    execution_access_mode="standard",
+                    agreed_defer_ctl_state_backend_sync=False,
+                    force_skip_ctl_state_backend_sync=False,
+                    provider_credential=None,
+                )
+
+
+class FullCfgValidationGateTests(unittest.TestCase):
+    @staticmethod
+    def _report(*, structural=False):
+        return common.build_cfg_validation_report(
+            [
+                {
+                    "cfg_path": "providers.example.bindings.unused",
+                    "status": "failed",
+                    "error": "unresolved placeholder",
+                    "structural": structural,
+                }
+            ]
+        )
+
+    def test_failed_full_cfg_binding_blocks_by_default(self):
+        report = self._report()
+        common.apply_full_cfg_validation_gate(report, force_skip=False)
+        self.assertEqual(report["gate"]["status"], "failed")
+        with self.assertRaisesRegex(RuntimeError, "full cfg validation failed"):
+            common.assert_full_cfg_validation_gate_accepted(report)
+
+    def test_authorized_force_skips_only_the_aggregate_gate(self):
+        report = self._report()
+        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["gate"]["status"], "force_skipped")
+        common.assert_full_cfg_validation_gate_accepted(report)
+        rendered = "\n".join(common._cfg_validation_text_lines(report))
+        self.assertIn(
+            "full cfg validation gate [ skipped ⏭ ]", rendered
+        )
+
+    def test_unclassified_failure_cannot_be_force_skipped(self):
+        report = common.build_cfg_validation_report(
+            [{"cfg_path": "providers.future", "status": "failed"}]
+        )
+        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        self.assertEqual(report["gate"]["status"], "failed")
+
+    def test_structural_failure_cannot_be_force_skipped(self):
+        report = self._report(structural=True)
+        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        self.assertEqual(report["gate"]["status"], "failed")
+        with self.assertRaisesRegex(RuntimeError, "full cfg validation failed"):
+            common.assert_full_cfg_validation_gate_accepted(report)
 
 
 class PreflightArtifactTests(unittest.TestCase):
@@ -433,6 +561,20 @@ class PreflightArtifactTests(unittest.TestCase):
             self.assertFalse((run_dir / "cfg").exists())
             self.assertFalse((run_dir / "target_sources").exists())
             self.assertFalse((run_dir / "step_utils").exists())
+
+    def test_run_metadata_records_execution_access_mode_for_degraded_audit(self):
+        """The degraded/profile-only mode must be persisted structurally in
+        RUN.yaml (not only in the logged command) so a later audit of committed
+        run records shows which runs ran force_bypass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = logging.handlers.MemoryHandler(capacity=10)
+            run_dir, _artifacts, _log = common.setup_preflight_run_dirs(
+                "run-id", "plan", "target", "example", Path(tmp), memory,
+                locator_segments=list(common.LOCAL_ONLY_LOCATOR),
+                execution_access_mode="force_bypass",
+            )
+            meta = common.load_run_metadata(run_dir)
+            self.assertEqual(meta.get("execution_access_mode"), "force_bypass")
 
     def test_command_log_redacts_provider_credential(self):
         rendered = common.redact_command_argv(

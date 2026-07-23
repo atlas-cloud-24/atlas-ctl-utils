@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atlas.example/schemas/guardrail-policies.schema.json",
+  "title": "Atlas guardrail policies",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["guardrail_policies"],
+  "properties": {
+    "guardrail_policies": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/policy"
+      }
+    }
+  },
+  "$defs": {
+    "subject": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "enum": ["ctl_cfg", "execution_context"]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target_path"],
+          "properties": {
+            "kind": {
+              "const": "plt_rendered_target"
+            },
+            "target_path": {
+              "type": "string",
+              "pattern": "^/(?!$)"
+            }
+          }
+        }
+      ]
+    },
+    "selectorValue": {
+      "type": ["string", "number", "integer", "boolean"]
+    },
+    "selectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "match": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/selectorValue"
+          }
+        },
+        "in": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/$defs/selectorValue"
+            }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "protected_paths"],
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/subject"
+        },
+        "selectors": {
+          "$ref": "#/$defs/selectors"
+        },
+        "instance_params": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^execution_context\\.params\\.[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        },
+        "protected_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        }
+      }
+    }
+  }
+}

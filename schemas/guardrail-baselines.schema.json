@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atlas.example/schemas/guardrail-baselines.schema.json",
+  "title": "Atlas guardrail baselines",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["guardrail_baselines"],
+  "properties": {
+    "guardrail_baselines": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/baseline"
+      }
+    }
+  },
+  "$defs": {
+    "params": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^execution_context\\.params\\.[A-Za-z_][A-Za-z0-9_]*$"
+      }
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["params"],
+      "properties": {
+        "params": {
+          "$ref": "#/$defs/params"
+        }
+      }
+    },
+    "subject": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "enum": ["ctl_cfg", "execution_context"]
+            },
+            "instance": {
+              "$ref": "#/$defs/instance"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target_path"],
+          "properties": {
+            "kind": {
+              "const": "plt_rendered_target"
+            },
+            "target_path": {
+              "type": "string",
+              "pattern": "^/(?!$)"
+            },
+            "instance": {
+              "$ref": "#/$defs/instance"
+            }
+          }
+        }
+      ]
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "values"],
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/subject"
+        },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^/"
+          }
+        }
+      }
+    }
+  }
+}

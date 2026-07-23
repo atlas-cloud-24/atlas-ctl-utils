@@ -85,7 +85,11 @@ def get_caller_identity(profile_name: str | None) -> dict:
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        source = f"profile {profile_name!r}" if profile_name else "ambient role-chain credentials"
+        source = (
+            "configured profile"
+            if profile_name
+            else "ambient role-chain credentials"
+        )
         raise RuntimeError(
             f"AWS access assertion failed for {source}: {detail}"
         )
@@ -102,37 +106,30 @@ def main() -> int:
     profile_name = None if role_chain else require_env("AWS_PROFILE")
     caller = get_caller_identity(profile_name)
 
-    profile_only = os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"
+    profile_only = (
+        os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"
+    )
     if profile_only:
         actual_account_id = caller.get("Account")
         actual_arn = caller.get("Arn")
         if not actual_account_id or not actual_arn:
             raise RuntimeError("STS GetCallerIdentity returned no Account or Arn")
-        print(
-            "AWS access: "
-            "mode=profile_only "
-            f"profile={profile_name} account={actual_account_id} arn={actual_arn}"
-        )
+        print("AWS access validation passed")
         return 0
 
     expected_account_id = require_env("ATLAS_AWS_EXPECT_ACCOUNT_ID")
-    permission_set_name = os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
+    permission_set_name = (
+        os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
+    )
     role_name = os.getenv("ATLAS_AWS_EXPECT_ROLE_NAME", "").strip() or None
 
-    actual_account_id, actual_arn = validate_caller_identity(
+    validate_caller_identity(
         caller,
         expected_account_id=expected_account_id,
         expected_permission_set_name=permission_set_name,
         expected_role_name=role_name,
     )
-    print(
-        "AWS access: "
-        f"execution_identity_key={os.getenv('ATLAS_EXECUTION_IDENTITY_KEY', '')} "
-        f"account_key={os.getenv('ATLAS_AWS_ACCOUNT_KEY', '')} "
-        f"credential_source_key={os.getenv('ATLAS_AWS_CREDENTIAL_SOURCE_KEY', '')} "
-        f"implementation_key={os.getenv('ATLAS_AWS_IMPLEMENTATION_KEY', '')} "
-        f"profile={profile_name or '<role-chain credentials>'} account={actual_account_id} arn={actual_arn}"
-    )
+    print("AWS access validation passed")
     return 0
 
 
