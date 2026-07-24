@@ -16,22 +16,25 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 from utils import common  # noqa: E402
 
 
-def key_value(value: str) -> tuple[str, str]:
-    if "=" not in value:
-        raise argparse.ArgumentTypeError(f"Expected key=value, got {value!r}")
-    key, raw = value.split("=", 1)
-    key, raw = key.strip(), raw.strip()
-    if not key or not raw:
-        raise argparse.ArgumentTypeError(f"Expected non-empty key=value, got {value!r}")
-    return key, raw
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ctl-cfg-root", required=True)
     parser.add_argument("--ctl-profile", required=True)
     parser.add_argument("--execution-runtime-mode", required=True, choices=common.EXECUTION_RUNTIME_MODES)
-    parser.add_argument("--execution-params", dest="execution_param", action="append", type=key_value, default=[])
+    parser.add_argument(
+        "--execution-params",
+        dest="execution_param",
+        action=common.ExecutionParamsAction,
+        default=[],
+        metavar="KEY=VALUE[,KEY=VALUE...]",
+    )
+    parser.add_argument(
+        "--providers",
+        dest="providers",
+        required=True,
+        type=common.parse_comma_list,
+        metavar="NAME[,NAME...]",
+    )
     parser.add_argument("--keep-artifacts", action="store_true")
     return parser.parse_args()
 
@@ -48,6 +51,7 @@ def main() -> int:
         ctl_profile=args.ctl_profile,
         execution_params=dict(args.execution_param),
         execution_runtime_mode=args.execution_runtime_mode,
+        providers=args.providers,
     )
     common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
     scope_params = common.scope_params_from_context(execution_context)

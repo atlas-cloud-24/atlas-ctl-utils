@@ -96,25 +96,30 @@ class PreflightPolicyTests(unittest.TestCase):
             args = argparse.Namespace(
                 execution_param=[],
                 ctl_state_local_root=tmp,
-                provider_credential=None,
-                execution_access_mode="standard",
+                providers=["aws"],
+                provider_options={"aws.credential_implementation": "profile"},
+                execution_access_modes={"aws": "standard"},
                 execution_identity_preflight_check_only=True,
-                force_skip_execution_identity_preflight_check=True,
+                force_skip_execution_identity_preflight_check=["aws"],
             )
             with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
                 common.finalize_common_args(args)
 
-    def test_provider_credential_requires_force_bypass(self):
+    def test_provider_options_must_match_the_mode_they_imply(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
                 execution_param=[],
                 ctl_state_local_root=tmp,
-                provider_credential="substitute",
-                execution_access_mode="standard",
+                providers=["aws"],
+                provider_options={
+                    "aws.credential_implementation": "profile",
+                    "aws.force_bypass_credential_profile": "substitute",
+                },
+                execution_access_modes={"aws": "standard"},
                 execution_identity_preflight_check_only=False,
-                force_skip_execution_identity_preflight_check=False,
+                force_skip_execution_identity_preflight_check=[],
             )
-            with self.assertRaisesRegex(RuntimeError, "cannot override"):
+            with self.assertRaisesRegex(RuntimeError, "only valid in execution access mode"):
                 common.finalize_common_args(args)
 
     def test_bypass_and_force_skip_are_incompatible(self):
@@ -122,12 +127,16 @@ class PreflightPolicyTests(unittest.TestCase):
             args = argparse.Namespace(
                 execution_param=[],
                 ctl_state_local_root=tmp,
-                provider_credential="substitute",
-                execution_access_mode="force_bypass",
+                providers=["aws"],
+                provider_options={
+                    "aws.credential_implementation": "profile",
+                    "aws.force_bypass_credential_profile": "substitute",
+                },
+                execution_access_modes={"aws": "force_bypass"},
                 execution_identity_preflight_check_only=False,
-                force_skip_execution_identity_preflight_check=True,
+                force_skip_execution_identity_preflight_check=["aws"],
             )
-            with self.assertRaisesRegex(RuntimeError, "not applicable"):
+            with self.assertRaisesRegex(RuntimeError, "without resolving an execution identity"):
                 common.finalize_common_args(args)
 
     def test_force_skip_requires_profile_permission(self):
@@ -136,7 +145,10 @@ class PreflightPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
-                "ctl_profiles:\n  strict: {ref_policy: commit_required}\n"
+                "ctl_profiles:\n  strict:\n    ref_policy: commit_required\n"
+                "    allowed_providers: [aws]\n"
+                "    aws:\n      allowed_execution_access_modes: [standard]\n"
+                "      allowed_credential_implementation: [profile]\n"
             )
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -148,11 +160,11 @@ class PreflightPolicyTests(unittest.TestCase):
                     workflow,
                     inventory,
                     execution_context={},
-                    execution_access_mode="standard",
+                    execution_access_modes={"aws": "standard"},
                     agreed_defer_ctl_state_backend_sync=False,
                     force_skip_ctl_state_backend_sync=False,
-                    provider_credential=None,
-                    force_skip_execution_identity_preflight_check=True,
+                    provider_options={},
+                    force_skip_execution_identity_preflight_check=["aws"],
                 )
 
 
@@ -162,7 +174,10 @@ class PreflightPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
-                "ctl_profiles:\n  strict: {ref_policy: commit_required}\n"
+                "ctl_profiles:\n  strict:\n    ref_policy: commit_required\n"
+                "    allowed_providers: [aws]\n"
+                "    aws:\n      allowed_execution_access_modes: [standard]\n"
+                "      allowed_credential_implementation: [profile]\n"
             )
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -176,10 +191,10 @@ class PreflightPolicyTests(unittest.TestCase):
                     execution_context={
                         "execution_context.ctl.force_skip_full_cfg_validation_gate": True
                     },
-                    execution_access_mode="standard",
+                    execution_access_modes={"aws": "standard"},
                     agreed_defer_ctl_state_backend_sync=False,
                     force_skip_ctl_state_backend_sync=False,
-                    provider_credential=None,
+                    provider_options={},
                 )
 
 
@@ -236,13 +251,13 @@ class PreflightArtifactTests(unittest.TestCase):
             def preflight_execution_identity(self, target_run_id, target_run, catalogs, **kwargs):
                 del target_run_id, catalogs, kwargs
                 return {
-                    "execution_identity_key": target_run["execution_identity_key"],
+                    "execution_identity": target_run["execution_identity"],
                     "provider": "fixture",
                     "access_mode": "standard",
                     "status": "passed",
                     "provider_path": [
                         {
-                            "display": f"principal: {target_run['execution_identity_key']}",
+                            "display": f"principal: {target_run['execution_identity']['account']}",
                             "status": "passed",
                         }
                     ],
@@ -252,8 +267,8 @@ class PreflightArtifactTests(unittest.TestCase):
             "selection_kind": "workflow",
             "selection_key": "example/workflow",
             "active_target_runs": {
-                "one": {"target": "target/one", "execution_identity_key": "identity_one"},
-                "two": {"target": "target/two", "execution_identity_key": "identity_two"},
+                "one": {"target": "target/one", "execution_identity": {"provider": "aws", "account": "one", "roles": {"readwrite": "ctl_target"}}},
+                "two": {"target": "target/two", "execution_identity": {"provider": "aws", "account": "two", "roles": {"readwrite": "ctl_target"}}},
             },
             "provider_adapter": Adapter(),
             "provider_catalogs": {},
@@ -261,10 +276,10 @@ class PreflightArtifactTests(unittest.TestCase):
         }
         report = common.build_execution_identity_preflight_report(
             selection,
-            implementation_key="local",
-            execution_access_mode="standard",
-            provider_credential=None,
-            force_skip=False,
+            implementation_key="profile",
+            execution_access_modes={"aws": "standard"},
+            provider_options={},
+            force_skip_providers=[],
         )
         self.assertEqual(report["status"], "passed")
         self.assertEqual(
@@ -279,7 +294,7 @@ class PreflightArtifactTests(unittest.TestCase):
             )
             rendered = (artifacts / "execution_identity_preflight.txt").read_text()
             self.assertIn("target: target/one [ passed \u2705 ]", rendered)
-            self.assertIn("principal: identity_two [ passed \u2705 ]", rendered)
+            self.assertIn("principal: two [ passed \u2705 ]", rendered)
 
     def test_skipped_results_use_one_human_status_and_reason(self):
         report = {
@@ -288,7 +303,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "results": [
                 {
                     "target_key": "env/core/baseline",
-                    "execution_identity_key": "env_dev_deploy",
+                    "execution_identity": {"provider": "aws", "account": "dev", "roles": {"readwrite": "ctl_target_deploy"}},
                     "provider": "aws",
                     "access_mode": "force_bypass",
                     "status": "not_applicable",
@@ -297,7 +312,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 },
                 {
                     "ctl_state_backend": "env",
-                    "execution_identity_key": None,
+                    "execution_identity": None,
                     "provider": None,
                     "access_mode": "agreed_direct",
                     "status": "not_applicable",
@@ -310,7 +325,7 @@ class PreflightArtifactTests(unittest.TestCase):
         self.assertIn("workflow: env/baseline [ passed ✅ ]", rendered)
         self.assertIn("target: env/core/baseline [ passed ✅ ]", rendered)
         self.assertIn(
-            "execution_identity: env_dev_deploy [ skipped ⏭ ]", rendered
+            "execution_identity: aws:dev:readwrite=ctl_target_deploy [ skipped ⏭ ]", rendered
         )
         self.assertIn("ctl_state_backend: env [ skipped ⏭ ]", rendered)
         self.assertIn(
@@ -348,8 +363,8 @@ class PreflightArtifactTests(unittest.TestCase):
                 ctl_profile="local_dev",
                 ctl_ref_policy="local_dirty_allowed",
                 execution_runtime_mode="local",
-                execution_access_mode="standard",
-                provider_credential=None,
+                execution_access_modes={"aws": "standard"},
+                provider_options={},
                 agreed_defer_ctl_state_backend_sync=False,
                 force_skip_ctl_state_backend_sync=False,
                 force_skip_execution_identity_preflight_check=False,
@@ -562,28 +577,36 @@ class PreflightArtifactTests(unittest.TestCase):
             self.assertFalse((run_dir / "target_sources").exists())
             self.assertFalse((run_dir / "step_utils").exists())
 
-    def test_run_metadata_records_execution_access_mode_for_degraded_audit(self):
-        """The degraded/profile-only mode must be persisted structurally in
-        RUN.yaml (not only in the logged command) so a later audit of committed
-        run records shows which runs ran force_bypass."""
+    def test_run_metadata_records_execution_access_modes_for_degraded_audit(self):
+        """Each provider's access mode must be persisted structurally in RUN.yaml
+        (not only in the logged command) so a later audit of committed run
+        records shows which runs escalated, and for which provider."""
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
             run_dir, _artifacts, _log = common.setup_preflight_run_dirs(
                 "run-id", "plan", "target", "example", Path(tmp), memory,
                 locator_segments=list(common.LOCAL_ONLY_LOCATOR),
-                execution_access_mode="force_bypass",
+                execution_access_modes={"aws": "force_bypass"},
             )
             meta = common.load_run_metadata(run_dir)
-            self.assertEqual(meta.get("execution_access_mode"), "force_bypass")
+            self.assertEqual(
+                meta.get("execution_access_modes"), {"aws": "force_bypass"}
+            )
 
-    def test_command_log_redacts_provider_credential(self):
+    def test_command_log_redacts_provider_option_values(self):
+        # the engine cannot tell which of an adapter's option keys is sensitive,
+        # so every provider-option VALUE is redacted
         rendered = common.redact_command_argv(
-            ["runner.py", "--provider-credential", "sensitive-selector"]
+            ["runner.py", "--provider-options", "aws.x=sensitive-selector"]
         )
         self.assertEqual(
             rendered,
-            ["runner.py", "--provider-credential", "<redacted>"],
+            ["runner.py", "--provider-options", "<redacted>"],
         )
+        rendered = common.redact_command_argv(
+            ["runner.py", "--provider-options=aws.x=sensitive-selector"]
+        )
+        self.assertEqual(rendered, ["runner.py", "--provider-options=<redacted>"])
         self.assertNotIn("sensitive-selector", " ".join(rendered))
 
     def test_failure_reason_redacts_secret_values(self):
@@ -629,7 +652,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "dev"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="local",
+                implementation_key="profile",
                 execution_access_mode="agreed_direct",
             )
         self.assertEqual(result["status"], "passed")
@@ -662,7 +685,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="local",
+                implementation_key="profile",
                 live_check=False,
             )
         self.assertEqual(result["status"], "force_skipped")
@@ -717,7 +740,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="local",
+                implementation_key="profile",
             )
         self.assertEqual(result["status"], "passed")
         self.assertEqual(assume.call_count, 2)
@@ -766,7 +789,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="local",
+                implementation_key="profile",
             )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["provider_path"][-1]["status"], "failed")
@@ -782,7 +805,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="local",
+                implementation_key="profile",
                 live_check=False,
             )
         self.assertEqual(result["status"], "failed")
@@ -799,12 +822,13 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "env_dev_deploy"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="local",
+                implementation_key="profile",
                 execution_access_mode="force_bypass",
-                provider_credential="do-not-render",
+                provider_options={"force_bypass_credential_profile": "do-not-render"},
+                live_check=False,
             )
         self.assertEqual(result["status"], "not_applicable")
-        self.assertEqual(result["execution_identity_key"], "env_dev_deploy")
+        self.assertEqual(result["execution_identity"], "<unresolved>")
         self.assertNotIn("do-not-render", str(result))
 
 

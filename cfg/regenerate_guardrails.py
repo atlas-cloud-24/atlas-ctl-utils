@@ -15,18 +15,6 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 from utils import common, guardrails  # noqa: E402
 
 
-def key_value(value: str) -> tuple[str, str]:
-    if "=" not in value:
-        raise argparse.ArgumentTypeError(f"Expected key=value, got {value!r}")
-    key, raw = value.split("=", 1)
-    key, raw = key.strip(), raw.strip()
-    if not key or not raw:
-        raise argparse.ArgumentTypeError(
-            f"Expected non-empty key=value, got {value!r}"
-        )
-    return key, raw
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("plt", "ctl"))
@@ -43,15 +31,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--execution-params",
         dest="execution_param",
-        action="append",
-        type=key_value,
+        action=common.ExecutionParamsAction,
         default=[],
+        metavar="KEY=VALUE[,KEY=VALUE...]",
+    )
+    parser.add_argument(
+        "--providers",
+        dest="providers",
+        required=True,
+        type=common.parse_comma_list,
+        metavar="NAME[,NAME...]",
     )
     parser.add_argument(
         "--execution-context",
-        action="append",
-        type=key_value,
+        action=common.ExecutionParamsAction,
         default=[],
+        metavar="KEY=VALUE[,KEY=VALUE...]",
     )
     parser.add_argument(
         "--policy",
@@ -78,6 +73,7 @@ def build_context(args: argparse.Namespace, ctl_cfg_root: Path) -> dict[str, obj
         ctl_profile=None,
         execution_params=dict(args.execution_param),
         execution_runtime_mode=args.execution_runtime_mode,
+        providers=args.providers,
     )
     for key, value in args.execution_context:
         context[key] = value

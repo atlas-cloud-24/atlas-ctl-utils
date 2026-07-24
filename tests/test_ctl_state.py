@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from utils import common  # noqa: E402
+from utils.providers import aws as aws_adapter  # noqa: E402
 
 
 def write(path: Path, content: str) -> None:
@@ -22,15 +23,29 @@ ctl_state_backends:
     backend_type: s3
     bucket_name: ${execution_context.params.main_tag}-${execution_context.params.env_type}-ctl-state
     bucket_region: eu-central-1
-    execution_identity_keys:
-      sync: ctl_state_env_synchronizer
+    execution_identity:
+      account: ctl_plane
+      operations:
+        read:
+          role: reader
+        sync:
+          role: synchronizer
+        maintenance:
+          role: maintainer
   deployments:
     provider: aws
     backend_type: s3
     bucket_name: ${execution_context.params.main_tag}-deployments-ctl-state
     bucket_region: us-east-1
-    execution_identity_keys:
-      sync: ctl_state_deployments_synchronizer
+    execution_identity:
+      account: ctl_plane
+      operations:
+        read:
+          role: reader
+        sync:
+          role: synchronizer
+        maintenance:
+          role: maintainer
 """
 
 
@@ -82,6 +97,71 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
                 common.load_ctl_state_backends_cfg(root)
 
 
+class RunRecordPublicationTests(unittest.TestCase):
+    """§Phase 57: a run prefix publishes a RECORD, never the whole run dir."""
+
+    def test_push_filters_are_an_allowlist(self):
+        captured = {}
+
+        class FakeResult:
+            returncode = 0
+            stderr = ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "ns" / "provision" / "workflow" / "wf" / "runs" / "rid"
+            run_dir.mkdir(parents=True)
+            syncer = aws_adapter.CtlStateSyncer(
+                root, "bucket", "eu-west-2", "profile", run_dir, required=False
+            )
+            syncer.ready = True
+
+            def fake_run_aws(argv):
+                captured["argv"] = argv
+                return FakeResult()
+
+            syncer._run_aws = fake_run_aws
+            syncer.push_run(run_dir, "test")
+
+        argv = captured["argv"]
+        # everything is excluded first — the includes are the allowlist
+        self.assertEqual(argv[argv.index("--exclude")], "--exclude")
+        self.assertEqual(argv[argv.index("--exclude") + 1], "*")
+        self.assertLess(argv.index("--exclude"), argv.index("--include"))
+        included = {argv[i + 1] for i, a in enumerate(argv) if a == "--include"}
+        for member in common.RUN_RECORD_MEMBERS:
+            self.assertIn(member, included)
+            self.assertIn(f"{member}/*", included)
+        # §gates: the run's verdicts are a published record member
+        self.assertIn("gates", common.RUN_RECORD_MEMBERS)
+        # the build workspace is not a record member, under any spelling
+        self.assertNotIn("target_sources", included)
+        self.assertNotIn("target_sources/*", included)
+
+    def test_workspace_lives_outside_every_run_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "ns" / "provision" / "workflow" / "wf" / "runs" / "rid"
+            run_dir.mkdir(parents=True)
+            common.write_yaml_file(
+                run_dir / common.RUN_METADATA_FILENAME,
+                {"run_id": "rid", "ctl_state_local_root": str(root)},
+            )
+            workspace = common.run_workspace_dir(run_dir)
+            self.assertEqual(
+                workspace, root / "_local" / "workspaces" / "rid"
+            )
+            # no sync of any run prefix can ever reach it
+            self.assertNotIn(str(run_dir), str(workspace))
+
+    def test_workspace_is_unknown_before_the_run_records_its_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "rid"
+            run_dir.mkdir(parents=True)
+            self.assertIsNone(common.run_workspace_dir(run_dir))
+            common.cleanup_run_workspace(run_dir)  # tolerated, not an error
+
+
 class CtlStateSkipPolicyTests(unittest.TestCase):
     def _ctl_root(self, tmp: str, policy_line: str) -> Path:
         root = Path(tmp)
@@ -96,7 +176,9 @@ class CtlStateSkipPolicyTests(unittest.TestCase):
             root = self._ctl_root(tmp, "")
             self.assertFalse(common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx"))
             self.assertFalse(common.ctl_allows_force_skip_ctl_state_backend_sync(root, "test_ctx"))
-            self.assertEqual(common.ctl_allowed_execution_access_modes(root, "test_ctx"), {"standard"})
+            # provider policy has no engine-granted default: it is declared
+            with self.assertRaisesRegex(RuntimeError, "must declare allowed_providers"):
+                common.ctl_allowed_providers(root, "test_ctx")
 
     def test_reads_profile_bool(self):
         with tempfile.TemporaryDirectory() as tmp:

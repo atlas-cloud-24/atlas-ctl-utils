@@ -20,7 +20,7 @@ class OperationIdentityTests(unittest.TestCase):
         cfg = self._load(
             "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: b\n    bucket_region: eu-central-1\n"
         )
-        self.assertNotIn("execution_identity_keys", cfg["env"])
+        self.assertNotIn("execution", cfg["env"])
 
     def test_legacy_single_identity_key_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "unsupported keys"):
@@ -30,10 +30,10 @@ class OperationIdentityTests(unittest.TestCase):
 
     def test_operation_identity_must_be_non_empty(self):
         with self.assertRaisesRegex(
-            RuntimeError, "execution_identity_keys.sync must be a non-empty string"
+            RuntimeError, "operations.sync.role must be a non-empty string"
         ):
             self._load(
-                "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: b\n    bucket_region: r\n    execution_identity_keys:\n      sync: '  '\n"
+                "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: b\n    bucket_region: r\n    execution_identity:\n      account: ctl_plane\n      operations:\n        sync:\n          role: '  '\n"
             )
 
 

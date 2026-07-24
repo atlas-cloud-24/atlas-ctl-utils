@@ -13,6 +13,9 @@ import yaml
 VAR_NAME_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 PLACEHOLDER_RE = re.compile(rf"\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}")
 EXACT_PLACEHOLDER_RE = re.compile(rf"^\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}$")
+# One key per nesting level: namespaced facts (e.g. a provider-namespaced
+# param) arrive as nested mappings, never as dotted keys, so every key is a
+# single identifier segment.
 RUNTIME_CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 CFG_ENTRY_REF_PREFIX = "cfg-entry-ref:"
 CFG_ENTRY_REF_KEY = "cfg_entry_ref"
@@ -63,15 +66,32 @@ def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
     if not isinstance(nested, dict):
         raise RuntimeError(f"execution context file must contain a top-level {EXECUTION_CONTEXT_ROOT} mapping: {path}")
     flat: dict[str, object] = {}
-    for namespace, entries in nested.items():
-        if not isinstance(entries, dict):
-            raise RuntimeError(f"{EXECUTION_CONTEXT_ROOT}.{namespace} must be a mapping: {path}")
+
+    def walk(prefix: str, entries: dict) -> None:
         for key, value in entries.items():
             if not isinstance(key, str) or not RUNTIME_CONTEXT_KEY_RE.fullmatch(key):
                 raise RuntimeError(f"execution context key {key!r} is not a valid identifier")
-            if not isinstance(value, (str, int, float, bool)):
-                raise RuntimeError(f"execution context key {key!r} must be scalar, got {type(value).__name__}")
-            flat[f"{EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = value
+            ref = f"{prefix}.{key}"
+            # A fact is a scalar, a list of scalars (e.g. the run's declared
+            # providers), or a nested mapping of facts — the same shapes the
+            # engine's context builder writes.
+            if isinstance(value, dict):
+                walk(ref, value)
+            elif isinstance(value, list):
+                if not all(isinstance(item, (str, int, float, bool)) for item in value):
+                    raise RuntimeError(
+                        f"execution context key {ref!r} must be a list of scalars"
+                    )
+                flat[ref] = value
+            elif isinstance(value, (str, int, float, bool)):
+                flat[ref] = value
+            else:
+                raise RuntimeError(f"execution context key {ref!r} must be scalar, got {type(value).__name__}")
+
+    for namespace, entries in nested.items():
+        if not isinstance(entries, dict):
+            raise RuntimeError(f"{EXECUTION_CONTEXT_ROOT}.{namespace} must be a mapping: {path}")
+        walk(f"{EXECUTION_CONTEXT_ROOT}.{namespace}", entries)
     return flat, nested
 
 

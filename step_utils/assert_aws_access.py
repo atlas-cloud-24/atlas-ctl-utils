@@ -73,7 +73,14 @@ def require_env(name: str) -> str:
     return value
 
 
-def get_caller_identity(profile_name: str | None) -> dict:
+def get_caller_identity(profile_name: str | None = None) -> dict:
+    """STS caller identity for the ambient credentials, or for a named profile.
+
+    IN THE BOX: no argument — every access path arrives as ambient env
+    credentials and the box has no AWS config or profiles. ON THE HOST: the
+    engine reuses this module (`aws.assert_profile_caller`) to probe a specific
+    host profile, which is the one place profiles still exist.
+    """
     cmd = ["aws", "sts", "get-caller-identity", "--output", "json"]
     if profile_name:
         cmd += ["--profile", profile_name]
@@ -85,14 +92,8 @@ def get_caller_identity(profile_name: str | None) -> dict:
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        source = (
-            "configured profile"
-            if profile_name
-            else "ambient role-chain credentials"
-        )
-        raise RuntimeError(
-            f"AWS access assertion failed for {source}: {detail}"
-        )
+        source = f"profile {profile_name!r}" if profile_name else "ambient env credentials"
+        raise RuntimeError(f"AWS access assertion failed for {source}: {detail}")
 
     try:
         caller = json.loads(result.stdout)
@@ -102,9 +103,7 @@ def get_caller_identity(profile_name: str | None) -> dict:
 
 
 def main() -> int:
-    role_chain = os.getenv("ATLAS_AWS_ROLE_CHAIN", "").strip().lower() == "true"
-    profile_name = None if role_chain else require_env("AWS_PROFILE")
-    caller = get_caller_identity(profile_name)
+    caller = get_caller_identity()
 
     profile_only = (
         os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"

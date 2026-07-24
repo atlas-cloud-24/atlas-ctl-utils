@@ -7,7 +7,6 @@ derived provider facts. Engine-core modules never import AWS vocabulary; they
 dispatch through utils.providers.get_adapter().
 """
 
-import configparser
 import functools
 import hashlib
 import json
@@ -61,7 +60,6 @@ AWS_CREDENTIAL_ENV_VARS = (
 AWS_ACCESS_TARGET_ENV_VARS = (
     "ATLAS_AWS_ASSERT_ACCESS",
     "ATLAS_AWS_PROFILE_ONLY_ACCESS",
-    "ATLAS_AWS_ROLE_CHAIN",
     "ATLAS_EXECUTION_IDENTITY_KEY",
     "ATLAS_AWS_ACCOUNT_KEY",
     "ATLAS_AWS_CREDENTIAL_SOURCE_KEY",
@@ -111,6 +109,15 @@ def load_aws_credential_sources_cfg(ctl_cfg_root: Path) -> dict:
                 f"❌ AWS credential source {credential_source_key!r} must be a non-empty mapping: {ctl_cfg_root}"
             )
         for implementation_key, implementation_cfg in credential_source_cfg.items():
+            if implementation_key in CREDENTIAL_SOURCE_NON_IMPLEMENTATION_FIELDS:
+                # `selectors` is the source's own applicability (§Phase 53), not a
+                # credential implementation — the engine validates its shape.
+                common.selector_requirements(
+                    implementation_cfg,
+                    label=f"providers.aws.credential_sources.{credential_source_key}.selectors",
+                    structured_only=True,
+                )
+                continue
             _validate_aws_credential_source_implementation(
                 credential_source_key,
                 implementation_key,
@@ -368,13 +375,13 @@ def _validate_aws_credential_source_implementation(
         path,
     )
 
-    if implementation_key == "local" and credential_key != "profile_name":
+    if implementation_key == "profile" and credential_key != "profile_name":
         raise RuntimeError(
-            f"❌ AWS credential source {credential_source_key!r}.local must use profile_name: {path}"
+            f"❌ AWS credential source {credential_source_key!r}.profile must use profile_name: {path}"
         )
-    if implementation_key == "ci" and credential_key != "iam_role_key":
+    if implementation_key == "web_identity" and credential_key != "iam_role_key":
         raise RuntimeError(
-            f"❌ AWS credential source {credential_source_key!r}.ci must use iam_role_key: {path}"
+            f"❌ AWS credential source {credential_source_key!r}.web_identity must use iam_role_key: {path}"
         )
 
     expect_cfg = implementation_cfg.get("expect")
@@ -655,16 +662,70 @@ def assume_ctl_role_chain(
     return credentials
 
 
+def _select_agreed_direct_credential_source(
+    execution: dict, aws_credential_sources: dict, execution_context: dict, *, label: str
+) -> str:
+    """Pick the one agreed direct credential source that applies to this run.
+
+    §Phase 53 Option C: the target declares the credential source KEYS it agrees
+    to run directly with; each source declares its own applicability `selectors`.
+    Exactly one must match — 0 or >1 is a hard error (the selectors ARE the
+    guard), so the account<->credential relation stays declared and readable
+    rather than discovered by trial.
+    """
+    keys = execution.get("agreed_direct_credential_source_keys")
+    if not keys:
+        single = execution.get("agreed_direct_credential_source_key")
+        keys = [single] if single else []
+    if not keys:
+        raise RuntimeError(
+            f"❌ {label} declares no agreed_direct_credential_source_keys; "
+            "it cannot run with direct execution access"
+        )
+    if len(keys) == 1:
+        # Nothing to disambiguate: selectors exist to pick among candidates, and a
+        # single declared source IS the selection (its expect/account checks below
+        # still prove it is the right credential).
+        only = keys[0]
+        if not isinstance(aws_credential_sources.get(only), dict):
+            raise RuntimeError(
+                f"❌ AWS credential source {only!r} is not defined in the "
+                "providers.aws.credential_sources catalog"
+            )
+        return only
+    matches: list[str] = []
+    for key in keys:
+        source_cfg = aws_credential_sources.get(key)
+        if not isinstance(source_cfg, dict):
+            raise RuntimeError(
+                f"❌ AWS credential source {key!r} is not defined in the "
+                "providers.aws.credential_sources catalog"
+            )
+        selectors = source_cfg.get("selectors")
+        if selectors is None or common.selector_matches(
+            selectors, execution_context,
+            label=f"providers.aws.credential_sources.{key}.selectors",
+            structured_only=True,
+        ):
+            matches.append(key)
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"❌ {label}: exactly one of agreed_direct_credential_source_keys {list(keys)} must "
+            f"apply to this run, matched {len(matches)} ({matches})"
+        )
+    return matches[0]
+
+
 def resolve_target_aws_access(
     target_run: dict,
-    execution_identities: dict,
+    _execution_identities: dict,
     aws_credential_sources: dict,
     *,
     execution_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str] | None = None,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
     ctl_role_chain: dict | None = None,
     target_roles: dict | None = None,
     ctl_state_roles: dict | None = None,
@@ -681,70 +742,72 @@ def resolve_target_aws_access(
     """
     for legacy_field in ("aws_account_key", "aws_access_context_key"):
         if legacy_field in target_run:
-            raise RuntimeError(f"❌ target_run uses deprecated {legacy_field}; use execution_identity_key")
+            raise RuntimeError(f"❌ target_run uses deprecated {legacy_field}; use the execution_identity block")
 
     if execution_access_mode == "force_bypass":
-        profile_name = (provider_credential or "").strip()
-        if not profile_name:
-            raise RuntimeError("❌ bypass execution access requires the --provider-credential substitute credential")
+        profile_name = force_bypass_credential_profile(provider_options)
         return {
             "provider": "aws",
-            "execution_identity_key": "substitute",
+            "execution_identity": {"provider": "aws", "account": "<substitute>"},
             "implementation_key": "substitute",
             "credential_provider_kind": "substitute_credential",
             "profile_name": profile_name,
             "identity_bypass": "true",
         }
 
-    identity_key = target_run.get("execution_identity_key")
-    if identity_key is None:
-        # Coverage is validated by common.validate_execution_identity_coverage; a lone
-        # resolve call for an identity-less target_run has nothing to resolve.
-        return None
-    if not isinstance(identity_key, str) or not identity_key.strip():
-        raise RuntimeError("❌ target_run execution_identity_key must be a non-empty string")
-    identity_key = identity_key.strip()
+    # Only the profile-based credential implementation is built. web_identity
+    # (AssumeRoleWithWebIdentity) is declared and validated in cfg but its
+    # ACQUISITION is not implemented. Fail explicitly here rather than letting it
+    # surface downstream as a confusing "has no profile_name" error.
+    if implementation_key != "profile":
+        raise RuntimeError(
+            f"❌ AWS credential implementation {implementation_key!r} is not implemented; "
+            f"only {CREDENTIAL_IMPLEMENTATIONS[0]!r} (profile-based) credential acquisition "
+            "is built"
+        )
 
-    # a group execution_identity_key resolves to its one concrete member for this
-    # run's context (§Phase 10); a concrete key returns itself
-    identity_key, identity_cfg = common.resolve_execution_identity_entry(
-        execution_identities, identity_key, execution_context
+    execution = target_run.get("execution_identity")
+    if execution is None:
+        # Coverage is validated by common.validate_target_execution_identity_coverage; a lone
+        # resolve call for an execution-less target_run has nothing to resolve.
+        return None
+    if not isinstance(execution, dict) or not execution:
+        raise RuntimeError("❌ target_run execution must be a non-empty mapping")
+
+    # A ctl-state operation block carries `role`+`operation`; a target block
+    # carries `roles` keyed by authorization class. Provider is declared on the
+    # target block; the ctl-state block inherits this adapter by dispatch.
+    is_ctl_state = "operation" in execution
+    identity_label = (
+        f"ctl-state {execution.get('operation')!r} execution"
+        if is_ctl_state
+        else "target execution"
     )
-    if not isinstance(identity_cfg, dict):
-        raise RuntimeError(
-            f"❌ target_run execution_identity_key {identity_key!r} is not defined in execution_identities.yaml"
-        )
-    provider = identity_cfg.get("provider")
-    runtime_provider = execution_context.get("execution_context.params.provider")
-    if runtime_provider is not None and str(runtime_provider) != provider:
-        raise RuntimeError(
-            f"❌ execution identity {identity_key!r} provider {provider!r} does not match "
-            f"runtime provider {runtime_provider!r}"
-        )
-    if provider != "aws":
-        raise RuntimeError(
-            f"❌ execution identity {identity_key!r} provider {provider!r} is not implemented by this runner"
-        )
+    if not is_ctl_state:
+        provider = execution.get("provider")
+        if provider != "aws":
+            raise RuntimeError(
+                f"❌ {identity_label} provider {provider!r} is not implemented by this runner"
+            )
 
     context = dict(execution_context)
     account_key = common.resolve_runtime_scalar(
-        identity_cfg.get("account_key"),
+        execution.get("account"),
         context,
-        label=f"execution_identities.{identity_key}.account_key",
+        label=f"{identity_label}.account",
     )
-    # Identity-field interpolation (Phase 8): credential-source values may carry
-    # the resolving identity's account facet.
+    # Credential-source values may carry the resolved account facet.
     context["identity.account_key"] = account_key
     expected_account_id = _registry_account_id(
         account_registry,
         account_key,
-        label=f"execution identity {identity_key!r}",
+        label=identity_label,
         require_concrete=require_valid_account_id,
     )
 
     resolved: dict[str, str] = {
         "provider": "aws",
-        "execution_identity_key": identity_key,
+        "execution_identity": execution,
         "account_key": account_key,
         "implementation_key": implementation_key,
         "expected_account_id": expected_account_id,
@@ -754,12 +817,9 @@ def resolve_target_aws_access(
         # Direct mode (Phase 14): both independent facts are validated — the
         # destination account (identity account_key -> registry) AND the actual
         # principal (the credential source's declared expect).
-        direct_source_key = identity_cfg.get("direct_credential_source_key")
-        if not direct_source_key:
-            raise RuntimeError(
-                f"❌ execution identity {identity_key!r} declares no direct_credential_source_key; "
-                "it cannot run with direct execution access"
-            )
+        direct_source_key = _select_agreed_direct_credential_source(
+            execution, aws_credential_sources, execution_context, label=identity_label
+        )
         credential_source_cfg = aws_credential_sources.get(direct_source_key)
         if not isinstance(credential_source_cfg, dict):
             raise RuntimeError(
@@ -806,7 +866,7 @@ def resolve_target_aws_access(
             if declared_account_id != expected_account_id:
                 raise RuntimeError(
                     f"❌ credential source {direct_source_key!r} expect.account_key resolves to "
-                    f"{declared_account_id}, but execution identity {identity_key!r} expects {expected_account_id}"
+                    f"{declared_account_id}, but {identity_label} expects {expected_account_id}"
                 )
         direct_principal = _resolve_expect_principal(
             direct_expect, context,
@@ -890,17 +950,27 @@ def resolve_target_aws_access(
     )
     # The final authorization class is explicit and belongs to exactly one
     # catalog: target execution or ctl-state operation access.
-    target_role_key = identity_cfg.get("ctl_target_role_key")
-    state_role_key = identity_cfg.get("ctl_state_role_key")
-    if bool(target_role_key) == bool(state_role_key):
-        raise RuntimeError(
-            f"❌ execution identity {identity_key!r} must declare exactly one of "
-            "ctl_target_role_key or ctl_state_role_key for standard access"
+    if is_ctl_state:
+        target_role_key, state_role_key = None, execution.get("role")
+    else:
+        # §Phase 53: the role follows the ACTION's authorization class, so a
+        # `plan` cannot run with deploy authority.
+        role_class = common.resolve_role_class(
+            execution_context.get(f"{common.EXECUTION_CONTEXT_ROOT}.ctl.action"),
+            label=identity_label,
         )
+        roles = execution.get("roles") or {}
+        target_role_key = roles.get(role_class)
+        if not target_role_key:
+            raise RuntimeError(
+                f"❌ {identity_label} declares no roles.{role_class}; "
+                f"declared classes: {sorted(roles)}"
+            )
+        state_role_key = None
     if target_role_key:
         final_role_key = target_role_key
         final_role_name, final_role_arn = _chain_role_arn(
-            target_role_key, label=f"execution identity {identity_key!r} target role",
+            target_role_key, label=f"{identity_label} target role",
             default_account_key=account_key,
         )
         resolved["target_role_key"] = target_role_key
@@ -910,8 +980,7 @@ def resolve_target_aws_access(
         role_cfg = ctl_state_roles.get(state_role_key)
         if not isinstance(role_cfg, dict):
             raise RuntimeError(
-                f"❌ providers.aws.ctl_state_roles has no key {state_role_key!r} "
-                f"(execution identity {identity_key!r})"
+                f"❌ providers.aws.ctl_state_roles has no key {state_role_key!r} ({identity_label})"
             )
         final_role_key = state_role_key
         final_role_name = common.resolve_runtime_scalar(
@@ -1003,7 +1072,7 @@ def resolve_target_cfg_references(
     execution_context: dict[str, object],
     implementation_key: str,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> dict:
     """Resolve every cfg binding reachable from one target without live calls.
 
@@ -1014,13 +1083,13 @@ def resolve_target_cfg_references(
     try:
         resolved = resolve_target_aws_access(
             target_run,
-            catalogs["execution_identities"],
+            {},
             catalogs["credential_sources"],
             execution_context=execution_context,
             implementation_key=implementation_key,
             account_registry=catalogs["account_registry"],
             execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            provider_options=provider_options,
             ctl_role_chain=catalogs["ctl_role_chain"],
             target_roles=catalogs["target_roles"],
             validate_local_credential=False,
@@ -1035,7 +1104,7 @@ def resolve_target_cfg_references(
         return {"status": "passed", "rows": []}
     rows = [
         {
-            "name": f"identity_ref: {resolved.get('execution_identity_key')}",
+            "name": f"execution: {common.describe_target_execution_identity(resolved.get('execution'))}",
             "status": "passed",
         }
     ]
@@ -1046,6 +1115,82 @@ def resolve_target_cfg_references(
     return {"status": "passed", "rows": rows}
 
 
+_CALLER_IDENTITY_CACHE: dict[str, dict] = {}
+
+
+def cached_caller_identity(profile_name: str) -> dict:
+    """One STS GetCallerIdentity per credential per process (§Phase 52 item 6)."""
+    if profile_name not in _CALLER_IDENTITY_CACHE:
+        _CALLER_IDENTITY_CACHE[profile_name] = _assertion().get_caller_identity(
+            profile_name
+        )
+    return _CALLER_IDENTITY_CACHE[profile_name]
+
+
+def check_account_expectation(
+    raw_execution: object,
+    *,
+    execution_context: dict[str, object],
+    account_registry: dict[str, str] | None,
+    profile_name: str,
+    provider_options: dict[str, str] | None,
+    label: str,
+) -> dict:
+    """Re-establish the account binding that bypass throws away (§Phase 52).
+
+    In `standard` mode the assume-role chain BINDS the account: the role ARN
+    lives in the target account, so acting on the wrong one is impossible. A
+    substitute profile has no such binding — it can silently point elsewhere
+    while the run believes it is in `params.aws.account`. This asserts the one
+    fact that matters: the credential's real account == the account the
+    execution scope expects.
+
+    EXPECTATION-GATED: it enforces only where the registry states a concrete
+    id. A placeholder, a missing key, or an execution-less target_run declares
+    no expectation, and no expectation means no assertion — so this arms itself
+    as real account ids arrive, with no flag to flip later.
+    """
+    if _option_is_true(provider_options, "force_skip_account_expectation_check"):
+        return {"status": "force_skipped",
+                "reason": "account expectation check force-skipped for this run"}
+    if not isinstance(raw_execution, dict) or not raw_execution.get("account"):
+        return {"status": "not_applicable",
+                "reason": "target declares no execution account to expect"}
+    try:
+        account_key = str(
+            common.resolve_runtime_scalar(
+                raw_execution["account"], execution_context, label=f"{label} execution.account"
+            )
+        )
+    except Exception as error:
+        return {"status": "not_applicable",
+                "reason": f"execution account is unresolved: {error}"}
+
+    expected = (account_registry or {}).get(account_key)
+    if not expected or not re.fullmatch(r"\d{12}", str(expected)):
+        return {"status": "not_applicable",
+                "reason": f"accounts_registry states no concrete id for {account_key!r}"}
+
+    caller = cached_caller_identity(profile_name)
+    actual = str(caller.get("Account") or "")
+    if not actual:
+        return {"status": "failed",
+                "failure_reason": "STS GetCallerIdentity returned no Account"}
+    if actual != str(expected):
+        return {
+            "status": "failed",
+            "failure_reason": (
+                f"substitute credential resolves to account {actual}, but the execution "
+                f"scope expects {account_key!r} = {expected}. Refusing: a bypass run has "
+                "no role chain to bind the account. Fix the profile or the registry, or "
+                "accept the risk with --provider-options "
+                "aws.force_skip_account_expectation_check=true"
+            ),
+        }
+    return {"status": "passed", "expected": str(expected),
+            "reason": f"substitute credential is in {account_key!r} ({expected})"}
+
+
 def preflight_execution_identity(
     target_run_id: str,
     target_run: dict,
@@ -1054,28 +1199,28 @@ def preflight_execution_identity(
     execution_context: dict[str, object],
     implementation_key: str,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
     live_check: bool = True,
 ) -> dict:
     """Resolve one target path and optionally prove it with read-only STS calls."""
-    raw_identity_key = target_run.get("execution_identity_key")
+    raw_execution = target_run.get("execution_identity")
     try:
         resolved = resolve_target_aws_access(
             target_run,
-            catalogs["execution_identities"],
+            {},
             catalogs["credential_sources"],
             execution_context=execution_context,
             implementation_key=implementation_key,
             account_registry=catalogs["account_registry"],
             execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            provider_options=provider_options,
             ctl_role_chain=catalogs["ctl_role_chain"],
             target_roles=catalogs["target_roles"],
             validate_local_credential=live_check,
         )
     except common.ProviderConfigBlockedError as error:
         return {
-            "execution_identity_key": raw_identity_key,
+            "execution_identity": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "not_evaluated",
@@ -1086,12 +1231,12 @@ def preflight_execution_identity(
         reason = _preflight_failure_reason(error)
         # the report nests this error under its execution_identity line, so a
         # trailing "(execution identity '<same key>')" label is redundant here
-        if raw_identity_key:
-            suffix = f"(execution identity {raw_identity_key!r})"
+        if raw_execution:
+            suffix = f"(execution {common.describe_target_execution_identity(raw_execution)!r})"
             if reason.endswith(suffix):
                 reason = reason[: -len(suffix)].rstrip()
         return {
-            "execution_identity_key": raw_identity_key,
+            "execution_identity": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "failed",
@@ -1101,7 +1246,7 @@ def preflight_execution_identity(
 
     if not resolved:
         return {
-            "execution_identity_key": raw_identity_key,
+            "execution_identity": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "failed",
@@ -1109,10 +1254,10 @@ def preflight_execution_identity(
             "failure_reason": "selected target has no execution identity",
         }
     if resolved.get("identity_bypass") == "true":
-        return {
-            "execution_identity_key": (
-                raw_identity_key
-                or resolved.get("execution_identity_key")
+        result = {
+            "execution_identity": (
+                raw_execution
+                or resolved.get("execution_identity")
                 or "<unresolved>"
             ),
             "provider": "aws",
@@ -1121,9 +1266,41 @@ def preflight_execution_identity(
             "provider_path": [],
             "reason": "execution identity was bypassed for this run",
         }
+        # §Phase 52: bypass skips the identity preflight BY DESIGN — this minimal
+        # account check runs precisely then, because bypass is the only mode with
+        # no role chain to bind the account. It is not the identity preflight and
+        # is not covered by that skip. Needs a live call, so it follows live_check.
+        if not live_check:
+            return result
+        verdict = check_account_expectation(
+            raw_execution,
+            execution_context=execution_context,
+            account_registry=catalogs.get("account_registry"),
+            profile_name=resolved["profile_name"],
+            provider_options=provider_options,
+            label=target_run_id,
+        )
+        # Rendered as its own provider_path node: a skipped identity row has its
+        # `reason` replaced by a generic line, so a verdict hidden there would be
+        # invisible — and an account binding that was proved must be SEEN.
+        node = _path_node(
+            "account_expectation",
+            cfg_key=None,
+            expected_name=None,
+            expected_account=verdict.get("expected"),
+            status=verdict["status"],
+        )
+        node["display"] = f"account expectation: {verdict.get('reason') or 'checked'}"
+        if verdict["status"] == "failed":
+            node["display"] = "account expectation"
+            node["failure_reason"] = verdict["failure_reason"]
+            result["status"] = "failed"
+            result["failure_reason"] = verdict["failure_reason"]
+        result["provider_path"] = [node]
+        return result
 
     result = {
-        "execution_identity_key": resolved["execution_identity_key"],
+        "execution_identity": resolved.get("execution_identity"),
         "provider": "aws",
         "access_mode": execution_access_mode,
         "status": "force_skipped" if not live_check else "passed",
@@ -1170,7 +1347,7 @@ def preflight_execution_identity(
                     for key in ("permission_set_name", "role_name")
                     if resolved.get(key)
                 },
-                label=f"execution identity {resolved['execution_identity_key']!r}",
+                label=f"execution {common.describe_target_execution_identity(resolved.get('execution'))!r}",
             )
             nodes[-1]["observed_account"] = caller.get("Account")
             nodes[-1]["observed_principal"] = caller.get("Arn")
@@ -1298,27 +1475,33 @@ def preflight_execution_identity(
 
 def validate_active_target_run_aws_access(
     active_target_runs: dict,
-    execution_identities: dict,
+    _execution_identities: dict,
     aws_credential_sources: dict,
     *,
     execution_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str] | None = None,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
     ctl_role_chain: dict | None = None,
     target_roles: dict | None = None,
 ) -> dict[str, str]:
     """Validate selected bindings and return the normalized account-key registry used by target_runs."""
-    common.validate_execution_identity_coverage(
+    common.validate_target_execution_identity_coverage(
         active_target_runs,
-        execution_access_mode=execution_access_mode,
+        execution_access_modes={PROVIDER_NAME: execution_access_mode},
+    )
+    # §Phase 53: the run declares its providers; a target reaching outside that
+    # declared set fails loud rather than silently widening the run.
+    common.validate_target_provider_coverage(
+        active_target_runs,
+        execution_context.get(f"{common.EXECUTION_CONTEXT_ROOT}.ctl.providers") or (),
     )
     if execution_access_mode != "force_bypass" and any(
-        target_run.get("execution_identity_key") is not None for target_run in active_target_runs.values()
+        target_run.get("execution_identity") is not None for target_run in active_target_runs.values()
     ):
         if account_registry is None:
-            raise RuntimeError("❌ AWS account registry is required for declared execution identities")
+            raise RuntimeError("❌ AWS account registry is required for declared target executions")
         expected_account_registry = dict(account_registry)
     else:
         expected_account_registry = account_registry or {}
@@ -1327,13 +1510,13 @@ def validate_active_target_run_aws_access(
     for target_run_id, target_run in active_target_runs.items():
         resolved = resolve_target_aws_access(
             target_run,
-            execution_identities,
+            {},
             aws_credential_sources,
             execution_context=execution_context,
             implementation_key=implementation_key,
             account_registry=expected_account_registry,
             execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            provider_options=provider_options,
                 ctl_role_chain=ctl_role_chain,
             target_roles=target_roles,
         )
@@ -1350,10 +1533,10 @@ def validate_active_target_run_aws_access(
             )
         validated_account_registry[account_key] = account_id
         logging.info(
-            "Validated AWS access for target_run %s: execution_identity_key=%s account_key=%s "
+            "Validated AWS access for target_run %s: execution=%s account_key=%s "
             "credential_source_key=%s implementation_key=%s credential_provider_kind=%s",
             target_run_id,
-            resolved["execution_identity_key"],
+            common.describe_target_execution_identity(resolved.get("execution_identity")),
             account_key,
             resolved["credential_source_key"],
             resolved["implementation_key"],
@@ -1363,74 +1546,39 @@ def validate_active_target_run_aws_access(
 
 
 
-def _collect_profile_sections(profile_name: str) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
-    """Collect the selected profile's config/credentials sections (following
-    source_profile and sso-session references) from the host AWS files."""
-    config_path = Path(os.environ.get("AWS_CONFIG_FILE", "~/.aws/config")).expanduser()
-    credentials_path = Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "~/.aws/credentials")).expanduser()
+def export_profile_credentials(profile_name: str) -> dict[str, str]:
+    """Resolve a host profile to plain env credentials for the target box.
 
-    config = configparser.RawConfigParser()
-    if config_path.is_file():
-        config.read(config_path)
-    credentials = configparser.RawConfigParser()
-    if credentials_path.is_file():
-        credentials.read(credentials_path)
-
-    def config_section(name: str) -> str | None:
-        for candidate in (f"profile {name}", name):
-            if config.has_section(candidate):
-                return candidate
-        return None
-
-    config_out: dict[str, dict[str, str]] = {}
-    credentials_out: dict[str, dict[str, str]] = {}
-    pending = [profile_name]
-    seen: set[str] = set()
-    while pending:
-        name = pending.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        section = config_section(name)
-        if section is not None:
-            values = dict(config.items(section))
-            config_out[section] = values
-            source = values.get("source_profile")
-            if source:
-                pending.append(source.strip())
-            sso_session = values.get("sso_session")
-            if sso_session and config.has_section(f"sso-session {sso_session.strip()}"):
-                sso_name = f"sso-session {sso_session.strip()}"
-                config_out[sso_name] = dict(config.items(sso_name))
-        if credentials.has_section(name):
-            credentials_out[name] = dict(credentials.items(name))
-    if not config_out and not credentials_out:
-        raise RuntimeError(
-            f"❌ AWS profile {profile_name!r} not found in {config_path} or {credentials_path}"
-        )
-    return config_out, credentials_out
-
-
-def _write_ini(path: Path, sections: dict[str, dict[str, str]]) -> None:
-    parser = configparser.RawConfigParser()
-    for name, values in sections.items():
-        parser.add_section(name)
-        for key, value in values.items():
-            parser.set(name, key, value)
-    with open(path, "w") as handle:
-        parser.write(handle)
-    os.chmod(path, 0o600)
-
-
-def materialize_profile_binding(binding_dir: Path, profile_name: str, target_env: dict[str, str]) -> None:
-    """Isolated per-target_run credential binding: a generated AWS config holding ONLY
-    the selected profile's sections. The target_run can no longer select any other
-    host profile after the initial assertion (exec-identity review item 2)."""
-    binding_dir.mkdir(parents=True, exist_ok=True)
-    config_out, credentials_out = _collect_profile_sections(profile_name)
-    _write_ini(binding_dir / "config", config_out)
-    _write_ini(binding_dir / "credentials", credentials_out)
-    target_env["ATLAS_PROVIDER_BINDING_DIR"] = str(binding_dir)
+    `aws configure export-credentials` runs the full host-side resolution
+    (static keys, SSO, source_profile, credential_process) and returns the
+    resulting credentials. The box receives ONLY env credentials — no config
+    file, no mounted credential material, no profile concept inside the box —
+    the same contract the role-chain path has always had. Nothing credential-
+    shaped ever touches the filesystem, let alone the run's ctl-state dir.
+    """
+    data = _run_aws_json(
+        [
+            "aws",
+            "configure",
+            "export-credentials",
+            "--profile",
+            profile_name,
+            "--format",
+            "process",
+        ]
+    )
+    for field in ("AccessKeyId", "SecretAccessKey"):
+        if not data.get(field):
+            raise RuntimeError(
+                f"❌ AWS profile {profile_name!r} resolved no {field}; cannot bind the target box"
+            )
+    credentials = {
+        "AWS_ACCESS_KEY_ID": str(data["AccessKeyId"]),
+        "AWS_SECRET_ACCESS_KEY": str(data["SecretAccessKey"]),
+    }
+    if data.get("SessionToken"):
+        credentials["AWS_SESSION_TOKEN"] = str(data["SessionToken"])
+    return credentials
 
 
 def derive_ctl_runner_arn(
@@ -1467,17 +1615,16 @@ def configure_target_aws_env(
     target_run_id: str,
     target_run: dict,
     target_env: dict[str, str],
-    execution_identities: dict,
+    _execution_identities: dict,
     aws_credential_sources: dict,
     *,
     execution_context: dict[str, object],
     implementation_key: str,
     account_registry: dict[str, str],
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
     ctl_role_chain: dict | None = None,
     target_roles: dict | None = None,
-    run_dir: Path | None = None,
 ) -> None:
     """Apply one target_run's selected AWS access implementation and assertion metadata."""
     for var_name in AWS_ACCESS_TARGET_ENV_VARS:
@@ -1488,13 +1635,13 @@ def configure_target_aws_env(
 
     resolved = resolve_target_aws_access(
         target_run,
-        execution_identities,
+        {},
         aws_credential_sources,
         execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
         execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        provider_options=provider_options,
         ctl_role_chain=ctl_role_chain,
         target_roles=target_roles,
     )
@@ -1503,14 +1650,10 @@ def configure_target_aws_env(
 
     target_env["AWS_EC2_METADATA_DISABLED"] = "true"
     target_env["ATLAS_AWS_ASSERT_ACCESS"] = "true"
-    target_env["ATLAS_EXECUTION_IDENTITY_KEY"] = resolved["execution_identity_key"]
+    target_env["ATLAS_EXECUTION"] = common.describe_target_execution_identity(resolved.get("execution_identity")) or ""
 
     if resolved.get("identity_bypass") == "true":
-        target_env["AWS_PROFILE"] = resolved["profile_name"]
-        if run_dir is not None:
-            materialize_profile_binding(
-                run_dir / "provider_binding" / target_run_id, resolved["profile_name"], target_env
-            )
+        target_env.update(export_profile_credentials(resolved["profile_name"]))
         target_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"] = "true"
         return
 
@@ -1541,7 +1684,6 @@ def configure_target_aws_env(
             entry_role_name=resolved.get("entry_role_name"),
         )
         target_env.update(chain_creds)
-        target_env["ATLAS_AWS_ROLE_CHAIN"] = "true"
         target_env["ATLAS_AWS_EXPECT_ROLE_NAME"] = resolved["role_name"]
         logging.info(
             "Resolved AWS standard (role-path) access for target_run %s: entry=%s hops=%s",
@@ -1553,21 +1695,16 @@ def configure_target_aws_env(
 
     # Direct mode: the target_run asserts BOTH facts — destination account and the
     # credential source's declared principal (Phase 14).
-    target_env["AWS_PROFILE"] = resolved["profile_name"]
+    target_env.update(export_profile_credentials(resolved["profile_name"]))
     if resolved.get("permission_set_name"):
         target_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"] = resolved["permission_set_name"]
     if resolved.get("role_name"):
         target_env["ATLAS_AWS_EXPECT_ROLE_NAME"] = resolved["role_name"]
-    if run_dir is not None:
-        materialize_profile_binding(
-            run_dir / "provider_binding" / target_run_id, resolved["profile_name"], target_env
-        )
-
     logging.info(
-        "Resolved AWS access for target_run %s: execution_identity_key=%s account_key=%s "
+        "Resolved AWS access for target_run %s: execution=%s account_key=%s "
         "credential_source_key=%s implementation_key=%s credential_provider_kind=%s expected_account_id=%s",
         target_run_id,
-        resolved["execution_identity_key"],
+        common.describe_target_execution_identity(resolved.get("execution_identity")),
         resolved["account_key"],
         resolved["credential_source_key"],
         resolved["implementation_key"],
@@ -1685,13 +1822,24 @@ class CtlStateSyncer:
             self.pull_object(f"{prefix}/committed.yaml")
 
     def push_run(self, run_dir: Path, reason: str) -> None:
-        """Upload one immutable run prefix; never mirror the namespace."""
+        """Upload one immutable run prefix; never mirror the namespace.
+
+        Publishes only `common.RUN_RECORD_MEMBERS` (§Phase 57): filters are
+        applied in order, so a leading `--exclude "*"` makes the includes an
+        ALLOWLIST. Publication is irreversible (`s3 sync` has no --delete), so
+        anything else under the run dir — build workspaces, caches, whatever is
+        added later — must default to unpublished rather than leak permanently.
+        """
         if not self.ensure_ready(f"push ({reason})"):
             return
         run_dir = Path(run_dir).resolve()
         rel_run = run_dir.relative_to(self.results_root).as_posix()
+        record_filters = ["--exclude", "*"]
+        for member in common.RUN_RECORD_MEMBERS:
+            record_filters += ["--include", member, "--include", f"{member}/*"]
         result = self._run_aws(
-            ["s3", "sync", str(run_dir), f"s3://{self.bucket_name}/{rel_run}", "--no-progress"]
+            ["s3", "sync", str(run_dir), f"s3://{self.bucket_name}/{rel_run}",
+             "--no-progress", *record_filters]
         )
         if result.returncode != 0:
             self._fail(
@@ -1916,35 +2064,255 @@ def validate_catalog(ctl_cfg_root: Path) -> None:
     load_aws_ctl_state_roles_cfg(ctl_cfg_root)
 
 
-def validate_execution_identity(identity_key: str, identity_cfg: dict, ctl_cfg_root: Path) -> None:
-    """Validate the AWS identity payload (everything except the generic envelope)."""
-    for removed_field in ("access_context_key", "direct_access_context_key"):
-        if removed_field in identity_cfg:
-            raise RuntimeError(
-                f"❌ execution identity {identity_key!r} uses removed {removed_field}; "
-                "rename it to direct_credential_source_key (§Skip Model D)"
-            )
-    allowed_fields = {
-        "provider", "account_key", "direct_credential_source_key",
-        "ctl_target_role_key", "ctl_state_role_key",
-    }
-    unknown = sorted(set(identity_cfg) - allowed_fields)
+PROVIDER_NAME = "aws"
+CREDENTIAL_SOURCE_NON_IMPLEMENTATION_FIELDS = frozenset({"selectors"})
+
+SUPPORTED_EXECUTION_ACCESS_MODES = ("standard", "agreed_direct", "force_bypass")
+CREDENTIAL_IMPLEMENTATIONS = ("profile", "web_identity")
+PROVIDER_OPTION_KEYS = {
+    "credential_implementation": "profile | web_identity",
+    "agreed_direct_credential_profile.<credential_source_key>": "<profile>",
+    "force_bypass_credential_profile": "<profile>",
+    "force_skip_account_expectation_check": "true | false",
+}
+# §Phase 52: options that cost an explicit ctl-profile grant, in THIS adapter's
+# `ctl_profiles.<profile>.aws` block. The adapter owns both names.
+PROVIDER_OPTION_PROFILE_GRANTS = {
+    "force_skip_account_expectation_check": "allow_force_skip_account_expectation_check",
+}
+# This adapter's ctl-profile policy vocabulary. The engine reads the block as
+# opaque and never interprets a key or value in it.
+PROFILE_POLICY_KEYS = (
+    "allowed_execution_access_modes",
+    "allowed_credential_implementation",
+    *sorted(PROVIDER_OPTION_PROFILE_GRANTS.values()),
+)
+
+
+def supported_execution_access_modes() -> set[str]:
+    """Modes this adapter implements (CSI-style capability advertisement)."""
+    return set(SUPPORTED_EXECUTION_ACCESS_MODES)
+
+
+def _option_is_true(provider_options: dict[str, str] | None, key: str) -> bool:
+    return str((provider_options or {}).get(key, "")).strip().lower() == "true"
+
+
+def validate_profile_policy(policy: dict, *, label: str) -> dict:
+    """Validate this adapter's `ctl_profiles.<profile>.aws` block.
+
+    Every policy is DECLARED: a profile that may run aws states which access
+    modes and which credential implementations it authorizes. There is no
+    default — the engine has no aws vocabulary to default to, and silently
+    granting the permissive direction is the unsafe one.
+    """
+    if not isinstance(policy, dict) or not policy:
+        raise RuntimeError(f"❌ {label} must be a non-empty mapping")
+    unknown = sorted(set(policy) - set(PROFILE_POLICY_KEYS))
     if unknown:
-        raise RuntimeError(f"❌ execution identity {identity_key!r} has unknown fields {unknown}")
-    common._require_non_empty_string(
-        identity_cfg.get("account_key"),
-        f"execution_identities.{identity_key}.account_key",
-        ctl_cfg_root,
-    )
-    for optional_field in (
-        "direct_credential_source_key", "ctl_target_role_key", "ctl_state_role_key"
+        raise RuntimeError(
+            f"❌ {label} has unknown policies {unknown}; known: {list(PROFILE_POLICY_KEYS)}"
+        )
+    for key, allowed in (
+        ("allowed_execution_access_modes", supported_execution_access_modes()),
+        ("allowed_credential_implementation", set(CREDENTIAL_IMPLEMENTATIONS)),
     ):
-        if optional_field in identity_cfg:
-            common._require_non_empty_string(
-                identity_cfg.get(optional_field),
-                f"execution_identities.{identity_key}.{optional_field}",
-                ctl_cfg_root,
+        values = policy.get(key)
+        if not isinstance(values, list) or not values:
+            raise RuntimeError(f"❌ {label}.{key} must be a non-empty list")
+        stray = sorted(set(map(str, values)) - allowed)
+        if stray:
+            raise RuntimeError(
+                f"❌ {label}.{key} has values this adapter does not offer: {stray} "
+                f"(offers {sorted(allowed)})"
             )
+    for permission in PROVIDER_OPTION_PROFILE_GRANTS.values():
+        if permission in policy and not isinstance(policy[permission], bool):
+            raise RuntimeError(f"❌ {label}.{permission} must be a bool")
+    return policy
+
+
+def authorize_run(
+    policy: dict,
+    *,
+    execution_access_mode: str,
+    provider_options: dict[str, str] | None,
+    label: str,
+) -> list[str]:
+    """Enforce this adapter's ctl-profile policy for one run (§Phase 52).
+
+    Everything provider-specific is decided here — the access mode, the
+    credential implementation, and any option that costs a grant — so the engine
+    enforces only its own provider-neutral policies and learns no aws vocabulary.
+
+    Returns human render lines describing what was authorized (the engine prints
+    them verbatim under the provider's policy node — it never composes aws
+    vocabulary itself). Failure is a hard error, as before.
+    """
+    validate_profile_policy(policy, label=label)
+
+    if execution_access_mode not in policy["allowed_execution_access_modes"]:
+        raise RuntimeError(
+            f"❌ execution access mode {execution_access_mode!r} is not allowed by "
+            f"{label} (allowed: {policy['allowed_execution_access_modes']})"
+        )
+    lines = [f"access mode: {execution_access_mode} [ allowed ]"]
+
+    implementation = (provider_options or {}).get("credential_implementation")
+    if implementation and implementation not in policy["allowed_credential_implementation"]:
+        raise RuntimeError(
+            f"❌ credential implementation {implementation!r} is not allowed by "
+            f"{label} (allowed: {policy['allowed_credential_implementation']})"
+        )
+    if implementation:
+        lines.append(f"credential implementation: {implementation} [ allowed ]")
+
+    for option, permission in sorted(PROVIDER_OPTION_PROFILE_GRANTS.items()):
+        if _option_is_true(provider_options, option):
+            if not policy.get(permission):
+                raise RuntimeError(
+                    f"❌ --provider-options aws.{option} requires {permission}, but "
+                    f"{label} does not grant it"
+                )
+            lines.append(f"grant spent: {permission}")
+    return lines
+
+
+def normal_execution_access_mode() -> str:
+    """This adapter's non-escalated mode — what an unremarkable run uses."""
+    return "standard"
+
+
+def target_consent(execution_access_mode: str) -> dict[str, str] | None:
+    """What a target must have declared to be run in this mode, if anything.
+
+    agreed_direct runs a target with a credential that bypasses the role chain,
+    so consent is two statements the target makes up front and separately:
+    `opt_in_field` — it accepts being run this way at all — and
+    `execution_field` — the sources it accepts being run with. They are not
+    redundant: a target may name sources it uses in other roles while
+    withholding the opt-in (see org/bootstrap_admin/teardown).
+
+    The other modes need no per-target consent: standard is the declared path,
+    and force_bypass is authorized run-wide by the ctl profile.
+    """
+    if execution_access_mode == "agreed_direct":
+        return {
+            "opt_in_field": "allow_agreed_direct_execution_access",
+            "execution_field": "agreed_direct_credential_source_keys",
+        }
+    return None
+
+
+def execution_access_mode_from_options(
+    provider_options: dict[str, str] | None,
+) -> str | None:
+    """The mode these options imply, if they imply one.
+
+    Passing a substitute credential IS the request to run without resolving an
+    identity — it means nothing in any other mode.
+    """
+    if (provider_options or {}).get("force_bypass_credential_profile"):
+        return "force_bypass"
+    return None
+
+
+def resolves_execution_identity(execution_access_mode: str) -> bool:
+    """Whether this mode resolves a declared execution identity.
+
+    force_bypass runs on a substitute credential and never resolves identity
+    cfg, so nothing is checked and there is no check to skip.
+    """
+    return execution_access_mode != "force_bypass"
+
+
+def supports_identity_preflight() -> bool:
+    """AWS proves the acquired credential with STS GetCallerIdentity."""
+    return True
+
+
+def describe() -> dict:
+    """Everything this adapter declares, for `ctl.py providers`.
+
+    The engine prints this verbatim; it names no mode, capability or option key
+    itself.
+    """
+    return {
+        "execution_access_modes": sorted(supported_execution_access_modes()),
+        "identity_preflight": supports_identity_preflight(),
+        "normal_execution_access_mode": normal_execution_access_mode(),
+        "modes_resolving_execution_identity": sorted(
+            mode for mode in supported_execution_access_modes()
+            if resolves_execution_identity(mode)
+        ),
+        "target_consent": {
+            mode: target_consent(mode)
+            for mode in sorted(supported_execution_access_modes())
+            if target_consent(mode)
+        },
+        "provider_options": dict(PROVIDER_OPTION_KEYS),
+        "provider_option_profile_grants": dict(PROVIDER_OPTION_PROFILE_GRANTS),
+    }
+
+
+def validate_provider_options(options: dict) -> dict:
+    """Validate this adapter's own option keys; unknown keys fail loud.
+
+    `credential_implementation` is REQUIRED: whenever aws participates in a run,
+    the operator states HOW it authenticates — there is no default to fall back
+    to, exactly as with the execution access mode.
+    """
+    if not (options or {}).get("credential_implementation"):
+        raise RuntimeError(
+            "❌ aws requires --provider-options aws.credential_implementation="
+            f"{{{' | '.join(CREDENTIAL_IMPLEMENTATIONS)}}} (no default)"
+        )
+    cleaned: dict[str, str] = {}
+    for key, value in (options or {}).items():
+        if key == "credential_implementation":
+            if value not in CREDENTIAL_IMPLEMENTATIONS:
+                raise RuntimeError(
+                    f"❌ aws.credential_implementation must be one of "
+                    f"{list(CREDENTIAL_IMPLEMENTATIONS)}, got {value!r}"
+                )
+        elif key == "force_bypass_credential_profile":
+            pass
+        elif key == "force_skip_account_expectation_check":
+            if str(value).strip().lower() not in ("true", "false"):
+                raise RuntimeError(
+                    f"❌ aws.{key} must be 'true' or 'false', got {value!r}"
+                )
+        elif key.startswith("agreed_direct_credential_profile."):
+            if len(key.split(".", 1)[1].strip()) == 0:
+                raise RuntimeError(
+                    "❌ aws.agreed_direct_credential_profile must name a credential source key"
+                )
+        else:
+            raise RuntimeError(
+                f"❌ unknown aws provider option {key!r}; known: {sorted(PROVIDER_OPTION_KEYS)}"
+            )
+        cleaned[key] = value
+    return cleaned
+
+
+def validate_target_execution_identity(execution: dict, ctl_cfg_root: Path, *, label: str) -> None:
+    """Validate the AWS payload of a target's execution_identity block.
+
+    The generic shape (provider/account/roles + optional lists) is validated by
+    the engine; this checks the AWS-specific bits: the role keys name entries the
+    AWS catalogs can resolve, and the account is a non-empty registry key.
+    """
+    common._require_non_empty_string(
+        execution.get("account"), f"{label}.execution.account", ctl_cfg_root
+    )
+    for role_class, role_key in (execution.get("roles") or {}).items():
+        common._require_non_empty_string(
+            role_key, f"{label}.execution.roles.{role_class}", ctl_cfg_root
+        )
+    for key in execution.get("agreed_direct_credential_source_keys") or []:
+        common._require_non_empty_string(
+            key, f"{label}.execution_identity.agreed_direct_credential_source_keys", ctl_cfg_root
+        )
 
 
 def load_runtime_catalogs(
@@ -1959,7 +2327,6 @@ def load_runtime_catalogs(
     reporting without allowing them to block an otherwise valid selection.
     """
     return {
-        "execution_identities": common.load_execution_identities_cfg(ctl_cfg_root),
         "credential_sources": load_aws_credential_sources_cfg(ctl_cfg_root),
         "account_registry": load_aws_account_registry_cfg(
             ctl_cfg_root,
@@ -1979,17 +2346,17 @@ def validate_active_target_access(
     execution_context: dict[str, object],
     implementation_key: str,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> None:
     catalogs["validated_account_registry"] = validate_active_target_run_aws_access(
         active_target_runs,
-        catalogs["execution_identities"],
+        {},
         catalogs["credential_sources"],
         execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=catalogs["account_registry"],
         execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        provider_options=provider_options,
         ctl_role_chain=catalogs["ctl_role_chain"],
         target_roles=catalogs["target_roles"],
     )
@@ -2004,23 +2371,21 @@ def materialize_target_binding(
     execution_context: dict[str, object],
     implementation_key: str,
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
-    run_dir: Path | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> None:
     configure_target_aws_env(
         target_run_id,
         target_run,
         target_env,
-        catalogs["execution_identities"],
+        {},
         catalogs["credential_sources"],
         execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=catalogs.get("validated_account_registry") or catalogs["account_registry"],
         execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        provider_options=provider_options,
         ctl_role_chain=catalogs["ctl_role_chain"],
         target_roles=catalogs["target_roles"],
-        run_dir=run_dir,
     )
 
 
@@ -2056,12 +2421,12 @@ def resolve_state_backend_probe_credential(
     execution_context: dict[str, object],
     implementation_key: str,
     execution_access_mode: str,
-    provider_credential: str | None,
+    provider_options: dict[str, str] | None,
 ) -> str | dict[str, str]:
     """Resolve the backend-provisioning target credential used by readiness probes."""
     resolved = resolve_target_aws_access(
         target_run,
-        catalogs["execution_identities"],
+        {},
         catalogs["credential_sources"],
         execution_context=execution_context,
         implementation_key=implementation_key,
@@ -2070,7 +2435,7 @@ def resolve_state_backend_probe_credential(
             or catalogs["account_registry"]
         ),
         execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        provider_options=provider_options,
         ctl_role_chain=catalogs["ctl_role_chain"],
         target_roles=catalogs["target_roles"],
         ctl_state_roles=catalogs["ctl_state_roles"],
@@ -2237,7 +2602,7 @@ def build_ctl_state_session_policy(
     return {"Version": "2012-10-17", "Statement": statements}
 
 def resolve_ctl_state_credential(
-    identity_key: str,
+    operation_execution: dict,
     ctl_cfg_root: Path,
     *,
     execution_context: dict[str, object],
@@ -2247,16 +2612,12 @@ def resolve_ctl_state_credential(
     object_keys: list[str] | tuple[str, ...] = (),
     object_prefixes: list[str] | tuple[str, ...] = (),
     execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> str | dict[str, str]:
     if execution_access_mode == "force_bypass":
-        if not provider_credential:
-            raise RuntimeError(
-                "❌ bypass execution access requires the --provider-credential substitute credential"
-            )
-        return provider_credential.strip()
+        return force_bypass_credential_profile(provider_options)
 
-    identities = common.load_execution_identities_cfg(ctl_cfg_root)
+
     credential_sources = load_aws_credential_sources_cfg(ctl_cfg_root)
     account_registry = load_aws_account_registry_cfg(
         ctl_cfg_root,
@@ -2267,20 +2628,20 @@ def resolve_ctl_state_credential(
     target_roles = load_aws_target_roles_cfg(ctl_cfg_root)
     ctl_state_roles = load_aws_ctl_state_roles_cfg(ctl_cfg_root)
     resolved = resolve_target_aws_access(
-        {"execution_identity_key": identity_key},
-        identities,
+        {"execution_identity": operation_execution},
+        {},
         credential_sources,
         execution_context=execution_context,
         implementation_key=implementation_key,
         account_registry=account_registry,
         execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        provider_options=provider_options,
         ctl_role_chain=ctl_role_chain,
         target_roles=target_roles,
         ctl_state_roles=ctl_state_roles,
     )
     if not resolved:
-        raise RuntimeError(f"❌ ctl-state identity {identity_key!r} did not resolve")
+        raise RuntimeError(f"❌ ctl-state {operation} execution did not resolve")
 
     if resolved.get("credential_provider_kind") == "direct_profile":
         assert_profile_caller(
@@ -2291,13 +2652,13 @@ def resolve_ctl_state_credential(
                 for key in ("permission_set_name", "role_name")
                 if resolved.get(key)
             },
-            label=f"ctl-state {operation} identity {identity_key!r}",
+            label=f"ctl-state {operation} execution",
         )
         return resolved["profile_name"]
 
     if resolved.get("credential_provider_kind") != "role_chain":
         raise RuntimeError(
-            f"❌ ctl-state identity {identity_key!r} resolved unsupported credential kind "
+            f"❌ ctl-state {operation} execution resolved unsupported credential kind "
             f"{resolved.get('credential_provider_kind')!r}"
         )
     credentials = assume_ctl_role_chain(
@@ -2331,5 +2692,18 @@ def create_state_syncer(results_root, bucket_name: str, bucket_region: str, cred
     )
 
 
-def normalize_provider_credential(value: str | None) -> str | None:
-    return normalize_optional_aws_profile(value)
+def force_bypass_credential_profile(provider_options: dict[str, str] | None) -> str:
+    """The substitute profile for force_bypass, from this provider's options.
+
+    An option rather than an engine arg because it is an AWS local profile name —
+    meaningless to a provider that authenticates another way.
+    """
+    profile_name = normalize_optional_aws_profile(
+        (provider_options or {}).get("force_bypass_credential_profile")
+    )
+    if not profile_name:
+        raise RuntimeError(
+            "❌ aws execution access mode 'force_bypass' requires the substitute "
+            "credential: --provider-options aws.force_bypass_credential_profile=<profile>"
+        )
+    return profile_name

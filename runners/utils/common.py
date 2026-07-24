@@ -59,6 +59,23 @@ RUN_TYPES = ("workflow", "target", "step_sequence", "maintenance", "fan_out")
 # §Phase 30: reserved local-only ctl-state root — never synced, never a locator.
 # Locator segments must start alphanumeric, so "_local" cannot collide.
 LOCAL_ONLY_LOCATOR = ("_local",)
+# §Phase 57: the build workspace (repo checkout + provider cache) lives under the
+# reserved never-synced `_local` tree, NOT inside a run prefix — a run prefix is
+# published to the backend and `s3 sync` has no --delete, so anything that lands
+# there is permanent.
+LOCAL_WORKSPACES_DIRNAME = "workspaces"
+# §Phase 57: what a published run prefix contains. An ALLOWLIST, never an exclude
+# list: publication is irreversible, so anything new under a run dir must default
+# to NOT published. The engine decides WHAT a record is; the adapter uploads it.
+RUN_RECORD_MEMBERS = (
+    "RUN.yaml",
+    "source_refs.yaml",
+    "gates",
+    "logs",
+    "artifacts",
+    "execution",
+    "cfg",
+)
 LOCATOR_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _UUID7_LAST_TIMESTAMP_MS = -1
 _UUID7_COUNTER = 0
@@ -177,15 +194,48 @@ def validate_uuid7(v: str) -> str:
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
 
-def parse_selector_arg(value: str) -> tuple[str, str]:
-    if "=" not in value:
-        raise argparse.ArgumentTypeError(f"Selector must use key=value format, got: {value!r}")
-    key, selector_value = value.split("=", 1)
-    key = key.strip()
-    selector_value = selector_value.strip()
-    if not key or not selector_value:
-        raise argparse.ArgumentTypeError(f"Selector must use non-empty key=value, got: {value!r}")
-    return key, selector_value
+def parse_selector_pairs(value: str) -> list[tuple[str, str]]:
+    """Parse one --execution-params value into (key, value) pairs.
+
+    Accepts a comma-separated list (`a=1,b=2`); a single pair is the one-element
+    case. Combined with ExecutionParamsAction (which EXTENDS the dest list), both
+    `--execution-params a=1,b=2` and the repeated `--execution-params a=1
+    --execution-params b=2` produce the same flat list of pairs.
+    """
+    pairs: list[tuple[str, str]] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Selector must use key=value format, got: {item!r}")
+        key, selector_value = item.split("=", 1)
+        key = key.strip()
+        selector_value = selector_value.strip()
+        if not key or not selector_value:
+            raise ValueError(f"Selector must use non-empty key=value, got: {item!r}")
+        pairs.append((key, selector_value))
+    if not pairs:
+        raise ValueError(f"Selector must use key=value format, got: {value!r}")
+    return pairs
+
+
+class ExecutionParamsAction(argparse.Action):
+    """Collect execution params as a FLAT list of (key, value) pairs.
+
+    `type=` is deliberately not used: an append action with a list-returning type
+    would nest to list[list[tuple]], while every downstream consumer
+    (selectors_to_map, the arg normalizers, the tests) expects a flat
+    list[tuple[str, str]].
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = list(getattr(namespace, self.dest, None) or [])
+        try:
+            current.extend(parse_selector_pairs(values))
+        except ValueError as exc:
+            raise argparse.ArgumentError(self, str(exc)) from exc
+        setattr(namespace, self.dest, current)
 
 
 def selectors_to_map(items: list[tuple[str, str]], *, label: str) -> dict[str, str]:
@@ -227,9 +277,13 @@ def collect_top_level_sections(cfg_root: Path, key: str) -> list[tuple[Path, obj
 
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
-    bundles governing ctl behavior: ref_policy, allowed_execution_access_modes
-    (§12), and the ctl-state sync skip permissions
-    (allow_agreed_defer_ctl_state_backend_sync, allow_force_skip_ctl_state_backend_sync)."""
+    bundles governing ctl behavior.
+
+    TWO LEVELS, split by who DEFINES the concept: the top level holds engine
+    policies (ref_policy, execution runtime, ctl-state sync skips, guardrail and
+    cfg-gate skips) plus `allowed_providers`; a `<provider>:` block holds the
+    policies whose vocabulary belongs to that provider. The engine never reads
+    inside a provider block — it hands it to the adapter (§Phase 52)."""
     profiles: dict[str, dict] = {}
     for path, section in collect_top_level_sections(ctl_cfg_root, "ctl_profiles"):
         if not isinstance(section, dict):
@@ -284,7 +338,276 @@ def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
     return value
 
 
-EXECUTION_ACCESS_MODES = ("standard", "agreed_direct", "force_bypass")
+# The engine owns NO execution-access-mode vocabulary at all: each adapter
+# advertises its own via supported_execution_access_modes(), and the operator
+# states one per participating provider. There is no engine-level default,
+# because the engine has no mode name to default to.
+
+# Authorization classes and the action that selects one. Reads and writes get
+# different authority, so the role a target assumes depends on the ACTION, not on
+# the target alone — a `plan` must not run with write authority. Both the classes
+# and this mapping are engine-owned and provider-neutral: a target's
+# `execution.roles` maps each class to a provider role key the adapter resolves.
+ROLE_CLASSES = ("readonly", "readwrite")
+# The role class is the action's ACCESS LEVEL: read-only for a preview, read-write
+# for a mutation. Mutating actions (provision/destroy) are the single source
+# `MUTATING_ACTIONS`, so the map is derived, not duplicated.
+ACTION_ROLE_CLASS = {
+    action: ("readwrite" if action in MUTATING_ACTIONS else "readonly")
+    for action in RUN_ACTIONS
+}
+
+
+def resolve_role_class(action: str | None, *, label: str) -> str:
+    """Map a lifecycle action to the authorization class it requires."""
+    if action is None:
+        raise RuntimeError(f"❌ {label}: an action is required to select the authorization class")
+    role_class = ACTION_ROLE_CLASS.get(str(action).strip())
+    if role_class is None:
+        raise RuntimeError(
+            f"❌ {label}: action {action!r} has no authorization class; "
+            f"known actions: {sorted(ACTION_ROLE_CLASS)}"
+        )
+    return role_class
+
+
+TARGET_EXECUTION_IDENTITY_FIELDS = frozenset(
+    {
+        "provider",
+        "account",
+        "roles",
+        "agreed_direct_credential_source_keys",
+        "allowed_accounts",
+    }
+)
+
+
+def selector_group_is_group(entry: object) -> bool:
+    """§Phase 31 3c: a selector-membered group entry in a cfg collection
+    (cfg_file_sets, refs.scoped) — same resolution semantics as execution
+    identity groups: `members` select exactly one concrete value."""
+    return isinstance(entry, dict) and "members" in entry
+
+
+def resolve_selector_group_member(
+    entry: dict,
+    execution_context: dict[str, object],
+    *,
+    value_field: str,
+    label: str,
+    tolerate_none: bool = False,
+) -> str | None:
+    """Resolve a selector-membered group entry to its one matching member's
+    `value_field` (§Phase 31 3c). Mirrors execution-identity group semantics:
+    members are {<value_field>, selectors}; EXACTLY ONE member must match the
+    frozen execution context. The returned value may still carry
+    ${execution_context.*} placeholders — the caller renders them.
+
+    With `tolerate_none=True`, ZERO matches returns None instead of raising (used
+    for an inactive target whose selector axis isn't bound in this run); MORE than
+    one match is always a hard error (a genuine cfg ambiguity)."""
+    members = entry.get("members")
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label}: group members must be a non-empty list")
+    for member in members:
+        if not isinstance(member, dict) or set(member) - {value_field, "selectors"}:
+            raise RuntimeError(
+                f"❌ {label}: group member must be {{{value_field}, selectors}}"
+            )
+        value = member.get(value_field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"❌ {label}: group member {value_field} must be a non-empty string")
+    reject_duplicate_selectors(
+        {m.get(value_field): m.get("selectors") for m in members}, label=label
+    )
+    matches = [
+        member for member in members
+        if selector_matches(
+            member.get("selectors"), execution_context,
+            label=f"{label} member {member.get(value_field)}",
+            structured_only=True,
+        )
+    ]
+    if len(matches) != 1:
+        if tolerate_none and not matches:
+            return None
+        member_values = [member.get(value_field) for member in members]
+        raise RuntimeError(
+            f"❌ {label}: exactly one group member must match the execution context, "
+            f"matched {len(matches)} (members: {member_values})"
+        )
+    return matches[0][value_field].strip()
+
+
+def _selector_param_axes(members: object) -> set[str]:
+    """The params-namespace axes referenced by a member list's selectors
+    (§Phase 32 consumed-axes guard input). Non-params refs (ctl.*) are ignored.
+    (EXECUTION_CONTEXT_ROOT is defined later in the module — reference it at
+    call time, never at import time.)"""
+    prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
+    axes: set[str] = set()
+    for member in members or []:
+        if not isinstance(member, dict):
+            continue
+        try:
+            requirements = selector_requirements(
+                member.get("selectors"), label="consumed-axes scan", structured_only=True
+            )
+        except Exception:
+            continue
+        for ref in requirements:
+            if ref.startswith(prefix):
+                axes.add(ref[len(prefix):])
+    return axes
+
+
+def _template_param_axes(value: object) -> set[str]:
+    """${execution_context.params.X} variables in a raw template string."""
+    if not isinstance(value, str):
+        return set()
+    pattern = (
+        rf"\$\{{{re.escape(EXECUTION_CONTEXT_ROOT)}\.params\.([A-Za-z_][A-Za-z0-9_]*)\}}"
+    )
+    return set(re.findall(pattern, value))
+
+
+def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
+    """§Phase 32 instance-uniqueness rule, field-agnostic: EVERY members-shaped
+    dispatch in target resolution feeds the guard, and the violation test is
+    per-AXIS, never per-field:
+
+    - a params axis → returned (must be declared in target_instance_params
+      unless path-encoded via the namespace);
+    - `ctl.action` → safe (the action is its own ctl-state path segment);
+    - any OTHER ctl.* fact (e.g. ctl.profile) → hard error: it is neither
+      path-encoded nor declarable, so two runs differing only in it would
+      collapse onto one instance path and self-override."""
+    params_prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
+    action_ref = f"{EXECUTION_CONTEXT_ROOT}.ctl.action"
+    axes: set[str] = set()
+    for member in members or []:
+        if not isinstance(member, dict):
+            continue
+        requirements = selector_requirements(
+            member.get("selectors"), label=label, structured_only=True
+        )
+        for ref in requirements:
+            if ref.startswith(params_prefix):
+                axes.add(ref[len(params_prefix):])
+            elif ref != action_ref:
+                raise RuntimeError(
+                    f"❌ {label}: dispatch on {ref!r} is not allowed — target "
+                    "resolution may dispatch only on declarable params axes or "
+                    "the path-encoded ctl.action"
+                )
+    return axes
+
+
+def resolve_list_members(
+    entry: dict,
+    execution_context: dict[str, object] | None,
+    *,
+    value_field: str,
+    label: str,
+    allow_empty: bool = False,
+) -> list | None:
+    """Resolve a members-shaped LIST-valued declaration
+    ({members: [{<value_field>: [...], selectors: {...}}, ...]}) to the ONE
+    matching member's list (§Phase 32 instance schemas, §Phase 33 per-action
+    cfg_files/target_keys). The scalar twin is resolve_selector_group_member.
+    Returns None when no context is available or the dispatch axis is unbound
+    (deferred — the caller decides whether that is an error)."""
+    members = entry.get("members")
+    if set(entry) != {"members"} or not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label}: members-shaped declaration must be {{members: [...]}}")
+    for member in members:
+        if not isinstance(member, dict) or set(member) != {value_field, "selectors"}:
+            raise RuntimeError(f"❌ {label}: each member must be {{{value_field}, selectors}}")
+        if not isinstance(member[value_field], list) or (
+            not member[value_field] and not allow_empty
+        ):
+            raise RuntimeError(f"❌ {label}: member {value_field} must be a non-empty list")
+    if execution_context is None:
+        return None
+    matches = [
+        member for member in members
+        if selector_matches(
+            member["selectors"], execution_context,
+            label=f"{label} member", structured_only=True,
+        )
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"❌ {label}: exactly one member must match the execution context, matched {len(matches)}"
+        )
+    return list(matches[0][value_field])
+
+
+def _resolve_instance_params_members(
+    entry: dict, execution_context: dict[str, object] | None, *, target_name: str
+) -> list[str] | None:
+    return resolve_list_members(
+        entry,
+        execution_context,
+        value_field="params",
+        label=f"target {target_name!r} target_instance_params",
+    )
+
+
+def validate_target_execution_identity(execution: object, *, label: str) -> dict:
+    """Validate a target's `execution_identity:` block — the provider-tagged payload.
+
+    The engine reads only `provider` (to pick the adapter) and the generic shape;
+    every value below it (`account`, the role keys, credential source keys) is
+    opaque here and interpreted by that provider's adapter.
+    """
+    if not isinstance(execution, dict) or not execution:
+        raise RuntimeError(f"❌ {label} execution must be a non-empty mapping")
+
+    unknown = sorted(set(execution) - TARGET_EXECUTION_IDENTITY_FIELDS)
+    if unknown:
+        raise RuntimeError(
+            f"❌ {label} execution has unknown fields {unknown}; "
+            f"allowed: {sorted(TARGET_EXECUTION_IDENTITY_FIELDS)}"
+        )
+
+    for field in ("provider", "account"):
+        value = execution.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"❌ {label} execution.{field} must be a non-empty string")
+
+    roles = execution.get("roles")
+    if not isinstance(roles, dict) or not roles:
+        raise RuntimeError(
+            f"❌ {label} execution.roles must be a non-empty mapping of "
+            f"authorization class -> provider role key ({', '.join(ROLE_CLASSES)})"
+        )
+    unknown_classes = sorted(set(roles) - set(ROLE_CLASSES))
+    if unknown_classes:
+        raise RuntimeError(
+            f"❌ {label} execution.roles has unknown authorization classes {unknown_classes}; "
+            f"allowed: {list(ROLE_CLASSES)}"
+        )
+    for role_class, role_key in roles.items():
+        if not isinstance(role_key, str) or not role_key.strip():
+            raise RuntimeError(
+                f"❌ {label} execution.roles.{role_class} must be a non-empty string"
+            )
+
+    for field in ("agreed_direct_credential_source_keys", "allowed_accounts"):
+        if field not in execution:
+            continue
+        values = execution.get(field)
+        if not isinstance(values, list) or not values or not all(
+            isinstance(item, str) and item.strip() for item in values
+        ):
+            raise RuntimeError(
+                f"❌ {label} execution.{field} must be a non-empty list of non-empty strings"
+            )
+
+    return execution
 
 # Phase 26 — execution runtime (WHERE a target_run's box is produced). CTL selects one
 # runtime for the whole run (always explicit, no default); the target_run declares
@@ -340,24 +663,74 @@ def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execut
         )
 
 
-def ctl_allowed_execution_access_modes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
-    """Modes the ctl profile authorizes (§12). Absent = {standard} only."""
+def target_consent_opt_in_fields() -> set[str]:
+    """Every per-target opt-in field any registered adapter asks for."""
+    from utils.providers import REGISTERED_PROVIDERS, get_adapter
+
+    fields: set[str] = set()
+    for provider in REGISTERED_PROVIDERS:
+        adapter = get_adapter(provider)
+        for mode in adapter.supported_execution_access_modes():
+            consent = adapter.target_consent(mode)
+            if consent:
+                fields.add(consent["opt_in_field"])
+    return fields
+
+
+def ctl_allowed_providers(ctl_cfg_root: Path, ctl_profile: str) -> list[str]:
+    """Providers this ctl profile may run (§Phase 52 profile split).
+
+    Declared, never defaulted: a profile states which providers it authorizes,
+    and each one must carry its own policy block. Provider IDENTITY is engine
+    vocabulary; everything inside a provider's block is not.
+    """
+    from utils.providers import REGISTERED_PROVIDERS
+
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
-    raw = policy.get("allowed_execution_access_modes")
-    if raw is None:
-        return {"standard"}
-    if not isinstance(raw, list) or not all(isinstance(m, str) for m in raw):
+    raw = policy.get("allowed_providers")
+    if not isinstance(raw, list) or not raw or not all(isinstance(p, str) for p in raw):
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes must be a list of strings"
+            f"❌ ctl profile {ctl_profile!r} must declare allowed_providers as a "
+            "non-empty list of provider names"
         )
-    modes = set(raw)
-    unknown = modes - set(EXECUTION_ACCESS_MODES)
+    unknown = sorted(set(raw) - set(REGISTERED_PROVIDERS))
     if unknown:
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} allowed_execution_access_modes has unknown modes {sorted(unknown)}"
+            f"❌ ctl profile {ctl_profile!r} allowed_providers names unregistered "
+            f"providers {unknown}; registered: {list(REGISTERED_PROVIDERS)}"
         )
-    modes.add("standard")  # standard is always permitted
-    return modes
+    missing = sorted(p for p in raw if not isinstance(policy.get(p), dict))
+    if missing:
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allows providers {missing} but declares no "
+            f"policy block for them (expected a `{missing[0]}:` mapping in the profile)"
+        )
+    return list(raw)
+
+
+def validate_ctl_allowed_providers(
+    ctl_cfg_root: Path, ctl_profile: str, providers: list[str] | tuple[str, ...]
+) -> None:
+    allowed = ctl_allowed_providers(ctl_cfg_root, ctl_profile)
+    stray = sorted(set(providers) - set(allowed))
+    if stray:
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} does not allow providers {stray} "
+            f"(allowed: {allowed})"
+        )
+
+
+def ctl_profile_provider_policy(
+    ctl_cfg_root: Path, ctl_profile: str, provider: str
+) -> dict:
+    """One provider's policy block, opaque to the engine — the adapter reads it."""
+    ctl_allowed_providers(ctl_cfg_root, ctl_profile)
+    policy = ctl_profile_policy(ctl_cfg_root, ctl_profile).get(provider)
+    if not isinstance(policy, dict):
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} declares no {provider!r} policy block"
+        )
+    return policy
 
 
 def ctl_allows_agreed_defer_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile: str) -> bool:
@@ -436,6 +809,11 @@ def validate_reuse_committed_ref_policy(
         )
 
 
+EXECUTION_CONTEXT_CONSTRAINT_FIELDS = frozenset(
+    {"when_all", "when_any", "require_present", "allowed_values"}
+)
+
+
 def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
     constraint_entries: list[tuple[dict, Path]] = []
     for path, section in collect_top_level_sections(ctl_cfg_root, "execution_context_constraints"):
@@ -447,11 +825,34 @@ def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
     for idx, (constraint, path) in enumerate(constraint_entries, start=1):
         if not isinstance(constraint, dict):
             raise RuntimeError(f"❌ execution context constraint #{idx} must be a mapping: {path}")
-        when = constraint.get("when") or {}
+        if "when" in constraint:
+            raise RuntimeError(
+                f"❌ execution context constraint #{idx} uses `when`, which is removed: {path}; "
+                "use `when_all` (list of match-mappings, ALL must match) — a multi-path `when` "
+                "mapping becomes N single-path entries — or `when_any` (ANY matches)"
+            )
+        unknown = sorted(set(constraint) - set(EXECUTION_CONTEXT_CONSTRAINT_FIELDS))
+        if unknown:
+            raise RuntimeError(
+                f"❌ execution context constraint #{idx} has unknown fields {unknown}: {path}; "
+                f"allowed: {sorted(EXECUTION_CONTEXT_CONSTRAINT_FIELDS)}"
+            )
+        for clause in ("when_all", "when_any"):
+            if clause not in constraint:
+                continue
+            entries = constraint.get(clause)
+            if not isinstance(entries, list) or not entries:
+                raise RuntimeError(
+                    f"❌ execution context constraint #{idx} {clause} must be a non-empty list "
+                    f"of match-mappings: {path}"
+                )
+            if not all(isinstance(entry, dict) and entry for entry in entries):
+                raise RuntimeError(
+                    f"❌ execution context constraint #{idx} {clause} entries must be non-empty "
+                    f"mappings: {path}"
+                )
         require_present = constraint.get("require_present") or []
         allowed_values = constraint.get("allowed_values") or {}
-        if not isinstance(when, dict):
-            raise RuntimeError(f"❌ execution context constraint #{idx} when must be a mapping: {path}")
         if not isinstance(require_present, list) or not all(isinstance(item, str) and item for item in require_present):
             raise RuntimeError(f"❌ execution context constraint #{idx} require_present must be a list of non-empty strings: {path}")
         if not isinstance(allowed_values, dict):
@@ -460,11 +861,42 @@ def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
     return constraints
 
 
+def execution_context_constraint_applies(
+    constraint: dict, execution_context: dict[str, object], *, idx: int
+) -> bool:
+    """Does this constraint's gate match?
+
+    `when_all` — every entry must match (this is what the removed `when` did across
+    the paths of one mapping). `when_any` — at least one entry must match (OR, which
+    the old mapping-only form could not express, forcing duplicated rules). Both
+    present → AND of the two. Neither present → the constraint always applies.
+    """
+    entries_all = constraint.get("when_all") or []
+    if entries_all and not all(
+        selector_matches(entry, execution_context, label=f"execution_context_constraints[{idx}].when_all[{n}]")
+        for n, entry in enumerate(entries_all)
+    ):
+        return False
+
+    entries_any = constraint.get("when_any") or []
+    if entries_any and not any(
+        selector_matches(entry, execution_context, label=f"execution_context_constraints[{idx}].when_any[{n}]")
+        for n, entry in enumerate(entries_any)
+    ):
+        return False
+
+    return True
+
+
 def validate_execution_context_constraints(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
     for idx, constraint in enumerate(load_execution_context_constraints(ctl_cfg_root), start=1):
-        when = constraint.get("when") or {}
-        if not selector_matches(when, execution_context, label=f"execution_context_constraints[{idx}].when"):
+        if not execution_context_constraint_applies(constraint, execution_context, idx=idx):
             continue
+        when = {
+            key: constraint[key]
+            for key in ("when_all", "when_any")
+            if key in constraint
+        }
 
         for ref in constraint.get("require_present") or []:
             validate_execution_context_ref(ref, label=f"execution_context_constraints[{idx}].require_present")
@@ -498,26 +930,21 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
     args.execution_params = selectors_to_map(args.execution_param, label="execution param")
     args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
-    if getattr(args, "provider_credential", None) is not None:
-        value = args.provider_credential.strip()
-        args.provider_credential = value or None
-    args.execution_access_mode = normalize_execution_access_mode(args)
+    validate_provider_options(
+        getattr(args, "provider_options", None), getattr(args, "providers", ()) or ()
+    )
+    args.execution_access_modes = normalize_execution_access_modes(args)
+    args.force_skip_execution_identity_preflight_check = (
+        normalize_force_skip_execution_identity_preflight_check(args)
+    )
     # §Phase 50: --status is gone from the run parsers (status is standalone).
     if (
         getattr(args, "execution_identity_preflight_check_only", False)
-        and getattr(args, "force_skip_execution_identity_preflight_check", False)
+        and getattr(args, "force_skip_execution_identity_preflight_check", None)
     ):
         raise RuntimeError(
             "❌ --execution-identity-preflight-check-only and "
             "--force-skip-execution-identity-preflight-check are mutually exclusive"
-        )
-    if (
-        args.execution_access_mode == "force_bypass"
-        and getattr(args, "force_skip_execution_identity_preflight_check", False)
-    ):
-        raise RuntimeError(
-            "❌ --force-skip-execution-identity-preflight-check is not applicable "
-            "with --execution-access-mode force_bypass"
         )
     # --reuse-committed is an explicit true/false with no default. A normal run
     # reaches the reuse-vs-rerun decision and must state intent; the exit-early
@@ -534,20 +961,109 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     args.run_id = generate_uuid7()
 
 
-def normalize_execution_access_mode(args: argparse.Namespace) -> str:
-    """Validate the selected access mode's credential pairing (§12)."""
-    mode = getattr(args, "execution_access_mode", "standard") or "standard"
-    if mode == "force_bypass" and not getattr(args, "provider_credential", None):
+def normalize_execution_access_modes(args: argparse.Namespace) -> dict[str, str]:
+    """Resolve the per-provider access mode map.
+
+    `--execution-access-mode <provider>=<mode>,...` — one mode per participating
+    provider.
+    A provider left unnamed takes the engine default; the engine validates only
+    that every named provider was declared, because the MODE NAMES belong to the
+    adapters (validated against supported_execution_access_modes()).
+    """
+    declared = list(getattr(args, "providers", ()) or ())
+    modes = dict(getattr(args, "execution_access_modes", None) or {})
+
+    stray = sorted(set(modes) - set(declared))
+    if stray:
         raise RuntimeError(
-            "❌ --execution-access-mode force_bypass requires the substitute credential "
-            "(--provider-credential): nothing to run with"
+            f"❌ --execution-access-mode names providers not declared in --providers "
+            f"{declared}: {stray}"
         )
-    if getattr(args, "provider_credential", None) and mode != "force_bypass":
+    missing = sorted(set(declared) - set(modes))
+    if missing:
         raise RuntimeError(
-            "❌ --provider-credential cannot override declared execution identities; "
-            "pass it only together with --execution-access-mode force_bypass"
+            "❌ --execution-access-mode must state the mode for every declared "
+            f"provider (no default): missing {missing}"
         )
-    return mode
+
+    from utils.providers import get_adapter
+
+    options = getattr(args, "provider_options", None)
+    for provider, mode in modes.items():
+        adapter = get_adapter(provider)
+        supported = adapter.supported_execution_access_modes()
+        if mode not in supported:
+            raise RuntimeError(
+                f"❌ provider {provider!r} does not support execution access mode "
+                f"{mode!r}; it advertises {sorted(supported)} (see `ctl.py providers`)"
+            )
+        # An option may only be meaningful in one mode (a substitute credential
+        # means nothing unless the run stops resolving identities). Passing it in
+        # another mode is a contradiction, not a silent no-op.
+        implied = adapter.execution_access_mode_from_options(
+            provider_options_for(options, provider)
+        )
+        if implied is not None and implied != mode:
+            raise RuntimeError(
+                f"❌ the --provider-options given for {provider!r} are only valid in "
+                f"execution access mode {implied!r}, but it runs {mode!r}"
+            )
+    return modes
+
+
+def normalize_force_skip_execution_identity_preflight_check(
+    args: argparse.Namespace,
+) -> list[str]:
+    """Resolve the providers whose live identity check is skipped.
+
+    A subset of --providers. Skipping is meaningless for a provider that has no
+    live check to begin with, and for one already running without a resolved
+    identity — both are named rather than silently ignored.
+    """
+    requested = list(getattr(args, "force_skip_execution_identity_preflight_check", ()) or [])
+    if not requested:
+        return []
+    declared = list(getattr(args, "providers", ()) or ())
+    stray = sorted(set(requested) - set(declared))
+    if stray:
+        raise RuntimeError(
+            "❌ --force-skip-execution-identity-preflight-check names providers not "
+            f"declared in --providers {declared}: {stray}"
+        )
+
+    from utils.providers import get_adapter
+
+    modes = getattr(args, "execution_access_modes", None) or {}
+    for provider in requested:
+        adapter = get_adapter(provider)
+        if not adapter.supports_identity_preflight():
+            raise RuntimeError(
+                f"❌ provider {provider!r} declares no live execution-identity check, "
+                "so there is nothing to skip (see `ctl.py providers`)"
+            )
+        if not adapter.resolves_execution_identity(
+            execution_access_mode_for(modes, provider)
+        ):
+            raise RuntimeError(
+                f"❌ provider {provider!r} runs mode "
+                f"{execution_access_mode_for(modes, provider)!r} without resolving an "
+                "execution identity, so its preflight check does not run and cannot "
+                "be skipped"
+            )
+    return sorted(set(requested))
+
+
+def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str) -> str:
+    """One provider's mode from the per-provider map."""
+    if isinstance(modes, str):          # already narrowed by a caller
+        return modes
+    try:
+        return (modes or {})[provider]
+    except KeyError:
+        raise RuntimeError(
+            f"❌ no execution access mode resolved for provider {provider!r} "
+            f"(have: {sorted(modes or {})})"
+        ) from None
 
 
 def _uuid7_timestamp_ms() -> int:
@@ -673,7 +1189,7 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ workflow runner requires --workflow")
     if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_identity_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
         raise RuntimeError("❌ workflow runner does not accept step-sequence synthetic target args")
 
 
@@ -685,7 +1201,7 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_identity_key", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
         raise RuntimeError("❌ target runner does not accept step-sequence synthetic target args")
 
 
@@ -697,7 +1213,8 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
         getattr(args, field, None)
         for field in (
             "source", "ref", "cfg_file_set", "step_sequence",
-            "execution_identity_key", "affected_target_keys",
+            "execution_provider", "execution_account", "execution_role",
+            "affected_target_keys",
         )
     ):
         raise RuntimeError(
@@ -745,9 +1262,14 @@ def validate_step_sequence_args(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "❌ step_sequence needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
         )
-    identity_key = getattr(args, "execution_identity_key", None)
-    if identity_key is not None and not identity_key.strip():
-        raise RuntimeError("❌ --execution-identity-key must be a non-empty string when provided")
+    execution_fields = ("execution_provider", "execution_account", "execution_role")
+    supplied = [f for f in execution_fields if getattr(args, f, None)]
+    if supplied and len(supplied) != len(execution_fields):
+        missing_execution = [f for f in execution_fields if f not in supplied]
+        raise RuntimeError(
+            "❌ a synthetic target's execution is declared in full or not at all; missing "
+            + ", ".join(f"--{m.replace('_', '-')}" for m in missing_execution)
+        )
     affected_target_keys = getattr(args, "affected_target_keys", None) or []
     if affected_target_keys:
         args.affected_target_keys = normalize_target_keys(affected_target_keys, label="--affected-target-key")
@@ -1157,11 +1679,11 @@ def build_active_target_runs(
             "cfg_files": cfg_files,
         }
 
-        execution_identity_key = target_override.get("execution_identity_key") or target_cfg.get("execution_identity_key")
-        if execution_identity_key is not None:
-            if not isinstance(execution_identity_key, str) or not execution_identity_key.strip():
-                raise RuntimeError(f"Target run {target_run_id!r} execution_identity_key must be a non-empty string")
-            active_target_run["execution_identity_key"] = execution_identity_key.strip()
+        target_execution_identity = target_override.get("execution_identity") or target_cfg.get("execution_identity")
+        if target_execution_identity is not None:
+            active_target_run["execution_identity"] = validate_target_execution_identity(
+                target_execution_identity, label=f"target run {target_run_id!r}"
+            )
 
         # §Phase 31/32: the declared instance identity must ride on the target_run
         # so per-target reports and the target-instance locator see it (the
@@ -1543,337 +2065,96 @@ def get_provider_adapter(provider: str):
     return get_adapter(provider)
 
 
+def run_providers(execution_context: dict[str, object]) -> list[str]:
+    """The providers this run DECLARED (--providers), in order."""
+    declared = execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.ctl.providers") or []
+    if isinstance(declared, str):
+        declared = [declared]
+    providers = [str(p).strip() for p in declared if str(p).strip()]
+    if not providers:
+        raise RuntimeError(
+            "❌ no providers declared for this run; pass --providers <name>[,<name>...]"
+        )
+    return providers
+
+
+def run_provider_adapters(execution_context: dict[str, object]) -> list[tuple[str, object]]:
+    """(name, adapter) for every participating provider."""
+    return [(name, get_provider_adapter(name)) for name in run_providers(execution_context)]
+
+
 def run_provider_adapter(execution_context: dict[str, object]):
-    """The run's adapter, selected by the required provider execution param."""
-    provider = execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.params.provider")
-    if not isinstance(provider, str) or not provider.strip():
-        raise RuntimeError("❌ execution param 'provider' is required to select the provider adapter")
-    return get_provider_adapter(provider.strip())
+    """The single participating provider's adapter.
+
+    The run-level catalog/preflight path still assumes ONE adapter per run (it keeps
+    one `provider_catalogs` bundle). Declaring several providers is accepted by the
+    CLI, gating and coverage guard, but this path is not wired for it yet — so fail
+    loud here rather than silently picking the first.
+    """
+    return get_provider_adapter(run_provider(execution_context))
+
+
+def run_provider(execution_context: dict[str, object]) -> str:
+    """The single participating provider's name (same single-provider fence)."""
+    providers = run_providers(execution_context)
+    if len(providers) > 1:
+        raise RuntimeError(
+            f"❌ this run declares multiple providers {providers}, but the run-level "
+            "provider catalog/preflight path is single-provider today; run them as "
+            "separate invocations until per-target adapter dispatch lands"
+        )
+    return providers[0]
+
+
+def target_run_provider(target_run: dict) -> str:
+    """The provider a target_run executes against, from its execution_identity block."""
+    provider = ((target_run or {}).get("execution_identity") or {}).get("provider")
+    if not provider:
+        raise RuntimeError("❌ target_run execution_identity block declares no provider")
+    return str(provider)
+
+
+def provider_inputs(
+    provider: str,
+    execution_access_modes: dict[str, str] | str | None,
+    provider_options: dict[str, str] | None,
+) -> tuple[str, dict[str, str]]:
+    """Narrow the run's per-provider inputs to ONE provider, for an adapter call.
+
+    An adapter is never handed another provider's mode or options: the mode names
+    and option keys are its own vocabulary and mean nothing outside it.
+    """
+    return (
+        execution_access_mode_for(execution_access_modes, provider),
+        provider_options_for(provider_options, provider),
+    )
+
+
+def ctl_state_publication_access_mode(adapter, execution_access_mode: str) -> str:
+    """The mode ctl-state publication runs under, given the run's mode.
+
+    Publication always takes the provider's NORMAL path — escalated target access
+    is about reaching the target, not about writing ctl-state. The one exception
+    is a mode that resolves no execution identity at all: there is no normal path
+    to fall back to, so it carries over. Both mode names come from the adapter.
+    """
+    if not adapter.resolves_execution_identity(execution_access_mode):
+        return execution_access_mode
+    return adapter.normal_execution_access_mode()
 
 
 def collect_provider_cfg_findings(
     ctl_cfg_root: Path, execution_context: dict[str, object]
 ) -> list[dict]:
-    """Stage-1 provider cfg well-formedness findings (run once), via the adapter."""
-    adapter = run_provider_adapter(execution_context)
-    return adapter.collect_provider_cfg_findings(
-        ctl_cfg_root, execution_context=execution_context
-    )
-
-
-def execution_identity_is_group(entry: object) -> bool:
-    """A group entry selects one concrete member by selectors (§Phase 10)."""
-    return isinstance(entry, dict) and "members" in entry
-
-
-def _validate_execution_identity_group(
-    group_key: str, group_cfg: dict, identities: dict, ctl_cfg_root: Path
-) -> None:
-    """A group is provider-homogeneous and declares its provider; members select
-    concrete identities of the SAME provider (§Phase 10)."""
-    unknown = set(group_cfg) - {"provider", "members"}
-    if unknown:
-        raise RuntimeError(
-            f"❌ execution identity group {group_key!r} has unsupported keys {sorted(unknown)} "
-            f"(a group is provider + members only): {ctl_cfg_root}"
-        )
-    members = group_cfg.get("members")
-    if not isinstance(members, list) or not members:
-        raise RuntimeError(f"❌ execution identity group {group_key!r} members must be a non-empty list: {ctl_cfg_root}")
-    group_provider = group_cfg["provider"]
-    seen: set[str] = set()
-    for member in members:
-        if not isinstance(member, dict) or set(member) - {"identity_key", "selectors"}:
-            raise RuntimeError(
-                f"❌ execution identity group {group_key!r} member must be {{identity_key, selectors}}: {ctl_cfg_root}"
+    """Stage-1 provider cfg well-formedness findings, once per participating provider."""
+    findings: list[dict] = []
+    for _name, adapter in run_provider_adapters(execution_context):
+        findings.extend(
+            adapter.collect_provider_cfg_findings(
+                ctl_cfg_root, execution_context=execution_context
             )
-        member_key = member.get("identity_key")
-        if not isinstance(member_key, str) or not member_key.strip():
-            raise RuntimeError(f"❌ execution identity group {group_key!r} member identity_key must be a non-empty string: {ctl_cfg_root}")
-        member_key = member_key.strip()
-        if member_key in seen:
-            raise RuntimeError(f"❌ execution identity group {group_key!r} lists member {member_key!r} twice: {ctl_cfg_root}")
-        seen.add(member_key)
-        # selectors must be the structured match/in form (generic evaluator)
-        selector_requirements(member.get("selectors"), label=f"group {group_key} member {member_key}", structured_only=True)
-        if member_key == group_key:
-            raise RuntimeError(
-                f"❌ execution identity group {group_key!r} references itself: {ctl_cfg_root}"
-            )
-        # §Phase 33: a member may be a concrete identity OR another group (one
-        # dispatch axis per group; deep cycles fail at resolve time).
-        concrete = identities.get(member_key)
-        if not isinstance(concrete, dict):
-            raise RuntimeError(
-                f"❌ execution identity group {group_key!r} member {member_key!r} is not defined "
-                f"in execution_identities: {ctl_cfg_root}"
-            )
-        if concrete.get("provider") != group_provider:
-            raise RuntimeError(
-                f"❌ execution identity group {group_key!r} is provider {group_provider!r} but member "
-                f"{member_key!r} is provider {concrete.get('provider')!r} (groups are provider-homogeneous): {ctl_cfg_root}"
-            )
-    # a group resolves exactly one member — reject byte-identical member selectors.
-    reject_duplicate_selectors(
-        {m.get("identity_key"): m.get("selectors") for m in members},
-        label=f"execution identity group {group_key}",
-    )
-    # §Phase 32 per-axis rule: identity dispatch may use only declarable params
-    # axes or the path-encoded ctl.action — never other ctl.* facts.
-    collect_member_dispatch_axes(
-        members, label=f"execution identity group {group_key}"
-    )
-
-
-def selector_group_is_group(entry: object) -> bool:
-    """§Phase 31 3c: a selector-membered group entry in a cfg collection
-    (cfg_file_sets, refs.scoped) — same resolution semantics as execution
-    identity groups: `members` select exactly one concrete value."""
-    return isinstance(entry, dict) and "members" in entry
-
-
-def resolve_selector_group_member(
-    entry: dict,
-    execution_context: dict[str, object],
-    *,
-    value_field: str,
-    label: str,
-    tolerate_none: bool = False,
-) -> str | None:
-    """Resolve a selector-membered group entry to its one matching member's
-    `value_field` (§Phase 31 3c). Mirrors execution-identity group semantics:
-    members are {<value_field>, selectors}; EXACTLY ONE member must match the
-    frozen execution context. The returned value may still carry
-    ${execution_context.*} placeholders — the caller renders them.
-
-    With `tolerate_none=True`, ZERO matches returns None instead of raising (used
-    for an inactive target whose selector axis isn't bound in this run); MORE than
-    one match is always a hard error (a genuine cfg ambiguity)."""
-    members = entry.get("members")
-    if not isinstance(members, list) or not members:
-        raise RuntimeError(f"❌ {label}: group members must be a non-empty list")
-    for member in members:
-        if not isinstance(member, dict) or set(member) - {value_field, "selectors"}:
-            raise RuntimeError(
-                f"❌ {label}: group member must be {{{value_field}, selectors}}"
-            )
-        value = member.get(value_field)
-        if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(f"❌ {label}: group member {value_field} must be a non-empty string")
-    reject_duplicate_selectors(
-        {m.get(value_field): m.get("selectors") for m in members}, label=label
-    )
-    matches = [
-        member for member in members
-        if selector_matches(
-            member.get("selectors"), execution_context,
-            label=f"{label} member {member.get(value_field)}",
-            structured_only=True,
         )
-    ]
-    if len(matches) != 1:
-        if tolerate_none and not matches:
-            return None
-        member_values = [member.get(value_field) for member in members]
-        raise RuntimeError(
-            f"❌ {label}: exactly one group member must match the execution context, "
-            f"matched {len(matches)} (members: {member_values})"
-        )
-    return matches[0][value_field].strip()
-
-
-def _selector_param_axes(members: object) -> set[str]:
-    """The params-namespace axes referenced by a member list's selectors
-    (§Phase 32 consumed-axes guard input). Non-params refs (ctl.*) are ignored.
-    (EXECUTION_CONTEXT_ROOT is defined later in the module — reference it at
-    call time, never at import time.)"""
-    prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
-    axes: set[str] = set()
-    for member in members or []:
-        if not isinstance(member, dict):
-            continue
-        try:
-            requirements = selector_requirements(
-                member.get("selectors"), label="consumed-axes scan", structured_only=True
-            )
-        except Exception:
-            continue
-        for ref in requirements:
-            if ref.startswith(prefix):
-                axes.add(ref[len(prefix):])
-    return axes
-
-
-def _template_param_axes(value: object) -> set[str]:
-    """${execution_context.params.X} variables in a raw template string."""
-    if not isinstance(value, str):
-        return set()
-    pattern = (
-        rf"\$\{{{re.escape(EXECUTION_CONTEXT_ROOT)}\.params\.([A-Za-z_][A-Za-z0-9_]*)\}}"
-    )
-    return set(re.findall(pattern, value))
-
-
-def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
-    """§Phase 32 instance-uniqueness rule, field-agnostic: EVERY members-shaped
-    dispatch in target resolution feeds the guard, and the violation test is
-    per-AXIS, never per-field:
-
-    - a params axis → returned (must be declared in target_instance_params
-      unless path-encoded via the namespace);
-    - `ctl.action` → safe (the action is its own ctl-state path segment);
-    - any OTHER ctl.* fact (e.g. ctl.profile) → hard error: it is neither
-      path-encoded nor declarable, so two runs differing only in it would
-      collapse onto one instance path and self-override."""
-    params_prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
-    action_ref = f"{EXECUTION_CONTEXT_ROOT}.ctl.action"
-    axes: set[str] = set()
-    for member in members or []:
-        if not isinstance(member, dict):
-            continue
-        requirements = selector_requirements(
-            member.get("selectors"), label=label, structured_only=True
-        )
-        for ref in requirements:
-            if ref.startswith(params_prefix):
-                axes.add(ref[len(params_prefix):])
-            elif ref != action_ref:
-                raise RuntimeError(
-                    f"❌ {label}: dispatch on {ref!r} is not allowed — target "
-                    "resolution may dispatch only on declarable params axes or "
-                    "the path-encoded ctl.action"
-                )
-    return axes
-
-
-def resolve_list_members(
-    entry: dict,
-    execution_context: dict[str, object] | None,
-    *,
-    value_field: str,
-    label: str,
-    allow_empty: bool = False,
-) -> list | None:
-    """Resolve a members-shaped LIST-valued declaration
-    ({members: [{<value_field>: [...], selectors: {...}}, ...]}) to the ONE
-    matching member's list (§Phase 32 instance schemas, §Phase 33 per-action
-    cfg_files/target_keys). The scalar twin is resolve_selector_group_member.
-    Returns None when no context is available or the dispatch axis is unbound
-    (deferred — the caller decides whether that is an error)."""
-    members = entry.get("members")
-    if set(entry) != {"members"} or not isinstance(members, list) or not members:
-        raise RuntimeError(f"❌ {label}: members-shaped declaration must be {{members: [...]}}")
-    for member in members:
-        if not isinstance(member, dict) or set(member) != {value_field, "selectors"}:
-            raise RuntimeError(f"❌ {label}: each member must be {{{value_field}, selectors}}")
-        if not isinstance(member[value_field], list) or (
-            not member[value_field] and not allow_empty
-        ):
-            raise RuntimeError(f"❌ {label}: member {value_field} must be a non-empty list")
-    if execution_context is None:
-        return None
-    matches = [
-        member for member in members
-        if selector_matches(
-            member["selectors"], execution_context,
-            label=f"{label} member", structured_only=True,
-        )
-    ]
-    if not matches:
-        return None
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"❌ {label}: exactly one member must match the execution context, matched {len(matches)}"
-        )
-    return list(matches[0][value_field])
-
-
-def _resolve_instance_params_members(
-    entry: dict, execution_context: dict[str, object] | None, *, target_name: str
-) -> list[str] | None:
-    return resolve_list_members(
-        entry,
-        execution_context,
-        value_field="params",
-        label=f"target {target_name!r} target_instance_params",
-    )
-
-
-def resolve_execution_identity_entry(
-    identities: dict,
-    identity_key: str,
-    execution_context: dict[str, object],
-    _stack: tuple = (),
-) -> tuple[str, dict]:
-    """Resolve an execution_identity_key to (concrete_key, concrete_cfg) (§Phase 10).
-
-    A group entry selects EXACTLY ONE member by matching member selectors against
-    the execution context; a concrete entry returns itself. §Phase 33: a member
-    may itself be a GROUP (each group dispatches ONE axis, e.g. ctl.action →
-    account), resolved recursively with cycle detection. The group's declared
-    provider is checked against the run BEFORE matching, so a wrong-provider run
-    fails precisely rather than as an ambiguous no-match."""
-    if identity_key in _stack:
-        raise RuntimeError(
-            f"❌ execution identity group cycle: {' -> '.join([*_stack, identity_key])}"
-        )
-    entry = identities.get(identity_key)
-    if not isinstance(entry, dict):
-        raise RuntimeError(f"❌ execution_identity_key {identity_key!r} is not defined in execution_identities")
-    if not execution_identity_is_group(entry):
-        return identity_key, entry
-    group_provider = entry.get("provider")
-    run_provider = execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.params.provider")
-    if run_provider is not None and str(run_provider) != group_provider:
-        raise RuntimeError(
-            f"❌ execution identity group {identity_key!r} is provider {group_provider!r}, "
-            f"but the run provider is {run_provider!r}"
-        )
-    matches = [
-        member for member in entry["members"]
-        if selector_matches(
-            member.get("selectors"), execution_context,
-            label=f"execution identity group {identity_key} member {member.get('identity_key')}",
-            structured_only=True,
-        )
-    ]
-    if len(matches) != 1:
-        member_keys = [member.get("identity_key") for member in entry["members"]]
-        raise RuntimeError(
-            f"❌ execution identity group {identity_key!r}: exactly one member must match the execution "
-            f"context, matched {len(matches)} (members: {member_keys})"
-        )
-    member_key = matches[0]["identity_key"].strip()
-    return resolve_execution_identity_entry(
-        identities, member_key, execution_context, (*_stack, identity_key)
-    )
-
-
-def load_execution_identities_cfg(ctl_cfg_root: Path) -> dict:
-    """Load provider-neutral execution identities from ctl cfg."""
-    identities = collect_resource(ctl_cfg_root, "execution_identities")
-
-    for identity_key, identity_cfg in identities.items():
-        if not isinstance(identity_key, str) or not identity_key.strip():
-            raise RuntimeError(f"❌ execution identity keys must be non-empty strings: {ctl_cfg_root}")
-        if not isinstance(identity_cfg, dict) or not identity_cfg:
-            raise RuntimeError(
-                f"❌ execution identity {identity_key!r} must be a non-empty mapping: {ctl_cfg_root}"
-            )
-        provider = identity_cfg.get("provider")
-        if not isinstance(provider, str) or not provider.strip():
-            raise RuntimeError(f"❌ execution identity {identity_key!r} must define non-empty provider")
-        provider = provider.strip()
-        if execution_identity_is_group(identity_cfg):
-            # a GROUP is a provider-neutral selector envelope (§Phase 10); the
-            # engine validates it generically — no provider adapter payload
-            _validate_execution_identity_group(identity_key, identity_cfg, identities, ctl_cfg_root)
-            continue
-        # the generic loader owns only the envelope; the identity payload is the
-        # selected provider adapter's schema
-        get_provider_adapter(provider).validate_execution_identity(identity_key, identity_cfg, ctl_cfg_root)
-
-    return identities
+    return findings
 
 
 def load_provider_catalogs(ctl_cfg_root: Path) -> dict:
@@ -1930,25 +2211,222 @@ def _require_non_empty_string(value, label: str, path: Path | None = None) -> st
 
 
 
-def validate_execution_identity_coverage(
+def parse_provider_options(value: str) -> dict[str, str]:
+    """Parse `--provider-options` into a flat map of provider-namespaced keys.
+
+    ONE generic engine arg instead of per-adapter flags (which would explode the
+    CLI as providers are added). The engine parses key=value and NEVER interprets
+    either side; a key's leading segment routes it to that provider's adapter,
+    which owns and validates its own option vocabulary.
+    """
+    options: dict[str, str] = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                f"provider option must use <provider>.<key>=<value>, got: {item!r}"
+            )
+        key, raw = item.split("=", 1)
+        key, raw = key.strip(), raw.strip()
+        if not key or not raw:
+            raise argparse.ArgumentTypeError(
+                f"provider option must use non-empty <provider>.<key>=<value>, got: {item!r}"
+            )
+        if "." not in key:
+            raise argparse.ArgumentTypeError(
+                f"provider option key must be provider-namespaced (<provider>.<key>), got: {key!r}"
+            )
+        if key in options:
+            raise argparse.ArgumentTypeError(f"duplicate provider option {key!r}")
+        options[key] = raw
+    if not options:
+        raise argparse.ArgumentTypeError(f"expected <provider>.<key>=<value>, got: {value!r}")
+    return options
+
+
+class ProviderOptionsAction(argparse.Action):
+    """Merge repeated/comma-separated --provider-options into one flat map."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        merged = dict(getattr(namespace, self.dest, None) or {})
+        try:
+            for key, value in parse_provider_options(values).items():
+                if key in merged:
+                    raise argparse.ArgumentTypeError(f"duplicate provider option {key!r}")
+                merged[key] = value
+        except argparse.ArgumentTypeError as exc:
+            raise argparse.ArgumentError(self, str(exc)) from exc
+        setattr(namespace, self.dest, merged)
+
+
+class ExecutionAccessModesAction(argparse.Action):
+    """Merge repeated/comma-separated --execution-access-mode into one map.
+
+    Parses shape only (`provider=mode`); the MODE NAMES are the adapters', so
+    they are validated later against each adapter's advertised set.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        merged = dict(getattr(namespace, self.dest, None) or {})
+        for pair in parse_comma_list(values):
+            if "=" not in pair:
+                raise argparse.ArgumentError(
+                    self, f"expected PROVIDER=MODE, got {pair!r}"
+                )
+            provider, mode = (part.strip() for part in pair.split("=", 1))
+            if not provider or not mode:
+                raise argparse.ArgumentError(
+                    self, f"expected PROVIDER=MODE, got {pair!r}"
+                )
+            if provider in merged and merged[provider] != mode:
+                raise argparse.ArgumentError(
+                    self, f"conflicting execution access modes for provider {provider!r}"
+                )
+            merged[provider] = mode
+        setattr(namespace, self.dest, merged)
+
+
+def provider_options_for(options: dict[str, str] | None, provider: str) -> dict[str, str]:
+    """The subset of options addressed to one provider, with its prefix stripped."""
+    prefix = f"{provider}."
+    return {
+        key[len(prefix):]: value
+        for key, value in (options or {}).items()
+        if key.startswith(prefix)
+    }
+
+
+def validate_provider_options(
+    options: dict[str, str] | None, providers: list[str] | tuple[str, ...]
+) -> None:
+    """Validate provider options: addressed to a declared provider, and a key
+    that provider actually offers. The engine checks the ADDRESS; each adapter
+    checks its own KEYS — the engine knows none of them."""
+    validate_provider_options_addressing(options, providers)
+    from utils.providers import get_adapter
+
+    for provider in providers:
+        get_adapter(provider).validate_provider_options(
+            provider_options_for(options, provider)
+        )
+
+
+def validate_provider_options_addressing(
+    options: dict[str, str] | None, providers: list[str] | tuple[str, ...]
+) -> None:
+    """Every option must address a provider that is actually participating."""
+    declared = set(providers or ())
+    stray = sorted(key for key in (options or {}) if key.split(".", 1)[0] not in declared)
+    if stray:
+        raise RuntimeError(
+            "❌ --provider-options address providers not declared in --providers "
+            f"{sorted(declared)}: {stray}"
+        )
+
+
+def resolve_provider_implementation_key(
+    provider_options: dict[str, str] | None, provider: str
+) -> str:
+    """The credential implementation this run wants from one provider.
+
+    WHERE a run executes (execution_runtime_mode) and HOW it authenticates are
+    INDEPENDENT axes; this reads only the latter, from the provider's own
+    options. REQUIRED — the engine has no implementation to default to, and it
+    does not interpret the value: the adapter does.
+    """
+    options = provider_options_for(provider_options, provider)
+    implementation_key = options.get("credential_implementation")
+    if not implementation_key:
+        raise RuntimeError(
+            f"❌ no credential implementation declared for provider {provider!r}; "
+            f"pass --provider-options {provider}.credential_implementation=... "
+            f"(see `ctl.py providers`)"
+        )
+    return implementation_key
+
+
+def run_provider_implementation_key(args: argparse.Namespace) -> str:
+    """The single declared provider's credential implementation, from CLI args."""
+    providers = list(getattr(args, "providers", ()) or ())
+    if len(providers) != 1:
+        raise RuntimeError(
+            f"❌ this run declares providers {providers}, but the run-level "
+            "provider catalog/preflight path is single-provider today; run them as "
+            "separate invocations until per-target adapter dispatch lands"
+        )
+    return resolve_provider_implementation_key(
+        getattr(args, "provider_options", None), providers[0]
+    )
+
+
+def parse_comma_list(value: str) -> list[str]:
+    """Comma-separated list arg, order-preserving and duplicate-free."""
+    items: list[str] = []
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if item not in items:
+            items.append(item)
+    if not items:
+        raise argparse.ArgumentTypeError(f"expected a comma-separated list, got: {value!r}")
+    return items
+
+
+def validate_target_provider_coverage(
+    active_target_runs: dict, providers: list[str] | tuple[str, ...]
+) -> None:
+    """Every selected target's provider must be among the run's declared providers.
+
+    The provider set is DECLARED (--providers), never inferred from the targets, so
+    a target reaching for an undeclared provider fails loud instead of silently
+    widening the run.
+    """
+    declared = set(providers or ())
+    offenders = sorted(
+        f"{target_run_id} (provider {(target_run.get('execution') or {}).get('provider')!r})"
+        for target_run_id, target_run in active_target_runs.items()
+        if (target_run.get("execution_identity") or {}).get("provider")
+        and (target_run.get("execution_identity") or {}).get("provider") not in declared
+    )
+    if offenders:
+        raise RuntimeError(
+            "❌ selected target_runs use providers not declared in --providers "
+            f"{sorted(declared)}: " + ", ".join(offenders)
+        )
+
+
+def validate_target_execution_identity_coverage(
     active_target_runs: dict,
     *,
-    execution_access_mode: str = "standard",
+    execution_access_modes: dict[str, str] | None = None,
 ) -> None:
-    """Every target_run declares its execution identity, always. The only run without
-    identities is bypass mode (--execution-access-mode force_bypass + substitute
-    credential), which covers identity-less target_runs too."""
-    if execution_access_mode == "force_bypass":
+    """Every target_run declares its `execution_identity:` block, always.
+
+    The one exception is a run where NO provider resolves an execution identity
+    (every provider runs on a substitute credential) — then there is nothing for
+    the block to feed. A mixed run still requires it everywhere: a target_run
+    without a block does not say which provider it belongs to, so it cannot be
+    matched to the provider that would have excused it.
+    """
+    modes = execution_access_modes or {}
+    if modes and not any(
+        get_provider_adapter(provider).resolves_execution_identity(mode)
+        for provider, mode in modes.items()
+    ):
         return
-    stages_without_identity = sorted(
+    stages_without_execution = sorted(
         target_run_id for target_run_id, target_run in active_target_runs.items()
-        if target_run.get("execution_identity_key") is None
+        if target_run.get("execution_identity") is None
     )
-    if stages_without_identity:
+    if stages_without_execution:
         raise RuntimeError(
-            "❌ selected target_runs have no execution_identity_key: "
-            + ", ".join(stages_without_identity)
-            + "; declare it, or run with --execution-access-mode force_bypass + --provider-credential"
+            "❌ selected target_runs have no execution_identity block: "
+            + ", ".join(stages_without_execution)
+            + "; declare it, or run every provider in a mode that resolves no "
+            "execution identity (see `ctl.py providers`)"
         )
 
 
@@ -2162,11 +2640,25 @@ def _add_step_sequence_args(parser: argparse._ActionsContainer) -> None:
         dest="step_sequence",
         help="repo-local step_sequence to run",
     )
+    # §Phase 53: a synthetic target declares the same execution axes a declared
+    # target does — provider, account and the role to assume. All three or none.
     parser.add_argument(
-        "--execution-identity-key",
-        dest="execution_identity_key",
+        "--execution-provider",
+        dest="execution_provider",
         default=None,
-        help="execution identity key for a synthetic target",
+        help="synthetic target: provider whose adapter runs it",
+    )
+    parser.add_argument(
+        "--execution-account",
+        dest="execution_account",
+        default=None,
+        help="synthetic target: account to run in",
+    )
+    parser.add_argument(
+        "--execution-role",
+        dest="execution_role",
+        default=None,
+        help="synthetic target: provider role key to assume",
     )
     parser.add_argument(
         "--affected-target-key",
@@ -2230,23 +2722,22 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
     )
     # 2) execution access mode, then runtime.
-    # Execution access is a provider-neutral MODE (§12): standard (normal),
-    # agreed_direct (approved bootstrap/recovery access from the identity's
-    # direct source), force_bypass (whole-run emergency substitute credential;
-    # identity cfg is not resolved). One typed enum — the value itself carries
-    # the escalation class. Required, no default: the operator states intent.
+    # Execution access is a PER-PROVIDER decision (§Phase 53): a run that spans
+    # providers may need normal access to one and escalated access to another,
+    # and the mode NAMES belong to the adapters — the engine owns no mode
+    # vocabulary of its own. Hence a provider=mode map, required and complete:
+    # the operator states intent for every provider the run declares.
     execution_group.add_argument(
         "--execution-access-mode",
-        choices=EXECUTION_ACCESS_MODES,
         required=True,
-        dest="execution_access_mode",
-        help="Execution access mode (required, no default): 'standard' normal adapter access; "
-        "'agreed_direct' runs each target_run with its identity's direct_credential_source_key "
-        "profile (account-id + principal checked, no chained roles; requires the ctl profile "
-        "to allow it and every active target to set allow_agreed_direct_execution_access: "
-        "true); 'force_bypass' runs every target_run with the --provider-credential substitute "
-        "credential (identity cfg is not resolved and nothing is checked; requires the "
-        "ctl profile to allow it and --provider-credential)",
+        dest="execution_access_modes",
+        action=ExecutionAccessModesAction,
+        metavar="PROVIDER=MODE[,PROVIDER=MODE...]",
+        help="Execution access mode per provider, comma-separated and/or repeatable "
+        "(required, no default). Must name every provider given to --providers, and "
+        "each mode must be one the adapter advertises — run `ctl.py providers` to see "
+        "what each supports, and what provider options a mode needs "
+        "(passed with --provider-options).",
     )
     # execution runtime (§Phase 26): WHERE CTL produces each target_run's clean box.
     execution_group.add_argument(
@@ -2254,7 +2745,7 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         choices=EXECUTION_RUNTIME_MODES,
         required=True,
         help="Execution runtime (required, no default): 'local' builds a fresh Docker "
-        "box per target_run on this machine; 'ci' runs each target_run on the GitHub Actions "
+        "box per target_run on this machine; 'ci' runs each target_run on the CI "
         "runner (no Docker-in-Docker). Must be allowed by the ctl profile "
         "(allowed_execution_runtime_modes) and supported by every active target_run "
         "(step.yaml runtime.supported_execution_runtime_modes).",
@@ -2263,10 +2754,29 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     execution_group.add_argument(
         "--execution-params",
         dest="execution_param",
-        action="append",
+        action=ExecutionParamsAction,
         default=[],
-        type=parse_selector_arg,
-        help="Execution param in key=value form; repeatable; lands in execution_context.params.*",
+        metavar="KEY=VALUE[,KEY=VALUE...]",
+        help="Execution params in key=value form; comma-separated and/or repeatable; "
+        "lands in execution_context.params.*",
+    )
+    execution_group.add_argument(
+        "--providers",
+        dest="providers",
+        required=True,
+        type=parse_comma_list,
+        metavar="NAME[,NAME...]",
+        help="Providers participating in this run; every selected target's provider "
+        "must be one of these. Lands in execution_context.ctl.providers",
+    )
+    execution_group.add_argument(
+        "--provider-options",
+        dest="provider_options",
+        action=ProviderOptionsAction,
+        default={},
+        metavar="PROVIDER.KEY=VALUE[,...]",
+        help="Provider-namespaced options, comma-separated and/or repeatable. The "
+        "engine only routes them; each provider owns its option vocabulary",
     )
     # 4) action
     selector_group.add_argument(
@@ -2338,11 +2848,17 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     if run_type in {"workflow", "target", "fan_out"}:
         override_group.add_argument(
             "--force-skip-execution-identity-preflight-check",
-            action="store_true",
-            help="Resolve every selected execution identity but skip provider live checks: "
-            "you accept the risk that any target fails MID-RUN on an incorrect "
-            "execution identity that the preflight would have caught up front; "
-            "requires ctl-profile authorization",
+            dest="force_skip_execution_identity_preflight_check",
+            default=[],
+            type=parse_comma_list,
+            metavar="PROVIDER[,PROVIDER...]",
+            help="Providers whose live execution-identity check to skip (a subset of "
+            "--providers; the identity is still RESOLVED for all of them). Per provider "
+            "because only some adapters have a live check at all, and a mixed run may "
+            "need to skip one provider's probe while keeping another's. You accept the "
+            "risk that a skipped provider's target fails MID-RUN on an execution "
+            "identity the preflight would have caught up front; requires ctl-profile "
+            "authorization.",
         )
     # 7) cfg variation
     if run_type in {"workflow", "fan_out"}:
@@ -2378,15 +2894,6 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             help="Resolve and live-check every selected execution identity, write the "
             "preflight artifacts, and exit without state, guardrails, or target_runs",
         )
-    # misc
-    misc_group.add_argument(
-        "--provider-credential",
-        dest="provider_credential",
-        default=None,
-        help="Substitute provider credential (an opaque provider-specific selector, "
-        "e.g. a local profile name); required with and only valid together with "
-        "--execution-access-mode force_bypass",
-    )
     # internal, engine-set (hidden from --help) — last
     parser.add_argument(
         "--parent-graph-provisions-ctl-state-backend",
@@ -2411,7 +2918,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     )
 
 def redact_command_argv(argv: list[str]) -> list[str]:
-    """Redact opaque credential selectors before command lines reach logs."""
+    """Redact opaque credential selectors before command lines reach logs.
+
+    Provider options are the one place a credential selector can be typed, and
+    the engine cannot tell which of an adapter's keys is sensitive — so the
+    VALUE of every provider option is redacted, whatever the key.
+    """
     redacted: list[str] = []
     hide_next = False
     for value in argv:
@@ -2419,12 +2931,12 @@ def redact_command_argv(argv: list[str]) -> list[str]:
             redacted.append("<redacted>")
             hide_next = False
             continue
-        if value == "--provider-credential":
+        if value == "--provider-options":
             redacted.append(value)
             hide_next = True
             continue
-        if value.startswith("--provider-credential="):
-            redacted.append("--provider-credential=<redacted>")
+        if value.startswith("--provider-options="):
+            redacted.append("--provider-options=<redacted>")
             continue
         redacted.append(value)
     return redacted
@@ -2854,7 +3366,7 @@ def load_inventory_cfg(
             file is a flat `targets:` map; all files for an action merge (duplicate
             names rejected). A target is self-contained:
               {source_key, ref_key, step_sequence_key, cfg_file_set_key,
-               [execution_identity_key], [cfg_files], [selectors],
+               [execution], [cfg_files], [selectors],
                [required_plt_overlay_keys]}.
 
     Returns the flat shape build_active_target_runs consumes ({target_sources,
@@ -2961,31 +3473,19 @@ def load_inventory_cfg(
         if not isinstance(step_sequence, str) or not step_sequence:
             raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'step_sequence_key'")
 
-        # §Phase 33: per-action field variation via inline members dispatched by
-        # execution_context.ctl.action. The resolved value may itself be a NAMED
-        # group (e.g. env_readonly), resolved later by its own axis (two-stage).
-        execution_identity_key = target_def.get("execution_identity_key")
-        if isinstance(execution_identity_key, dict):
-            consumed_group_axes.update(
-                collect_member_dispatch_axes(
-                    execution_identity_key.get("members"),
-                    label=f"target {target_name!r} execution_identity_key members",
-                )
-            )
-            if execution_context is None:
-                execution_identity_key = None
-            else:
-                execution_identity_key = resolve_selector_group_member(
-                    execution_identity_key,
-                    execution_context,
-                    value_field="identity_key",
-                    label=f"target {target_name!r} execution_identity_key",
-                )
-        if execution_identity_key is not None and (
-            not isinstance(execution_identity_key, str) or not execution_identity_key.strip()
-        ):
+        # §Phase 53: the target declares its execution axes inline. The old
+        # `execution_identity_key` (a bundle of account + role + credential,
+        # dispatched through named identity groups) is gone: per-action variation
+        # is now `execution.roles`, keyed by authorization class.
+        if "execution_identity_key" in target_def:
             raise RuntimeError(
-                f"❌ target {target_name!r} execution_identity_key must be a non-empty string"
+                f"❌ target {target_name!r} uses `execution_identity_key`, which is removed; "
+                "declare an `execution_identity:` block (provider, account, roles) instead"
+            )
+        target_execution_identity = target_def.get("execution_identity")
+        if target_execution_identity is not None:
+            target_execution_identity = validate_target_execution_identity(
+                target_execution_identity, label=f"target {target_name!r}"
             )
 
         extra_files = target_def.get("cfg_files", []) or []
@@ -3057,8 +3557,8 @@ def load_inventory_cfg(
                     f"❌ target {target_name!r} target_instance_params must be a list of non-empty strings"
                 )
             resolved["target_instance_params"] = [p.strip() for p in instance_params]
-        if execution_identity_key is not None:
-            resolved["execution_identity_key"] = execution_identity_key.strip()
+        if target_execution_identity is not None:
+            resolved["execution_identity"] = target_execution_identity
         if "provisions_ctl_state_bucket" in target_def:
             raise RuntimeError(
                 f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
@@ -3066,16 +3566,23 @@ def load_inventory_cfg(
             )
         if target_def.get("provisions_ctl_state_backend") is True:
             resolved["provisions_ctl_state_backend"] = True
+        # per-target consent to a mode that requires it (§12); the adapter names
+        # the field, the engine only carries it through. Default: not granted.
+        for consent_field in target_consent_opt_in_fields():
+            if consent_field in target_def:
+                if not isinstance(target_def[consent_field], bool):
+                    raise RuntimeError(f"❌ target {consent_field} must be a boolean")
+                resolved[consent_field] = target_def[consent_field]
         for legacy_flag in (  # removed keys
             "allow_skip_ctl_entry",
             "allow_skip_ctl_state_sync",
             "skip_ctl_role_chain",  # removed
-            "execution_access_modes",
+            "execution_access_mode",
         ):
             if legacy_flag in target_def:
                 raise RuntimeError(
                     f"❌ target {target_name!r} uses removed {legacy_flag}; "
-                    "use allow_agreed_direct_execution_access (§12) for access, "
+                    "use the execution_identity block's consent fields (§12) for access, "
                     "allow_agreed_defer_ctl_state_backend_sync for deferred sync"
                 )
         # Static policy: the target may participate in an explicitly agreed
@@ -3088,10 +3595,6 @@ def load_inventory_cfg(
                     "must be literal true when present"
                 )
             resolved["allow_agreed_defer_ctl_state_backend_sync"] = True
-        # allow_agreed_direct_execution_access: does the target opt into DIRECT mode (§12); default False
-        if "allow_agreed_direct_execution_access" in target_def:
-            target_allows_agreed_direct_execution_access(target_def)  # validate
-            resolved["allow_agreed_direct_execution_access"] = target_def["allow_agreed_direct_execution_access"]
         if "selectors" in target_def:
             resolved["selectors"] = target_def["selectors"]
         if "required_plt_overlay_keys" in target_def:
@@ -3247,7 +3750,7 @@ def setup_run_dirs(
     instance_address: str | None = None,
     target_addresses: list[str] | None = None,
     identity_doc: dict | None = None,
-    execution_access_mode: str | None = None,
+    execution_access_modes: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Create run directories under the stable ctl result key and setup file logging.
 
@@ -3288,10 +3791,6 @@ def setup_run_dirs(
         shutil.rmtree(cfg_dir)
     os.makedirs(cfg_dir)
 
-    target_sources_dir = run_dir / "target_sources"
-    if target_sources_dir.exists():
-        shutil.rmtree(target_sources_dir)
-
     plt_merged_dir = cfg_dir / "plt" / "merged"
     os.makedirs(plt_merged_dir)
 
@@ -3323,11 +3822,11 @@ def setup_run_dirs(
             "log_path": str(log_file),
             "target_keys": [],
             "mutation_started": False,
-            # Degraded-mode audit: the access mode is persisted structurally (not
-            # only in the logged command) so an audit of committed run records can
-            # tell which runs ran profile-only/bypass. force_bypass == degraded.
-            **({"execution_access_mode": execution_access_mode}
-               if execution_access_mode else {}),
+            # Degraded-mode audit: each provider's access mode is persisted
+            # structurally (not only in the logged command) so an audit of
+            # committed run records can tell which runs escalated, and where.
+            **({"execution_access_modes": execution_access_modes}
+               if execution_access_modes else {}),
             # §Phase 31: instance identity + namespace facts of this run.
             **({"ctl_state_namespace": locator_segments[0]}
                if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
@@ -3356,10 +3855,6 @@ def setup_run_workspace(run_dir: Path) -> Path:
         shutil.rmtree(cfg_dir)
     cfg_dir.mkdir(parents=True)
 
-    target_sources_dir = run_dir / "target_sources"
-    if target_sources_dir.exists():
-        shutil.rmtree(target_sources_dir)
-
     plt_merged_dir = cfg_dir / "plt" / "merged"
     plt_merged_dir.mkdir(parents=True)
     return plt_merged_dir
@@ -3380,7 +3875,7 @@ def setup_preflight_run_dirs(
     target_addresses: list[str] | None = None,
     identity_doc: dict | None = None,
     parent_fan_out_run_id: str | None = None,
-    execution_access_mode: str | None = None,
+    execution_access_modes: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
     result_name = normalize_result_name(result_name, label="ctl result name")
@@ -3430,9 +3925,9 @@ def setup_preflight_run_dirs(
             "target_keys": [],
             "mutation_started": False,
             "execution_identity_preflight_check_only": bool(check_only),
-            # Degraded-mode audit (see setup_run_dirs): force_bypass == degraded.
-            **({"execution_access_mode": execution_access_mode}
-               if execution_access_mode else {}),
+            # Degraded-mode audit (see setup_run_dirs).
+            **({"execution_access_modes": execution_access_modes}
+               if execution_access_modes else {}),
             # §Phase 31: instance identity + namespace facts of this run.
             **({"ctl_state_namespace": locator_segments[0]}
                if locator_segments and locator_segments[0] != LOCAL_ONLY_LOCATOR[0] else {}),
@@ -3553,15 +4048,32 @@ def remove_state_slot(run_dir: Path, state: str) -> None:
         shutil.rmtree(slot_dir)
 
 
+def run_workspace_dir(run_dir: Path) -> Path | None:
+    """This run's build workspace root (§Phase 57).
+
+    `<ctl_state_local_root>/_local/workspaces/<run_id>/` — outside every run
+    prefix, so no sync can reach it whatever it publishes. Returns None when the
+    run has no recorded local root yet (a failure before RUN.yaml exists).
+    """
+    local_root = load_run_metadata(run_dir).get("ctl_state_local_root")
+    if not local_root:
+        return None
+    return (
+        Path(local_root)
+        .joinpath(*LOCAL_ONLY_LOCATOR)
+        / LOCAL_WORKSPACES_DIRNAME
+        / Path(run_dir).name
+    )
+
+
 def cleanup_run_workspace(run_dir: Path) -> None:
-    """Drop the run's target_sources workspace (the materialized repo checkout +
+    """Drop the run's build workspace (the materialized repo checkout +
     .terraform provider cache). It is used only DURING the run and is fully
     reproducible from the pinned source_commit/cfg_source_commit in RUN.yaml;
-    nothing reads it after the run. Called before ctl-state sync so run history
-    never carries hundreds of MB of build cache."""
-    ts = Path(run_dir) / "target_sources"
-    if ts.exists():
-        shutil.rmtree(ts, ignore_errors=True)
+    nothing reads it after the run."""
+    workspace = run_workspace_dir(run_dir)
+    if workspace is not None and workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
@@ -4271,8 +4783,13 @@ def selector_expected_values(expected, *, label: str) -> list[str]:
 EXECUTION_CONTEXT_ROOT = "execution_context"
 EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params")
 EXECUTION_CONTEXT_PARAMS_PREFIX = f"{EXECUTION_CONTEXT_ROOT}.params."
+# The key may itself be dotted — that is how provider-specific params are
+# namespaced under their provider. Provider-neutral params keep a single segment
+# (execution_context.params.env_type). Kept in sync with CONTEXT_KEY_RE, which
+# validates the key on the way in.
 EXECUTION_CONTEXT_REF_RE = re.compile(
-    rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})\.[A-Za-z_][A-Za-z0-9_]*$"
+    rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})"
+    rf"\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
 )
 
 
@@ -4295,6 +4812,56 @@ def execution_context_miss_message(execution_context: dict[str, object], ref: st
     return f"{ref!r} not found in execution context; available: {available}"
 
 
+SELECTOR_STRUCTURED_KEYS = ("match", "in", "contains")
+
+
+def selector_contains_requirements(selectors: object, *, label: str) -> dict[str, set[str]]:
+    """The `contains` block: ref -> values that must be PRESENT IN the list-valued
+    fact at ref.
+
+    `match`/`in` ask "is this scalar fact one of these values?". `contains` asks
+    the inverse: "is this value among the facts?" — needed for list-valued context
+    facts such as the run's declared providers. Generic: nothing here is
+    provider-specific; it applies to any list-valued fact.
+    """
+    if not isinstance(selectors, dict):
+        return {}
+    requirements: dict[str, set[str]] = {}
+
+    # structured form: {contains: {ref: values}}
+    raw = selectors.get("contains") or {}
+    if raw:
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"❌ selectors.contains must be a mapping: {label}")
+        for ref, expected in raw.items():
+            ref = validate_execution_context_ref(ref, label=f"{label}.contains")
+            requirements[ref] = set(
+                selector_expected_values(expected, label=f"{label}.contains.{ref}")
+            )
+
+    # per-ref form: {ref: {contains: values}} — the shape constraint gates use,
+    # where each entry is a direct match-mapping rather than a selectors block
+    for ref, expected in selectors.items():
+        if ref in ("match", "in", "contains") or not _is_contains_predicate(expected):
+            continue
+        ref = validate_execution_context_ref(ref, label=label)
+        requirements[ref] = set(
+            selector_expected_values(expected["contains"], label=f"{label}.{ref}.contains")
+        )
+    return requirements
+
+
+def _is_contains_predicate(value: object) -> bool:
+    return isinstance(value, dict) and set(value) == {"contains"}
+
+
+def _context_fact_members(value: object) -> set[str]:
+    """A context fact as a set of members (a list fact -> its items; a scalar -> itself)."""
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value}
+    return {str(value)}
+
+
 def selector_requirements(selectors: dict | None, *, label: str, structured_only: bool = False) -> dict[str, set[str]]:
     """Normalize selector requirements to ref -> allowed string values.
 
@@ -4307,14 +4874,16 @@ def selector_requirements(selectors: dict | None, *, label: str, structured_only
     if not isinstance(selectors, dict):
         raise RuntimeError(f"❌ selectors must be a mapping: {label}")
 
-    uses_structured = any(key in selectors for key in ("match", "in"))
+    uses_structured = any(key in selectors for key in SELECTOR_STRUCTURED_KEYS)
     if uses_structured:
-        unknown = sorted(set(selectors) - {"match", "in"})
+        unknown = sorted(set(selectors) - set(SELECTOR_STRUCTURED_KEYS))
         if unknown:
             raise RuntimeError(f"❌ selectors has unsupported keys {unknown}: {label}")
         requirements: dict[str, set[str]] = {}
         raw_match = selectors.get("match") or {}
         raw_in = selectors.get("in") or {}
+        # `contains` is a different predicate KIND (membership in a list-valued
+        # fact, not a scalar in a set) — see selector_contains_requirements.
         if not isinstance(raw_match, dict):
             raise RuntimeError(f"❌ selectors.match must be a mapping: {label}")
         if not isinstance(raw_in, dict):
@@ -4338,6 +4907,8 @@ def selector_requirements(selectors: dict | None, *, label: str, structured_only
 
     requirements = {}
     for ref, expected in selectors.items():
+        if _is_contains_predicate(expected):
+            continue  # handled by selector_contains_requirements
         ref = validate_execution_context_ref(ref, label=label)
         requirements[ref] = set(selector_expected_values(expected, label=f"{label}.{ref}"))
     return requirements
@@ -4388,6 +4959,12 @@ def selector_matches(
             return False
         if str(execution_context[ref]) not in allowed_values:
             return False
+    for ref, required_members in selector_contains_requirements(selectors, label=label).items():
+        if ref not in execution_context:
+            logging.debug("Selector %s: %s", label, execution_context_miss_message(execution_context, ref))
+            return False
+        if not required_members <= _context_fact_members(execution_context[ref]):
+            return False
     return True
 
 
@@ -4419,7 +4996,14 @@ def selector_requirements_cover_scope(declaration_selectors: dict | None, scope_
             return False
     return True
 
-CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# An execution-context key is one or more identifier segments joined by dots.
+# The dotted form is how provider-specific params are namespaced under their
+# provider (`<provider>.<param>`), so one provider's vocabulary cannot collide
+# with another's; provider-neutral params stay single-segment (`env_type`,
+# `landing_zone`). The context is a flat dotted map, so a dotted key is simply a
+# longer key — selectors already match full paths. The engine assigns no meaning
+# to the leading segment; only the provider adapter interprets it.
+CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 EXECUTION_PARAMS_KEY = "execution_params"
 EXECUTION_CONTEXT_PARAM_REF_RE = re.compile(
     rf"^\$\{{({EXECUTION_CONTEXT_ROOT}\.(?:ctl|params)\.[A-Za-z_][A-Za-z0-9_]*)\}}$"
@@ -4459,19 +5043,29 @@ def build_execution_context(
     action: str | None,
     ctl_profile: str | None,
     execution_params: dict[str, str],
-    execution_access_mode: str = "standard",
+    execution_access_modes: dict[str, str] | None = None,
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_full_cfg_validation_gate: bool = False,
     execution_runtime_mode: str,
-    force_skip_execution_identity_preflight_check: bool = False,
+    force_skip_execution_identity_preflight_check: list[str] | None = None,
+    providers: list[str] | tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Build the flat dotted execution context: the closed, namespaced facts of
     this execution. Two namespaces — `ctl` (promoted engine args) and `params`
     (consumer values, merged from --execution-params CLI + the execution_params
     cfg block). Keys look like 'execution_context.params.env_type'."""
     context: dict[str, object] = {}
+
+    def put_list(namespace: str, key: str, values, *, label: str) -> None:
+        """A LIST-valued promoted fact. Params remain scalar-only; this exists for
+        facts that are inherently plural (the run's declared providers), matched
+        with the `contains` selector predicate."""
+        if not CONTEXT_KEY_RE.fullmatch(key):
+            raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
+        cleaned = [str(_context_scalar(v, label=label)) for v in (values or [])]
+        context[f"{EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = cleaned
 
     def put(namespace: str, key: str, value, *, label: str) -> None:
         if not CONTEXT_KEY_RE.fullmatch(key):
@@ -4482,7 +5076,16 @@ def build_execution_context(
         put("ctl", "action", action, label="promoted --action")
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
-    put("ctl", "execution_access_mode", execution_access_mode, label="promoted execution access mode")
+    # One fact per participating provider — the mode is a per-provider decision,
+    # so cfg gates on `...ctl.execution_access_mode.<provider>`, never on a
+    # single run-wide value. The engine names no provider and no mode here.
+    for _provider, _mode in sorted((execution_access_modes or {}).items()):
+        put(
+            "ctl",
+            f"execution_access_mode.{_provider}",
+            _mode,
+            label="promoted --execution-access-mode",
+        )
     put("ctl", "agreed_defer_ctl_state_backend_sync", bool(agreed_defer_ctl_state_backend_sync), label="promoted --agreed-defer-ctl-state-backend-sync")
     put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
     put("ctl", "force_skip_guardrails", bool(force_skip_guardrails), label="promoted --force-skip-guardrails")
@@ -4499,6 +5102,9 @@ def build_execution_context(
         label="promoted --force-skip-execution-identity-preflight-check",
     )
     put("ctl", "execution_runtime_mode", execution_runtime_mode, label="promoted execution runtime")
+    # §Phase 53: the run DECLARES its participating providers; cfg gates on
+    # membership (`contains`), and every target's provider must be in this list.
+    put_list("ctl", "providers", providers, label="promoted --providers")
 
     # cfg-declared params are inserted first (so they lead the rendered
     # context), but CLI values are staged up front so cfg params may still
@@ -4543,11 +5149,29 @@ def build_execution_context(
 
 
 def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
-    """Nested {execution_context: {ctl: {...}, params: {...}}} view."""
+    """Nested {execution_context: {ctl: {...}, params: {...}}} view.
+
+    Dotted keys nest fully (params.<provider>.x -> params: {<provider>: {x: ...}}),
+    so the rendered artifact reads as structure, not as flat dotted strings. A
+    scalar and a subtree cannot share a path — that collision fails loud.
+    """
     nested: dict[str, dict[str, object]] = {ns: {} for ns in EXECUTION_CONTEXT_NAMESPACES}
     for ref, value in execution_context.items():
         _, namespace, key = ref.split(".", 2)
-        nested[namespace][key] = value
+        node = nested[namespace]
+        segments = key.split(".")
+        for segment in segments[:-1]:
+            child = node.setdefault(segment, {})
+            if not isinstance(child, dict):
+                raise RuntimeError(
+                    f"❌ execution context key {ref!r} nests under a scalar fact"
+                )
+            node = child
+        if isinstance(node.get(segments[-1]), dict):
+            raise RuntimeError(
+                f"❌ execution context key {ref!r} collides with a nested subtree"
+            )
+        node[segments[-1]] = value
     return {EXECUTION_CONTEXT_ROOT: nested}
 
 
@@ -5269,7 +5893,7 @@ def write_target_run_flow_artifact(path: Path, workflow_meta: dict | None, activ
                 "target": target_run.get("target"),
                 "source": target_run.get("source"),
                 "workflow": target_run.get("workflow"),
-                "execution_identity_key": target_run.get("execution_identity_key"),
+                "execution_identity": target_run.get("execution_identity"),
                 "branch": target_run.get("branch"),
                 "commit": target_run.get("commit"),
             }
@@ -5431,12 +6055,110 @@ def write_git_metas(
 # S3 bucket. Local-first mechanics, remote system of record after final push.
 # ---------------------------------------------------------------------------
 
+CTL_STATE_OPERATIONS = ("read", "sync", "maintenance")
+
+
+def validate_ctl_state_backend_execution(execution: object, *, label: str, path: Path) -> dict:
+    """Validate a ctl-state backend's `execution_identity:` block (§Phase 53).
+
+    Same shape as a target's, with one structural difference: a backend has a
+    role per ctl-state OPERATION (read / sync / maintenance — least privilege),
+    where a target has one per authorization class. The account is fixed, so the
+    direct credential source is SINGULAR per operation rather than a list.
+    """
+    if not isinstance(execution, dict) or not execution:
+        raise RuntimeError(f"❌ {label}.execution must be a non-empty mapping: {path}")
+    unknown = sorted(set(execution) - {"account", "operations"})
+    if unknown:
+        raise RuntimeError(
+            f"❌ {label}.execution has unknown fields {unknown}; allowed: ['account', 'operations']: {path}"
+        )
+    account = execution.get("account")
+    if not isinstance(account, str) or not account.strip():
+        raise RuntimeError(f"❌ {label}.execution.account must be a non-empty string: {path}")
+
+    operations = execution.get("operations")
+    if not isinstance(operations, dict) or not operations:
+        raise RuntimeError(
+            f"❌ {label}.execution_identity.operations must be a non-empty mapping keyed by "
+            f"{list(CTL_STATE_OPERATIONS)}: {path}"
+        )
+    unknown_ops = sorted(set(operations) - set(CTL_STATE_OPERATIONS))
+    if unknown_ops:
+        raise RuntimeError(
+            f"❌ {label}.execution_identity.operations has unknown operations {unknown_ops}; "
+            f"allowed: {list(CTL_STATE_OPERATIONS)}: {path}"
+        )
+
+    cleaned_ops: dict[str, dict] = {}
+    for operation, spec in operations.items():
+        op_label = f"{label}.execution_identity.operations.{operation}"
+        if not isinstance(spec, dict) or not spec:
+            raise RuntimeError(f"❌ {op_label} must be a non-empty mapping: {path}")
+        unknown_fields = sorted(set(spec) - {"role", "agreed_direct_credential_source_key"})
+        if unknown_fields:
+            raise RuntimeError(f"❌ {op_label} has unknown fields {unknown_fields}: {path}")
+        role = spec.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise RuntimeError(f"❌ {op_label}.role must be a non-empty string: {path}")
+        cleaned = {"role": role.strip()}
+        direct_key = spec.get("agreed_direct_credential_source_key")
+        if direct_key is not None:
+            if not isinstance(direct_key, str) or not direct_key.strip():
+                raise RuntimeError(
+                    f"❌ {op_label}.agreed_direct_credential_source_key must be a non-empty string: {path}"
+                )
+            cleaned["agreed_direct_credential_source_key"] = direct_key.strip()
+        cleaned_ops[operation] = cleaned
+
+    return {"account": account.strip(), "operations": cleaned_ops}
+
+
+def describe_target_execution_identity(execution: object) -> str | None:
+    """Compact report label for a resolved execution_identity block: provider:account:role.
+
+    Provider-neutral — the engine only joins the declared fields; it does not
+    interpret them.
+    """
+    if not isinstance(execution, dict) or not execution:
+        return None
+    parts = [str(execution.get("provider") or "?"), str(execution.get("account") or "?")]
+    roles = execution.get("roles")
+    if isinstance(roles, dict) and roles:
+        parts.append("/".join(f"{cls}={key}" for cls, key in sorted(roles.items())))
+    elif execution.get("role"):
+        parts.append(str(execution["role"]))
+    return ":".join(parts)
+
+
+def ctl_state_backend_operation_execution(
+    entry: dict, operation: str, *, namespace_key: str, required: bool = True
+) -> dict | None:
+    """A ctl-state backend's execution narrowed to ONE operation (§Phase 53).
+
+    Returns the account plus that operation's role and optional direct credential
+    source; the adapter turns those into a credential. Replaces the old
+    execution_identity_keys.<operation> indirection.
+    """
+    execution = entry.get("execution_identity") or {}
+    spec = (execution.get("operations") or {}).get(operation)
+    if spec is None:
+        if required:
+            raise RuntimeError(
+                f"❌ ctl_state_backends.{namespace_key} declares no "
+                f"execution_identity.operations.{operation}"
+            )
+        return None
+    return {"account": execution.get("account"), "operation": operation, **spec}
+
+
 def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
     """Load the optional ctl-state backend registry.
 
     Schema is ``ctl_state_backends``:
     {namespace: {selectors, provider, backend_type, bucket_name,
-    bucket_region, execution_identity_keys}}.
+    bucket_region, execution}}. The backend declares its own `execution_identity:` block
+    (§Phase 53) — one account, and a role per ctl-state OPERATION.
     """
     merged: dict = {}
     seen_sources: dict[str, Path] = {}
@@ -5454,7 +6176,7 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
                 raise RuntimeError(f"❌ duplicate {section_name} namespace {namespace_key!r}: {path} (first: {seen_sources[namespace_key]})")
             if not isinstance(entry, dict):
                 raise RuntimeError(f"❌ {section_name}.{namespace_key} must be a mapping: {path}")
-            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity_keys", "selectors"}
+            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity", "selectors"}
             unknown = set(entry) - allowed
             if unknown:
                 raise RuntimeError(f"❌ {section_name}.{namespace_key} has unsupported keys {sorted(unknown)}: {path}")
@@ -5472,22 +6194,11 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
                 "bucket_name": entry["bucket_name"].strip(),
                 "bucket_region": entry["bucket_region"].strip(),
             }
-            identity_keys = entry.get("execution_identity_keys")
-            if identity_keys is not None:
-                # §Phase 31 Q5: per-operation access identities (least privilege)
-                if not isinstance(identity_keys, dict) or set(identity_keys) - {"read", "sync", "maintenance"}:
-                    raise RuntimeError(
-                        f"❌ {section_name}.{namespace_key}.execution_identity_keys must be a map with "
-                        f"read/sync/maintenance keys only: {path}"
-                    )
-                cleaned: dict[str, str] = {}
-                for op, key in identity_keys.items():
-                    if not isinstance(key, str) or not key.strip():
-                        raise RuntimeError(
-                            f"❌ {section_name}.{namespace_key}.execution_identity_keys.{op} must be a non-empty string: {path}"
-                        )
-                    cleaned[op] = key.strip()
-                resolved["execution_identity_keys"] = cleaned
+            execution = entry.get("execution_identity")
+            if execution is not None:
+                resolved["execution_identity"] = validate_ctl_state_backend_execution(
+                    execution, label=f"{section_name}.{namespace_key}", path=path
+                )
             selectors = entry.get("selectors")
             if selectors is not None:
                 # §Phase 31: a backend entry IS the namespace — its selectors
@@ -5515,6 +6226,7 @@ def require_unique_fan_out_namespace(
     ctl_profile: str,
     execution_params: dict[str, str],
     execution_runtime_mode: str,
+    providers: list[str] | tuple[str, ...] = (),
 ) -> str:
     """§Phase 31 item 3: a fan-out first expands, then resolves the namespace
     for EVERY child execution context and requires the unique set to contain
@@ -5530,6 +6242,7 @@ def require_unique_fan_out_namespace(
             action=action,
             ctl_profile=ctl_profile,
             execution_params=child_params,
+            providers=providers,
             execution_runtime_mode=execution_runtime_mode,
         )
         namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, child_context)
@@ -5585,8 +6298,8 @@ def inspect_selected_graph_ctl_state_backend(
     ctl_cfg_root: Path,
     *,
     implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
 ) -> dict[str, object]:
     """Find the one backend provisioner and classify the selected backend."""
     provisioners: list[tuple[dict, str, dict]] = []
@@ -5614,13 +6327,16 @@ def inspect_selected_graph_ctl_state_backend(
         )
     )
     bucket_region = str(entry["bucket_region"])
+    probe_access_mode, probe_options = provider_inputs(
+        str(entry["provider"]), execution_access_modes, provider_options
+    )
     credential = adapter.resolve_state_backend_probe_credential(
         target_run,
         selection["provider_catalogs"],
         execution_context=selection["execution_context"],
         implementation_key=implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_mode=probe_access_mode,
+        provider_options=probe_options,
     )
     probe = adapter.probe_state_backend(bucket_name, bucket_region, credential)
     status = probe.get("status")
@@ -5646,8 +6362,8 @@ def _ctl_state_sync_config(
     execution_context: dict[str, object],
     run_dir: Path,
     *,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
     provider_implementation_key: str,
 ) -> dict:
     metadata = load_run_metadata(run_dir)
@@ -5676,8 +6392,8 @@ def _ctl_state_sync_config(
         "results_root": Path(results_root_value).joinpath(*locator),
         "bucket_name": bucket_name,
         "bucket_region": str(entry["bucket_region"]),
-        "execution_access_mode": execution_access_mode,
-        "provider_credential": provider_credential,
+        "execution_access_modes": execution_access_modes,
+        "provider_options": provider_options,
         "provider_implementation_key": provider_implementation_key,
     }
 
@@ -5707,34 +6423,22 @@ def _arm_ctl_state_sync(config: dict, *, tolerate_not_ready: bool) -> bool:
     global _CTL_STATE_SYNCER, _CTL_STATE_SYNC_NOTE
     entry = config["entry"]
     adapter = get_provider_adapter(entry["provider"])
-    identity_key = (entry.get("execution_identity_keys") or {}).get("sync")
-    if identity_key is None and config["execution_access_mode"] != "force_bypass":
-        raise RuntimeError(
-            f"❌ ctl_state_backends.{config['namespace_key']} declares no "
-            "execution_identity_keys.sync"
-        )
-    if identity_key is not None:
-        identity_key = str(
-            resolve_runtime_scalar(
-                identity_key,
-                config["execution_context"],
-                label=(
-                    f"ctl_state_backends.{config['namespace_key']}."
-                    "execution_identity_keys.sync"
-                ),
-            )
-        )
-    # Bootstrap target access may be direct, but ctl-state publication switches
-    # to its normal role path as soon as the access role exists.
-    sync_access_mode = (
-        "force_bypass"
-        if config["execution_access_mode"] == "force_bypass"
-        else "standard"
+    run_access_mode, adapter_options = provider_inputs(
+        entry["provider"], config["execution_access_modes"], config["provider_options"]
     )
+    operation_execution = ctl_state_backend_operation_execution(
+        entry,
+        "sync",
+        namespace_key=config["namespace_key"],
+        required=adapter.resolves_execution_identity(run_access_mode),
+    )
+    # Escalated target access may be needed to reach the target, but ctl-state
+    # publication takes the provider's normal path as soon as it can.
+    sync_access_mode = ctl_state_publication_access_mode(adapter, run_access_mode)
     try:
         object_keys, object_prefixes = _ctl_state_run_access_scope(config)
         credential = adapter.resolve_ctl_state_credential(
-            identity_key,
+            operation_execution,
             config["ctl_cfg_root"],
             execution_context=config["execution_context"],
             implementation_key=config["provider_implementation_key"],
@@ -5743,7 +6447,7 @@ def _arm_ctl_state_sync(config: dict, *, tolerate_not_ready: bool) -> bool:
             object_keys=object_keys,
             object_prefixes=object_prefixes,
             execution_access_mode=sync_access_mode,
-            provider_credential=config["provider_credential"],
+            provider_options=adapter_options,
         )
     except Exception as error:
         if not tolerate_not_ready:
@@ -5789,8 +6493,8 @@ def configure_ctl_state_sync(
     provisions_ctl_state_backend: bool = False,
     selected_graph_provisions_ctl_state_backend: bool = False,
     backend_absence_confirmed: bool = False,
-    execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    execution_access_modes: dict[str, str] | None = None,
+    provider_options: dict[str, str] | None = None,
     provider_implementation_key: str = "local",
 ) -> dict[str, str] | None:
     """Arm namespace publication or establish an explicitly proven defer queue."""
@@ -5821,8 +6525,8 @@ def configure_ctl_state_sync(
         entry,
         execution_context,
         run_dir,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         provider_implementation_key=provider_implementation_key,
     )
     _CTL_STATE_SYNC_CONFIG = config
@@ -6300,8 +7004,8 @@ def _arm_ctl_state_operation(
     *,
     operation: str,
     provider_implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
     object_keys: list[str] | tuple[str, ...] = (),
     object_prefixes: list[str] | tuple[str, ...] = (),
 ):
@@ -6317,17 +7021,18 @@ def _arm_ctl_state_operation(
             label=f"ctl_state_backends.{namespace_key}.bucket_name",
         )
     )
-    identity_key = (entry.get("execution_identity_keys") or {}).get(operation)
-    if identity_key is None and execution_access_mode != "force_bypass":
-        raise RuntimeError(
-            f"❌ ctl_state_backends.{namespace_key} declares no "
-            f"execution_identity_keys.{operation}"
-        )
-    operation_access_mode = (
-        "force_bypass" if execution_access_mode == "force_bypass" else "standard"
+    run_access_mode, adapter_options = provider_inputs(
+        entry["provider"], execution_access_modes, provider_options
     )
+    operation_execution = ctl_state_backend_operation_execution(
+        entry,
+        operation,
+        namespace_key=namespace_key,
+        required=adapter.resolves_execution_identity(run_access_mode),
+    )
+    operation_access_mode = ctl_state_publication_access_mode(adapter, run_access_mode)
     credential = adapter.resolve_ctl_state_credential(
-        identity_key,
+        operation_execution,
         ctl_cfg_root,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
@@ -6336,7 +7041,7 @@ def _arm_ctl_state_operation(
         object_keys=object_keys,
         object_prefixes=object_prefixes,
         execution_access_mode=operation_access_mode,
-        provider_credential=provider_credential,
+        provider_options=adapter_options,
     )
     namespace_root = Path(ctl_state_local_root) / namespace_key
     syncer = adapter.create_state_syncer(
@@ -6363,8 +7068,8 @@ def _arm_ctl_state_reader(
     ctl_state_local_root: Path,
     *,
     provider_implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
 ):
     return _arm_ctl_state_operation(
         ctl_cfg_root,
@@ -6372,8 +7077,8 @@ def _arm_ctl_state_reader(
         ctl_state_local_root,
         operation="read",
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
     )
 
 
@@ -6407,6 +7112,7 @@ def run_ctl_state_status_sweep(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
+        providers=getattr(args, "providers", ()),
         force_skip_full_cfg_validation_gate=(
             args.force_skip_full_cfg_validation_gate
         ),
@@ -6441,8 +7147,8 @@ def _run_ctl_state_status_sweep_in(
         ctl_state_root,
         operation="read",
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=args.execution_access_mode,
-        provider_credential=args.provider_credential,
+        execution_access_modes=args.execution_access_modes,
+        provider_options=args.provider_options,
     )
     hydrate_ctl_state_index(reader)
     # §Phase 50.10: ONE lean root-level map (advisory, bucket-owned), replacing
@@ -6469,8 +7175,8 @@ def _run_ctl_state_status_sweep_in(
         operation="sync",
         object_keys=[cache_key],
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=args.execution_access_mode,
-        provider_credential=args.provider_credential,
+        execution_access_modes=args.execution_access_modes,
+        provider_options=args.provider_options,
     )
     writer.put_object(cache_key, cache_path)
     report = {
@@ -6510,6 +7216,7 @@ def run_ctl_state_history_prune(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
+        providers=getattr(args, "providers", ()),
         force_skip_full_cfg_validation_gate=(
             args.force_skip_full_cfg_validation_gate
         ),
@@ -6521,8 +7228,8 @@ def run_ctl_state_history_prune(
         args.ctl_state_local_root,
         operation="read",
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=args.execution_access_mode,
-        provider_credential=args.provider_credential,
+        execution_access_modes=args.execution_access_modes,
+        provider_options=args.provider_options,
     )
     keys = hydrate_ctl_state_index(reader)
     selected_ids = set(args.prune_run_id or [])
@@ -6640,8 +7347,8 @@ def run_ctl_state_history_prune(
         operation="maintenance",
         object_keys=[manifest_key, *deletion_keys],
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=args.execution_access_mode,
-        provider_credential=args.provider_credential,
+        execution_access_modes=args.execution_access_modes,
+        provider_options=args.provider_options,
     )
     maintainer.put_object(manifest_key, manifest_path)
     if args.apply_history_prune:
@@ -6665,7 +7372,8 @@ def run_ctl_state_maintenance_command(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
-        execution_access_mode=args.execution_access_mode,
+        providers=getattr(args, "providers", ()),
+        execution_access_modes=args.execution_access_modes,
         agreed_defer_ctl_state_backend_sync=args.agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=args.force_skip_ctl_state_backend_sync,
         force_skip_guardrails=args.force_skip_guardrails,
@@ -6732,6 +7440,7 @@ def run_status_command(
             action=args.action,
             ctl_profile=args.ctl_profile,
             execution_params=args.execution_params,
+        providers=getattr(args, "providers", ()),
             execution_runtime_mode=args.execution_runtime_mode,
         )
         plan = expand_fan_out(ctl_cfg_root, args.fan_out, expansion_context)
@@ -6744,6 +7453,7 @@ def run_status_command(
             action=args.action,
             ctl_profile=args.ctl_profile,
             execution_params=args.execution_params,
+        providers=getattr(args, "providers", ()),
             execution_runtime_mode=args.execution_runtime_mode,
         )
         selections = []
@@ -6765,8 +7475,8 @@ def run_status_command(
                     target_repo_key="repo_path",
                     require_target_ref=False,
                     execution_runtime_mode=args.execution_runtime_mode,
-                    provider_credential=args.provider_credential,
-                    execution_access_mode=args.execution_access_mode,
+                    provider_options=args.provider_options,
+                    execution_access_modes=args.execution_access_modes,
                     target_name=child["key"] if child["kind"] == "target" else None,
                     # §Phase 50: a status read needs only the cfg-level state
                     # spec (prefix/segments); it enforces no mutate policy and
@@ -6790,8 +7500,8 @@ def run_status_command(
             target_repo_key="repo_path",
             require_target_ref=False,
             execution_runtime_mode=args.execution_runtime_mode,
-            provider_credential=args.provider_credential,
-            execution_access_mode=args.execution_access_mode,
+            provider_options=args.provider_options,
+            execution_access_modes=args.execution_access_modes,
             target_name=args.target if run_type == "target" else None,
             # §Phase 50: cfg-level state spec only — no mutate policy, no
             # provider catalogs (a read never uses account ids).
@@ -6822,8 +7532,8 @@ def run_status_command(
                 selections[0],
                 Path(scratch_root),
                 provider_implementation_key=provider_implementation_key,
-                execution_access_mode=args.execution_access_mode,
-                provider_credential=args.provider_credential,
+                execution_access_modes=args.execution_access_modes,
+                provider_options=args.provider_options,
             )
             for spec in specs:
                 child_prefixes = [
@@ -7026,11 +7736,10 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
     query_group.add_argument(
         "--execution-params",
         dest="execution_param",
-        action="append",
+        action=ExecutionParamsAction,
         default=[],
-        metavar="KEY=VALUE",
-        type=parse_selector_arg,
-        help="Execution param key=value; repeatable. Namespace selectors "
+        metavar="KEY=VALUE[,KEY=VALUE...]",
+        help="Execution params key=value; comma-separated and/or repeatable. Namespace selectors "
         "(provider, landing_zone) always; instance selectors (account, env_type, "
         "region) only for a targeted query",
     )
@@ -7061,9 +7770,9 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         "--scope",
         required=True,
         choices=("local", "remote"),
-        help="'local' reads the dir offline (no bucket, no credentials) — the "
-        "only way to see force-skipped runs; 'remote' is the authoritative "
-        "bucket view (hydrated into an auto temp, discarded)",
+        help="'local' reads the dir offline (no remote ctl-state backend, no "
+        "credentials) — the only way to see force-skipped runs; 'remote' is the "
+        "authoritative ctl-state backend view (hydrated into an auto temp, discarded)",
     )
     scope_group.add_argument(
         "--ctl-state-local-root",
@@ -7073,13 +7782,15 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         "valid for --scope remote (remote uses an auto temp)",
     )
     scope_group.add_argument(
-        "--provider-credential",
-        dest="provider_credential",
-        default=None,
-        metavar="PROFILE",
-        help="dev/emergency substitute credential for --scope remote when no "
-        "ctl-state read chain exists yet; passing it skips identity resolution "
-        "(the read's force-bypass — same arg the run runners use)",
+        "--provider-options",
+        dest="provider_options",
+        action=ProviderOptionsAction,
+        default={},
+        metavar="PROVIDER.KEY=VALUE[,...]",
+        help="Provider-namespaced options for --scope remote, comma-separated "
+        "and/or repeatable — including a substitute credential when no ctl-state "
+        "read chain exists yet, which makes the read skip identity resolution. "
+        "Run `ctl.py providers` for each provider's option keys.",
     )
     scope_group.add_argument(
         "--write-cache",
@@ -7108,10 +7819,10 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     if args.scope == "local":
         if not args.ctl_state_local_root:
             raise RuntimeError("❌ --scope local requires --ctl-state-local-root")
-        if args.provider_credential:
+        if args.provider_options:
             raise RuntimeError(
-                "❌ --provider-credential is not valid with --scope local "
-                "(local reads the dir — no bucket, no credentials)"
+                "❌ --provider-options is not valid with --scope local "
+                "(local reads the dir — no remote ctl-state backend, no credentials)"
             )
         args.ctl_state_local_root = normalize_ctl_state_local_root(
             args.ctl_state_local_root
@@ -7137,12 +7848,31 @@ def finalize_status_args(args: argparse.Namespace) -> None:
             )
         else:
             args.ctl_state_local_root = None
-    if args.provider_credential:
-        args.execution_access_mode = "force_bypass"
-        args.provider_credential = args.provider_credential.strip() or None
-    else:
-        args.execution_access_mode = "standard"
-        args.provider_credential = None
+    # A read has ONE operation against ONE provider — the namespace selector
+    # names it — so the run-level per-provider inputs collapse to that provider.
+    # The mode is the provider's normal path, unless its options imply another
+    # (a substitute credential IS the request to skip identity resolution). The
+    # engine picks no mode name here; the adapter does.
+    read_provider = args.execution_params.get("provider")
+    if args.scope == "remote" and not read_provider:
+        raise RuntimeError(
+            "❌ --scope remote requires --execution-params provider=<name>: the read "
+            "acquires a credential, and only the provider knows how"
+        )
+    # scope local reads the dir offline: no credential is acquired, so the
+    # provider (if given as a query selector) implies no options and no mode.
+    args.providers = [read_provider] if read_provider and args.scope == "remote" else []
+    args.execution_access_modes = {}
+    if args.providers:
+        validate_provider_options(args.provider_options, args.providers)
+        adapter = get_provider_adapter(read_provider)
+        adapter_options = provider_options_for(args.provider_options, read_provider)
+        args.execution_access_modes = {
+            read_provider: (
+                adapter.execution_access_mode_from_options(adapter_options)
+                or adapter.normal_execution_access_mode()
+            )
+        }
     # inert for a read (no box is built) but required by the shared context
     # builders / selection resolvers.
     args.execution_runtime_mode = "local"
@@ -7171,7 +7901,8 @@ def run_status_all_command(
         action=args.action,
         ctl_profile=args.ctl_profile,
         execution_params=args.execution_params,
-        execution_access_mode=args.execution_access_mode,
+        providers=getattr(args, "providers", ()),
+        execution_access_modes=args.execution_access_modes,
         execution_runtime_mode=args.execution_runtime_mode,
     )
     namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
@@ -7188,8 +7919,8 @@ def run_status_all_command(
                 Path(scratch_root),
                 operation="read",
                 provider_implementation_key=provider_implementation_key,
-                execution_access_mode=args.execution_access_mode,
-                provider_credential=args.provider_credential,
+                execution_access_modes=args.execution_access_modes,
+                provider_options=args.provider_options,
             )
             hydrate_ctl_state_index(syncer)
             instances = compute_namespace_status_map(namespace_root)
@@ -7542,11 +8273,17 @@ def prepare_target_repo(
     provider_catalogs: dict | None = None,
     execution_context: dict[str, object] | None = None,
     provider_implementation_key: str | None = None,
-    execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    execution_access_modes: dict[str, str] | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Clone/copy a target_run repo, materialize child modules, and prepare its execution env."""
-    repo_path = run_dir / "target_sources" / target_run_id
+    workspace = run_workspace_dir(run_dir)
+    if workspace is None:
+        raise RuntimeError(
+            "❌ cannot materialize a target_run workspace: the run records no "
+            "ctl_state_local_root"
+        )
+    repo_path = workspace / target_run_id
     if os.path.exists(repo_path):
         shutil.rmtree(repo_path)
 
@@ -7575,6 +8312,9 @@ def prepare_target_repo(
     if provider_adapter is not None:
         if provider_catalogs is None or execution_context is None or provider_implementation_key is None:
             raise RuntimeError("❌ incomplete provider inputs for target_run preparation")
+        adapter_access_mode, adapter_options = provider_inputs(
+            target_run_provider(target_run), execution_access_modes, provider_options
+        )
         provider_adapter.materialize_target_binding(
             target_run_id,
             target_run,
@@ -7582,9 +8322,8 @@ def prepare_target_repo(
             provider_catalogs,
             execution_context=execution_context,
             implementation_key=provider_implementation_key,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
-                run_dir=run_dir,
+            execution_access_mode=adapter_access_mode,
+            provider_options=adapter_options,
         )
     return repo_path, target_env
 
@@ -7974,7 +8713,9 @@ def populate_workflow_child_slice(
         if target_run.get(key) is not None
     }
     if source_refs:
-        write_yaml_file(child_run_dir / "target_sources" / "source_refs.yaml", source_refs)
+        # §Phase 57: a RECORD (what this run ran), not workspace scratch — it no
+        # longer shares a name with the build workspace.
+        write_yaml_file(child_run_dir / "source_refs.yaml", source_refs)
 
 
 def run_steps(
@@ -7991,8 +8732,8 @@ def run_steps(
     provider_catalogs: dict,
     provider_implementation_key: str,
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
-    execution_access_mode: str = "standard",
-    provider_credential: str | None = None,
+    execution_access_modes: dict[str, str] | None = None,
+    provider_options: dict[str, str] | None = None,
     skip_committed_rerun: bool = False,
 ) -> None:
     """Clone and run all active target runs."""
@@ -8028,8 +8769,8 @@ def run_steps(
             provider_catalogs=provider_catalogs,
             execution_context=execution_context,
             provider_implementation_key=provider_implementation_key,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
             )
 
         step_sequence_key = target_run.get("step_sequence")
@@ -8167,13 +8908,14 @@ def run_maintenance(
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
-    provider_credential: str | None,
+    provider_options: dict[str, str] | None,
     execution_runtime_mode: str,
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_full_cfg_validation_gate: bool = False,
-    execution_access_mode: str = "standard",
+    execution_access_modes: dict[str, str] | None = None,
+    providers: list[str] | tuple[str, ...] = (),
 ) -> None:
     """Run a maintenance action against a single target_run target."""
     if (
@@ -8189,11 +8931,12 @@ def run_maintenance(
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        providers=providers,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
         force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
-        execution_access_mode=execution_access_mode,
+        execution_access_modes=execution_access_modes,
         execution_runtime_mode=execution_runtime_mode,
     )
     scope_params = scope_params_from_context(execution_context)
@@ -8209,8 +8952,8 @@ def run_maintenance(
         execution_context=execution_context,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
     )
     cfg_report = build_cfg_validation_report(
         collect_provider_cfg_findings(ctl_cfg_root, execution_context)
@@ -8218,7 +8961,7 @@ def run_maintenance(
     apply_full_cfg_validation_gate(
         cfg_report, force_skip=force_skip_full_cfg_validation_gate
     )
-    write_cfg_validation_artifacts(artifacts_dir, cfg_report)
+    write_cfg_validation_artifacts(run_gates_dir(run_dir), cfg_report)
     assert_full_cfg_validation_gate_accepted(cfg_report)
     ctl_state_namespace_key, _ = resolve_ctl_state_namespace(
         ctl_cfg_root, execution_context
@@ -8236,8 +8979,8 @@ def run_maintenance(
         run_dir,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         provider_implementation_key=provider_implementation_key,
     )
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
@@ -8298,13 +9041,16 @@ def run_maintenance(
     provider_catalogs = provider_adapter.load_runtime_catalogs(
         ctl_cfg_root, execution_context=execution_context
     )
+    adapter_access_mode, adapter_options = provider_inputs(
+        run_provider(execution_context), execution_access_modes, provider_options
+    )
     provider_adapter.validate_active_target_access(
         active_target_runs,
         provider_catalogs,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_mode=adapter_access_mode,
+        provider_options=adapter_options,
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
     plt_targets_dir_path = run_cfg_distribution(
@@ -8331,8 +9077,8 @@ def run_maintenance(
         provider_catalogs=provider_catalogs,
         execution_context=execution_context,
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
     )
     assertion_argv = provider_adapter.target_assertion_argv(materialize_step_utils(run_dir))
     if assertion_argv:
@@ -8650,6 +9396,7 @@ def resolve_run_locator_segments(
     workflow_name: str | None = None,
     target_name: str | None = None,
     ctl_variants: list[str] | tuple[str, ...] = (),
+    providers: list[str] | tuple[str, ...] = (),
 ) -> list[str]:
     """Resolve a run's local ctl-state locator BEFORE its dirs exist (§Phase 30).
 
@@ -8674,6 +9421,7 @@ def resolve_run_locator_segments(
         action=action,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        providers=providers,
         execution_runtime_mode=execution_runtime_mode,
     )
     namespace_key, _ = resolve_ctl_state_namespace(ctl_cfg_root, execution_context)
@@ -8691,6 +9439,7 @@ def resolve_run_instance_identity(
     workflow_name: str | None = None,
     target_name: str | None = None,
     ctl_variants: list[str] | tuple[str, ...] = (),
+    providers: list[str] | tuple[str, ...] = (),
 ) -> dict | None:
     """Resolve a run's target-instance identity BEFORE its dirs exist (§Phase 31 6b).
 
@@ -8706,6 +9455,7 @@ def resolve_run_instance_identity(
         action=action,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        providers=providers,
         execution_runtime_mode=execution_runtime_mode,
     )
     inventory_cfg = load_inventory_cfg(ctl_cfg_root, action, execution_context)
@@ -8802,18 +9552,6 @@ def active_targets_missing_key(workflow_cfg: dict, inventory_cfg: dict, skip_key
     return missing
 
 
-def target_allows_agreed_direct_execution_access(target_cfg: dict) -> bool:
-    """Whether a target opts into agreed_direct execution access (§12); default False.
-
-    `standard` is always permitted and `force_bypass` is profile-gated (not
-    per-target), so `agreed_direct` is the only mode a target actually gates —
-    hence a boolean flag rather than a mode list."""
-    raw = target_cfg.get("allow_agreed_direct_execution_access", False)
-    if not isinstance(raw, bool):
-        raise RuntimeError("❌ target allow_agreed_direct_execution_access must be a boolean")
-    return raw
-
-
 def validate_execution_access(
     ctl_cfg_root: Path,
     ctl_profile: str,
@@ -8821,65 +9559,51 @@ def validate_execution_access(
     inventory_cfg: dict,
     *,
     execution_context: dict[str, object],
-    execution_access_mode: str,
+    execution_access_modes: dict[str, str],
     agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
-    provider_credential: str | None,
-    force_skip_execution_identity_preflight_check: bool = False,
+    provider_options: dict[str, str] | None,
+    force_skip_execution_identity_preflight_check: list[str] | None = None,
 ) -> None:
-    """Validate the run's execution ACCESS MODE (§12) and the ctl-state sync
-    skip actions. `standard` needs no permission; `direct`/`bypass` are gated by
-    the ctl profile and (for direct) by each active target and its identity."""
-    if execution_access_mode not in EXECUTION_ACCESS_MODES:
-        raise RuntimeError(f"❌ unknown execution access mode {execution_access_mode!r}")
+    """Validate the PROVIDER-NEUTRAL execution access policy: per-target mode
+    consent, and the ctl-state sync / guardrail / cfg-gate skip permissions.
 
-    # bypass: whole-run substitute credential, emergency/debug
-    if execution_access_mode == "force_bypass":
-        if not provider_credential:
+    Provider gating and each provider's own policy (mode, credential
+    implementation, option grants) are validated separately — the
+    `allowed_providers` and `provider_access_policy` checks — so this function
+    names no provider vocabulary."""
+    # consent: a mode may require each active target of that provider to have
+    # declared, up front, that it accepts being run this way and with what
+    # (§Phase 53). The ADAPTER says which of its modes need consent and which
+    # target fields carry it; declaring the sources is not the same as opting in.
+    targets = inventory_cfg.get("targets", {})
+    for target_name in active_target_names(workflow_cfg):
+        target_cfg = targets.get(target_name) or {}
+        execution = target_cfg.get("execution_identity")
+        if execution is None:
+            continue  # coverage is validated separately
+        provider = execution.get("provider")
+        if not provider or provider not in (execution_access_modes or {}):
+            continue  # provider coverage is validated separately
+        mode = execution_access_modes[str(provider)]
+        consent = get_provider_adapter(str(provider)).target_consent(mode)
+        if not consent:
+            continue
+        opt_in_field = consent["opt_in_field"]
+        opt_in = target_cfg.get(opt_in_field, False)
+        if not isinstance(opt_in, bool):
+            raise RuntimeError(f"❌ target {opt_in_field} must be a boolean")
+        if not opt_in:
             raise RuntimeError(
-                "❌ bypass execution access requires the substitute credential (--provider-credential)"
+                f"❌ execution access mode {mode!r} was requested, but target "
+                f"{target_name!r} does not set {opt_in_field}: true"
             )
-    elif provider_credential:
-        raise RuntimeError(
-            "❌ --provider-credential is valid only with --execution-access-mode force_bypass"
-        )
-
-    # profile authorizes the mode
-    allowed_modes = ctl_allowed_execution_access_modes(ctl_cfg_root, ctl_profile)
-    if execution_access_mode not in allowed_modes:
-        raise RuntimeError(
-            f"❌ execution access mode {execution_access_mode!r} is not allowed by ctl "
-            f"profile {ctl_profile!r} (allowed: {sorted(allowed_modes)})"
-        )
-
-    # direct: every active target must allow direct and its identity must
-    # declare a direct credential source
-    if execution_access_mode == "agreed_direct":
-        identities = load_execution_identities_cfg(ctl_cfg_root)
-        targets = inventory_cfg.get("targets", {})
-        for target_name in active_target_names(workflow_cfg):
-            target_cfg = targets.get(target_name) or {}
-            if not target_allows_agreed_direct_execution_access(target_cfg):
-                raise RuntimeError(
-                    f"❌ direct execution access requested, but target {target_name!r} does not "
-                    "set allow_agreed_direct_execution_access: true"
-                )
-            identity_ref = target_cfg.get("execution_identity_key")
-            if identity_ref is None:
-                continue  # coverage is validated separately
-            identity_key = resolve_runtime_scalar(
-                identity_ref, execution_context,
-                label=f"target {target_name} execution_identity_key",
+        execution_field = consent["execution_field"]
+        if not (execution.get(execution_field) or []):
+            raise RuntimeError(
+                f"❌ execution access mode {mode!r} was requested, but target "
+                f"{target_name!r} declares no execution_identity.{execution_field}"
             )
-            # a group resolves to its concrete member for this run's context
-            identity_key, identity_cfg = resolve_execution_identity_entry(
-                identities, identity_key, execution_context
-            )
-            if not identity_cfg.get("direct_credential_source_key"):
-                raise RuntimeError(
-                    f"❌ direct execution access: target {target_name!r} identity "
-                    f"{identity_key!r} declares no direct_credential_source_key"
-                )
 
     # ctl-state sync skip (an operation, orthogonal to access mode)
     sync_permission_checks = (
@@ -8905,11 +9629,6 @@ def validate_execution_access(
         ),
     )
     if force_skip_execution_identity_preflight_check:
-        if execution_access_mode == "force_bypass":
-            raise RuntimeError(
-                "❌ --force-skip-execution-identity-preflight-check is not applicable "
-                "with bypass execution access"
-            )
         if not ctl_allows_force_skip_execution_identity_preflight_check(
             ctl_cfg_root, ctl_profile
         ):
@@ -9016,7 +9735,10 @@ def build_step_sequence_cfg(
     ref: str,
     cfg_file_set_name: str,
     step_sequence: str,
-    execution_identity_key: str | None,
+    execution_provider: str | None = None,
+    execution_account: str | None = None,
+    execution_role: str | None = None,
+    action_role_class: str | None = None,
 ) -> tuple[dict, dict]:
     """Build a one-target cfg for a synthetic repo-local step_sequence run.
 
@@ -9036,8 +9758,20 @@ def build_step_sequence_cfg(
         "cfg_root": cfg_file_set.get("cfg_root", "/"),
         "cfg_files": resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
     }
-    if execution_identity_key:
-        resolved["execution_identity_key"] = execution_identity_key
+    if execution_provider:
+        # The synthetic target gets the same execution_identity block a declared target
+        # has; a single --execution-role is bound to the class this action needs.
+        role_class = action_role_class or resolve_role_class(
+            action, label="synthetic step_sequence target"
+        )
+        resolved["execution_identity"] = validate_target_execution_identity(
+            {
+                "provider": execution_provider,
+                "account": execution_account,
+                "roles": {role_class: execution_role},
+            },
+            label="synthetic step_sequence target",
+        )
     name = "step_sequence"
     inventory_cfg = {"target_sources": target_sources, "targets": {name: resolved}}
     workflow_cfg = {
@@ -9222,17 +9956,18 @@ def resolve_pipeline_selection(
     target_repo_key: str,
     require_target_ref: bool,
     execution_runtime_mode: str,
-    provider_credential: str | None,
-    execution_access_mode: str,
+    provider_options: dict[str, str] | None,
+    execution_access_modes: dict[str, str],
     target_name: str | None = None,
     step_sequence_run: dict | None = None,
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_full_cfg_validation_gate: bool = False,
-    force_skip_execution_identity_preflight_check: bool = False,
+    force_skip_execution_identity_preflight_check: list[str] | None = None,
     enforce_ctl_policy: bool = True,
     load_provider_catalogs: bool = True,
+    providers: list[str] | tuple[str, ...] = (),
 ) -> dict:
     """Resolve a run through active target_runs without touching state or plt cfg.
 
@@ -9253,11 +9988,12 @@ def resolve_pipeline_selection(
         action=inventory_name,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
+        providers=providers,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_guardrails=force_skip_guardrails,
         force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
-        execution_access_mode=execution_access_mode,
+        execution_access_modes=execution_access_modes,
         execution_runtime_mode=execution_runtime_mode,
         force_skip_execution_identity_preflight_check=(
             force_skip_execution_identity_preflight_check
@@ -9275,7 +10011,9 @@ def resolve_pipeline_selection(
             ref=step_sequence_run["ref"],
             cfg_file_set_name=step_sequence_run["cfg_file_set"],
             step_sequence=step_sequence_run["step_sequence"],
-            execution_identity_key=step_sequence_run.get("execution_identity_key"),
+            execution_provider=step_sequence_run.get("execution_provider"),
+            execution_account=step_sequence_run.get("execution_account"),
+            execution_role=step_sequence_run.get("execution_role"),
         )
         selection_kind = "step_sequence"
         selection_key = step_sequence_run["step_sequence"]
@@ -9327,8 +10065,8 @@ def resolve_pipeline_selection(
             execution_context=execution_context,
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
             force_skip_execution_identity_preflight_check=(
                 force_skip_execution_identity_preflight_check
             ),
@@ -9453,19 +10191,24 @@ def build_ctl_policy_preflight_report(
     ctl_profile: str,
     ctl_ref_policy: str,
     execution_runtime_mode: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
     agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
-    force_skip_execution_identity_preflight_check: bool,
+    force_skip_execution_identity_preflight_check: list[str],
 ) -> dict:
     """Evaluate run policy independently from provider identity reachability."""
     checks: list[dict] = []
 
     def check(name: str, validator) -> None:
         try:
-            validator()
-            checks.append({"name": name, "status": "passed"})
+            detail = validator()
+            entry = {"name": name, "status": "passed"}
+            # A validator MAY return render lines (provider-authored strings the
+            # engine prints verbatim); it never composes provider vocabulary itself.
+            if detail:
+                entry["detail"] = list(detail) if not isinstance(detail, dict) else detail
+            checks.append(entry)
         except Exception as error:
             checks.append(
                 {
@@ -9484,6 +10227,29 @@ def build_ctl_policy_preflight_report(
             ctl_cfg_root, execution_context
         ),
     )
+
+    def _providers_check() -> list[str]:
+        declared = sorted(execution_access_modes or {})
+        validate_ctl_allowed_providers(ctl_cfg_root, ctl_profile, declared)
+        return [f"declared: {', '.join(declared) or '(none)'}"]
+
+    check("allowed_providers", _providers_check)
+
+    # per-provider access authorization, each provider's own policy block. The
+    # ADAPTER returns the render lines; the engine nests them, naming no mode.
+    def _provider_access_detail() -> dict[str, list[str]]:
+        rows: dict[str, list[str]] = {}
+        for provider, mode in sorted((execution_access_modes or {}).items()):
+            rows[provider] = get_provider_adapter(provider).authorize_run(
+                ctl_profile_provider_policy(ctl_cfg_root, ctl_profile, provider),
+                execution_access_mode=mode,
+                provider_options=provider_options_for(provider_options, provider),
+                label=f"ctl profile {ctl_profile!r} policy for {provider!r}",
+            )
+        return rows
+
+    check("provider_access_policy", _provider_access_detail)
+
     check(
         "execution_access_policy",
         lambda: validate_execution_access(
@@ -9494,8 +10260,8 @@ def build_ctl_policy_preflight_report(
             execution_context=execution_context,
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
             force_skip_execution_identity_preflight_check=(
                 force_skip_execution_identity_preflight_check
             ),
@@ -9601,9 +10367,9 @@ def build_ctl_state_backend_preflight_result(
     *,
     ctl_cfg_root: Path,
     implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
-    force_skip: bool,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
+    force_skip_providers: list[str],
     agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
 ) -> dict:
@@ -9616,9 +10382,9 @@ def build_ctl_state_backend_preflight_result(
     buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
     result: dict = {
         "ctl_state_backend": None,
-        "execution_identity_key": None,
+        "execution_identity": None,
         "provider": None,
-        "access_mode": "agreed_direct",
+        "access_mode": None,
         "status": "not_applicable",
         "provider_path": [],
     }
@@ -9644,42 +10410,46 @@ def build_ctl_state_backend_preflight_result(
         return result
     entry = buckets[namespace_key]
     result["provider"] = entry.get("provider")
-    identity_key = (entry.get("execution_identity_keys") or {}).get("sync")
-    if identity_key is None:
-        if execution_access_mode == "force_bypass":
+    # The backend's own provider decides the mode and options here — it is not
+    # necessarily the provider the targets run against.
+    namespace_provider = str(entry["provider"])
+    namespace_adapter = get_provider_adapter(namespace_provider)
+    namespace_access_mode, namespace_adapter_options = provider_inputs(
+        namespace_provider, execution_access_modes, provider_options
+    )
+    operation_execution = ctl_state_backend_operation_execution(
+        entry, "sync", namespace_key=namespace_key, required=False
+    )
+    if operation_execution is None:
+        if not namespace_adapter.resolves_execution_identity(namespace_access_mode):
             result["reason"] = "identity bypass: synchronizer uses the substitute credential"
             return result
         result["status"] = "failed"
         result["failure_reason"] = (
-            f"ctl_state_backends.{namespace_key} declares no execution_identity_keys.sync"
+            f"ctl_state_backends.{namespace_key} declares no execution_identity.operations.sync"
         )
         return result
-    identity_key = str(
-        resolve_runtime_scalar(
-            identity_key,
-            selection["execution_context"],
-            label=f"ctl_state_backends.{namespace_key}.execution_identity_keys.sync",
-        )
-    )
     # Ctl-state publication always uses its normal operation role path.
-    sync_access_mode = "force_bypass" if execution_access_mode == "force_bypass" else "standard"
-    provider_adapter = selection["provider_adapter"]
+    sync_access_mode = ctl_state_publication_access_mode(
+        namespace_adapter, namespace_access_mode
+    )
+    provider_adapter = namespace_adapter
     try:
         checked = provider_adapter.preflight_execution_identity(
             f"ctl_state_backend/{namespace_key}",
-            {"execution_identity_key": identity_key},
+            {"execution_identity": operation_execution},
             selection["provider_catalogs"],
             execution_context=selection["execution_context"],
             implementation_key=implementation_key,
             execution_access_mode=sync_access_mode,
-            provider_credential=provider_credential,
-            live_check=not force_skip,
+            provider_options=namespace_adapter_options,
+            live_check=namespace_provider not in force_skip_providers,
         )
         if not isinstance(checked, dict) or checked.get("status") not in PREFLIGHT_RESULT_STATUSES:
             raise RuntimeError("provider preflight returned an invalid result")
     except Exception as error:
         result["status"] = "failed"
-        result["execution_identity_key"] = identity_key
+        result["execution_identity"] = operation_execution
         result["failure_reason"] = credential_free_preflight_failure_reason(error)
         return result
     checked = dict(checked)
@@ -9691,9 +10461,9 @@ def build_execution_identity_preflight_report(
     selection: dict,
     *,
     implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
-    force_skip: bool,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
+    force_skip_providers: list[str],
     ctl_cfg_root: Path | None = None,
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
@@ -9715,25 +10485,32 @@ def build_execution_identity_preflight_report(
     results: list[dict] = []
     for target_key, (target_run_id, target_run) in target_runs_by_key.items():
         try:
+            adapter_access_mode, adapter_options = provider_inputs(
+                target_run_provider(target_run),
+                execution_access_modes,
+                provider_options,
+            )
             result = provider_adapter.preflight_execution_identity(
                 target_run_id,
                 target_run,
                 catalogs,
                 execution_context=execution_context,
                 implementation_key=implementation_key,
-                execution_access_mode=execution_access_mode,
-                provider_credential=provider_credential,
-                live_check=not force_skip,
+                execution_access_mode=adapter_access_mode,
+                provider_options=adapter_options,
+                live_check=target_run_provider(target_run) not in force_skip_providers,
             )
             if not isinstance(result, dict):
                 raise RuntimeError("provider preflight returned a non-mapping result")
         except Exception as error:
             result = {
-                "execution_identity_key": target_run.get("execution_identity_key"),
-                "provider": execution_context.get(
-                    f"{EXECUTION_CONTEXT_ROOT}.params.provider"
-                ),
-                "access_mode": execution_access_mode,
+                "execution_identity": target_run.get("execution_identity"),
+                # the target's OWN provider, not a run-global one
+                "provider": (target_run.get("execution_identity") or {}).get("provider"),
+                "access_mode": execution_access_mode_for(
+                    execution_access_modes,
+                    (target_run.get("execution_identity") or {}).get("provider", ""),
+                ) if (target_run.get("execution_identity") or {}).get("provider") else None,
                 "status": "failed",
                 "provider_path": [],
                 "failure_reason": credential_free_preflight_failure_reason(error),
@@ -9741,9 +10518,9 @@ def build_execution_identity_preflight_report(
         status = result.get("status")
         if status not in PREFLIGHT_RESULT_STATUSES:
             result = {
-                "execution_identity_key": result.get("execution_identity_key"),
+                "execution_identity": result.get("execution_identity"),
                 "provider": result.get("provider"),
-                "access_mode": result.get("access_mode", execution_access_mode),
+                "access_mode": result.get("access_mode"),
                 "status": "failed",
                 "provider_path": [],
                 "failure_reason": f"provider preflight returned invalid status {status!r}",
@@ -9759,9 +10536,9 @@ def build_execution_identity_preflight_report(
                 selection,
                 ctl_cfg_root=ctl_cfg_root,
                 implementation_key=implementation_key,
-                execution_access_mode=execution_access_mode,
-                provider_credential=provider_credential,
-                force_skip=force_skip,
+                execution_access_modes=execution_access_modes,
+                provider_options=provider_options,
+                force_skip_providers=force_skip_providers,
                 agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
                 force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             )
@@ -9842,11 +10619,10 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         tag = _preflight_status_tag
         if "ctl_state_backend" in result:
             children: list[dict] = []
-            if result.get("execution_identity_key"):
+            backend_execution = describe_target_execution_identity(result.get("execution_identity"))
+            if backend_execution:
                 children.append(
-                    _node(
-                        f"execution_identity: {result['execution_identity_key']} {tag(status)}"
-                    )
+                    _node(f"execution_identity: {backend_execution} {tag(status)}")
                 )
             if result.get("reason"):
                 children.append(_node(f"reason: {result['reason']}"))
@@ -9860,7 +10636,7 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         # container row carries only passed/failed/not_evaluated; the identity
         # row keeps the raw status (bypassed/skipped/not-applicable count as passed)
         row_status = status if status in ("failed", "not_evaluated") else "passed"
-        identity_key = result.get("execution_identity_key") or "<unresolved>"
+        identity_key = describe_target_execution_identity(result.get("execution_identity")) or "<unresolved>"
         identity_children: list[dict] = []
         for path_node in result.get("provider_path") or []:
             display = (
@@ -9908,11 +10684,19 @@ def _policy_check_nodes(report: dict) -> list[dict]:
     tag = _preflight_status_tag
 
     def check_node(check: dict) -> dict:
-        children = (
-            [_node(f"error: {check['failure_reason']}")]
-            if check.get("failure_reason")
-            else []
-        )
+        children: list[dict] = []
+        if check.get("failure_reason"):
+            children.append(_node(f"error: {check['failure_reason']}"))
+        # Detail is provider-authored render text (§Phase 52): a flat list of
+        # lines, or a mapping of provider -> lines for the per-provider check.
+        detail = check.get("detail")
+        if isinstance(detail, dict):
+            for name in sorted(detail):
+                children.append(
+                    _node(f"provider: {name}", [_node(line) for line in detail[name]])
+                )
+        elif detail:
+            children.extend(_node(line) for line in detail)
         return _node(f"check: {check['name']} {tag(check['status'])}", children)
 
     nodes = [check_node(check) for check in report.get("checks", [])]
@@ -9930,10 +10714,21 @@ def _ctl_policy_preflight_text_lines(report: dict) -> list[str]:
     return _render_tree(_nested_report_node(report, _policy_check_nodes))
 
 
+def run_gates_dir(run_dir: Path) -> Path:
+    """The run's GATES dir — a top-level sibling of artifacts/ and logs/.
+
+    Holds the verdicts that decide whether the run may proceed (cfg validation,
+    target-cfg validation, ctl-policy, execution-identity preflight), kept apart
+    from artifacts/ (what the run PRODUCES) and logs/ (what it SAID). Published
+    with the run record (RUN_RECORD_MEMBERS).
+    """
+    return Path(run_dir) / "gates"
+
+
 def write_ctl_policy_preflight_artifacts(
-    artifacts_dir: Path, report: dict
+    gates_dir: Path, report: dict
 ) -> None:
-    text_path = artifacts_dir / "ctl_policy_validation.txt"
+    text_path = Path(gates_dir) / "ctl_policy_validation.txt"
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text(
         "\n".join(_ctl_policy_preflight_text_lines(report)) + "\n",
@@ -10015,8 +10810,8 @@ def _cfg_validation_text_lines(report: dict) -> list[str]:
     return _render_tree(root)
 
 
-def write_cfg_validation_artifacts(artifacts_dir: Path, report: dict) -> None:
-    text_path = artifacts_dir / "cfg_validation.txt"
+def write_cfg_validation_artifacts(gates_dir: Path, report: dict) -> None:
+    text_path = Path(gates_dir) / "cfg_validation.txt"
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text(
         "\n".join(_cfg_validation_text_lines(report)) + "\n", encoding="utf-8"
@@ -10052,33 +10847,14 @@ def collect_target_consumed_axes(
         except Exception:
             member_template = None
         consumed |= _template_param_axes(member_template)
-    identity_key = inventory_target.get("execution_identity_key")
-    identity_entry = (execution_identities or {}).get(identity_key)
-    # §Phase 33: groups may nest (one dispatch axis per level) — gather every
-    # level's selector axes while walking to the concrete identity.
-    seen: set = set()
-    while (
-        isinstance(identity_entry, dict)
-        and "members" in identity_entry
-        and identity_key not in seen
-    ):
-        seen.add(identity_key)
-        consumed |= _selector_param_axes(identity_entry.get("members"))
-        next_key = None
-        for member in identity_entry["members"]:
-            if isinstance(member, dict) and selector_matches(
-                member.get("selectors"), execution_context,
-                label=f"consumed-axes scan {identity_key}", structured_only=True,
-            ):
-                next_key = member.get("identity_key")
-                break
-        if not next_key:
-            identity_entry = None
-            break
-        identity_key = next_key
-        identity_entry = (execution_identities or {}).get(identity_key)
-    if isinstance(identity_entry, dict):
-        consumed |= _template_param_axes(identity_entry.get("account_key"))
+    # §Phase 53: the target declares its execution inline, so the only axis it can
+    # consume is the `account` template. The old walk over nested identity groups
+    # (one dispatch axis per level) is gone with the groups themselves; per-action
+    # variation is now `execution.roles`, keyed by authorization class, which
+    # consumes no params axis.
+    execution = inventory_target.get("execution_identity")
+    if isinstance(execution, dict):
+        consumed |= _template_param_axes(execution.get("account"))
     return consumed
 
 
@@ -10103,8 +10879,8 @@ def build_target_cfg_validation_report(
     selection: dict,
     *,
     implementation_key: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
     ctl_cfg_root: Path | None = None,
 ) -> dict:
     """Per-target cfg resolution requires every selected identity/account binding
@@ -10121,14 +10897,19 @@ def build_target_cfg_validation_report(
     results: list[dict] = []
     for target_key, (target_run_id, target_run) in by_key.items():
         try:
+            adapter_access_mode, adapter_options = provider_inputs(
+                target_run_provider(target_run),
+                execution_access_modes,
+                provider_options,
+            )
             result = provider_adapter.resolve_target_cfg_references(
                 target_run_id,
                 target_run,
                 catalogs,
                 execution_context=execution_context,
                 implementation_key=implementation_key,
-                execution_access_mode=execution_access_mode,
-                provider_credential=provider_credential,
+                execution_access_mode=adapter_access_mode,
+                provider_options=adapter_options,
             )
         except Exception as error:
             result = {
@@ -10208,8 +10989,8 @@ def _target_cfg_validation_text_lines(report: dict) -> list[str]:
     return _render_tree(_nested_report_node(report, _target_cfg_result_nodes))
 
 
-def write_target_cfg_validation_artifacts(artifacts_dir: Path, report: dict) -> None:
-    text_path = artifacts_dir / "target_cfg_validation.txt"
+def write_target_cfg_validation_artifacts(gates_dir: Path, report: dict) -> None:
+    text_path = Path(gates_dir) / "target_cfg_validation.txt"
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text(
         "\n".join(_target_cfg_validation_text_lines(report)) + "\n", encoding="utf-8"
@@ -10233,9 +11014,9 @@ def assert_target_cfg_validation_accepted(report: dict) -> None:
 
 
 def write_execution_identity_preflight_artifacts(
-    artifacts_dir: Path, report: dict
+    gates_dir: Path, report: dict
 ) -> None:
-    text_path = artifacts_dir / "execution_identity_preflight.txt"
+    text_path = Path(gates_dir) / "execution_identity_preflight.txt"
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text("\n".join(_preflight_text_lines(report)) + "\n", encoding="utf-8")
 
@@ -10284,10 +11065,10 @@ def build_selection_validation_reports(
     ctl_profile: str,
     ctl_ref_policy: str,
     execution_runtime_mode: str,
-    execution_access_mode: str,
-    provider_credential: str | None,
+    execution_access_modes: dict[str, str],
+    provider_options: dict[str, str] | None,
     implementation_key: str,
-    force_skip_execution_identity_preflight_check: bool,
+    force_skip_execution_identity_preflight_check: list[str],
     agreed_defer_ctl_state_backend_sync: bool,
     force_skip_ctl_state_backend_sync: bool,
 ) -> dict:
@@ -10305,8 +11086,8 @@ def build_selection_validation_reports(
         ctl_profile=ctl_profile,
         ctl_ref_policy=ctl_ref_policy,
         execution_runtime_mode=execution_runtime_mode,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
         force_skip_execution_identity_preflight_check=(
@@ -10322,16 +11103,16 @@ def build_selection_validation_reports(
         target_cfg_report = build_target_cfg_validation_report(
             selection,
             implementation_key=implementation_key,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
             ctl_cfg_root=ctl_cfg_root,
         )
         identity_report = build_execution_identity_preflight_report(
             selection,
             implementation_key=implementation_key,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
-            force_skip=force_skip_execution_identity_preflight_check,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
+            force_skip_providers=force_skip_execution_identity_preflight_check,
             ctl_cfg_root=ctl_cfg_root,
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
@@ -10371,16 +11152,18 @@ def resolve_and_preflight_execution_identities(
     require_target_ref: bool,
     provider_implementation_key: str,
     execution_runtime_mode: str,
-    provider_credential: str | None,
-    execution_access_mode: str,
+    provider_options: dict[str, str] | None,
+    execution_access_modes: dict[str, str],
     artifacts_dir: Path,
+    gates_dir: Path,
     target_name: str | None = None,
     step_sequence_run: dict | None = None,
     agreed_defer_ctl_state_backend_sync: bool = False,
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_full_cfg_validation_gate: bool = False,
-    force_skip_execution_identity_preflight_check: bool = False,
+    force_skip_execution_identity_preflight_check: list[str] | None = None,
+    providers: list[str] | tuple[str, ...] = (),
 ) -> tuple[dict, dict]:
     """Single-runner (workflow/target/step_sequence) preflight: the same four
     validation reports the fan-out produces, for this one selection."""
@@ -10395,8 +11178,8 @@ def resolve_and_preflight_execution_identities(
         target_repo_key=target_repo_key,
         require_target_ref=require_target_ref,
         execution_runtime_mode=execution_runtime_mode,
-        provider_credential=provider_credential,
-        execution_access_mode=execution_access_mode,
+        provider_options=provider_options,
+        execution_access_modes=execution_access_modes,
         target_name=target_name,
         step_sequence_run=step_sequence_run,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
@@ -10408,6 +11191,7 @@ def resolve_and_preflight_execution_identities(
         ),
         enforce_ctl_policy=False,
         load_provider_catalogs=False,
+        providers=providers,
     )
     cfg_report = build_cfg_validation_report(
         collect_provider_cfg_findings(ctl_cfg_root, selection["execution_context"])
@@ -10421,8 +11205,8 @@ def resolve_and_preflight_execution_identities(
         ctl_profile=ctl_profile,
         ctl_ref_policy=ctl_ref_policy,
         execution_runtime_mode=execution_runtime_mode,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         implementation_key=provider_implementation_key,
         force_skip_execution_identity_preflight_check=(
             force_skip_execution_identity_preflight_check
@@ -10430,10 +11214,10 @@ def resolve_and_preflight_execution_identities(
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
     )
-    write_cfg_validation_artifacts(artifacts_dir, cfg_report)
-    write_target_cfg_validation_artifacts(artifacts_dir, reports["target_cfg"])
-    write_ctl_policy_preflight_artifacts(artifacts_dir, reports["policy"])
-    write_execution_identity_preflight_artifacts(artifacts_dir, reports["identity"])
+    write_cfg_validation_artifacts(gates_dir, cfg_report)
+    write_target_cfg_validation_artifacts(gates_dir, reports["target_cfg"])
+    write_ctl_policy_preflight_artifacts(gates_dir, reports["policy"])
+    write_execution_identity_preflight_artifacts(gates_dir, reports["identity"])
     # Full cfg health is always rendered. The authorized force flag skips only
     # this aggregate gate; structural and selected-run validation still block.
     assert_full_cfg_validation_gate_accepted(cfg_report)
@@ -10463,7 +11247,7 @@ def run_pipeline(
     artifacts_dir: Path,
     plt_merged_dir: Path,
     log_file: Path,
-    provider_credential: str | None,
+    provider_options: dict[str, str] | None,
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
     target_name: str | None = None,
     step_sequence_run: dict | None = None,
@@ -10471,8 +11255,8 @@ def run_pipeline(
     force_skip_ctl_state_backend_sync: bool = False,
     force_skip_guardrails: bool = False,
     force_skip_full_cfg_validation_gate: bool = False,
-    execution_access_mode: str = "standard",
-    force_skip_execution_identity_preflight_check: bool = False,
+    execution_access_modes: dict[str, str] | None = None,
+    force_skip_execution_identity_preflight_check: list[str] | None = None,
     skip_committed_rerun: bool = False,
     parent_graph_provisions_ctl_state_backend: bool = False,
     parent_ctl_state_backend_absence_confirmed: bool = False,
@@ -10496,9 +11280,10 @@ def run_pipeline(
             require_target_ref=require_target_ref,
             provider_implementation_key=provider_implementation_key,
             execution_runtime_mode=execution_runtime_mode,
-            provider_credential=provider_credential,
-            execution_access_mode=execution_access_mode,
+            provider_options=provider_options,
+            execution_access_modes=execution_access_modes,
             artifacts_dir=artifacts_dir,
+            gates_dir=run_gates_dir(run_dir),
             target_name=target_name,
             step_sequence_run=step_sequence_run,
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
@@ -10536,13 +11321,16 @@ def run_pipeline(
     provider_catalogs = selection["provider_catalogs"]
 
     # Preserve the runtime binding contract after the live gate passes.
+    adapter_access_mode, adapter_options = provider_inputs(
+        run_provider(execution_context), execution_access_modes, provider_options
+    )
     provider_adapter.validate_active_target_access(
         active_target_runs,
         provider_catalogs,
         execution_context=execution_context,
         implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_mode=adapter_access_mode,
+        provider_options=adapter_options,
     )
 
     selected_graph_provisions_backend = parent_graph_provisions_ctl_state_backend
@@ -10552,8 +11340,8 @@ def run_pipeline(
             [selection],
             ctl_cfg_root,
             implementation_key=provider_implementation_key,
-            execution_access_mode=execution_access_mode,
-            provider_credential=provider_credential,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
         )
         selected_graph_provisions_backend = True
         backend_absence_confirmed = graph_probe["status"] == "absent"
@@ -10591,8 +11379,8 @@ def run_pipeline(
         provisions_ctl_state_backend=run_provisions_ctl_state_backend(workflow_cfg, inventory_cfg),
         selected_graph_provisions_ctl_state_backend=selected_graph_provisions_backend,
         backend_absence_confirmed=backend_absence_confirmed,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         provider_implementation_key=provider_implementation_key,
     )
     execution_context_path = write_execution_context_artifact(run_dir, execution_context)
@@ -10719,8 +11507,8 @@ def run_pipeline(
         provider_adapter=provider_adapter,
         provider_catalogs=provider_catalogs,
         provider_implementation_key=provider_implementation_key,
-        execution_access_mode=execution_access_mode,
-        provider_credential=provider_credential,
+        execution_access_modes=execution_access_modes,
+        provider_options=provider_options,
         execution_runtime_mode=execution_runtime_mode,
         skip_committed_rerun=skip_committed_rerun,
     )

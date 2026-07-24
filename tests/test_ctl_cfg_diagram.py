@@ -68,7 +68,7 @@ def make_cfg(root: Path) -> Path:
         "    provider: aws\n"
         "    backend_type: s3\n"
         "    bucket_name: example-env-ctl-state\n"
-        "    execution_identity_keys:\n      sync: sync-${execution_context.params.account}\n",
+        "    execution_identity:\n      account: ctl_plane\n      operations:\n        sync:\n          role: synchronizer\n",
     )
     return cfg
 

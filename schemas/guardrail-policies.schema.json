@@ -93,7 +93,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "pattern": "^execution_context\\.params\\.[A-Za-z_][A-Za-z0-9_]*$"
+            "pattern": "^execution_context\\.params\\.[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*$"
           }
         },
         "protected_paths": {

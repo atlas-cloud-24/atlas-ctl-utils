@@ -95,39 +95,26 @@ run_local_step() {
     -t "$step_name" \
     "$step_dir"
 
-  # Credential isolation: never mount the full host ~/.aws. Profile-based
-  # bindings mount ONLY the generated per-step config (plus the SSO token
-  # cache, which holds no profile definitions); role-chain bindings carry STS
-  # env credentials and need no mounts at all.
-  provider_binding_mount_args=()
-  if [ -n "${ATLAS_PROVIDER_BINDING_DIR:-}" ]; then
-    provider_binding_mount_args+=(-v "${ATLAS_PROVIDER_BINDING_DIR}:/mnt/provider_binding:ro")
-    provider_binding_mount_args+=(-e AWS_CONFIG_FILE=/mnt/provider_binding/config)
-    provider_binding_mount_args+=(-e AWS_SHARED_CREDENTIALS_FILE=/mnt/provider_binding/credentials)
-    if [ -d "$HOME/.aws/sso" ]; then
-      provider_binding_mount_args+=(-v "$HOME/.aws/sso:/root/.aws/sso:ro")
-    fi
-  fi
+  # Credential isolation: nothing from the host ~/.aws is ever mounted. Every
+  # access path (role chain, direct, bypass) is resolved on the HOST to plain
+  # session credentials and enters the box as env vars only.
 
   docker run --rm --name "$step_name" \
     --entrypoint sh \
     -v "$PWD:/mnt/source:ro" \
     -v "$(realpath "$origin_cfg_base_dir_path"):/mnt/origin_cfg:ro" \
     -v "$step_utils_dir_host:/mnt/step_utils:ro" \
-    "${provider_binding_mount_args[@]}" \
     -e ATLAS_EXECUTION_CONTEXT_FILE \
     -e ATLAS_STEP_UTILS_DIR=/mnt/step_utils \
     -e step_dir="$step_dir" \
     -e cfg_files \
     -e STEP_WRITE_VALUES_JSON \
     -e STEP_WRITE_ENV_SH \
-    -e AWS_PROFILE="${AWS_PROFILE:-}" \
     -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
     -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
     -e AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
     -e ATLAS_AWS_ASSERT_ACCESS \
     -e ATLAS_AWS_PROFILE_ONLY_ACCESS \
-    -e ATLAS_AWS_ROLE_CHAIN \
     -e ATLAS_EXECUTION_IDENTITY_KEY \
     -e ATLAS_AWS_ACCOUNT_KEY \
     -e ATLAS_AWS_CREDENTIAL_SOURCE_KEY \

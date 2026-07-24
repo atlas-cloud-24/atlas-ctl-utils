@@ -182,7 +182,7 @@ class Phase50FinalizeStatusArgsTests(unittest.TestCase):
             execution_param=[("provider", "aws"), ("landing_zone", "live")],
             all=False, target=None, workflow=None, fan_out=None,
             action=None, scope="local", ctl_state_local_root="/tmp/x",
-            provider_credential=None, write_cache=False,
+            provider_options={}, write_cache=False,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -191,9 +191,14 @@ class Phase50FinalizeStatusArgsTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             common.finalize_status_args(self._ns(all=True, ctl_state_local_root=None))
 
-    def test_local_rejects_provider_credential(self):
+    def test_local_rejects_provider_options(self):
         with self.assertRaises(RuntimeError):
-            common.finalize_status_args(self._ns(all=True, provider_credential="prof"))
+            common.finalize_status_args(
+                self._ns(
+                    all=True,
+                    provider_options={"aws.force_bypass_credential_profile": "prof"},
+                )
+            )
 
     def test_remote_rejects_local_root(self):
         with self.assertRaises(RuntimeError):
@@ -201,20 +206,29 @@ class Phase50FinalizeStatusArgsTests(unittest.TestCase):
                 self._ns(all=True, scope="remote", ctl_state_local_root="/tmp/x")
             )
 
-    def test_remote_default_is_standard_chain(self):
-        args = self._ns(all=True, scope="remote", ctl_state_local_root=None)
-        common.finalize_status_args(args)
-        self.assertEqual(args.execution_access_mode, "standard")
-        self.assertIsNone(args.provider_credential)
-
-    def test_remote_provider_credential_maps_to_force_bypass(self):
+    def test_remote_default_is_the_providers_normal_mode(self):
         args = self._ns(
             all=True, scope="remote", ctl_state_local_root=None,
-            provider_credential="dev-profile",
+            provider_options={"aws.credential_implementation": "profile"},
         )
         common.finalize_status_args(args)
-        self.assertEqual(args.execution_access_mode, "force_bypass")
-        self.assertEqual(args.provider_credential, "dev-profile")
+        self.assertEqual(args.providers, ["aws"])
+        self.assertEqual(args.execution_access_modes, {"aws": "standard"})
+
+    def test_remote_substitute_credential_option_implies_its_mode(self):
+        args = self._ns(
+            all=True, scope="remote", ctl_state_local_root=None,
+            provider_options={
+                "aws.credential_implementation": "profile",
+                "aws.force_bypass_credential_profile": "dev-profile",
+            },
+        )
+        common.finalize_status_args(args)
+        self.assertEqual(args.execution_access_modes, {"aws": "force_bypass"})
+        self.assertEqual(
+            args.provider_options["aws.force_bypass_credential_profile"],
+            "dev-profile",
+        )
 
     def test_targeted_requires_action(self):
         with self.assertRaises(RuntimeError):
@@ -251,7 +265,7 @@ class Phase50WriteCacheTests(unittest.TestCase):
                 execution_param=[("provider", "aws"), ("landing_zone", "live")],
                 all=True, target=None, workflow=None, fan_out=None,
                 action=None, scope="local", ctl_state_local_root=str(root),
-                provider_credential=None, write_cache=True, ctl_profile="local_dev",
+                provider_options={}, write_cache=True, ctl_profile="local_dev",
             )
             common.finalize_status_args(args)
             with unittest.mock.patch.object(
@@ -282,7 +296,7 @@ class Phase50WriteCacheTests(unittest.TestCase):
                 execution_param=[("provider", "aws"), ("landing_zone", "live")],
                 all=True, target=None, workflow=None, fan_out=None,
                 action=None, scope="local", ctl_state_local_root=str(root),
-                provider_credential=None, write_cache=False, ctl_profile="local_dev",
+                provider_options={}, write_cache=False, ctl_profile="local_dev",
             )
             common.finalize_status_args(args)
             with unittest.mock.patch.object(

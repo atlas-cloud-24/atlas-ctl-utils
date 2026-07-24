@@ -21,10 +21,12 @@ BACKENDS = (
     "    backend_type: s3\n"
     "    bucket_name: oxygen-live-ctl-state\n"
     "    bucket_region: eu-west-2\n"
-    "    execution_identity_keys:\n"
-    "      read: ctl_state_reader\n"
-    "      sync: ctl_state_synchronizer\n"
-    "      maintenance: ctl_state_maintainer\n"
+    "    execution_identity:\n"
+    "      account: ctl_plane\n"
+    "      operations:\n"
+    "        read:\n          role: reader\n"
+    "        sync:\n          role: synchronizer\n"
+    "        maintenance:\n          role: maintainer\n"
     "  canary:\n"
     "    selectors:\n"
     "      match:\n"
@@ -53,7 +55,7 @@ class NamespaceResolverTests(unittest.TestCase):
             key, backend = common.resolve_ctl_state_namespace(root, ctx(landing_zone="live"))
             self.assertEqual(key, "live")
             self.assertEqual(backend["bucket_name"], "oxygen-live-ctl-state")
-            self.assertEqual(backend["execution_identity_keys"]["sync"], "ctl_state_synchronizer")
+            self.assertEqual(backend["execution_identity"]["operations"]["sync"]["role"], "synchronizer")
 
     def test_zero_matches_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:

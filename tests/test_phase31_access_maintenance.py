@@ -99,6 +99,7 @@ class AccountRegistryTests(unittest.TestCase):
         with temporary:
             context = {
                 "execution_context.params.provider": "aws",
+                "execution_context.ctl.providers": ["aws"],
                 "execution_context.params.landing_zone": "live",
             }
             catalogs = aws.load_runtime_catalogs(root, execution_context=context)
@@ -106,21 +107,23 @@ class AccountRegistryTests(unittest.TestCase):
                 catalogs["account_registry"]["management"],
                 "<live-management-account-id>",
             )
-            catalogs["execution_identities"] = {
+            executions = {
                 "dev_direct": {
                     "provider": "aws",
-                    "account_key": "dev",
-                    "direct_credential_source_key": "dev",
+                    "account": "dev",
+                    "roles": {"readwrite": "ctl_target"},
+                    "agreed_direct_credential_source_keys": ["dev"],
                 },
                 "management_direct": {
                     "provider": "aws",
-                    "account_key": "management",
-                    "direct_credential_source_key": "management",
+                    "account": "management",
+                    "roles": {"readwrite": "ctl_target"},
+                    "agreed_direct_credential_source_keys": ["management"],
                 },
             }
             catalogs["credential_sources"] = {
                 key: {
-                    "local": {
+                    "profile": {
                         "profile_name": key,
                         "expect": {"account_key": account_key, "role_name": "Admin"},
                     }
@@ -133,20 +136,20 @@ class AccountRegistryTests(unittest.TestCase):
 
             dev_cfg_result = aws.resolve_target_cfg_references(
                 "dev",
-                {"execution_identity_key": "dev_direct"},
+                {"execution_identity": executions["dev_direct"]},
                 catalogs,
                 execution_context=context,
-                implementation_key="local",
+                implementation_key="profile",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(dev_cfg_result["status"], "passed")
 
             management_cfg_result = aws.resolve_target_cfg_references(
                 "management",
-                {"execution_identity_key": "management_direct"},
+                {"execution_identity": executions["management_direct"]},
                 catalogs,
                 execution_context=context,
-                implementation_key="local",
+                implementation_key="profile",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(management_cfg_result["status"], "failed")
@@ -161,10 +164,10 @@ class AccountRegistryTests(unittest.TestCase):
                 return_value="111111111111",
             ):
                 aws.validate_active_target_access(
-                    {"dev": {"execution_identity_key": "dev_direct"}},
+                    {"dev": {"execution_identity": executions["dev_direct"]}},
                     catalogs,
                     execution_context=context,
-                    implementation_key="local",
+                    implementation_key="profile",
                     execution_access_mode="agreed_direct",
                 )
             self.assertEqual(
@@ -179,12 +182,12 @@ class AccountRegistryTests(unittest.TestCase):
                 aws.validate_active_target_access(
                     {
                         "management": {
-                            "execution_identity_key": "management_direct"
+                            "execution_identity": executions["management_direct"]
                         }
                     },
                     catalogs,
                     execution_context=context,
-                    implementation_key="local",
+                    implementation_key="profile",
                     execution_access_mode="agreed_direct",
                 )
 
@@ -392,8 +395,8 @@ class HistoryPruneTests(unittest.TestCase):
             execution_params={},
             execution_runtime_mode="local",
             ctl_state_local_root=root,
-            execution_access_mode="standard",
-            provider_credential=None,
+            execution_access_modes={"aws": "standard"},
+            provider_options={},
             prune_run_id=[run_id],
             prune_before=None,
             prune_kind=None,

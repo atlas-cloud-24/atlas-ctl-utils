@@ -69,8 +69,8 @@ def _status_args(local_root: Path, scope: str) -> argparse.Namespace:
         execution_params={"account": "dev"},
         execution_runtime_mode="local",
         force_skip_full_cfg_validation_gate=False,
-        execution_access_mode="standard",
-        provider_credential=None,
+        execution_access_modes={"aws": "standard"},
+        provider_options={},
         ctl_ref_policy="commit_required",
         ctl_state_local_root=local_root,
     )
