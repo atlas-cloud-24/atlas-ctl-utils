@@ -1675,9 +1675,20 @@ def build_active_target_runs(
             "branch": branch,
             "commit": commit,
             "step_sequence": child_step_sequence,
+            "cfg_file_set": target_cfg.get("cfg_file_set"),
             "cfg_root": normalize_cfg_root(target_cfg.get("cfg_root", "/"), target_key=target_key),
             "cfg_files": cfg_files,
         }
+        required_overlays = target_cfg.get("requires_plt_overlays")
+        if required_overlays:
+            active_target_run["requires_plt_overlays"] = list(required_overlays)
+        for behavior_field in (
+            "provisions_ctl_state_backend",
+            "allow_agreed_defer_ctl_state_backend_sync",
+            *sorted(target_consent_opt_in_fields()),
+        ):
+            if target_cfg.get(behavior_field) is not None:
+                active_target_run[behavior_field] = target_cfg[behavior_field]
 
         target_execution_identity = target_override.get("execution_identity") or target_cfg.get("execution_identity")
         if target_execution_identity is not None:
@@ -2811,7 +2822,7 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             "omit only with --status or --execution-identity-preflight-check-only): "
             "when true, reuse a workflow child's committed result (skip re-running "
             "it) only when its committed target instance is current, commit-pinned, "
-            "clean, and matches the current source/cfg commits; when false, always re-run",
+            "clean, and matches the current source/cfg commits and effective target definition/cfg view; when false, always re-run",
         )
     # 6) --agreed-* / --force-* overrides
     override_group.add_argument(
@@ -3513,6 +3524,7 @@ def load_inventory_cfg(
             "source": source,
             "ref": target_ref.strip(),
             "step_sequence": step_sequence,
+            "cfg_file_set": cfg_file_set_name,
             "cfg_root": cfg_file_set.get("cfg_root", "/"),
             "cfg_files": [
                 *(
@@ -3605,6 +3617,16 @@ def load_inventory_cfg(
                 raise RuntimeError(
                     f"❌ target {target_name!r} required_plt_overlay_keys must be "
                     "a list of non-empty strings"
+                )
+            duplicate_overlay_keys = [
+                key
+                for key, count in collections.Counter(overlay_keys).items()
+                if count > 1
+            ]
+            if duplicate_overlay_keys:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} required_plt_overlay_keys must be unique; "
+                    f"duplicates: {', '.join(sorted(duplicate_overlay_keys))}"
                 )
             resolved["requires_plt_overlays"] = overlay_keys
         resolved_targets[target_name] = resolved
@@ -4109,6 +4131,7 @@ COMMITTED_POINTER_NAME = "committed.yaml"
 _COMMITTED_FACT_KEYS = (
     "child_revisions", "source_commit", "cfg_source_commit",
     "source_state", "ref_policy", "workflow_definition_sha256",
+    "target_definition_sha256", "target_cfg_view_sha256",
 )
 
 
@@ -5667,6 +5690,177 @@ def copy_cfg_root_without_overlay_catalog(plt_cfg_root: Path, dest_root: Path) -
     shutil.copytree(cfg_root, dest_root, ignore=ignore)
 
 
+def canonical_sha256(value: object) -> str:
+    """Hash a JSON-compatible value with stable mapping-key ordering."""
+    canonical = json.dumps(
+        value, separators=(",", ":"), sort_keys=True, default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def target_definition_document(target_run: dict) -> dict:
+    """Return the stable, resolved target definition used for execution."""
+    stable_keys = (
+        "target",
+        "source",
+        "ref",
+        "branch",
+        "commit",
+        "step_sequence",
+        "cfg_file_set",
+        "cfg_root",
+        "cfg_files",
+        "target_instance_params",
+        "requires_plt_overlays",
+        "execution_identity",
+        "provisions_ctl_state_backend",
+        "allow_agreed_defer_ctl_state_backend_sync",
+        *sorted(target_consent_opt_in_fields()),
+    )
+    definition = {
+        key: target_run[key]
+        for key in stable_keys
+        if target_run.get(key) is not None
+    }
+    modules = {}
+    for module_name, module in (target_run.get("modules") or {}).items():
+        stable_module = {
+            key: module[key]
+            for key in ("dest", "branch", "commit")
+            if module.get(key) is not None
+        }
+        modules[module_name] = stable_module
+    if modules:
+        definition["modules"] = modules
+    return definition
+
+
+def attach_target_definition_facts(active_target_runs: dict) -> None:
+    for target_run in active_target_runs.values():
+        definition = target_definition_document(target_run)
+        target_run["target_definition"] = definition
+        target_run["target_definition_sha256"] = canonical_sha256(definition)
+
+
+def directory_content_sha256(path: Path) -> str:
+    """Hash a directory view from sorted relative paths and exact file bytes."""
+    digest = hashlib.sha256()
+    files = (
+        sorted(item for item in Path(path).rglob("*") if item.is_file())
+        if Path(path).is_dir()
+        else []
+    )
+    for item in files:
+        relative = item.relative_to(path).as_posix().encode("utf-8")
+        content = item.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def attach_target_cfg_view_facts(
+    active_target_runs: dict, plt_targets_dir: Path
+) -> None:
+    for target_run_id, target_run in active_target_runs.items():
+        target_run["target_cfg_view_sha256"] = directory_content_sha256(
+            Path(plt_targets_dir) / target_run_id / "input"
+        )
+
+
+def finalize_target_cfg_view_facts(
+    active_target_runs: dict,
+    plt_targets_dir: Path,
+    pipeline_run_cfg_path: Path,
+) -> None:
+    """Attach cfg-view hashes and refresh the resolved target-run artifact."""
+    attach_target_cfg_view_facts(active_target_runs, plt_targets_dir)
+    pipeline_cfg = load_yaml(pipeline_run_cfg_path) or {}
+    pipeline_cfg["target_runs"] = active_target_runs
+    write_yaml_file(pipeline_run_cfg_path, pipeline_cfg)
+
+
+def _overlay_leaf_values(overlay: dict) -> dict:
+    return _scope_final_yaml_leaves(
+        {"source_dirs": [str(overlay["root"])]},
+        skip_filenames=SCOPE_META_SKIP_FILENAMES,
+    )
+
+
+def resolve_run_plt_overlays(
+    plt_cfg_root: Path,
+    explicit_overlays: list[str],
+    active_target_runs: dict,
+    *,
+    execution_context: dict[str, object],
+) -> list[str]:
+    """Append target-required overlays in target order and validate conflicts."""
+    duplicates = [
+        item
+        for item, count in collections.Counter(explicit_overlays).items()
+        if count > 1
+    ]
+    if duplicates:
+        raise RuntimeError(
+            "plt overlays must be unique; duplicates: " + ", ".join(sorted(duplicates))
+        )
+
+    final_overlays = list(explicit_overlays)
+    automatically_appended: list[str] = []
+    for target_run in active_target_runs.values():
+        for overlay_name in target_run.get("requires_plt_overlays") or []:
+            if overlay_name not in final_overlays:
+                final_overlays.append(overlay_name)
+                automatically_appended.append(overlay_name)
+
+    if not final_overlays:
+        return []
+
+    candidates = discover_overlay_candidates(
+        plt_cfg_root, execution_context=execution_context
+    )
+    for overlay_name in final_overlays:
+        overlay = candidates.get(overlay_name)
+        if overlay is None:
+            available = ", ".join(sorted(candidates)) or "none"
+            raise RuntimeError(
+                f"Unknown plt overlay {overlay_name!r}; available overlays: {available}"
+            )
+        if not overlay["matches"]:
+            raise RuntimeError(
+                f"plt overlay {overlay_name!r} is not allowed for this execution context; "
+                f"selectors={overlay['selectors']}"
+            )
+
+    leaf_cache: dict[str, dict] = {}
+    for overlay_name in automatically_appended:
+        overlay_index = final_overlays.index(overlay_name)
+        current_leaves = leaf_cache.setdefault(
+            overlay_name, _overlay_leaf_values(candidates[overlay_name])
+        )
+        for previous_name in final_overlays[:overlay_index]:
+            previous_leaves = leaf_cache.setdefault(
+                previous_name, _overlay_leaf_values(candidates[previous_name])
+            )
+            conflicts = sorted(
+                leaf_key
+                for leaf_key in current_leaves.keys() & previous_leaves.keys()
+                if current_leaves[leaf_key] != previous_leaves[leaf_key]
+            )
+            if conflicts:
+                rel_path, yaml_path = conflicts[0]
+                rendered_path = ".".join(str(part) for part in yaml_path) or "<root>"
+                raise RuntimeError(
+                    f"Automatically required plt overlay {overlay_name!r} conflicts with "
+                    f"selected overlay {previous_name!r} at {rel_path}:{rendered_path}; "
+                    "supply the complete ordered overlay list explicitly with --plt-overlays "
+                    "to acknowledge precedence"
+                )
+
+    return final_overlays
+
+
 def apply_selected_overlays_to_cfg_root(
     plt_cfg_root: Path,
     effective_cfg_root: Path,
@@ -5830,12 +6024,12 @@ def prepare_pipeline_cfg(
     require_commit_refs: bool = False,
     refs: dict | None = None,
     active_target_runs: dict | None = None,
-) -> tuple[dict, Path]:
+) -> tuple[dict, Path, list[str]]:
     """
     Merge config dirs, build active target_runs, and write pipeline_run_cfg.
 
     Returns:
-        tuple: (active_target_runs, pipeline_run_cfg_path)
+        tuple: (active_target_runs, pipeline_run_cfg_path, final_plt_overlays)
     """
     source_log_roots = (plt_cfg_root.resolve(),)
     dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
@@ -5853,11 +6047,21 @@ def prepare_pipeline_cfg(
             require_commit_refs=require_commit_refs,
         )
 
+    final_plt_overlays = resolve_run_plt_overlays(
+        plt_cfg_root,
+        plt_overlays,
+        active_target_runs,
+        execution_context=execution_context or {},
+    )
+    for target_run in active_target_runs.values():
+        target_run["plt_overlays"] = list(final_plt_overlays)
+    attach_target_definition_facts(active_target_runs)
+
     merged_files = merge_plt_cfg_dirs(
         plt_cfg_root=plt_cfg_root,
         plt_merged_dir=plt_merged_dir,
         ctl_profile=ctl_profile,
-        plt_overlays=plt_overlays,
+        plt_overlays=final_plt_overlays,
         scope_params=scope_params,
         execution_context=execution_context,
         source_log_roots=source_log_roots,
@@ -5880,7 +6084,7 @@ def prepare_pipeline_cfg(
     with pipeline_run_cfg_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(pipeline_run_cfg, f, sort_keys=False)
 
-    return active_target_runs, pipeline_run_cfg_path
+    return active_target_runs, pipeline_run_cfg_path, final_plt_overlays
 
 
 def write_target_run_flow_artifact(path: Path, workflow_meta: dict | None, active_target_runs: dict) -> None:
@@ -6835,6 +7039,14 @@ def selection_state_spec(selection: dict) -> dict:
             {
                 "kind": "target",
                 "key": target_key,
+                "target_definition_sha256": canonical_sha256(
+                    target_definition_document(target_run)
+                ),
+                **(
+                    {"target_cfg_view_sha256": target_run["target_cfg_view_sha256"]}
+                    if target_run.get("target_cfg_view_sha256") is not None
+                    else {}
+                ),
                 "segments": segments,
                 "address": target_instance_address(target_key, segments),
                 "prefix": compose_state_relpath(
@@ -6907,6 +7119,16 @@ def compute_target_instance_status(
     instance_dir = namespace_root / spec["prefix"]
     pointer = read_committed_pointer(instance_dir)
     verdict, reasons = _committed_pointer_verdict(pointer)
+    if pointer is not None:
+        for fact_key, reason in (
+            ("target_definition_sha256", "target definition changed"),
+            ("target_cfg_view_sha256", "target cfg view changed"),
+        ):
+            expected = spec.get(fact_key)
+            if expected is not None and pointer.get(fact_key) != expected:
+                reasons.append(reason)
+        if reasons and verdict == "current":
+            verdict = "outdated"
     lifecycle_candidates: list[tuple[str, str, dict]] = []
     for lifecycle_action in ("provision", "destroy"):
         candidate_dir = namespace_root / compose_state_relpath(
@@ -8548,7 +8770,14 @@ def committed_target_revision_if_skippable(
         return None
     source_commit = target_run.get("source_commit")
     cfg_source_commit = target_run.get("cfg_source_commit")
-    if not source_commit or not cfg_source_commit:
+    target_definition_sha256 = target_run.get("target_definition_sha256")
+    target_cfg_view_sha256 = target_run.get("target_cfg_view_sha256")
+    if not all((
+        source_commit,
+        cfg_source_commit,
+        target_definition_sha256,
+        target_cfg_view_sha256,
+    )):
         return None
     instance_dir, address = target_instance_dir_for_run(
         parent_run_dir, target_run, execution_context
@@ -8561,6 +8790,8 @@ def committed_target_revision_if_skippable(
         "cfg_source_commit": cfg_source_commit,
         "source_state": "clean",
         "ref_policy": "commit_required",
+        "target_definition_sha256": target_definition_sha256,
+        "target_cfg_view_sha256": target_cfg_view_sha256,
     }
     if any(pointer.get(key) != value for key, value in expected.items()):
         return None
@@ -8639,7 +8870,8 @@ def begin_workflow_target_run(
             **{
                 key: target_run[key]
                 for key in (
-                    "source_commit", "cfg_source_commit", "source_state", "ref_policy"
+                    "source_commit", "cfg_source_commit", "source_state", "ref_policy",
+                    "plt_overlays", "target_definition_sha256", "target_cfg_view_sha256"
                 )
                 if target_run.get(key) is not None
             },
@@ -8707,6 +8939,10 @@ def populate_workflow_child_slice(
         src = plt_targets_dir_path / target_run_id / view
         if src.is_dir():
             shutil.copytree(src, cfg_dst / view, dirs_exist_ok=True)
+    if target_run.get("target_definition") is not None:
+        write_yaml_file(
+            cfg_dst / "target_definition.yaml", target_run["target_definition"]
+        )
     source_refs = {
         key: target_run[key]
         for key in ("source", "ref", "branch", "commit", "step_sequence")
@@ -9009,7 +9245,7 @@ def run_maintenance(
     }
     validate_workflow_target_selectors(workflow_cfg, inventory_cfg, execution_context)
 
-    active_target_runs, pipeline_run_cfg_path = prepare_pipeline_cfg(
+    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
@@ -9024,6 +9260,7 @@ def run_maintenance(
         require_commit_refs=require_commit_refs,
         refs=refs,
     )
+    update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
     record_run_target_keys(run_dir, target_keys_from_active_target_runs(active_target_runs))
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
     verify_guardrails(
@@ -9057,6 +9294,9 @@ def run_maintenance(
         pipeline_run_cfg_path,
         plt_rendered_dir,
         run_dir,
+    )
+    finalize_target_cfg_view_facts(
+        active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
     )
 
     os.chdir(run_dir)
@@ -11394,7 +11634,7 @@ def run_pipeline(
     logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
 
     # Prepare pipeline config
-    active_target_runs, pipeline_run_cfg_path = prepare_pipeline_cfg(
+    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = prepare_pipeline_cfg(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
@@ -11410,6 +11650,7 @@ def run_pipeline(
         refs=refs,
         active_target_runs=active_target_runs,
     )
+    update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
     # Single derivation chain: render the merged tree, then verify guards
     # against rendered values, then distribute target_run input views from it.
     plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
@@ -11443,7 +11684,7 @@ def run_pipeline(
         inventory_name=inventory_name,
         workflow_name=workflow_name,
         ctl_variants=ctl_variants,
-        plt_overlays=plt_overlays,
+        plt_overlays=final_plt_overlays,
         target_repo_key=target_repo_key,
         require_target_ref=require_target_ref,
         require_commit_refs=require_commit_refs,
@@ -11470,6 +11711,26 @@ def run_pipeline(
     plt_targets_dir_path = run_cfg_distribution(
         pipeline_run_cfg_path, plt_rendered_dir, run_dir
     )
+    finalize_target_cfg_view_facts(
+        active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
+    )
+    if load_run_metadata(run_dir).get("run_type") == "target":
+        only_target = next(iter(active_target_runs.values()), None)
+        if only_target and only_target.get("target_definition") is not None:
+            write_yaml_file(
+                run_dir / "cfg" / "target_definition.yaml",
+                only_target["target_definition"],
+            )
+        if only_target:
+            update_run_metadata(
+                run_dir,
+                {
+                    key: only_target[key]
+                    for key in (
+                        "target_definition_sha256", "target_cfg_view_sha256"
+                    )
+                },
+            )
     # Prepared snapshot: cfg layers + run-level metadata are immutable from here.
     ctl_state_push("preparation complete")
 
