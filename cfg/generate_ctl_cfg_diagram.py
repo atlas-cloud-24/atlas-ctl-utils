@@ -151,6 +151,38 @@ def selected_actions(
     return requested
 
 
+def workflow_target_keys(
+    workflow_cfg: dict,
+    *,
+    action: str,
+    workflow_key: str,
+) -> list[str]:
+    """Resolve an action-specific workflow target list."""
+    target_keys = workflow_cfg.get("target_keys") or []
+    if isinstance(target_keys, list):
+        return target_keys
+    if not common.selector_group_is_group(target_keys):
+        raise RuntimeError(
+            f"workflows.{action}.{workflow_key}.target_keys must be a list or "
+            "a members-shaped declaration"
+        )
+    execution_context = {
+        "execution_context.ctl.action": action,
+    }
+    resolved = common.resolve_list_members(
+        target_keys,
+        execution_context,
+        value_field="target_keys",
+        label=f"workflow {workflow_key!r} target_keys",
+    )
+    if resolved is None:
+        raise RuntimeError(
+            f"workflows.{action}.{workflow_key}.target_keys cannot be resolved "
+            f"for action {action!r}"
+        )
+    return resolved
+
+
 def build_diagram(
     ctl_cfg_root: Path,
     *,
@@ -278,7 +310,9 @@ def build_diagram(
                 edges.add(
                     Edge(source_id, node_id("workflow", f"{action}:{imported}"), "imports")
                 )
-            for target_key in workflow_cfg.get("target_keys") or []:
+            for target_key in workflow_target_keys(
+                workflow_cfg, action=action, workflow_key=workflow_key
+            ):
                 if target_key not in action_targets:
                     raise RuntimeError(
                         f"workflows.{action}.{workflow_key}.target_keys references missing key {target_key!r}"

@@ -223,6 +223,45 @@ class CtlCfgDiagramTests(unittest.TestCase):
                     view="sources",
                 )
 
+    def test_workflow_target_members_are_resolved_by_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_cfg(Path(tmp))
+            write(
+                cfg / "not-workflows.yaml",
+                """workflows:
+  deploy:
+    actions: [plan, provision]
+    target_keys:
+      members:
+      - selectors:
+          match:
+            execution_context.ctl.action: provision
+        target_keys: [app]
+      - selectors:
+          match:
+            execution_context.ctl.action: plan
+        target_keys: [inspect-app]
+""",
+            )
+            write(
+                cfg / "plan-target.yaml",
+                """targets:
+  inspect-app:
+    actions: [plan]
+    source_key: app-source
+""",
+            )
+
+            provision = diagram.build_diagram(
+                cfg, action="provision", view="general"
+            )
+            plan = diagram.build_diagram(cfg, action="plan", view="general")
+
+            self.assertIn("provision<br/>app", provision)
+            self.assertNotIn("inspect-app", provision)
+            self.assertIn("plan<br/>inspect-app", plan)
+            self.assertNotIn("provision<br/>app", plan)
+
     def test_action_filter_keeps_only_selected_workflows_and_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_cfg(Path(tmp))
