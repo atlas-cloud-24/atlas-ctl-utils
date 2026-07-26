@@ -5166,6 +5166,30 @@ def build_execution_context(
 
     for key, value in staged_cli.items():
         put("params", key, value, label=f"--execution-params {key}")
+
+    # Provider-DERIVED params. A fact that is a property of a declared param
+    # (not an independent choice) is resolved by the adapter that owns it,
+    # instead of being restated at every call site. The engine names no key: it
+    # hands each participating adapter the declared params and namespaces
+    # whatever it returns. Derived facts never override a declared one.
+    declared = {
+        ref[len(f"{EXECUTION_CONTEXT_ROOT}.params."):]: value
+        for ref, value in context.items()
+        if ref.startswith(f"{EXECUTION_CONTEXT_ROOT}.params.")
+    }
+    for provider in providers or ():
+        adapter = get_provider_adapter(provider)
+        derive = getattr(adapter, "derived_params", None)
+        if derive is None:
+            continue
+        for key, value in (derive(ctl_cfg_root, dict(declared)) or {}).items():
+            label = f"provider {provider!r} derived param {key}"
+            if key in declared:
+                raise RuntimeError(
+                    f"❌ {label} collides with a declared execution param; "
+                    "a derived fact must not be passed explicitly"
+                )
+            put("params", key, value, label=label)
     return context
 
 
@@ -10095,6 +10119,27 @@ def expand_fan_out(
         kind = "workflow" if workflow_key else "target"
         key = workflow_key or target_key
         param_set_key = run.get("fan_out_param_set_key")
+        # §Phase 59: `extra_params` adds the SAME param to every member of the
+        # referenced set, so one account list can serve several domains instead
+        # of being copied per domain. Additive only — a key already declared by
+        # a member is a hard error, never a silent override.
+        extra_params = run.get("extra_params")
+        if extra_params is not None:
+            run_label = f"fan-out {fan_out_key!r} run[{i}] extra_params"
+            if not isinstance(extra_params, dict) or not extra_params:
+                raise RuntimeError(f"❌ {run_label} must be a non-empty map")
+            if param_set_key is None:
+                raise RuntimeError(
+                    f"❌ {run_label} requires fan_out_param_set_key "
+                    "(there are no members to add the params to)"
+                )
+            for extra_key, extra_value in extra_params.items():
+                if not isinstance(extra_key, str) or not CONTEXT_KEY_RE.fullmatch(extra_key):
+                    raise RuntimeError(f"❌ {run_label}: key {extra_key!r} must be a valid identifier")
+                if isinstance(extra_value, (dict, list)):
+                    raise RuntimeError(f"❌ {run_label}.{extra_key} must be a scalar")
+            if "domain" in extra_params:
+                validate_domain_value(domains, extra_params["domain"], label=run_label)
         if param_set_key is None:
             children.append(
                 {
@@ -10131,6 +10176,14 @@ def expand_fan_out(
                 raise RuntimeError(f"❌ {member_label}: selectors must be a member field, not a param")
             if "domain" in params:
                 validate_domain_value(domains, params["domain"], label=member_label)
+            if extra_params:
+                collisions = sorted(set(params) & set(extra_params))
+                if collisions:
+                    raise RuntimeError(
+                        f"❌ {member_label} already declares {collisions} also set by "
+                        f"fan-out {fan_out_key!r} run[{i}] extra_params; define each param "
+                        "in one place"
+                    )
             if not selector_matches(
                 member.get("selectors"), execution_context,
                 label=member_label, structured_only=True,
@@ -10140,8 +10193,15 @@ def expand_fan_out(
                 {
                     "kind": kind,
                     "key": key,
-                    "params": dict(params),
-                    "label": f"{key}[{entry_name}]",
+                    "params": {**params, **(extra_params or {})},
+                    # One param set may serve several runs of the same
+                    # workflow (each pinned by different extra_params), so the
+                    # member name alone no longer identifies a child.
+                    "label": (
+                        f"{key}[{'+'.join(str(v) for v in extra_params.values())}:{entry_name}]"
+                        if extra_params
+                        else f"{key}[{entry_name}]"
+                    ),
                     "fan_out_param_set_key": param_set_key,
                     "fan_out_param_entry_key": entry_name,
                 }

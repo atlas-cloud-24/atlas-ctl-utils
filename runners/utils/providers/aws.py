@@ -128,6 +128,59 @@ def load_aws_credential_sources_cfg(ctl_cfg_root: Path) -> dict:
     return credential_sources
 
 
+ACCOUNT_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def load_aws_account_slugs(ctl_cfg_root: Path) -> dict[str, str]:
+    """account_key -> AWS-FACING spelling.
+
+    Internal account keys are snake_case; provider-facing names are hyphenated,
+    and S3 bucket names reject underscores outright (AWS: bucket names may
+    contain only lowercase letters, numbers, periods and hyphens). The slug is
+    landing-zone invariant, so it sits on the registry ENTRY and is read without
+    resolving selector members.
+    """
+    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts_registry", {})
+    slugs: dict[str, str] = {}
+    for account_key, account_cfg in accounts.items():
+        if not isinstance(account_cfg, dict):
+            continue
+        label = f"providers.aws.accounts_registry.{account_key}.slug"
+        slug = account_cfg.get("slug")
+        if slug is None:
+            raise RuntimeError(f"❌ {label} is required (the account's AWS-facing spelling)")
+        slug = common._require_non_empty_string(slug, label, ctl_cfg_root)
+        if not ACCOUNT_SLUG_RE.fullmatch(slug):
+            raise RuntimeError(
+                f"❌ {label} must be lowercase alphanumerics separated by single hyphens, "
+                f"got {slug!r} (it is rendered into S3 bucket names)"
+            )
+        slugs[account_key] = slug
+    return slugs
+
+
+def derived_params(ctl_cfg_root: Path, params: dict[str, str]) -> dict[str, str]:
+    """Provider facts DERIVED from declared params, published into
+    `execution_context.params.aws.*`.
+
+    `account_slug` is a property OF THE ACCOUNT, not a choice the run makes, so
+    it is resolved from the registry rather than passed by every caller — a
+    manual `--execution-params aws.account=non_prod_email_svc` gets it for free.
+    """
+    account_key = params.get("aws.account")
+    if not account_key:
+        return {}
+    slugs = load_aws_account_slugs(ctl_cfg_root)
+    slug = slugs.get(str(account_key).strip())
+    if slug is None:
+        available = ", ".join(sorted(slugs)) or "none"
+        raise RuntimeError(
+            f"❌ providers.aws.accounts_registry has no account {account_key!r} "
+            f"(cannot derive aws.account_slug); declared: {available}"
+        )
+    return {"aws.account_slug": slug}
+
+
 def load_aws_account_registry_cfg(
     ctl_cfg_root: Path,
     *,
@@ -160,7 +213,7 @@ def load_aws_account_registry_cfg(
             raise RuntimeError(f"❌ aws account keys must be non-empty strings: {ctl_cfg_root}")
         if not isinstance(account_cfg, dict):
             raise RuntimeError(f"❌ aws account {account_key!r} must be a mapping: {ctl_cfg_root}")
-        unknown = sorted(set(account_cfg) - {"account_id", "members"})
+        unknown = sorted(set(account_cfg) - {"account_id", "members", "slug"})
         if unknown:
             raise RuntimeError(f"❌ aws account {account_key!r} has unknown fields {unknown}: {ctl_cfg_root}")
         has_static = "account_id" in account_cfg
@@ -1581,36 +1634,6 @@ def export_profile_credentials(profile_name: str) -> dict[str, str]:
     return credentials
 
 
-def derive_ctl_runner_arn(
-    ctl_role_chain: dict | None,
-    target_roles: dict | None,
-    account_registry: dict[str, str],
-    execution_context: dict[str, object],
-) -> str | None:
-    """Compose the ctl-runner role ARN from the ctl registries (§Phase 9).
-
-    Resolved from ctl_role_chain.runner_role_key -> target_roles entry
-    (account_key + role_name) -> account registry id. Returns None when any
-    link is missing (e.g. the registry id is not populated yet) — consumers
-    treat the fact as absent, never guess."""
-    if not ctl_role_chain or not target_roles:
-        return None
-    runner_entry = target_roles.get(ctl_role_chain.get("runner_role_key")) or {}
-    account_key = runner_entry.get("account_key")
-    role_name = runner_entry.get("role_name")
-    if not account_key or not role_name:
-        return None
-    account_id = (account_registry or {}).get(account_key)
-    if not account_id:
-        return None
-    role_name = str(
-        common.resolve_runtime_scalar(
-            role_name, execution_context, label="target_roles runner role_name"
-        )
-    )
-    return f"arn:aws:iam::{account_id}:role/{role_name}"
-
-
 def configure_target_aws_env(
     target_run_id: str,
     target_run: dict,
@@ -1661,15 +1684,6 @@ def configure_target_aws_env(
     target_env["ATLAS_AWS_CREDENTIAL_SOURCE_KEY"] = resolved["credential_source_key"]
     target_env["ATLAS_AWS_IMPLEMENTATION_KEY"] = resolved["implementation_key"]
     target_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"] = resolved["expected_account_id"]
-
-    # §Phase 9: adapter-derived run fact — the trusted ctl-runner ARN, composed
-    # from the ctl registries; never authored in plt cfg. Absent when the
-    # runner's account id is not registered yet.
-    ctl_runner_arn = derive_ctl_runner_arn(
-        ctl_role_chain, target_roles, account_registry, execution_context
-    )
-    if ctl_runner_arn:
-        target_env["ATLAS_AWS_CTL_RUNNER_ARN"] = ctl_runner_arn
 
     if resolved["credential_provider_kind"] == "role_chain":
         # Standard mode: hand the target_run the FINAL role's assumed credentials

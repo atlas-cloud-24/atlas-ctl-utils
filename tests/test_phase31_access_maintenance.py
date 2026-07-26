@@ -204,6 +204,54 @@ class AccountRegistryTests(unittest.TestCase):
             aws.load_aws_account_registry_cfg(root)
 
 
+class AccountSlugTests(unittest.TestCase):
+    """§Phase 59: the account's AWS-facing spelling is a property OF THE ACCOUNT,
+    so the adapter derives it from the registry rather than every caller passing
+    it. S3 bucket names reject the underscores the internal keys use."""
+
+    def _root(self, body: str):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        write(root / "accounts_registry.yaml", "providers:\n  aws:\n    accounts_registry:\n" + body)
+        return temporary, root
+
+    ENTRY = (
+        "      non_prod_email_svc:\n"
+        "        slug: non-prod-email-svc\n"
+        "        account_id: '111111111111'\n"
+    )
+
+    def test_derived_params_publishes_the_slug_for_the_declared_account(self):
+        temporary, root = self._root(self.ENTRY)
+        with temporary:
+            self.assertEqual(
+                aws.derived_params(root, {"aws.account": "non_prod_email_svc"}),
+                {"aws.account_slug": "non-prod-email-svc"},
+            )
+
+    def test_no_declared_account_derives_nothing(self):
+        temporary, root = self._root(self.ENTRY)
+        with temporary:
+            self.assertEqual(aws.derived_params(root, {"landing_zone": "live"}), {})
+
+    def test_unknown_account_is_rejected(self):
+        temporary, root = self._root(self.ENTRY)
+        with temporary, self.assertRaisesRegex(RuntimeError, "cannot derive aws.account_slug"):
+            aws.derived_params(root, {"aws.account": "nope"})
+
+    def test_missing_slug_is_rejected(self):
+        temporary, root = self._root("      ctl_plane:\n        account_id: '111111111111'\n")
+        with temporary, self.assertRaisesRegex(RuntimeError, r"ctl_plane\.slug is required"):
+            aws.load_aws_account_slugs(root)
+
+    def test_slug_must_be_a_legal_bucket_name_fragment(self):
+        temporary, root = self._root(
+            "      ctl_plane:\n        slug: ctl_plane\n        account_id: '111111111111'\n"
+        )
+        with temporary, self.assertRaisesRegex(RuntimeError, "separated by single hyphens"):
+            aws.load_aws_account_slugs(root)
+
+
 class SessionPolicyTests(unittest.TestCase):
     def test_sync_policy_is_limited_to_approved_run_and_pointer(self):
         policy = aws.build_ctl_state_session_policy(

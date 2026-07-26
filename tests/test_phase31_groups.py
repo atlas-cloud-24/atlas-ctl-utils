@@ -255,5 +255,84 @@ class CfgFileSetGroupInventoryTests(unittest.TestCase):
                 )
 
 
+class FanOutExtraParamsTests(unittest.TestCase):
+    """§Phase 59: a run may pin a constant param over every member of a SHARED
+    param set, so one account list serves several domains instead of being
+    copied per domain. Additive only."""
+
+    def _root(self, tmp: str, run_extra: str) -> Path:
+        root = Path(tmp)
+        _write(root, "fan_outs.yaml", (
+            "fan_outs:\n"
+            "  lz/all:\n"
+            "    runs:\n"
+            "      - workflow_key: wf/one\n"
+            "        fan_out_param_set_key: accounts\n"
+            f"{run_extra}"
+            "    max_parallel: 1\n"
+            "    failure_mode: stop\n"
+        ))
+        _write(root, "domains.yaml", "domains:\n  org: {}\n  notifications: {}\n")
+        _write(root, "param_sets.yaml", (
+            "fan_out_param_sets:\n"
+            "  accounts:\n"
+            "    ctl_plane:\n"
+            "      params:\n"
+            "        aws.account: ctl_plane\n"
+            "    identity:\n"
+            "      params:\n"
+            "        aws.account: identity\n"
+        ))
+        return root
+
+    def test_extra_params_are_merged_into_every_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, "        extra_params:\n          domain: notifications\n")
+            children = common.expand_fan_out(root, "lz/all", LIVE_CTX)["children"]
+            self.assertEqual(
+                [c["params"] for c in children],
+                [
+                    {"aws.account": "ctl_plane", "domain": "notifications"},
+                    {"aws.account": "identity", "domain": "notifications"},
+                ],
+            )
+            # The member name alone no longer identifies a child: one param set
+            # may back several runs of the same workflow.
+            self.assertEqual(
+                [c["label"] for c in children],
+                ["wf/one[notifications:ctl_plane]", "wf/one[notifications:identity]"],
+            )
+
+    def test_collision_with_a_member_param_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, "        extra_params:\n          aws.account: org\n")
+            with self.assertRaisesRegex(RuntimeError, "define each param\\s+in one place"):
+                common.expand_fan_out(root, "lz/all", LIVE_CTX)
+
+    def test_domain_value_is_validated_against_the_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, "        extra_params:\n          domain: nope\n")
+            with self.assertRaises(RuntimeError):
+                common.expand_fan_out(root, "lz/all", LIVE_CTX)
+
+    def test_extra_params_without_a_param_set_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write(root, "fan_outs.yaml", (
+                "fan_outs:\n"
+                "  lz/all:\n"
+                "    runs:\n"
+                "      - workflow_key: wf/one\n"
+                "        extra_params:\n"
+                "          domain: notifications\n"
+                "    max_parallel: 1\n"
+                "    failure_mode: stop\n"
+            ))
+            _write(root, "domains.yaml", "domains:\n  notifications: {}\n")
+            _write(root, "param_sets.yaml", "fan_out_param_sets: {}\n")
+            with self.assertRaisesRegex(RuntimeError, "requires fan_out_param_set_key"):
+                common.expand_fan_out(root, "lz/all", LIVE_CTX)
+
+
 if __name__ == "__main__":
     unittest.main()
