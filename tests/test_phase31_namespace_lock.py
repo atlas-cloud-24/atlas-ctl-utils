@@ -1,5 +1,7 @@
 import sys
 import tempfile
+import pathlib
+import logging.handlers
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -183,6 +185,77 @@ class MutationLockTests(unittest.TestCase):
             common.evaluate_mutation_lock(stale, action="plan", run_id="r2")["decision"],
             "proceed",
         )
+
+
+class ChildOfHolderTest(unittest.TestCase):
+    """A workflow child must not be blocked by its own parent's namespace lock."""
+
+    @staticmethod
+    def _held_by(run_id: str) -> dict:
+        return common.build_mutation_lock_doc(run_id, "provision")
+
+    def test_child_proceeds_past_its_parents_lock(self):
+        outcome = common.evaluate_mutation_lock(
+            self._held_by("parent-run"),
+            action="provision",
+            run_id="child-run",
+            parent_run_id="parent-run",
+        )
+        self.assertEqual(outcome["decision"], "proceed")
+
+    def test_unrelated_run_is_still_blocked(self):
+        outcome = common.evaluate_mutation_lock(
+            self._held_by("someone-else"),
+            action="provision",
+            run_id="child-run",
+            parent_run_id="parent-run",
+        )
+        self.assertEqual(outcome["decision"], "blocked")
+        self.assertEqual(outcome["holder"], "someone-else")
+
+    def test_no_parent_means_no_exemption(self):
+        outcome = common.evaluate_mutation_lock(
+            self._held_by("parent-run"),
+            action="provision",
+            run_id="child-run",
+        )
+        self.assertEqual(outcome["decision"], "blocked")
+
+
+class ParentRunIdIsRecordedTest(unittest.TestCase):
+    """The exemption is only reachable if the child RECORDS its parent.
+
+    The decision logic and the metadata that feeds it were added in separate
+    places; testing only the logic left the whole path dead.
+    """
+
+    def test_setup_run_dirs_records_parent_workflow_run_id(self):
+        import inspect
+        signature = inspect.signature(common.setup_run_dirs)
+        self.assertIn("parent_workflow_run_id", signature.parameters)
+
+        with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
+            memory_handler = logging.handlers.MemoryHandler(capacity=1024)
+            run_dir, _, _ = common.setup_run_dirs(
+                "child-run", "destroy", "target", "env/seed/baseline",
+                pathlib.Path(tmp), memory_handler,
+                locator_segments=["live"],
+                parent_workflow_run_id="parent-run",
+            )
+            metadata = common.load_run_metadata(run_dir)
+            self.assertEqual(metadata.get("parent_workflow_run_id"), "parent-run")
+
+    def test_absent_parent_leaves_no_key(self):
+        with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
+            memory_handler = logging.handlers.MemoryHandler(capacity=1024)
+            run_dir, _, _ = common.setup_run_dirs(
+                "solo-run", "destroy", "target", "env/seed/baseline",
+                pathlib.Path(tmp), memory_handler,
+                locator_segments=["live"],
+            )
+            self.assertIsNone(
+                common.load_run_metadata(run_dir).get("parent_workflow_run_id")
+            )
 
 
 if __name__ == "__main__":

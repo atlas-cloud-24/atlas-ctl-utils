@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import yaml
 
+from utils import cfg_presets
 from utils.git_meta import write_git_meta_to_file
 
 REQUIRED_TOOLING_REFS = ("ctl-utils", "plt-utils")
@@ -4059,6 +4060,7 @@ def setup_run_dirs(
     *,
     locator_segments: list[str],
     parent_fan_out_run_id: str | None = None,
+    parent_workflow_run_id: str | None = None,
     instance_segments: list[str] | None = None,
     instance_address: str | None = None,
     target_addresses: list[str] | None = None,
@@ -4146,6 +4148,10 @@ def setup_run_dirs(
             # §Phase 31 item 8: the stateless fan-out's batch audit record —
             # "these runs were one invocation" lives only in child metadata.
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
+            # §Phase 31 Q1b: a child spawned by a workflow records its parent, so the
+            # namespace mutation lock can tell "my parent holds it" from contention.
+            **({"parent_workflow_run_id": parent_workflow_run_id}
+               if parent_workflow_run_id else {}),
         },
     )
 
@@ -4183,6 +4189,7 @@ def setup_preflight_run_dirs(
     target_addresses: list[str] | None = None,
     identity_doc: dict | None = None,
     parent_fan_out_run_id: str | None = None,
+    parent_workflow_run_id: str | None = None,
     execution_access_modes: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
@@ -4243,6 +4250,10 @@ def setup_preflight_run_dirs(
             **({"instance_address": instance_address} if instance_address else {}),
             **({"target_addresses": list(target_addresses)} if target_addresses else {}),
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
+            # §Phase 31 Q1b: a child spawned by a workflow records its parent, so the
+            # namespace mutation lock can tell "my parent holds it" from contention.
+            **({"parent_workflow_run_id": parent_workflow_run_id}
+               if parent_workflow_run_id else {}),
         },
     )
     logging.info("Using preflight run_dir: %s", run_dir)
@@ -5160,7 +5171,29 @@ def force_unlock_ctl_state_lock(ctl_state_local_root: Path, lock_id: str, mainte
 
 SCOPE_META_FILENAME = "__meta__.yaml"
 SCOPE_COMPOSITION_FILENAME = "__scope_composition__.yaml"
-SCOPE_META_SKIP_FILENAMES = {SCOPE_META_FILENAME, PLT_GUARDRAILS_FILENAME, SCOPE_COMPOSITION_FILENAME}
+# §Phase 62: declaration files configure composition and are never payload.
+SCOPE_META_SKIP_FILENAMES = {
+    SCOPE_META_FILENAME,
+    PLT_GUARDRAILS_FILENAME,
+    SCOPE_COMPOSITION_FILENAME,
+    *cfg_presets.DECLARATION_FILENAMES,
+}
+
+# §Phase 62: materialized imports live for exactly one discovery pass. The next
+# pass frees the previous one, so a long-lived process holds at most one run's
+# worth rather than accumulating them.
+_MATERIALIZED_IMPORT_DIRS: list[tempfile.TemporaryDirectory] = []
+
+
+def _new_materialization_workspace() -> Path:
+    workspace = tempfile.TemporaryDirectory(prefix="atlas-cfg-preset-")
+    _MATERIALIZED_IMPORT_DIRS.append(workspace)
+    return Path(workspace.name)
+
+
+def _release_materialized_imports() -> None:
+    while _MATERIALIZED_IMPORT_DIRS:
+        _MATERIALIZED_IMPORT_DIRS.pop().cleanup()
 
 def selector_expected_values(expected, *, label: str) -> list[str]:
     if isinstance(expected, str) and expected:
@@ -5921,34 +5954,53 @@ def load_scope_candidate(
         allow_root=False,
     )
 
-    raw_imports = meta_cfg.get("imports") or []
-    if not isinstance(raw_imports, list):
-        raise RuntimeError(f"imports must be a list: {meta_path}")
+    # §Phase 62: imports are declared in their own file, so a preset can import
+    # without being a scope. A scope declaring them in __meta__.yaml is stale.
+    if "imports" in meta_cfg:
+        raise RuntimeError(
+            f"❌ imports belong in {cfg_presets.IMPORTS_FILENAME}, not {SCOPE_META_FILENAME}: {meta_path}"
+        )
+    if (scope_root / cfg_presets.PARAMS_FILENAME).exists():
+        raise RuntimeError(
+            f"❌ a scope is selected by selectors, not instantiated by an importer, so it cannot "
+            f"declare {cfg_presets.PARAMS_FILENAME}: {scope_id}"
+        )
 
     source_dirs: list[str] = []
     seen_imports: set[Path] = set()
-    for raw_import in raw_imports:
+    entries = cfg_presets.declared_imports(scope_root)
+    workspace = _new_materialization_workspace() if entries else None
+    # one composition per scope: a preset reached by several paths must be
+    # configured the same way each time
+    composition: dict[str, tuple] = {}
+    cfg_presets.assert_no_redundant_imports(cfg_root, scope_root, scope_id)
+    for index, entry in enumerate(entries):
         import_path = normalize_cfg_absolute_path(
-            raw_import,
-            label=f"import path in {meta_path}",
+            entry["from"],
+            label=f"import path in {scope_id}",
             allow_root=False,
         )
-        src = cfg_abs_path_to_dir(cfg_root, import_path, label=f"import path in {meta_path}")
-        if src in seen_imports:
-            raise RuntimeError(f"Duplicate import path in {meta_path}: {import_path}")
+        src = cfg_abs_path_to_dir(cfg_root, import_path, label=f"import path in {scope_id}")
         if not src.exists():
             raise RuntimeError(f"Import path not found: {src}")
         if not src.is_dir():
             raise RuntimeError(f"Import path must be a directory: {src}")
         if not any(p.is_file() and ".git" not in p.relative_to(src).parts for p in src.rglob("*.yaml")):
-            raise RuntimeError(f"Import path must contain at least one yaml cfg file: {src} ({meta_path})")
+            raise RuntimeError(f"Import path must contain at least one yaml cfg file: {src} ({scope_id})")
         validate_no_cfg_meta_inside_data_dir(src, import_path=import_path, meta_path=meta_path)
-
+        if src == scope_root:
+            raise RuntimeError(f"Scope imports itself in {scope_id}: {import_path}")
         seen_imports.add(src)
-        source_dirs.append(str(src))
 
-    if scope_root in seen_imports:
-        raise RuntimeError(f"Scope imports itself in {meta_path}: {scope_id}")
+        materialized = workspace / f"{index:03d}"
+        cfg_presets.materialize(
+            cfg_root,
+            import_path,
+            dest=materialized,
+            bindings=entry["with"],
+            composition=composition,
+        )
+        source_dirs.append(str(materialized))
 
     source_dirs.append(str(scope_root))
     return {
@@ -5962,6 +6014,41 @@ def load_scope_candidate(
     }
 
 
+def validate_all_cfg_payload_is_reachable(cfg_root: Path) -> None:
+    """§Phase 62: every payload file sits inside a scope or an imported preset.
+
+    A file outside both is never merged and never renders — it is silently dead
+    cfg, which reads as configuration and behaves as nothing. Composition is the
+    only way payload reaches a target, so a file that no unit contains is an
+    authoring error rather than an inert extra.
+    """
+    units: list[str] = []
+    for meta_path in discover_cfg_meta_paths(cfg_root):
+        if load_cfg_meta(meta_path)["type"] == "overlay":
+            continue
+        units.append("/" + meta_path.parent.relative_to(cfg_root).as_posix())
+    for imports_path in sorted(cfg_root.rglob(cfg_presets.IMPORTS_FILENAME)):
+        for entry in cfg_presets.declared_imports(imports_path.parent):
+            units.append(entry["from"])
+    prefixes = tuple(unit.rstrip("/") + "/" for unit in units)
+
+    orphans: list[str] = []
+    for path in sorted(cfg_root.rglob("*.yaml")):
+        parts = path.relative_to(cfg_root).parts
+        if parts[0] in (".git", "_overlays", "diagrams") or PLT_GUARDRAILS_DIRNAME in parts:
+            continue
+        if path.name in SCOPE_META_SKIP_FILENAMES:
+            continue
+        rel = "/" + path.relative_to(cfg_root).as_posix()
+        if not rel.startswith(prefixes):
+            orphans.append(rel)
+    if orphans:
+        raise RuntimeError(
+            "❌ cfg payload outside every scope and preset, so it can never be merged: "
+            + ", ".join(orphans)
+        )
+
+
 def discover_active_cfg_scopes(
     plt_cfg_root: Path,
     *,
@@ -5971,6 +6058,8 @@ def discover_active_cfg_scopes(
     """Discover active cfg merge scopes from type: scope metadata."""
     cfg_root = plt_cfg_root.resolve()
     runtime_context = execution_context or execution_context_from_scope_params(scope_params)
+    validate_all_cfg_payload_is_reachable(cfg_root)
+    _release_materialized_imports()
     active_scopes: list[dict] = []
 
     for meta_path in discover_cfg_meta_paths(cfg_root):
@@ -7299,6 +7388,7 @@ def configure_ctl_state_sync(
         syncer,
         action=str(metadata.get("action") or ""),
         run_id=str(metadata.get("run_id") or Path(run_dir).name),
+        parent_run_id=metadata.get("parent_workflow_run_id"),
     )
     syncer.push("run started")
     _CTL_STATE_SYNC_NOTE = syncer.summary()
@@ -8723,7 +8813,9 @@ def pending_ctl_state_manifest_paths(local_root: Path, namespace_key: str) -> li
 _MUTATION_LOCK_HELD: dict | None = None
 
 
-def enforce_mutation_lock(syncer, *, action: str, run_id: str) -> None:
+def enforce_mutation_lock(
+    syncer, *, action: str, run_id: str, parent_run_id: str | None = None
+) -> None:
     """§Phase 31 Q1b: the interim global mutation lock, enforced at the
     namespace bucket. Mutating runs acquire it exclusively; non-mutating runs
     check and fail fast with the holder's run id. No syncer (sync skipped or
@@ -8734,7 +8826,9 @@ def enforce_mutation_lock(syncer, *, action: str, run_id: str) -> None:
         logging.info("mutation lock skipped: no armed ctl-state syncer")
         return
     existing = syncer.read_mutation_lock()
-    outcome = evaluate_mutation_lock(existing, action=action, run_id=run_id)
+    outcome = evaluate_mutation_lock(
+        existing, action=action, run_id=run_id, parent_run_id=parent_run_id
+    )
     decision = outcome["decision"]
     if decision == "blocked":
         raise RuntimeError(
@@ -10042,7 +10136,7 @@ def run_maintenance(
         """
 set -euo pipefail
 source "$ATLAS_STEP_UTILS_DIR/ctl/prepare_step_runtime.sh"
-prepare_step_runtime "${MAINTENANCE_TARGET_CFG_DIR}" "${MAINTENANCE_CFG_FILES_JSON}"
+prepare_step_runtime "${MAINTENANCE_TARGET_CFG_DIR}" "${MAINTENANCE_CFG_KEYS_JSON}"
 ./bin/tf.sh "$TF_STACK_DIR" init "$TFSTATE_KEY_VAR"
 ./bin/tf.sh "$TF_STACK_DIR" force-unlock "$TFSTATE_KEY_VAR" "$LOCK_ID"
 """,
@@ -10147,7 +10241,7 @@ def mutation_lock_is_stale(lock_doc: dict, *, now: datetime | None = None) -> bo
 
 
 def evaluate_mutation_lock(
-    existing_lock: dict | None, *, action: str, run_id: str
+    existing_lock: dict | None, *, action: str, run_id: str, parent_run_id: str | None = None
 ) -> dict:
     """Pure decision logic for the interim global mutation lock (§Phase 31 Q1b).
 
@@ -10171,6 +10265,14 @@ def evaluate_mutation_lock(
             }
         return {"decision": "proceed"}
     holder = str(existing_lock.get("run_id"))
+    # A workflow holds the namespace for the whole run and spawns its targets as
+    # child processes. A child meeting its OWN parent's lock is not contention —
+    # the namespace is already held on its behalf, and blocking it would make
+    # every sync-armed workflow fail on its first child. Mirrors the single-use
+    # local-lock grant, which covers the flock but not this backend lock.
+    if parent_run_id and holder == str(parent_run_id):
+        logging.info("mutation lock held by parent run %s; proceeding as its child", holder)
+        return {"decision": "proceed"}
     return {"decision": "blocked", "holder": holder}
 
 

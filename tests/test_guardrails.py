@@ -59,7 +59,6 @@ def write_env_scope(plt_root: Path) -> None:
         "selectors:\n"
         "  match:\n"
         "    execution_context.params.env.type: dev\n"
-        "imports: []\n",
     )
 
 
@@ -389,8 +388,7 @@ class VerificationTest(unittest.TestCase):
                 "selectors:\n"
                 "  match:\n"
                 "    execution_context.params.env.type: test\n"
-                "imports: []\n",
-            )
+                    )
             write(rendered / "env" / "value.yaml", "region: eu-west-2\n")
             with self.assertRaisesRegex(RuntimeError, "has no baseline"):
                 guardrails.verify_plt_guardrails(
