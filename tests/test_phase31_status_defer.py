@@ -257,7 +257,7 @@ class Phase31StateTests(unittest.TestCase):
 
 
 class Phase56OverlayTests(unittest.TestCase):
-    context = {"execution_context.params.env_type": "dev"}
+    context = {"execution_context.params.env.type": "dev"}
 
     @staticmethod
     def add_overlay(root: Path, name: str, payload: dict) -> None:
@@ -268,7 +268,7 @@ class Phase56OverlayTests(unittest.TestCase):
                 "type": "overlay",
                 "name": name,
                 "selectors": {
-                    "in": {"execution_context.params.env_type": ["dev"]}
+                    "in": {"execution_context.params.env.type": ["dev"]}
                 },
             },
         )
@@ -288,9 +288,8 @@ class Phase56OverlayTests(unittest.TestCase):
                         "source": "source",
                         "ref": "context",
                         "step_sequence": "steps",
-                        "cfg_file_set": "env",
-                        "cfg_root": "/env",
-                        "cfg_files": ["*"],
+                        "domains": ["env"],
+                        "cfg_keys": {"env": ["*"]},
                         "requires_plt_overlays": ["required"],
                         "provisions_ctl_state_backend": True,
                     }
@@ -299,7 +298,8 @@ class Phase56OverlayTests(unittest.TestCase):
             repo_key="repo_path",
             require_branch_or_commit=False,
         )["run"]
-        self.assertEqual(active["cfg_file_set"], "env")
+        self.assertEqual(active["domains"], ["env"])
+        self.assertEqual(active["cfg_keys"], {"env": ["*"]})
         self.assertEqual(active["requires_plt_overlays"], ["required"])
         self.assertTrue(active["provisions_ctl_state_backend"])
 
@@ -387,9 +387,8 @@ class Phase56OverlayTests(unittest.TestCase):
             "ref": "env",
             "commit": "a" * 40,
             "step_sequence": "baseline",
-            "cfg_file_set": "env",
-            "cfg_root": "/env",
-            "cfg_files": ["*"],
+            "domains": ["env"],
+            "cfg_keys": {"env": ["*"]},
             "target_instance_params": ["account"],
             "requires_plt_overlays": ["tech_jobs"],
             "execution_identity": {"provider": "aws", "account": "dev"},

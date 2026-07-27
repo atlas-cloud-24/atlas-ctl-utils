@@ -62,23 +62,27 @@ class ResultsBootstrapDetectionTests(unittest.TestCase):
         self.assertFalse(common.run_provisions_ctl_state_backend({"target_runs": []}, self.INVENTORY))
 
 
-class RequiredTargetPathsTests(unittest.TestCase):
-    def test_collects_top_level_paths_from_cfg_roots(self):
-        target_runs = {
-            "a": {"cfg_root": "/env"},
-            "b": {"cfg_root": "/env/sub"},
-            "c": {"cfg_root": "/org"},
-        }
-        self.assertEqual(common.required_target_paths_for_target_runs(target_runs), {"/env", "/org"})
+class ScopeConditionTests(unittest.TestCase):
+    """§Phase 60/61: a plt scope declares its own CONDITION and activates iff the
+    run reads its domain. The former `required_target_paths` filter decided the
+    same thing from the other side and was removed — two mechanisms deciding one
+    thing can disagree."""
 
-    def test_root_cfg_root_means_all_scopes(self):
-        target_runs = {"a": {"cfg_root": "/env"}, "b": {"cfg_root": "/"}}
-        self.assertIsNone(common.required_target_paths_for_target_runs(target_runs))
+    SCOPE = {"contains": {"execution_context.target.domains": "env"}}
 
-    def test_missing_cfg_root_defaults_to_all(self):
-        self.assertIsNone(common.required_target_paths_for_target_runs({"a": {}}))
+    def test_scope_activates_when_the_run_reads_its_domain(self):
+        self.assertTrue(common.selector_matches(
+            self.SCOPE, {"execution_context.target.domains": ["env", "org"]}, label="t"))
 
+    def test_scope_is_dropped_when_it_does_not(self):
+        self.assertFalse(common.selector_matches(
+            self.SCOPE, {"execution_context.target.domains": ["org"]}, label="t"))
 
+    def test_scope_is_dropped_when_no_domains_are_declared(self):
+        self.assertFalse(common.selector_matches(self.SCOPE, {}, label="t"))
+
+    def test_the_removed_filter_is_gone(self):
+        self.assertFalse(hasattr(common, "required_target_paths_for_target_runs"))
 
 
 if __name__ == "__main__":

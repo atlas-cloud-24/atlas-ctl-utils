@@ -2,7 +2,9 @@
 
 import argparse
 import collections
+import contextlib
 import fcntl
+import fnmatch
 import functools
 import hashlib
 import json
@@ -384,7 +386,7 @@ TARGET_EXECUTION_IDENTITY_FIELDS = frozenset(
 
 def selector_group_is_group(entry: object) -> bool:
     """§Phase 31 3c: a selector-membered group entry in a cfg collection
-    (cfg_file_sets, refs.scoped) — same resolution semantics as execution
+    (cfg_key_sets, refs.scoped) — same resolution semantics as execution
     identity groups: `members` select exactly one concrete value."""
     return isinstance(entry, dict) and "members" in entry
 
@@ -514,7 +516,7 @@ def resolve_list_members(
     """Resolve a members-shaped LIST-valued declaration
     ({members: [{<value_field>: [...], selectors: {...}}, ...]}) to the ONE
     matching member's list (§Phase 32 instance schemas, §Phase 33 per-action
-    cfg_files/target_keys). The scalar twin is resolve_selector_group_member.
+    target_keys). The scalar twin is resolve_selector_group_member.
     Returns None when no context is available or the dispatch axis is unbound
     (deferred — the caller decides whether that is an error)."""
     members = entry.get("members")
@@ -653,7 +655,7 @@ def ctl_allowed_execution_runtime_modes(ctl_cfg_root: Path, ctl_profile: str) ->
 def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execution_runtime_mode: str) -> None:
     """Reconcile the selected runtime against the ctl profile (§Phase 26): a known
     runtime, allowed by the profile. Per-target_run `supported_execution_runtime_modes` is enforced in
-    run_steps, where the repo-local target_run manifest is loaded."""
+    run_targets, where the repo-local target_run manifest is loaded."""
     if execution_runtime_mode not in EXECUTION_RUNTIME_MODES:
         raise RuntimeError(f"❌ unknown execution runtime {execution_runtime_mode!r} (known: {sorted(EXECUTION_RUNTIME_MODES)})")
     allowed = ctl_allowed_execution_runtime_modes(ctl_cfg_root, ctl_profile)
@@ -751,6 +753,20 @@ def ctl_allows_force_skip_ctl_state_backend_sync(ctl_cfg_root: Path, ctl_profile
 
 def ctl_allows_force_skip_guardrails(ctl_cfg_root: Path, ctl_profile: str) -> bool:
     return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_force_skip_guardrails")
+
+
+def ctl_allows_skip_children_precheck(ctl_cfg_root: Path, ctl_profile: str) -> bool:
+    return ctl_profile_bool(ctl_cfg_root, ctl_profile, "allow_skip_children_precheck")
+
+
+def validate_skip_children_precheck(
+    ctl_cfg_root: Path, ctl_profile: str, requested: bool
+) -> None:
+    if requested and not ctl_allows_skip_children_precheck(ctl_cfg_root, ctl_profile):
+        raise RuntimeError(
+            "❌ --skip-children-precheck was requested, but ctl profile "
+            f"{ctl_profile!r} does not grant allow_skip_children_precheck"
+        )
 
 
 def ctl_allows_force_skip_full_cfg_validation_gate(
@@ -1129,6 +1145,32 @@ def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub('', text)
 
 
+@contextlib.contextmanager
+def target_run_log(child_run_dir: Path | None):
+    """§Phase 61(c): a target run writes its OWN log while it executes.
+
+    Implemented as a SECOND file handler rather than by redirecting: the workflow
+    keeps the aggregate of everything (the operator's single reading surface) and
+    the target gets its own copy, which is what makes a target run independently
+    inspectable. Duplication is deliberate.
+    """
+    if child_run_dir is None:
+        yield None
+        return
+    logs_dir = child_run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{SERVICE_ID}_{child_run_dir.name}.log"
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(handler)
+    try:
+        yield log_path
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
 def log_target_run_banner(target_run_id: str, *, ch: str = "#", min_width: int = 70) -> None:
     title = f" {target_run_id} "
     width = max(min_width, len(title) + 2)  # ensure it always fits
@@ -1189,7 +1231,7 @@ def validate_workflow_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ workflow runner requires --workflow")
     if getattr(args, "target", None):
         raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "domain", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
         raise RuntimeError("❌ workflow runner does not accept step-sequence synthetic target args")
 
 
@@ -1201,7 +1243,7 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner does not accept --workflow")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for target runs")
-    if any(getattr(args, field, None) for field in ("source", "ref", "cfg_file_set", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
+    if any(getattr(args, field, None) for field in ("source", "ref", "domain", "step_sequence", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
         raise RuntimeError("❌ target runner does not accept step-sequence synthetic target args")
 
 
@@ -1212,7 +1254,7 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
     if any(
         getattr(args, field, None)
         for field in (
-            "source", "ref", "cfg_file_set", "step_sequence",
+            "source", "ref", "domain", "step_sequence",
             "execution_provider", "execution_account", "execution_role",
             "affected_target_keys",
         )
@@ -1257,7 +1299,7 @@ def validate_step_sequence_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ step_sequence runner does not accept --workflow or --target")
     if getattr(args, "ctl_variants", None):
         raise RuntimeError("❌ --ctl-variants is not supported for step_sequence runs")
-    missing = [f for f in ("source", "ref", "cfg_file_set", "step_sequence") if not getattr(args, f, None)]
+    missing = [f for f in ("source", "ref", "domain", "step_sequence") if not getattr(args, f, None)]
     if missing:
         raise RuntimeError(
             "❌ step_sequence needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
@@ -1662,11 +1704,15 @@ def build_active_target_runs(
                 f"Target run {target_run_id!r} (target={target_key!r}, source={target_source!r}) missing {repo_key!r} in inventory {workflow_cfg.get('inventory')!r}"
             )
 
-        cfg_files = target_cfg.get("cfg_files", [])
-        if cfg_files is None:
-            cfg_files = []
-        if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Target run target {target_key!r} cfg_files must be a list")
+        # §Phase 60: a target_run carries its declared domains + per-domain key
+        # contract. A domain-generic target whose axis is unbound arrives with
+        # domains=None and is not materializable.
+        target_domains = target_cfg.get("domains")
+        target_cfg_keys = target_cfg.get("cfg_keys")
+        if target_domains is not None and not isinstance(target_domains, list):
+            raise RuntimeError(f"Target run target {target_key!r} domains must be a list")
+        if target_cfg_keys is not None and not isinstance(target_cfg_keys, dict):
+            raise RuntimeError(f"Target run target {target_key!r} cfg_keys must be a map")
 
         active_target_run = {
             "target": target_key,
@@ -1675,9 +1721,8 @@ def build_active_target_runs(
             "branch": branch,
             "commit": commit,
             "step_sequence": child_step_sequence,
-            "cfg_file_set": target_cfg.get("cfg_file_set"),
-            "cfg_root": normalize_cfg_root(target_cfg.get("cfg_root", "/"), target_key=target_key),
-            "cfg_files": cfg_files,
+            "domains": target_domains,
+            "cfg_keys": target_cfg_keys,
         }
         required_overlays = target_cfg.get("requires_plt_overlays")
         if required_overlays:
@@ -1812,10 +1857,10 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     """Merge a top-level resource map identified by `key` across every cfg file.
 
     A resource's type is its top-level YAML key (content-key), not its filename: a
-    file with a `cfg_file_sets:` key contributes cfg-file-sets wherever it lives. The maps are
+    file with a `cfg_key_sets:` key contributes cfg-key-sets wherever it lives. The maps are
     unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
     error (same rule as targets), order-independent. `entry_depth` is how deep the
-    unique entries sit: 1 for flat catalogs (target_sources/cfg_file_sets),
+    unique entries sit: 1 for flat catalogs (target_sources/cfg_key_sets),
     2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>` and
     `providers.<name>.<section>.<entry>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
@@ -2045,13 +2090,26 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
     return selectors_to_in_shape(effective)
 
 
-def resolve_runtime_scalar(value, context: dict[str, object], *, label: str) -> str:
+RUNTIME_SCALAR_TOKEN_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
+
+
+def resolve_runtime_scalar(
+    value, context: dict[str, object], *, label: str, tolerate_missing: bool = False
+) -> str | None:
     """Resolve ${execution_context.<ns>.<key>} placeholders from the flat
-    execution context (dotted keys)."""
+    execution context (dotted keys).
+
+    With `tolerate_missing`, an unbound reference yields None instead of raising —
+    used where a domain-GENERIC declaration may simply not apply to this run.
+    """
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError(f"❌ {label} must be a non-empty string")
 
-    token_re = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
+    token_re = RUNTIME_SCALAR_TOKEN_RE
+    if tolerate_missing and any(
+        context.get(ref) in (None, "") for ref in token_re.findall(value)
+    ):
+        return None
 
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
@@ -2640,10 +2698,10 @@ def _add_step_sequence_args(parser: argparse._ActionsContainer) -> None:
         help="ref context (a key in refs.scoped, e.g. env/${env_type} or org) for a synthetic target",
     )
     parser.add_argument(
-        "--cfg-file-set",
+        "--domain",
         required=True,
-        dest="cfg_file_set",
-        help="cfg_file_set for a synthetic target",
+        dest="domain",
+        help="plt domain a synthetic target reads (it takes the whole domain)",
     )
     parser.add_argument(
         "--step-sequence",
@@ -2841,6 +2899,17 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         "ignoring target keys; requires profile allow_force_skip_ctl_state_backend_sync",
     )
     override_group.add_argument(
+        "--skip-children-precheck",
+        action="store_true",
+        dest="skip_children_precheck",
+        help="Do not pre-check this run's CHILDREN before starting them: a fan-out "
+        "skips pre-checking its workflows, a workflow skips pre-checking its targets. "
+        "Each child still renders and validates its own cfg when it runs, so this "
+        "changes WHEN a bad child is found, not whether it is. A target run has no "
+        "children, so it is a no-op there. Requires profile "
+        "allow_skip_children_precheck",
+    )
+    override_group.add_argument(
         "--force-skip-guardrails",
         action="store_true",
         dest="force_skip_guardrails",
@@ -2927,6 +2996,15 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
+    # §Phase 61(d): a workflow-spawned child target run executes under the lock its
+    # parent already holds. Internal wiring, not an operator flag.
+    parser.add_argument(
+        "--parent-workflow-run-id",
+        dest="parent_workflow_run_id",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+
 
 def redact_command_argv(argv: list[str]) -> list[str]:
     """Redact opaque credential selectors before command lines reach logs.
@@ -3328,39 +3406,183 @@ def apply_ctl_variants_to_workflow_cfg(
     return patched
 
 
-def resolve_cfg_file_set_files(
-    cfg_file_set_key: str,
-    cfg_file_sets: dict,
-    cfg_file_sets_path: Path,
+def resolve_input_params(
+    input_params: object,
+    input_param_set_keys: object,
+    param_sets: dict,
+    *,
+    label: str,
+    cfg_path: Path,
     _stack: tuple = (),
-) -> list:
-    """Resolve cfg_file_set_keys in order, then append the selected cfg_file_set's cfg_files."""
-    if cfg_file_set_key in _stack:
-        cycle = " -> ".join([*_stack, cfg_file_set_key])
-        raise RuntimeError(f"❌ cfg_file_set key cycle: {cycle} ({cfg_file_sets_path})")
-    cfg_file_set = cfg_file_sets.get(cfg_file_set_key)
-    if cfg_file_set is None:
-        raise RuntimeError(f"❌ missing cfg_file_set key {cfg_file_set_key!r}: {cfg_file_sets_path}")
-    if selector_group_is_group(cfg_file_set):
-        raise RuntimeError(
-            f"❌ cfg_file_set {cfg_file_set_key!r} is a selector group and cannot be "
-            f"composed via cfg_file_set_keys (groups are target-level indirection only): {cfg_file_sets_path}"
-        )
-    if not isinstance(cfg_file_set, dict):
-        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} must be a mapping: {cfg_file_sets_path}")
+) -> list[str]:
+    """§Phase 61(a): resolve a target's declared INPUT PARAMS.
 
-    included_keys = cfg_file_set.get("cfg_file_set_keys") or []
-    cfg_files = cfg_file_set.get("cfg_files") or []
-    if not isinstance(included_keys, list) or not all(isinstance(key, str) and key for key in included_keys):
-        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} cfg_file_set_keys must be a list of non-empty strings")
-    if not isinstance(cfg_files, list) or not all(isinstance(path, str) and path for path in cfg_files):
-        raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_key!r} cfg_files must be a list of non-empty strings")
+    Set references and literal param names are separate fields, the same split
+    `cfg_key_sets`/`cfg_keys` uses: one is a ctl catalog lookup, the other a param
+    name, so they cannot collide. Nearly every target needs the same naming and
+    placement axes, which is what the sets exist for.
+    """
+    resolved: list[str] = []
+    if input_param_set_keys is not None:
+        if not isinstance(input_param_set_keys, list) or not input_param_set_keys:
+            raise RuntimeError(f"❌ {label} input_param_sets must be a non-empty list ({cfg_path})")
+        for name in input_param_set_keys:
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError(f"❌ {label} input_param_sets entries must be non-empty strings")
+            name = name.strip()
+            if name not in param_sets:
+                available = ", ".join(sorted(param_sets)) or "none"
+                raise RuntimeError(
+                    f"❌ {label}: undefined param_set {name!r}; declared: {available} ({cfg_path})"
+                )
+            if name in _stack:
+                raise RuntimeError(f"❌ param_set cycle: {' -> '.join([*_stack, name])} ({cfg_path})")
+            member = param_sets[name]
+            if not isinstance(member, dict):
+                raise RuntimeError(f"❌ param_set {name!r} must be a mapping ({cfg_path})")
+            unknown = sorted(set(member) - {"input_param_sets", "input_params"})
+            if unknown:
+                raise RuntimeError(f"❌ param_set {name!r} has unsupported keys {unknown} ({cfg_path})")
+            resolved.extend(
+                resolve_input_params(
+                    member.get("input_params"), member.get("input_param_sets"), param_sets,
+                    label=f"param_set {name!r}", cfg_path=cfg_path, _stack=(*_stack, name),
+                )
+            )
+    if input_params is not None:
+        if not isinstance(input_params, list) or not input_params:
+            raise RuntimeError(f"❌ {label} input_params must be a non-empty list ({cfg_path})")
+        for entry in input_params:
+            if not isinstance(entry, str) or not CONTEXT_KEY_RE.fullmatch(entry.strip()):
+                raise RuntimeError(f"❌ {label} input_params entry {entry!r} must be a param name")
+            resolved.append(entry.strip())
+    seen: set[str] = set()
+    return [e for e in resolved if not (e in seen or seen.add(e))]
 
-    resolved: list = []
-    for included_key in included_keys:
-        resolved.extend(resolve_cfg_file_set_files(included_key, cfg_file_sets, cfg_file_sets_path, (*_stack, cfg_file_set_key)))
-    resolved.extend(cfg_files)
-    return resolved
+
+CFG_KEY_ENTRY_RE = re.compile(r"^[A-Za-z_*?\[][A-Za-z0-9_.*?\[\]-]*$")
+
+
+def resolve_cfg_key_entries(
+    cfg_keys: object,
+    cfg_key_set_keys: object,
+    cfg_key_sets: dict,
+    *,
+    label: str,
+    cfg_path: Path,
+    _stack: tuple = (),
+) -> list[str]:
+    """§Phase 60: resolve one consumer's contract into concrete key SELECTORS.
+
+    Set REFERENCES and content KEYS are separate fields, exactly as the
+    predecessor `cfg_file_sets` split `cfg_file_set_keys` from `cfg_files`. They
+    are different things to the engine — one is a ctl catalog lookup, the other a
+    plt content address — so they cannot collide, and a plt key is free to be
+    named like a set.
+
+    Referenced sets are spliced FIRST (they carry the axis/naming prefix), then
+    the consumer's own keys. A key is an exact name, a dotted sub-path, or a glob
+    over top-level names.
+    """
+    resolved: list[str] = []
+    if cfg_key_set_keys is not None:
+        if not isinstance(cfg_key_set_keys, list) or not cfg_key_set_keys:
+            raise RuntimeError(f"❌ {label} cfg_key_sets must be a non-empty list ({cfg_path})")
+        for name in cfg_key_set_keys:
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError(f"❌ {label} cfg_key_sets entries must be non-empty strings ({cfg_path})")
+            name = name.strip()
+            if name not in cfg_key_sets:
+                available = ", ".join(sorted(cfg_key_sets)) or "none"
+                raise RuntimeError(
+                    f"❌ {label}: undefined cfg_key_set {name!r}; declared: {available} ({cfg_path})"
+                )
+            if name in _stack:
+                cycle = " -> ".join([*_stack, name])
+                raise RuntimeError(f"❌ cfg_key_set cycle: {cycle} ({cfg_path})")
+            member = cfg_key_sets[name]
+            if not isinstance(member, dict):
+                raise RuntimeError(
+                    f"❌ cfg_key_set {name!r} must be a mapping of "
+                    f"cfg_key_sets / cfg_keys ({cfg_path})"
+                )
+            unknown = sorted(set(member) - {"cfg_key_sets", "cfg_keys"})
+            if unknown:
+                raise RuntimeError(f"❌ cfg_key_set {name!r} has unsupported keys {unknown} ({cfg_path})")
+            resolved.extend(
+                resolve_cfg_key_entries(
+                    member.get("cfg_keys"), member.get("cfg_key_sets"), cfg_key_sets,
+                    label=f"cfg_key_set {name!r}", cfg_path=cfg_path, _stack=(*_stack, name),
+                )
+            )
+    if cfg_keys is not None:
+        if not isinstance(cfg_keys, list) or not cfg_keys:
+            raise RuntimeError(f"❌ {label} cfg_keys must be a non-empty list ({cfg_path})")
+        for entry in cfg_keys:
+            if not isinstance(entry, str) or not entry.strip():
+                raise RuntimeError(f"❌ {label} cfg_keys entries must be non-empty strings ({cfg_path})")
+            entry = entry.strip()
+            if not CFG_KEY_ENTRY_RE.fullmatch(entry):
+                raise RuntimeError(
+                    f"❌ {label}: {entry!r} is not a legal cfg key selector "
+                    f"(key, key.path, or glob) ({cfg_path})"
+                )
+            resolved.append(entry)
+    if not resolved:
+        raise RuntimeError(f"❌ {label} declares neither cfg_key_sets nor cfg_keys ({cfg_path})")
+    seen: set[str] = set()
+    return [e for e in resolved if not (e in seen or seen.add(e))]
+
+
+def project_cfg_keys(doc: dict, entries: list[str], *, label: str) -> dict:
+    """Project the declared key selectors out of one domain's merged cfg doc.
+
+    Assertion 1 (every declared key resolves in its domain) and assertion 5 (a
+    glob matching nothing is a stale declaration) are enforced here — an entry
+    that selects nothing is an ERROR, never a silent empty view.
+    """
+    projected: dict = {}
+    for entry in entries:
+        if entry == "*":
+            matched = list(doc)
+        elif any(ch in entry for ch in "*?["):
+            matched = sorted(k for k in doc if fnmatch.fnmatchcase(k, entry))
+        else:
+            head, _, path = entry.partition(".")
+            if head not in doc:
+                raise RuntimeError(
+                    f"❌ {label}: cfg key {entry!r} does not resolve in this domain; "
+                    f"available: {', '.join(sorted(doc)) or 'none'}"
+                )
+            if not path:
+                matched = [head]
+            else:
+                node = doc[head]
+                for segment in path.split("."):
+                    if not isinstance(node, dict) or segment not in node:
+                        raise RuntimeError(
+                            f"❌ {label}: cfg key path {entry!r} does not resolve in this domain"
+                        )
+                    node = node[segment]
+                branch = projected.setdefault(head, {})
+                if not isinstance(branch, dict):
+                    raise RuntimeError(
+                        f"❌ {label}: cfg key path {entry!r} conflicts with whole key {head!r}"
+                    )
+                cursor = branch
+                segments = path.split(".")
+                for segment in segments[:-1]:
+                    cursor = cursor.setdefault(segment, {})
+                cursor[segments[-1]] = node
+                continue
+        if not matched:
+            raise RuntimeError(
+                f"❌ {label}: cfg key selector {entry!r} matched no key in this domain "
+                "(stale declaration)"
+            )
+        for key in matched:
+            projected[key] = doc[key]
+    return projected
 
 
 def load_inventory_cfg(
@@ -3368,32 +3590,34 @@ def load_inventory_cfg(
     inventory_name: str,
     execution_context: dict[str, object] | None = None,
 ) -> dict:
-    """Compose action cfg from target_sources + cfg_file_sets + targets/<action>/*.yaml.
+    """Compose action cfg from target_sources + cfg_key_sets + targets/<action>/*.yaml.
 
     `inventory_name` is the action (provision/plan/destroy/readonly). Layout:
       - target_sources.yaml  source repos: source key -> meta
-      - cfg_file_sets.yaml       config views: cfg-file-set key -> {cfg_root, cfg_file_set_keys, cfg_files}
+      - cfg_key_sets.yaml        named CONTENT-KEY bundles: set key -> [key selectors]
       - targets/<action>/*.yaml  fat targets (the directory IS the action). Each
             file is a flat `targets:` map; all files for an action merge (duplicate
             names rejected). A target is self-contained:
-              {source_key, ref_key, step_sequence_key, cfg_file_set_key,
-               [execution], [cfg_files], [selectors],
+              {source_key, ref_key, step_sequence_key, domains, cfg_keys,
+               [execution], [selectors],
                [required_plt_overlay_keys]}.
 
     Returns the flat shape build_active_target_runs consumes ({target_sources,
-    targets}), where each target carries source + cfg_root + cfg_files
-    (resolved from its cfg_file_set_key) + step_sequence + execution identity requirement
+    targets}), where each target carries source + domains + cfg_keys
+    (its declared domains + per-domain cfg_keys) + step_sequence + execution identity requirement
     (+ selectors /
     requires_plt_overlays when present).
     """
     # global resources + targets are content-key (collected by top-level key)
     target_sources = collect_resource(ctl_cfg_root, "target_sources")
-    cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
-    cfg_file_sets_path = ctl_cfg_root  # label for include/error messages
+    cfg_key_sets = collect_resource(ctl_cfg_root, "cfg_key_sets")
+    param_sets = collect_resource(ctl_cfg_root, "param_sets")
+    cfg_key_sets_path = ctl_cfg_root  # label for include/error messages
+    domain_registry = load_domain_registry(ctl_cfg_root)
     if not target_sources:
         raise RuntimeError(f"❌ no 'target_sources' defined under: {ctl_cfg_root}")
-    if not cfg_file_sets:
-        raise RuntimeError(f"❌ no 'cfg_file_sets' defined under: {ctl_cfg_root}")
+    if not domain_registry:
+        raise RuntimeError(f"❌ no 'domains' registry defined under: {ctl_cfg_root}")
 
     # §Phase 33: targets are declared ONCE (no action level); each declares a
     # REQUIRED `actions:` allowlist (default-closed) and the inventory for a run
@@ -3420,65 +3644,100 @@ def load_inventory_cfg(
         if not isinstance(target_ref, str) or not target_ref.strip():
             raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'ref_key'")
 
-        cfg_file_set_name = target_def.get("cfg_file_set_key")
-        if not isinstance(cfg_file_set_name, str) or not cfg_file_set_name:
-            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'cfg_file_set_key'")
-        cfg_file_set = cfg_file_sets.get(cfg_file_set_name)
-        if cfg_file_set is None:
+        # §Phase 60: the target DECLARES the domains it reads and, per domain, the
+        # content keys it consumes. `domains` is identity (which namespaces this
+        # target subscribes to); `cfg_keys` is the contract (what it takes out of
+        # them). Neither names a plt FILE, so plt owns its own layout.
+        declared_domains = target_def.get("domains")
+        if not isinstance(declared_domains, list) or not declared_domains:
             raise RuntimeError(
-                f"❌ target {target_name!r} references missing cfg_file_set {cfg_file_set_name!r}: {cfg_file_sets_path}"
+                f"❌ target {target_name!r} must define a non-empty 'domains' list"
             )
-        if not isinstance(cfg_file_set, dict):
-            raise RuntimeError(f"❌ cfg_file_set {cfg_file_set_name!r} must be a mapping: {cfg_file_sets_path}")
-        # §Phase 31 3c: a group entry resolves to one concrete cfg_file_set per
-        # the frozen execution context (e.g. state_backend -> org). Without a
-        # context (static/inventory-wide tools) the group stays unresolved; it
-        # hard-errors only if such a target is actually materialized.
-        if selector_group_is_group(cfg_file_set):
+        # A domain-GENERIC target (tfstate_backend) takes its domain from the
+        # execution context. If that axis is not bound — a generic target in a
+        # shared inventory this run does not activate — resolution is deferred
+        # (None) rather than failing an unrelated run.
+        domains: list[str] | None = []
+        for raw_domain in declared_domains:
+            if not isinstance(raw_domain, str) or not raw_domain.strip():
+                raise RuntimeError(
+                    f"❌ target {target_name!r} domains entries must be non-empty strings"
+                )
+            raw_domain = raw_domain.strip()
+            if "${" not in raw_domain:
+                domains.append(raw_domain)
+                continue
             if execution_context is None:
-                cfg_file_set = {"cfg_root": None}
-                cfg_file_set_name = None
-            else:
-                # A domain-specific target DECLARES its domain (`domain: env`);
-                # a domain-generic target (e.g. tfstate_backend) takes it from the
-                # execution context. If the axis isn't bound — a generic target in
-                # a shared inventory that this run doesn't activate — resolution
-                # is deferred (None) instead of failing an unrelated run; a
-                # declared-domain target must still resolve.
-                declared_domain = target_def.get("domain")
-                group_context = execution_context
-                if declared_domain is not None:
-                    group_context = {
-                        **execution_context,
-                        f"{EXECUTION_CONTEXT_ROOT}.params.domain": str(declared_domain),
-                    }
-                # §Phase 32 guard input: the group's selector axes are axes this
-                # target CONSUMES (unless satisfied by a declared domain).
-                # collect_member_dispatch_axes also ENFORCES the per-axis rule
-                # (params or ctl.action only) on every dispatch.
-                group_axes = collect_member_dispatch_axes(
-                    cfg_file_set.get("members"),
-                    label=f"target {target_name!r} cfg_file_set group",
+                domains = None
+                break
+            consumed_group_axes.update(
+                ref[len(f"{EXECUTION_CONTEXT_ROOT}.params."):]
+                for ref in RUNTIME_SCALAR_TOKEN_RE.findall(raw_domain)
+                if ref.startswith(f"{EXECUTION_CONTEXT_ROOT}.params.")
+            )
+            resolved_domain = resolve_runtime_scalar(
+                raw_domain, execution_context,
+                label=f"target {target_name!r} domains entry",
+                tolerate_missing=True,
+            )
+            if resolved_domain is None:
+                domains = None
+                break
+            domains.append(str(resolved_domain))
+        if domains is not None:
+            if len(set(domains)) != len(domains):
+                raise RuntimeError(f"❌ target {target_name!r} lists a domain twice: {domains}")
+            for domain in domains:
+                validate_domain_value(
+                    domain_registry, domain, label=f"target {target_name!r} domains"
                 )
-                if declared_domain is None:
-                    consumed_group_axes.update(group_axes)
-                concrete_name = resolve_selector_group_member(
-                    cfg_file_set, group_context,
-                    value_field="cfg_file_set_key",
-                    label=f"cfg_file_set group {cfg_file_set_name!r}",
-                    tolerate_none=declared_domain is None,
+
+        raw_cfg_keys = target_def.get("cfg_keys") or {}
+        raw_cfg_key_sets = target_def.get("cfg_key_sets") or {}
+        for field, value in (("cfg_keys", raw_cfg_keys), ("cfg_key_sets", raw_cfg_key_sets)):
+            if not isinstance(value, dict):
+                raise RuntimeError(f"❌ target {target_name!r} {field} must be a map (domain -> list)")
+        if not raw_cfg_keys and not raw_cfg_key_sets:
+            raise RuntimeError(
+                f"❌ target {target_name!r} must define cfg_key_sets and/or cfg_keys "
+                "(domain -> what it consumes)"
+            )
+        cfg_keys: dict[str, list[str]] | None = None
+        if domains is not None:
+            def _domain_key(raw):
+                key = str(raw).strip()
+                if "${" in key:
+                    key = str(resolve_runtime_scalar(
+                        key, execution_context,
+                        label=f"target {target_name!r} cfg_keys domain"))
+                return key
+            per_domain: dict[str, dict] = {}
+            for raw_key, entries in raw_cfg_key_sets.items():
+                per_domain.setdefault(_domain_key(raw_key), {})["cfg_key_sets"] = entries
+            for raw_key, entries in raw_cfg_keys.items():
+                per_domain.setdefault(_domain_key(raw_key), {})["cfg_keys"] = entries
+            cfg_keys = {
+                domain_key: resolve_cfg_key_entries(
+                    spec.get("cfg_keys"), spec.get("cfg_key_sets"), cfg_key_sets,
+                    label=f"target {target_name!r} [{domain_key}]",
+                    cfg_path=cfg_key_sets_path,
                 )
-                if concrete_name is None:
-                    cfg_file_set = {"cfg_root": None}
-                    cfg_file_set_name = None
-                else:
-                    cfg_file_set = cfg_file_sets.get(concrete_name)
-                    if not isinstance(cfg_file_set, dict) or selector_group_is_group(cfg_file_set):
-                        raise RuntimeError(
-                            f"❌ cfg_file_set group {cfg_file_set_name!r} member {concrete_name!r} must "
-                            f"reference a concrete cfg_file_set (no nested groups): {cfg_file_sets_path}"
-                        )
-                    cfg_file_set_name = concrete_name
+                for domain_key, spec in per_domain.items()
+            }
+            # assertion 2: cfg_keys for a domain this target does not read
+            extra = sorted(set(cfg_keys) - set(domains))
+            if extra:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} declares cfg_keys for {extra}, "
+                    f"which are not in its domains {domains}"
+                )
+            # assertion 3: a declared domain this target takes nothing from
+            missing = sorted(set(domains) - set(cfg_keys))
+            if missing:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} declares domains {missing} with no "
+                    "cfg_keys entry — a subscription that consumes nothing"
+                )
 
         step_sequence = target_def.get("step_sequence_key")
         if not isinstance(step_sequence, str) or not step_sequence:
@@ -3499,53 +3758,85 @@ def load_inventory_cfg(
                 target_execution_identity, label=f"target {target_name!r}"
             )
 
-        extra_files = target_def.get("cfg_files", []) or []
-        if isinstance(extra_files, dict):
-            consumed_group_axes.update(
-                collect_member_dispatch_axes(
-                    extra_files.get("members"),
-                    label=f"target {target_name!r} cfg_files members",
+        # §Phase 61(a): a target declares the COORDINATES it consumes and the
+        # CONSTANTS it always uses. The two must not intersect — a name is either
+        # a coordinate or a constant, never both.
+        declared_input_params = resolve_input_params(
+            target_def.get("input_params"),
+            target_def.get("input_param_sets"),
+            param_sets,
+            label=f"target {target_name!r}",
+            cfg_path=cfg_key_sets_path,
+        )
+        static_vars = target_def.get("static_vars") or {}
+        if not isinstance(static_vars, dict):
+            raise RuntimeError(f"❌ target {target_name!r} static_vars must be a map")
+        for var_name, var_value in static_vars.items():
+            if not isinstance(var_name, str) or not CONTEXT_KEY_RE.fullmatch(var_name):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} static_vars key {var_name!r} must be an identifier"
                 )
-            )
-            extra_files = (
-                resolve_list_members(
-                    extra_files,
-                    execution_context,
-                    value_field="cfg_files",
-                    label=f"target {target_name!r} cfg_files",
-                    allow_empty=True,
+            if isinstance(var_value, (dict, list)):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} static_vars.{var_name} must be a literal scalar; "
+                    "a selector-dependent constant varies per instance, which makes it a coordinate"
                 )
-                or []
+        overlap = sorted(set(declared_input_params) & set(static_vars))
+        if overlap:
+            raise RuntimeError(
+                f"❌ target {target_name!r} declares {overlap} as BOTH an input param and a "
+                "static var; a name is either a coordinate or a constant"
             )
-        if not isinstance(extra_files, list):
-            raise RuntimeError(f"❌ target {target_name!r} cfg_files must be a list")
 
         resolved = {
             "source": source,
             "ref": target_ref.strip(),
             "step_sequence": step_sequence,
-            "cfg_file_set": cfg_file_set_name,
-            "cfg_root": cfg_file_set.get("cfg_root", "/"),
-            "cfg_files": [
-                *(
-                    resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path)
-                    if cfg_file_set_name is not None
-                    else []
-                ),
-                *extra_files,
-            ],
+            "domains": domains,
+            "cfg_keys": cfg_keys,
+            "input_params": declared_input_params,
+            "static_vars": dict(static_vars),
         }
-        if cfg_file_set_name is None:
-            # unresolved cfg_file_set group (no execution context at load time)
-            resolved["cfg_file_set_group_unresolved"] = target_def.get("cfg_file_set_key")
+        if domains is None:
+            # Domain-generic target whose domain axis is not bound in this run.
+            # Record the AXIS NAMES it needs, never the raw `${...}` template:
+            # the ctl cfg snapshot resolves every scalar it walks, so an
+            # unresolved placeholder stored here would fail the whole run.
+            resolved["domains_unresolved"] = sorted(
+                {
+                    ref
+                    for raw in declared_domains
+                    for ref in RUNTIME_SCALAR_TOKEN_RE.findall(str(raw))
+                }
+            )
         # §Phase 31: declared instance identity flows through to the resolved
         # target (consumed by resolve_run_instance_identity).
         # §Phase 32: a GENERIC target whose instance axes vary by another axis
         # dispatches its schema by `members` ({params: [...], selectors: {...}}),
-        # the same pattern as its ref/cfg_file_set groups. Exactly one member
+        # the same pattern as its ref groups. Exactly one member
         # matches; an unbound dispatch axis defers (hard error only if the
         # target is actually activated in a run).
         instance_params = target_def.get("target_instance_params")
+        # §Phase 61(a): every coordinate must be a declared input — checked on ALL
+        # members branches, not just the one this run selects, so an unreachable
+        # branch cannot hide a typo until some later execution context picks it.
+        for branch in (
+            [m.get("params") for m in (instance_params.get("members") or [])]
+            if isinstance(instance_params, dict)
+            else [instance_params]
+        ):
+            if not isinstance(branch, list):
+                continue
+            undeclared = sorted(
+                {str(x).strip() for x in branch if isinstance(x, str)}
+                - set(declared_input_params)
+            )
+            if undeclared:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} target_instance_params {undeclared} are not "
+                    f"declared input params (declared: {sorted(declared_input_params) or 'none'}); "
+                    "a target cannot be identified by a coordinate it does not read"
+                )
         if isinstance(instance_params, dict):
             # the dispatch axes of the schema itself are consumed axes too
             consumed_group_axes.update(
@@ -3813,9 +4104,6 @@ def setup_run_dirs(
         shutil.rmtree(cfg_dir)
     os.makedirs(cfg_dir)
 
-    plt_merged_dir = cfg_dir / "plt" / "merged"
-    os.makedirs(plt_merged_dir)
-
     logs_dir = run_dir / "logs"
     os.makedirs(logs_dir, exist_ok=True)
     logs_run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
@@ -3864,7 +4152,7 @@ def setup_run_dirs(
     logging.info(f"Using artifacts_dir: {artifacts_dir}")
     logging.info(f"Logging to: {log_file}")
 
-    return run_dir, artifacts_dir, plt_merged_dir, log_file
+    return run_dir, artifacts_dir, log_file
 
 
 def setup_run_workspace(run_dir: Path) -> Path:
@@ -3877,9 +4165,7 @@ def setup_run_workspace(run_dir: Path) -> Path:
         shutil.rmtree(cfg_dir)
     cfg_dir.mkdir(parents=True)
 
-    plt_merged_dir = cfg_dir / "plt" / "merged"
-    plt_merged_dir.mkdir(parents=True)
-    return plt_merged_dir
+    return cfg_dir
 
 
 def setup_preflight_run_dirs(
@@ -4573,6 +4859,62 @@ def load_ctl_state_lock_metadata(ctl_state_local_root: Path) -> dict:
     return data
 
 
+CHILD_LOCK_GRANT_ENV = "ATLAS_CHILD_LOCK_GRANT"
+# A grant is spent ONCE globally, but the lock decision is asked twice per run
+# (prepare, then complete_prepare_after_preflight). Remember the redemption for
+# this process so the second ask does not look like a replay.
+_REDEEMED_CHILD_GRANT: str | None = None
+
+
+def mint_child_lock_grant(
+    ctl_state_local_root: Path, *, child_kind: str, child_key: str
+) -> str:
+    """§Phase 61(d): mint a SINGLE-USE grant letting one child run under the lock
+    this process holds.
+
+    The run id cannot serve as the credential: it is printed in logs, stored in
+    run metadata and visible in `ps`, and it stays valid for the whole run — so
+    anyone who reads it can start a concurrent run against the same ctl-state
+    while the parent is still going. A nonce is unguessable, is BOUND to the one
+    child it was minted for, and is CONSUMED on use, so a leaked value buys
+    nothing.
+    """
+    metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
+    if not metadata:
+        raise RuntimeError("❌ cannot mint a child lock grant without a held ctl-state lock")
+    grant = uuid.uuid4().hex
+    grants = dict(metadata.get("child_lock_grants") or {})
+    grants[grant] = {"kind": child_kind, "key": child_key}
+    metadata["child_lock_grants"] = grants
+    write_yaml_file(ctl_state_lock_metadata_path(ctl_state_local_root), metadata)
+    return grant
+
+
+def consume_child_lock_grant(
+    ctl_state_local_root: Path, grant: str | None, *, child_kind: str, child_key: str | None
+) -> bool:
+    """Redeem a child grant exactly once, for the child it was minted for."""
+    global _REDEEMED_CHILD_GRANT
+    if not grant:
+        return False
+    if _REDEEMED_CHILD_GRANT == grant:
+        return True
+    metadata = load_ctl_state_lock_metadata(ctl_state_local_root)
+    grants = dict(metadata.get("child_lock_grants") or {})
+    claim = grants.get(grant)
+    if not isinstance(claim, dict):
+        return False
+    if claim.get("kind") != child_kind or (
+        claim.get("key") is not None and claim.get("key") != child_key
+    ):
+        return False
+    del grants[grant]                       # single use
+    metadata["child_lock_grants"] = grants
+    write_yaml_file(ctl_state_lock_metadata_path(ctl_state_local_root), metadata)
+    _REDEEMED_CHILD_GRANT = grant
+    return True
+
+
 def ctl_state_lock_matches(ctl_state_local_root: Path, lock_id: str | None) -> bool:
     if not lock_id:
         return False
@@ -4690,10 +5032,35 @@ def release_ctl_state_lock(lock: CtlResultsLock | None) -> None:
 
 
 def should_bypass_ctl_state_lock(args: argparse.Namespace, run_type: str) -> bool:
-    return (
-        run_type == "maintenance"
-        and getattr(args, "maintenance_action", None) == "force-unlock"
-        and ctl_state_lock_matches(args.ctl_state_local_root, getattr(args, "lock_id", None))
+    """Whether this run proceeds WITHOUT acquiring the ctl-state lock.
+
+    Two cases, both requiring the caller to PROVE it knows the held lock's id:
+
+    - `force-unlock` maintenance, which exists to release that very lock;
+    - §Phase 61(d) a workflow-spawned child target run, which executes under the
+      lock its parent already holds. The lock is `flock(LOCK_EX | LOCK_NB)`, so a
+      child that tried to acquire it would fail outright — exactly one holder, and
+      children run provably under it. Authorisation is a SINGLE-USE grant minted
+      per child and redeemed once, so the public run id cannot be replayed into a
+      concurrent run; an FD handed down instead would be unforgeable but could not
+      cross a container or host boundary.
+    """
+    if run_type == "maintenance":
+        return (
+            getattr(args, "maintenance_action", None) == "force-unlock"
+            and ctl_state_lock_matches(
+                args.ctl_state_local_root, getattr(args, "lock_id", None)
+            )
+        )
+    # §Phase 61(d): a child runs under its parent's lock only by redeeming a
+    # SINGLE-USE grant the parent minted for it, passed by environment so it is
+    # absent from `ps` and from the logged command line. The parent run id is NOT
+    # a credential — it is public.
+    return consume_child_lock_grant(
+        args.ctl_state_local_root,
+        os.environ.get(CHILD_LOCK_GRANT_ENV),
+        child_kind=run_type,
+        child_key=getattr(args, run_type, None) if run_type != "fan_out" else None,
     )
 
 
@@ -4804,11 +5171,16 @@ def selector_expected_values(expected, *, label: str) -> list[str]:
 
 
 EXECUTION_CONTEXT_ROOT = "execution_context"
-EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params")
+# §Phase 61(a): three namespaces, by KIND of fact.
+#   ctl     the invocation      action, profile, providers, runtime mode
+#   params  COORDINATES         identify an instance; become ctl-state path segments
+#   target  the target's own    what it reads (domains) + its constants (static_vars);
+#                               never a coordinate, never a path segment
+EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params", "target")
 EXECUTION_CONTEXT_PARAMS_PREFIX = f"{EXECUTION_CONTEXT_ROOT}.params."
 # The key may itself be dotted — that is how provider-specific params are
 # namespaced under their provider. Provider-neutral params keep a single segment
-# (execution_context.params.env_type). Kept in sync with CONTEXT_KEY_RE, which
+# (execution_context.params.env.type). Kept in sync with CONTEXT_KEY_RE, which
 # validates the key on the way in.
 EXECUTION_CONTEXT_REF_RE = re.compile(
     rf"^{EXECUTION_CONTEXT_ROOT}\.(?:{'|'.join(EXECUTION_CONTEXT_NAMESPACES)})"
@@ -5028,8 +5400,11 @@ def selector_requirements_cover_scope(declaration_selectors: dict | None, scope_
 # to the leading segment; only the provider adapter interprets it.
 CONTEXT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 EXECUTION_PARAMS_KEY = "execution_params"
+# The key may be DOTTED — namespaced params are the normal case, so a
+# whole-value reference must be able to name one.
 EXECUTION_CONTEXT_PARAM_REF_RE = re.compile(
-    rf"^\$\{{({EXECUTION_CONTEXT_ROOT}\.(?:ctl|params)\.[A-Za-z_][A-Za-z0-9_]*)\}}$"
+    rf"^\$\{{({EXECUTION_CONTEXT_ROOT}\.(?:ctl|params)\."
+    rf"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\}}$"
 )
 
 
@@ -5048,15 +5423,31 @@ def load_execution_params(ctl_cfg_root: Path) -> dict[str, object]:
     for path, section in collect_top_level_sections(ctl_cfg_root, EXECUTION_PARAMS_KEY):
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY} must be a mapping: {path}")
-        for key, raw in section.items():
-            if key in entries:
-                raise RuntimeError(
-                    f"❌ duplicate {EXECUTION_PARAMS_KEY}.{key}: {path} (also defined in {origins[key]})"
-                )
-            if not isinstance(key, str) or not CONTEXT_KEY_RE.fullmatch(key):
-                raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY} key must be a valid identifier: {key!r}")
-            entries[key] = raw
-            origins[key] = path
+        # A namespaced family may be authored as a NESTED mapping and is flattened
+        # to the dotted param keys the context uses — `ns: {key: x}` and
+        # `ns.key: x` declare the same param. Params stay scalar-only; nesting is
+        # an authoring shape only, so one namespace's params read as one block.
+        # The engine names no namespace: the consumer chooses them.
+        def walk(node, prefix=""):
+            for key, raw in node.items():
+                if not isinstance(key, str) or not CONTEXT_KEY_RE.fullmatch(key):
+                    raise RuntimeError(
+                        f"❌ {EXECUTION_PARAMS_KEY} key must be a valid identifier: {key!r}"
+                    )
+                dotted = f"{prefix}{key}"
+                if isinstance(raw, dict):
+                    if not raw:
+                        raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY}.{dotted} must not be an empty map: {path}")
+                    walk(raw, f"{dotted}.")
+                    continue
+                if dotted in entries:
+                    raise RuntimeError(
+                        f"❌ duplicate {EXECUTION_PARAMS_KEY}.{dotted}: {path} (also defined in {origins[dotted]})"
+                    )
+                entries[dotted] = raw
+                origins[dotted] = path
+
+        walk(section)
     return entries
 
 
@@ -5078,7 +5469,7 @@ def build_execution_context(
     """Build the flat dotted execution context: the closed, namespaced facts of
     this execution. Two namespaces — `ctl` (promoted engine args) and `params`
     (consumer values, merged from --execution-params CLI + the execution_params
-    cfg block). Keys look like 'execution_context.params.env_type'."""
+    cfg block). Keys look like 'execution_context.params.env.type'."""
     context: dict[str, object] = {}
 
     def put_list(namespace: str, key: str, values, *, label: str) -> None:
@@ -5177,12 +5568,14 @@ def build_execution_context(
         for ref, value in context.items()
         if ref.startswith(f"{EXECUTION_CONTEXT_ROOT}.params.")
     }
+    derived_param_keys: list[str] = []
     for provider in providers or ():
         adapter = get_provider_adapter(provider)
         derive = getattr(adapter, "derived_params", None)
         if derive is None:
             continue
         for key, value in (derive(ctl_cfg_root, dict(declared)) or {}).items():
+            derived_param_keys.append(key)
             label = f"provider {provider!r} derived param {key}"
             if key in declared:
                 raise RuntimeError(
@@ -5190,6 +5583,10 @@ def build_execution_context(
                     "a derived fact must not be passed explicitly"
                 )
             put("params", key, value, label=label)
+    # §Phase 61(a): a DERIVED param is not an input — no caller can supply it, so a
+    # target never declares it. Recording which keys were derived lets the per-target
+    # filter pass them through without treating them as declarable inputs.
+    put_list("ctl", "derived_params", sorted(derived_param_keys), label="derived params")
     return context
 
 
@@ -5247,18 +5644,6 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
     return target_dir
 
 
-def required_target_paths_for_target_runs(active_target_runs: dict) -> set[str] | None:
-    """Return the top-level PLT target paths consumed by target runs."""
-    paths: set[str] = set()
-    for target_run in active_target_runs.values():
-        cfg_root = str(target_run.get("cfg_root") or "/")
-        segments = [part for part in cfg_root.split("/") if part]
-        if not segments:
-            return None
-        paths.add(f"/{segments[0]}")
-    return paths
-
-
 def verify_ctl_guardrails(
     ctl_cfg_root: Path,
     guardrails_cfg_root: Path,
@@ -5279,7 +5664,6 @@ def verify_plt_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
-    required_target_paths: set[str] | None = None,
 ) -> None:
     from utils import guardrails
 
@@ -5290,7 +5674,6 @@ def verify_plt_guardrails(
         plt_rendered_dir,
         execution_context,
         scope_params,
-        required_target_paths,
     )
 
 
@@ -5301,7 +5684,6 @@ def verify_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
-    required_target_paths: set[str] | None = None,
 ) -> None:
     if execution_context.get(
         f"{EXECUTION_CONTEXT_ROOT}.ctl.force_skip_guardrails"
@@ -5323,7 +5705,6 @@ def verify_guardrails(
         plt_rendered_dir,
         execution_context,
         scope_params,
-        required_target_paths,
     )
     logging.info("plt guardrails: passed")
 
@@ -5731,9 +6112,8 @@ def target_definition_document(target_run: dict) -> dict:
         "branch",
         "commit",
         "step_sequence",
-        "cfg_file_set",
-        "cfg_root",
-        "cfg_files",
+        "domains",
+        "cfg_keys",
         "target_instance_params",
         "requires_plt_overlays",
         "execution_identity",
@@ -5789,7 +6169,8 @@ def attach_target_cfg_view_facts(
 ) -> None:
     for target_run_id, target_run in active_target_runs.items():
         target_run["target_cfg_view_sha256"] = directory_content_sha256(
-            Path(plt_targets_dir) / target_run_id / "input"
+            (Path(plt_targets_dir) if (Path(plt_targets_dir) / "input").is_dir()
+             else Path(plt_targets_dir) / target_run_id) / "input"
         )
 
 
@@ -5810,6 +6191,142 @@ def _overlay_leaf_values(overlay: dict) -> dict:
         {"source_dirs": [str(overlay["root"])]},
         skip_filenames=SCOPE_META_SKIP_FILENAMES,
     )
+
+
+def resolve_target_plt_overlays(
+    plt_cfg_root: Path,
+    explicit_overlays: list[str],
+    target_run: dict,
+    *,
+    execution_context: dict[str, object],
+) -> list[str]:
+    """§Phase 61(b): the overlays ONE target_run is merged with.
+
+    A target's `requires_plt_overlays` applies to that target and no other. The
+    run-wide union it replaces meant an overlay declared by one target reshaped
+    the cfg every other target received — `db_artificial_populator` alone touches
+    `foundation`, `ecr_images_cfg`, `ecr_repos_cfg` and `workload_identity`, all
+    of which other targets consume.
+    """
+    return resolve_run_plt_overlays(
+        plt_cfg_root,
+        explicit_overlays,
+        {"target": target_run},
+        execution_context=execution_context,
+    )
+
+
+def whole_tree_execution_context(
+    ctl_cfg_root: Path, execution_context: dict[str, object]
+) -> dict[str, object]:
+    """§Phase 60/61: a context that activates EVERY declared domain's scopes.
+
+    Scope activation is now the scope's own condition (`contains` over
+    `target.domains`), which a real run supplies per target. Whole-tree tooling —
+    `validate_cfg`, `regenerate_guardrails` — has no target, so it declares the
+    full domain registry: it is validating the tree, not running one target.
+    """
+    context = dict(execution_context)
+    context[f"{EXECUTION_CONTEXT_ROOT}.target.domains"] = sorted(
+        load_domain_registry(ctl_cfg_root)
+    )
+    return context
+
+
+def build_target_execution_context(
+    target_run_id: str,
+    target_run: dict,
+    run_execution_context: dict[str, object],
+) -> dict[str, object]:
+    """§Phase 61(a): the execution context AS ONE TARGET SEES IT.
+
+    - `ctl.*` passes through unchanged — it is a property of the INVOCATION.
+    - `params.*` is FILTERED to the params this target declared. A target cannot
+      read a coordinate it did not declare, so a param that is irrelevant to it is
+      structurally unreachable rather than merely unused.
+    - `target.*` carries what the target declares about itself: the domains it
+      reads and its static vars. Never a coordinate, never a ctl-state segment.
+    """
+    declared = target_run.get("input_params")
+    derived = set(
+        run_execution_context.get(f"{EXECUTION_CONTEXT_ROOT}.ctl.derived_params") or []
+    )
+    context: dict[str, object] = {}
+    for ref, value in run_execution_context.items():
+        _, namespace, key = ref.split(".", 2)
+        if namespace != "params":
+            context[ref] = value
+            continue
+        if declared is None or key in declared or key in derived:
+            context[ref] = value
+
+    if declared:
+        missing = sorted(
+            k for k in declared
+            if f"{EXECUTION_CONTEXT_ROOT}.params.{k}" not in context
+        )
+        if missing:
+            raise RuntimeError(
+                f"❌ target_run {target_run_id!r} declares input params {missing} that this "
+                "run does not supply"
+            )
+
+    domains = target_run.get("domains")
+    if domains:
+        context[f"{EXECUTION_CONTEXT_ROOT}.target.domains"] = [str(d) for d in domains]
+    for name, value in (target_run.get("static_vars") or {}).items():
+        context[f"{EXECUTION_CONTEXT_ROOT}.target.static_vars.{name}"] = _context_scalar(
+            value, label=f"target_run {target_run_id!r} static_vars.{name}"
+        )
+    return context
+
+
+def target_cfg_views_root(run_dir: Path, run_type: str) -> Path:
+    """Where a run keeps its per-target cfg derivations.
+
+    A TARGET run has exactly one target, so it writes straight to `cfg/plt` —
+    nesting it under `targets/<key>/` would repeat, in a path, what the whole run
+    already is. A WORKFLOW pre-checks many, so it keeps them apart under
+    `cfg/plt/targets/<key>/` (and drops the tree once each child owns its copy).
+    """
+    base = run_dir / "cfg" / "plt"
+    return base if run_type == "target" else base / "targets"
+
+
+def target_cfg_view_dir(run_dir: Path, run_type: str, target_run_id: str) -> Path:
+    root = target_cfg_views_root(run_dir, run_type)
+    return root if run_type == "target" else root / target_run_id
+
+
+def prepare_target_cfg_view(
+    target_run_id: str,
+    target_run: dict,
+    *,
+    plt_cfg_root: Path,
+    target_cfg_dir: Path,
+    ctl_profile: str,
+    scope_params: dict[str, str] | None,
+    execution_context: dict[str, object],
+) -> Path:
+    """§Phase 61(b): merge, render and project ONE target's cfg, under its own dir.
+
+    The workflow authors ordering; a target derives its own cfg. Nothing is shared
+    between targets, so a target runs standalone exactly as it runs in a workflow,
+    and its provenance is its own rather than a slice of a run-wide tree.
+    """
+    target_dir = target_cfg_dir
+    merged_dir = target_dir / "merged"
+    merge_plt_cfg_dirs(
+        plt_cfg_root=plt_cfg_root,
+        plt_merged_dir=merged_dir,
+        ctl_profile=ctl_profile,
+        plt_overlays=list(target_run.get("plt_overlays") or []),
+        scope_params=scope_params,
+        execution_context=execution_context,
+        source_log_roots=(plt_cfg_root.resolve(),),
+        dest_log_roots=(target_dir.resolve(),),
+    )
+    return render_plt_cfg(merged_dir, target_dir, execution_context)
 
 
 def resolve_run_plt_overlays(
@@ -5933,15 +6450,17 @@ def merge_plt_cfg_dirs(
     source_log_roots: tuple[Path, ...] | None = None,
     dest_log_roots: tuple[Path, ...] | None = None,
     merged_files: dict[str, list[str]] | None = None,
-    required_target_paths: set[str] | None = None,
 ) -> dict[str, list[str]]:
     """Build scoped merged cfg trees from typed __meta__.yaml metadata.
 
     Scope and overlay activation both use the uniform selectors.match/selectors.in
     execution-context selector model.
-    With `required_target_paths` set, only the scopes serving those target
-    paths merge (selective merge: a run composes only the cfg its target_runs
-    consume); None = every active scope."""
+    §Phase 60/61: a scope declares its own CONDITION
+    (`selectors.contains: {execution_context.target.domains: <domain>}`), so it
+    activates iff the run reads its domain. `target_path` stays purely the
+    DESTINATION. The former `required_target_paths` filter did the same job from
+    the other side and was removed — two mechanisms deciding one thing can
+    disagree."""
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
     os.makedirs(plt_merged_dir, exist_ok=True)
@@ -5961,20 +6480,8 @@ def merge_plt_cfg_dirs(
             scope_params=runtime_selectors,
             execution_context=execution_context,
         )
-        selected_scopes: list[dict] = []
-        for scope in active_scopes:
-            target_path = scope["target_path"]
-            if required_target_paths is not None and target_path not in required_target_paths:
-                logging.info(
-                    "Skipping cfg scope %s -> %s (not consumed by this run's target_runs)",
-                    scope["scope_path"],
-                    target_path,
-                )
-                continue
-            selected_scopes.append(scope)
-
         scopes_by_target: dict[str, list[dict]] = collections.defaultdict(list)
-        for scope in selected_scopes:
+        for scope in active_scopes:
             scopes_by_target[scope["target_path"]].append(scope)
         for target_path, scopes in scopes_by_target.items():
             validate_cross_scope_leaf_conflicts(
@@ -5985,7 +6492,7 @@ def merge_plt_cfg_dirs(
 
         merged_target_paths: set[str] = set()
 
-        for scope in selected_scopes:
+        for scope in active_scopes:
             target_path = scope["target_path"]
             target_rel = target_path.lstrip("/")
             target_dest = (plt_merged_dir / target_rel).resolve()
@@ -6037,7 +6544,6 @@ def prepare_pipeline_cfg(
     plt_cfg_root: Path,
     workflow_cfg: dict,
     inventory_cfg: dict,
-    plt_merged_dir: Path,
     artifacts_dir: Path,
     ctl_profile: str,
     plt_overlays: list[str],
@@ -6050,16 +6556,14 @@ def prepare_pipeline_cfg(
     active_target_runs: dict | None = None,
 ) -> tuple[dict, Path, list[str]]:
     """
-    Merge config dirs, build active target_runs, and write pipeline_run_cfg.
+    Build active target_runs, resolve per-target overlays, and write pipeline_run_cfg.
+
+    §Phase 61(b): this no longer merges anything. Each target derives its own cfg
+    (`prepare_target_cfg_view`), so there is no run-wide merged tree to build here.
 
     Returns:
         tuple: (active_target_runs, pipeline_run_cfg_path, final_plt_overlays)
     """
-    source_log_roots = (plt_cfg_root.resolve(),)
-    dest_log_roots = (plt_merged_dir.parent.parent.resolve(),)
-
-    # Resolve active target_runs first (needs no plt cfg), so the merge composes only
-    # the scopes this run's target_runs consume (selective merge by cfg_root).
     if active_target_runs is None:
         active_target_runs = build_active_target_runs(
             workflow_cfg,
@@ -6071,6 +6575,10 @@ def prepare_pipeline_cfg(
             require_commit_refs=require_commit_refs,
         )
 
+    # §Phase 61(b): overlays are a PER-TARGET declaration, so each target_run gets
+    # exactly the overlays it asked for plus the run's explicit ones. The former
+    # run-wide union meant a target that never declared an overlay still had its cfg
+    # merged with it — `requires_plt_overlays` now means what it says.
     final_plt_overlays = resolve_run_plt_overlays(
         plt_cfg_root,
         plt_overlays,
@@ -6078,20 +6586,13 @@ def prepare_pipeline_cfg(
         execution_context=execution_context or {},
     )
     for target_run in active_target_runs.values():
-        target_run["plt_overlays"] = list(final_plt_overlays)
+        target_run["plt_overlays"] = resolve_target_plt_overlays(
+            plt_cfg_root,
+            plt_overlays,
+            target_run,
+            execution_context=execution_context or {},
+        )
     attach_target_definition_facts(active_target_runs)
-
-    merged_files = merge_plt_cfg_dirs(
-        plt_cfg_root=plt_cfg_root,
-        plt_merged_dir=plt_merged_dir,
-        ctl_profile=ctl_profile,
-        plt_overlays=final_plt_overlays,
-        scope_params=scope_params,
-        execution_context=execution_context,
-        source_log_roots=source_log_roots,
-        dest_log_roots=dest_log_roots,
-        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
-    )
 
     write_target_run_flow_artifact(
         artifacts_dir / "resolved_target_runs_flow.yaml",
@@ -8344,10 +8845,13 @@ def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict) -> None:
         )
 
 
-def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[str, object]) -> Path:
-    """Render merged/ into rendered/ (whole-scope). In-process engine step —
-    no subprocess, no target_run costume."""
-    plt_rendered_dir = run_dir / "cfg" / "plt" / "rendered"
+def render_plt_cfg(
+    plt_merged_dir: Path, dest_dir: Path, execution_context: dict[str, object]
+) -> Path:
+    """Render merged/ into <dest_dir>/rendered (whole-scope). In-process engine
+    step — no subprocess, no target_run costume. §Phase 61(b): `dest_dir` is the
+    TARGET's own cfg dir, so nothing is rendered once and shared."""
+    plt_rendered_dir = dest_dir / "rendered"
     if plt_rendered_dir.exists():
         shutil.rmtree(plt_rendered_dir)
     plt_rendered_dir.mkdir(parents=True)
@@ -8361,73 +8865,64 @@ def render_plt_cfg(plt_merged_dir: Path, run_dir: Path, execution_context: dict[
     return plt_rendered_dir
 
 
-def run_cfg_distribution(pipeline_run_cfg_path: Path, plt_rendered_dir: Path, run_dir: Path) -> Path:
-    """Distribute target_run input views from the rendered tree (in-process engine
-    step — folded from the former dockerized prepare/cfg target_run).
+def run_cfg_distribution(
+    pipeline_run_cfg_path: Path, plt_targets_dir_path: Path, run_type: str = "workflow"
+) -> Path:
+    """Project each target_run's declared cfg keys out of ITS OWN rendered tree.
 
-    Single derivation chain: rendered/ derives from merged/; each
-    target_runs/<target_run>/input/ view is selected from rendered/ only.
+    §Phase 61(b): the rendered tree lives under the target
+    (`plt/targets/<target>/rendered`), not once per run, so this reads only what
+    that target derived for itself.
     """
-    plt_targets_dir_path = run_dir / "cfg" / "plt" / "targets"
     cfg = load_yaml(pipeline_run_cfg_path) or {}
     target_runs = cfg.get("target_runs") or {}
     if not isinstance(target_runs, dict):
         raise RuntimeError("pipeline_run_cfg.yaml target_runs must be a mapping")
     plt_targets_dir_path.mkdir(parents=True, exist_ok=True)
 
+    brc = _step_utils_module("build_runtime_cfg")
+
     for target_run_name, target_run_cfg in target_runs.items():
         if not isinstance(target_run_cfg, dict):
             raise RuntimeError(f"Target run {target_run_name!r} config must be a mapping")
-        cfg_files = target_run_cfg.get("cfg_files") or []
-        if not cfg_files:
+        domains = target_run_cfg.get("domains") or []
+        cfg_keys = target_run_cfg.get("cfg_keys") or {}
+        if not domains:
             continue
-        if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Target run {target_run_name!r} cfg_files must be a list")
+        if not isinstance(cfg_keys, dict):
+            raise RuntimeError(f"Target run {target_run_name!r} cfg_keys must be a mapping")
 
-        cfg_root = normalize_cfg_absolute_path(
-            target_run_cfg.get("cfg_root", "/"), label=f"target_run {target_run_name!r} cfg_root", allow_root=False
+        view_dir = (
+            plt_targets_dir_path if run_type == "target"
+            else plt_targets_dir_path / target_run_name
         )
-        if len([part for part in cfg_root.split("/") if part]) != 1:
-            raise RuntimeError(
-                f"Target run {target_run_name!r} cfg_root must be exactly one top-level scope "
-                f"(a single path segment), not {cfg_root!r} — a target_run may not span scopes"
-            )
-        scope_root = cfg_abs_path_to_dir(plt_rendered_dir, cfg_root, label=f"target_run {target_run_name!r} cfg_root")
-        if not scope_root.is_dir():
-            logging.info("[WARN] cfg root %r not found for target_run %r: %s", cfg_root, target_run_name, scope_root)
-            continue
-
-        target_input_dir = plt_targets_dir_path / target_run_name / "input"
+        rendered_root = view_dir / "rendered"
+        target_input_dir = view_dir / "input"
         target_input_dir.mkdir(parents=True, exist_ok=True)
 
-        for pattern in cfg_files:
-            if not isinstance(pattern, str) or not pattern.strip():
-                raise RuntimeError(f"Target run {target_run_name!r} cfg_files entries must be non-empty strings")
-            pattern_norm = pattern.strip().lstrip("/")
-            if pattern_norm == "*":
-                sources = [p for p in scope_root.iterdir()]
-            elif pattern_norm.endswith("/*"):
-                src_dir = cfg_abs_path_to_dir(scope_root, "/" + pattern_norm[:-2], label=f"target_run {target_run_name!r} cfg_files pattern")
-                if not src_dir.is_dir():
-                    logging.info("[WARN] cfg dir %r not found under %s", pattern_norm, cfg_root)
-                    continue
-                sources = [p for p in src_dir.iterdir()]
-            else:
-                sources = [cfg_abs_path_to_dir(scope_root, "/" + pattern_norm, label=f"target_run {target_run_name!r} cfg_files entry")]
-
-            for src in sources:
-                if not src.exists():
-                    logging.info("[WARN] cfg entry does not exist under %s: %s", cfg_root, src)
-                    continue
-                rel = src.relative_to(scope_root)
-                dst = target_input_dir / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                if src.is_dir():
-                    if dst.exists():
-                        shutil.rmtree(dst)
-                    shutil.copytree(dst if False else src, dst)
-                else:
-                    shutil.copy2(src, dst)
+        for domain in domains:
+            domain = str(domain).strip().strip("/")
+            scope_root = rendered_root / domain
+            # assertion 4: a declared domain that matches NO active scope would
+            # otherwise deliver a silently empty view.
+            if not scope_root.is_dir():
+                raise RuntimeError(
+                    f"❌ target_run {target_run_name!r} declares domain {domain!r}, but no active "
+                    f"cfg scope publishes into /{domain} for this execution context"
+                )
+            merged: dict = {}
+            for path in sorted(scope_root.rglob("*.yaml")):
+                merged = brc.merge_values(merged, brc.load_yaml_mapping(path))
+            entries = cfg_keys.get(domain)
+            if not entries:
+                raise RuntimeError(
+                    f"❌ target_run {target_run_name!r} declares domain {domain!r} with no cfg_keys"
+                )
+            projected = project_cfg_keys(
+                merged, list(entries),
+                label=f"target_run {target_run_name!r} domain {domain!r}",
+            )
+            write_yaml_file(target_input_dir / f"{domain}.yaml", projected)
 
     logging.info("Prepared target_run input cfg views under %s", plt_targets_dir_path)
     return plt_targets_dir_path
@@ -8606,17 +9101,32 @@ def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_
         if not isinstance(docker_build, bool):
             raise RuntimeError(f"Step metadata runtime.docker_build must be a boolean: {step_meta_path}")
         supported_execution_runtime_modes = step_supported_execution_runtime_modes(runtime_cfg, label=str(step_meta_path))
-        cfg_files = step_meta.get("cfg_files", [])
-        if cfg_files is None:
-            cfg_files = []
-        if not isinstance(cfg_files, list):
-            raise RuntimeError(f"Step metadata cfg_files must be a list: {step_meta_path}")
+        # §Phase 60: the STEP is the true consumer (its root's variables.tf), so
+        # it declares content keys, not files.
+        # §Phase 60: a step declares PURE CONTENT KEYS. `cfg_key_sets` is a
+        # CTL-cfg authoring convenience; a source repo cannot resolve a ctl
+        # catalog entry, and depending on one would recreate the cross-repo
+        # coupling this phase removed. The step's contract is its own root's
+        # variables, spelled out.
+        if step_meta.get("cfg_key_sets"):
+            raise RuntimeError(
+                f"Step metadata must not use cfg_key_sets — a step declares content keys, "
+                f"and cfg_key_sets is a CTL-cfg catalog the source repo cannot resolve: {step_meta_path}"
+            )
+        step_contract = step_meta.get("cfg_keys") or {}
+        if not isinstance(step_contract, dict):
+            raise RuntimeError(f"Step metadata cfg_keys must be a mapping: {step_meta_path}")
+        for domain, entries in step_contract.items():
+            if not isinstance(entries, list) or not entries:
+                raise RuntimeError(
+                    f"Step metadata cfg_keys[{domain!r}] must be a non-empty list: {step_meta_path}"
+                )
 
         active.append(
             {
                 "id": step_id,
                 "path": step_path,
-                "cfg_files": cfg_files,
+                "cfg_keys": step_contract,
                 "runtime": {
                     "values_json": values_json,
                     "env_sh": env_sh,
@@ -8633,7 +9143,9 @@ def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_
     return active
 
 
-def get_repo_local_steps(repo_path: Path, action: str, step_sequence_key: str) -> tuple[list[str], list[dict]]:
+def get_repo_local_steps(
+    repo_path: Path, action: str, step_sequence_key: str
+) -> tuple[list[str], list[dict]]:
     manifest_file = repo_path / ADAPTER_DIR / "manifest.yaml"
     if not manifest_file.is_file():
         raise RuntimeError(f"❌ manifest file not found: {manifest_file}")
@@ -8674,7 +9186,7 @@ def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path)
 
 def resolve_force_unlock_tfstate_binding(
     repo_path: Path, action: str, step_sequence_key: str
-) -> tuple[str, str, list[str]]:
+) -> tuple[str, str, dict]:
     """Resolve one Terraform project, state-key variable, and cfg-file set."""
     _, repo_steps = get_repo_local_steps(repo_path, action, step_sequence_key)
     bindings: dict[tuple[str, str], list[str]] = {}
@@ -8698,10 +9210,12 @@ def resolve_force_unlock_tfstate_binding(
                     f"{stack_dir!r} from {script_path}"
                 )
             binding = (stack_dir, match.group("state_key"))
-            cfg_files = bindings.setdefault(binding, [])
-            for cfg_file in repo_step["cfg_files"]:
-                if cfg_file not in cfg_files:
-                    cfg_files.append(cfg_file)
+            merged_keys = bindings.setdefault(binding, {})
+            for domain, entries in (repo_step["cfg_keys"] or {}).items():
+                bucket = merged_keys.setdefault(domain, [])
+                for entry in (entries if isinstance(entries, list) else []):
+                    if entry not in bucket:
+                        bucket.append(entry)
 
     if not bindings:
         raise RuntimeError(
@@ -8780,6 +9294,30 @@ def target_instance_dir_for_run(
         ),
         target_instance_address(target_key, segments),
     )
+
+
+def latest_child_revision(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+) -> dict | None:
+    """§Phase 61(d): the revision a SPAWNED child just committed.
+
+    The child publishes its own committed pointer, so the parent reads it back
+    rather than being told — the same record any later run would consult.
+    """
+    instance_dir, address = target_instance_dir_for_run(
+        parent_run_dir, target_run, execution_context
+    )
+    pointer = read_committed_pointer(instance_dir)
+    if not pointer:
+        return None
+    return {
+        "address": address,
+        "run_id": pointer.get("run_id"),
+        "snapshot_sha256": pointer.get("snapshot_sha256"),
+        "status": pointer.get("status"),
+    }
 
 
 def committed_target_revision_if_skippable(
@@ -8871,6 +9409,10 @@ def begin_workflow_target_run(
     # (<key>/instances/<seg>/…) — no identity.yaml is written (§minimal files).
     child_run_id = generate_uuid7()
     child_run_dir = instance_dir / "runs" / child_run_id
+    # §Phase 61(c): the target owns its own log; the workflow keeps the aggregate.
+    child_logs_dir = child_run_dir / "logs"
+    child_logs_dir.mkdir(parents=True, exist_ok=True)
+    child_log_path = child_logs_dir / f"{SERVICE_ID}_{child_run_id}.log"
     write_run_metadata(
         child_run_dir,
         {
@@ -8884,11 +9426,15 @@ def begin_workflow_target_run(
             "ctl_state_namespace": parent_metadata.get("ctl_state_namespace"),
             "ctl_state_dir": str(instance_dir),
             "run_dir": str(child_run_dir),
-            "log_path": parent_metadata.get("log_path"),
+            "log_path": str(child_log_path),
+            "parent_log_path": parent_metadata.get("log_path"),
             "target_keys": [target_key],
             "instance": segments,
             "instance_address": address,
             "parent_workflow_run_id": parent_metadata.get("run_id"),
+            # §Phase 61(b4): name the parent by INSTANCE too, so a target record
+            # says which workflow instance it belongs to without loading the parent.
+            "parent_workflow_instance_address": parent_metadata.get("instance_address"),
             "fan_out_run_id": parent_metadata.get("fan_out_run_id"),
             "mutation_started": False,
             **{
@@ -8957,15 +9503,27 @@ def populate_workflow_child_slice(
     artifacts (whole-workflow plan, resolved flow, orchestrator logs) stay under
     the parent run, which the child references by `parent_workflow_run_id`.
     Additive: it only writes into the child run dir, never the workflow run."""
-    write_execution_context_artifact(child_run_dir, execution_context)
+    # §Phase 61(b3): the child owns its WHOLE cfg derivation, not two views of a
+    # tree the workflow keeps. The workflow builds it up front (fail-fast for every
+    # target before any runs — §b2) and hands the complete tree to the target it
+    # describes; `run_pipeline` then drops the workflow-side copy.
     cfg_dst = child_run_dir / "cfg"
-    for view in ("input", "resolved"):
-        src = plt_targets_dir_path / target_run_id / view
+    src_root = plt_targets_dir_path / target_run_id
+    for view in ("merged", "rendered", "input", "resolved"):
+        src = src_root / view
         if src.is_dir():
-            shutil.copytree(src, cfg_dst / view, dirs_exist_ok=True)
+            shutil.copytree(src, cfg_dst / "plt" / view, dirs_exist_ok=True)
+    # the target's OWN execution context — params filtered to what it declared,
+    # plus target.* — not the run-wide one (§Phase 61(a))
+    target_context_path = src_root / "execution" / EXECUTION_CONTEXT_FILENAME
+    if target_context_path.is_file():
+        (child_run_dir / "execution").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target_context_path, child_run_dir / "execution" / EXECUTION_CONTEXT_FILENAME)
+    else:
+        write_execution_context_artifact(child_run_dir, execution_context)
     if target_run.get("target_definition") is not None:
         write_yaml_file(
-            cfg_dst / "target_definition.yaml", target_run["target_definition"]
+            cfg_dst / "ctl" / "target_definition.yaml", target_run["target_definition"]
         )
     source_refs = {
         key: target_run[key]
@@ -8978,7 +9536,54 @@ def populate_workflow_child_slice(
         write_yaml_file(child_run_dir / "source_refs.yaml", source_refs)
 
 
-def run_steps(
+def build_child_target_command(
+    spec: dict, target_key: str, *, parent_run_dir: Path, parent_run_id: str
+) -> list[str]:
+    """§Phase 61(d): the argv for one workflow child, derived from ONE frozen spec.
+
+    A child must run with exactly its parent's settings. Dropping a flag would not
+    fail — the child would silently run DIFFERENTLY — so the argv is built from a
+    single object captured in `run_pipeline`, never assembled from scattered
+    locals.
+    """
+    argv = [
+        sys.executable, str(spec["ctl_entrypoint"]), "target",
+        "--ctl-cfg", str(spec["ctl_cfg_root"]),
+        "--ctl-profile", spec["ctl_profile"],
+        "--ctl-state-local-root", str(spec["ctl_state_local_root"]),
+        "--execution-runtime-mode", spec["execution_runtime_mode"],
+        "--action", spec["action"],
+        "--target", target_key,
+        # the child runs UNDER the parent's ctl-state lock. Authorisation is a
+        # single-use grant passed by ENVIRONMENT (see CHILD_LOCK_GRANT_ENV); the
+        # run id below is provenance only, and is deliberately not a credential.
+        "--parent-workflow-run-id", parent_run_id,
+    ]
+    if spec.get("providers"):
+        argv += ["--providers", ",".join(spec["providers"])]
+    for key, value in (spec.get("execution_params") or {}).items():
+        argv += ["--execution-params", f"{key}={value}"]
+    for key, value in (spec.get("provider_options") or {}).items():
+        argv += ["--provider-options", f"{key}={value}"]
+    for provider, mode in (spec.get("execution_access_modes") or {}).items():
+        argv += ["--execution-access-mode", f"{provider}={mode}"]
+    for overlay in (spec.get("plt_overlays") or []):
+        argv += ["--plt-overlays", overlay]
+    for provider in (spec.get("force_skip_execution_identity_preflight_check") or []):
+        argv += ["--force-skip-execution-identity-preflight-check", provider]
+    for flag, enabled in (
+        ("--agreed-defer-ctl-state-backend-sync", spec.get("agreed_defer_ctl_state_backend_sync")),
+        ("--force-skip-ctl-state-backend-sync", spec.get("force_skip_ctl_state_backend_sync")),
+        ("--force-skip-guardrails", spec.get("force_skip_guardrails")),
+        ("--force-skip-full-cfg-validation-gate", spec.get("force_skip_full_cfg_validation_gate")),
+        ("--skip-children-precheck", spec.get("skip_children_precheck")),
+    ):
+        if enabled:
+            argv.append(flag)
+    return argv
+
+
+def run_targets(
     active_target_runs: dict,
     run_dir: Path,
     plt_targets_dir_path: Path,
@@ -8995,6 +9600,7 @@ def run_steps(
     execution_access_modes: dict[str, str] | None = None,
     provider_options: dict[str, str] | None = None,
     skip_committed_rerun: bool = False,
+    child_command_spec: dict | None = None,
 ) -> None:
     """Clone and run all active target runs."""
     os.chdir(run_dir)
@@ -9020,6 +9626,33 @@ def run_steps(
                 )
                 child_revisions.append(revision)
                 continue
+
+        # §Phase 61(d): a WORKFLOW spawns `ctl.py target` per child, so a target
+        # runs by exactly the same path standalone and inside a workflow. The child
+        # builds its own cfg, context and log; `run_and_log` streams its output into
+        # this run's log, so the workflow keeps the aggregate. It executes under this
+        # run's ctl-state lock — flock is exclusive and non-blocking, so acquiring it
+        # again would fail outright.
+        if child_command_spec is not None and load_run_metadata(run_dir).get(
+            "run_type"
+        ) == "workflow":
+            target_key = target_run.get("target")
+            argv = build_child_target_command(
+                child_command_spec, target_key,
+                parent_run_dir=run_dir, parent_run_id=run_id,
+            )
+            logging.info("Spawning child target run: %s", target_key)
+            child_env = dict(os.environ)
+            child_env[CHILD_LOCK_GRANT_ENV] = mint_child_lock_grant(
+                Path(child_command_spec["ctl_state_local_root"]),
+                child_kind="target", child_key=target_key,
+            )
+            run_and_log(argv, cwd=str(run_dir), env=child_env)
+            revision = latest_child_revision(run_dir, target_run, execution_context)
+            if revision is not None:
+                child_revisions.append(revision)
+            continue
+
         repo_path, target_env = prepare_target_repo(
             target_run_id,
             target_run,
@@ -9036,10 +9669,15 @@ def run_steps(
         step_sequence_key = target_run.get("step_sequence")
         if not isinstance(step_sequence_key, str) or not step_sequence_key:
             raise RuntimeError(f"❌ target run {target_run_id!r} must define a non-empty step_sequence")
-        origin_cfg_path = plt_targets_dir_path / target_run_id / "input"
+        target_view_dir = (
+            plt_targets_dir_path
+            if (plt_targets_dir_path / "input").is_dir()
+            else plt_targets_dir_path / target_run_id
+        )
+        origin_cfg_path = target_view_dir / "input"
         if not origin_cfg_path.is_dir():
             raise RuntimeError(f"❌ target_run input cfg dir not found for target_run {target_run_id!r}: {origin_cfg_path}")
-        target_cfg_dir = plt_targets_dir_path / target_run_id / "resolved"
+        target_cfg_dir = target_view_dir / "resolved"
         os.makedirs(target_cfg_dir, exist_ok=True)
         target_state_run_dir, target_instance_address = begin_workflow_target_run(
             run_dir, target_run, execution_context
@@ -9052,6 +9690,11 @@ def run_steps(
         os.makedirs(target_artifacts_dir, exist_ok=True)
 
         copied_execution_context = ensure_repo_execution_context(repo_path, execution_context_path)
+        # §Phase 61(c): everything this target emits also lands in its own log.
+        target_log = target_run_log(
+            target_state_run_dir if target_instance_address is not None else None
+        )
+        target_log.__enter__()
         try:
             repo_step_ids, repo_steps = get_repo_local_steps(repo_path, inventory_name, step_sequence_key)
             run_manifest = {
@@ -9085,7 +9728,7 @@ def run_steps(
                 step_run_cmd = [runtime_dispatcher]
                 repo_step_env = dict(target_env)
                 repo_step_env["ATLAS_EXECUTION_CONTEXT_FILE"] = EXECUTION_CONTEXT_FILENAME
-                repo_step_env["cfg_files"] = json.dumps(repo_step.get("cfg_files"))
+                repo_step_env["cfg_keys"] = json.dumps(repo_step.get("cfg_keys") or {})
                 repo_step_env["STEP_WRITE_VALUES_JSON"] = (
                     "true" if repo_step_runtime.get("values_json", True) else "false"
                 )
@@ -9132,6 +9775,7 @@ def run_steps(
                 finish_workflow_target_run(target_state_run_dir, error=error)
             raise
         finally:
+            target_log.__exit__(None, None, None)
             repo_execution_context_path = repo_path / EXECUTION_CONTEXT_FILENAME
             if copied_execution_context and repo_execution_context_path.is_file():
                 repo_execution_context_path.unlink()
@@ -9166,7 +9810,6 @@ def run_maintenance(
     provider_implementation_key: str,
     run_dir: Path,
     artifacts_dir: Path,
-    plt_merged_dir: Path,
     log_file: Path,
     provider_options: dict[str, str] | None,
     execution_runtime_mode: str,
@@ -9273,7 +9916,6 @@ def run_maintenance(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
-        plt_merged_dir,
         artifacts_dir,
         ctl_profile,
         plt_overlays,
@@ -9286,16 +9928,31 @@ def run_maintenance(
     )
     update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
     record_run_target_keys(run_dir, target_keys_from_active_target_runs(active_target_runs))
-    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
-    verify_guardrails(
-        ctl_cfg_root,
-        plt_cfg_root,
-        guardrails_cfg_root,
-        plt_rendered_dir,
-        execution_context,
-        scope_params,
-        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
-    )
+    # §Phase 61(b): per-target derivation, same as run_pipeline.
+    run_type_now = str(load_run_metadata(run_dir).get("run_type"))
+    plt_targets_dir_path = target_cfg_views_root(run_dir, run_type_now)
+    for target_run_id, target_run in active_target_runs.items():
+        if not target_run.get("domains"):
+            continue
+        target_context = build_target_execution_context(
+            target_run_id, target_run, execution_context
+        )
+        target_rendered_dir = prepare_target_cfg_view(
+            target_run_id, target_run,
+            plt_cfg_root=plt_cfg_root,
+            target_cfg_dir=target_cfg_view_dir(run_dir, run_type_now, target_run_id),
+            ctl_profile=ctl_profile,
+            scope_params=scope_params_from_context(target_context),
+            execution_context=target_context,
+        )
+        verify_guardrails(
+            ctl_cfg_root,
+            plt_cfg_root,
+            guardrails_cfg_root,
+            target_rendered_dir,
+            target_context,
+            scope_params_from_context(target_context),
+        )
 
     validate_target_runs_have_commits(active_target_runs, ctl_ref_policy)
     provider_adapter = run_provider_adapter(execution_context)
@@ -9315,9 +9972,7 @@ def run_maintenance(
     )
     write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
     plt_targets_dir_path = run_cfg_distribution(
-        pipeline_run_cfg_path,
-        plt_rendered_dir,
-        run_dir,
+        pipeline_run_cfg_path, plt_targets_dir_path, run_type_now
     )
     finalize_target_cfg_view_facts(
         active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
@@ -9348,7 +10003,11 @@ def run_maintenance(
     if assertion_argv:
         run_and_log(assertion_argv, cwd=repo_path, env=target_env)
 
-    target_cfg_dir = plt_targets_dir_path / target_run_id / "input"
+    target_cfg_dir = (
+        plt_targets_dir_path
+        if (plt_targets_dir_path / "input").is_dir()
+        else plt_targets_dir_path / target_run_id
+    ) / "input"
     if not target_cfg_dir.is_dir():
         raise RuntimeError(f"❌ target_run input cfg dir not found for target_run '{target_run_id}': {target_cfg_dir}")
 
@@ -9360,15 +10019,15 @@ def run_maintenance(
         raise RuntimeError(
             f"❌ target run {target_run_id!r} must define a non-empty step_sequence"
         )
-    tf_stack_dir, tfstate_key_var, maintenance_cfg_files = (
+    tf_stack_dir, tfstate_key_var, maintenance_cfg_keys = (
         resolve_force_unlock_tfstate_binding(
             repo_path, inventory_name, step_sequence_key
         )
     )
     target_env["GITHUB_WORKSPACE"] = str(repo_path)
     target_env["MAINTENANCE_TARGET_CFG_DIR"] = str(target_cfg_dir)
-    target_env["MAINTENANCE_CFG_FILES_JSON"] = json.dumps(
-        maintenance_cfg_files, separators=(",", ":")
+    target_env["MAINTENANCE_CFG_KEYS_JSON"] = json.dumps(
+        maintenance_cfg_keys, separators=(",", ":")
     )
     target_env["TF_STACK_DIR"] = tf_stack_dir
     target_env["TFSTATE_KEY_VAR"] = tfstate_key_var
@@ -9997,7 +10656,7 @@ def build_step_sequence_cfg(
     *,
     source: str,
     ref: str,
-    cfg_file_set_name: str,
+    domain_name: str,
     step_sequence: str,
     execution_provider: str | None = None,
     execution_account: str | None = None,
@@ -10010,17 +10669,19 @@ def build_step_sequence_cfg(
     in targets/<action>/. Synthetic runs are local-only and do not publish ctl state.
     """
     target_sources = collect_resource(ctl_cfg_root, "target_sources")
-    cfg_file_sets = collect_resource(ctl_cfg_root, "cfg_file_sets")
-    cfg_file_sets_path = ctl_cfg_root
-    cfg_file_set = cfg_file_sets.get(cfg_file_set_name)
-    if not isinstance(cfg_file_set, dict):
-        raise RuntimeError(f"❌ step_sequence cfg_file_set {cfg_file_set_name!r} not found under {cfg_file_sets_path}")
+    cfg_key_sets = collect_resource(ctl_cfg_root, "cfg_key_sets")
+    # §Phase 60: a synthetic step_sequence target names a DOMAIN and takes the
+    # whole of it — the operator is debugging one step, not authoring a contract.
+    domain = str(domain_name).strip().strip("/")
+    validate_domain_value(
+        load_domain_registry(ctl_cfg_root), domain, label="synthetic step_sequence target domain"
+    )
     resolved = {
         "source": source,
         "ref": ref,
         "step_sequence": step_sequence,
-        "cfg_root": cfg_file_set.get("cfg_root", "/"),
-        "cfg_files": resolve_cfg_file_set_files(cfg_file_set_name, cfg_file_sets, cfg_file_sets_path),
+        "domains": [domain],
+        "cfg_keys": {domain: ["*"]},
     }
     if execution_provider:
         # The synthetic target gets the same execution_identity block a declared target
@@ -10213,13 +10874,22 @@ def expand_fan_out(
                 f"{param_set_key!r} matches the execution context (a run entry must "
                 "contribute at least one child)"
             )
-    max_parallel = fan_out.get("max_parallel", 1)
-    if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1:
-        raise RuntimeError(f"❌ fan-out {fan_out_key!r} max_parallel must be a positive integer")
+    # Fan-out children run SEQUENTIALLY. Each child acquires the ctl-state lock,
+    # which is exclusive and non-blocking over the whole local root, so a second
+    # concurrent child fails outright. `max_parallel` therefore described a knob
+    # that could not be turned; it is removed rather than left as a trap. Running
+    # disjoint children in parallel needs a finer-grained lock (per namespace or
+    # per instance) — recorded as tech debt, not a cfg setting.
+    if "max_parallel" in fan_out:
+        raise RuntimeError(
+            f"❌ fan-out {fan_out_key!r} declares max_parallel, which is removed: "
+            "children run sequentially because each acquires the exclusive "
+            "ctl-state lock. Delete the key."
+        )
     failure_mode = fan_out.get("failure_mode", "stop")
     if failure_mode not in ("stop", "continue"):
         raise RuntimeError(f"❌ fan-out {fan_out_key!r} failure_mode must be 'stop' or 'continue'")
-    return {"max_parallel": max_parallel, "failure_mode": failure_mode, "children": children}
+    return {"failure_mode": failure_mode, "children": children}
 
 
 
@@ -10309,7 +10979,7 @@ def resolve_pipeline_selection(
             inventory_name,
             source=step_sequence_run["source"],
             ref=step_sequence_run["ref"],
-            cfg_file_set_name=step_sequence_run["cfg_file_set"],
+            domain_name=step_sequence_run["domain"],
             step_sequence=step_sequence_run["step_sequence"],
             execution_provider=step_sequence_run.get("execution_provider"),
             execution_account=step_sequence_run.get("execution_account"),
@@ -11128,7 +11798,7 @@ def collect_target_consumed_axes(
 ) -> set[str]:
     """§Phase 32 guard: statically derive the params-namespace axes a target
     consumes at its three resolution chokepoints — ref template / ref group,
-    cfg_file_set + instance-schema group selectors (recorded at inventory load),
+    domain + instance-schema group selectors (recorded at inventory load),
     and identity group selectors + account_key template."""
     consumed: set[str] = set(inventory_target.get("consumed_group_axes") or [])
     raw_ref = inventory_target.get("ref")
@@ -11545,7 +12215,6 @@ def run_pipeline(
     provider_implementation_key: str,
     run_dir: Path,
     artifacts_dir: Path,
-    plt_merged_dir: Path,
     log_file: Path,
     provider_options: dict[str, str] | None,
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
@@ -11557,7 +12226,9 @@ def run_pipeline(
     force_skip_full_cfg_validation_gate: bool = False,
     execution_access_modes: dict[str, str] | None = None,
     force_skip_execution_identity_preflight_check: list[str] | None = None,
+    providers: list[str] | tuple[str, ...] = (),
     skip_committed_rerun: bool = False,
+    skip_children_precheck: bool = False,
     parent_graph_provisions_ctl_state_backend: bool = False,
     parent_ctl_state_backend_absence_confirmed: bool = False,
     preflight_selection: dict | None = None,
@@ -11576,6 +12247,9 @@ def run_pipeline(
             inventory_name,
             workflow_name,
             ctl_variants=ctl_variants,
+            # a run DECLARES its providers; without this the selection resolves
+            # with none and every provider lookup fails ("no providers declared")
+            providers=providers,
             target_repo_key=target_repo_key,
             require_target_ref=require_target_ref,
             provider_implementation_key=provider_implementation_key,
@@ -11698,7 +12372,6 @@ def run_pipeline(
         plt_cfg_root,
         workflow_cfg,
         inventory_cfg,
-        plt_merged_dir,
         artifacts_dir,
         ctl_profile,
         plt_overlays,
@@ -11711,18 +12384,46 @@ def run_pipeline(
         active_target_runs=active_target_runs,
     )
     update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
-    # Single derivation chain: render the merged tree, then verify guards
-    # against rendered values, then distribute target_run input views from it.
-    plt_rendered_dir = render_plt_cfg(plt_merged_dir, run_dir, execution_context)
-    verify_guardrails(
-        ctl_cfg_root,
-        plt_cfg_root,
-        guardrails_cfg_root,
-        plt_rendered_dir,
-        execution_context,
-        scope_params,
-        required_target_paths=required_target_paths_for_target_runs(active_target_runs),
-    )
+    # §Phase 61(b) derivation chain, PER TARGET: each target_run merges its own
+    # scopes with its own overlays, renders them, is guard-verified against its own
+    # rendered values, and receives its projected key view. Nothing is shared, so a
+    # target's cfg cannot be reshaped by another target's declarations.
+    run_type_now = str(load_run_metadata(run_dir).get("run_type"))
+    plt_targets_dir_path = target_cfg_views_root(run_dir, run_type_now)
+    # §Phase 61(d): for a WORKFLOW this loop is a PRE-CHECK of its CHILDREN — each
+    # spawned target re-derives and re-validates its own cfg when it runs. Skipping
+    # trades fail-fast (catch a bad target before target #1 mutates anything) for not
+    # doing the work twice. A target run has no children, so the flag is a no-op.
+    precheck_runs = active_target_runs
+    if skip_children_precheck and load_run_metadata(run_dir).get("run_type") == "workflow":
+        logging.info(
+            "Skipping the child pre-check (--skip-children-precheck); each target "
+            "renders and validates its own cfg when it runs"
+        )
+        precheck_runs = {}
+        update_run_metadata(run_dir, {"skipped_children_precheck": True})
+    for target_run_id, target_run in precheck_runs.items():
+        if not target_run.get("domains"):
+            continue
+        target_context = build_target_execution_context(
+            target_run_id, target_run, execution_context
+        )
+        target_rendered_dir = prepare_target_cfg_view(
+            target_run_id, target_run,
+            plt_cfg_root=plt_cfg_root,
+            target_cfg_dir=target_cfg_view_dir(run_dir, run_type_now, target_run_id),
+            ctl_profile=ctl_profile,
+            scope_params=scope_params_from_context(target_context),
+            execution_context=target_context,
+        )
+        verify_guardrails(
+            ctl_cfg_root,
+            plt_cfg_root,
+            guardrails_cfg_root,
+            target_rendered_dir,
+            target_context,
+            scope_params_from_context(target_context),
+        )
 
     if step_sequence_run:
         target_keys = step_sequence_run.get("affected_target_keys") or []
@@ -11769,7 +12470,7 @@ def run_pipeline(
 
     # Distribute target_run input views from the rendered tree
     plt_targets_dir_path = run_cfg_distribution(
-        pipeline_run_cfg_path, plt_rendered_dir, run_dir
+        pipeline_run_cfg_path, plt_targets_dir_path, run_type_now
     )
     finalize_target_cfg_view_facts(
         active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
@@ -11778,7 +12479,7 @@ def run_pipeline(
         only_target = next(iter(active_target_runs.values()), None)
         if only_target and only_target.get("target_definition") is not None:
             write_yaml_file(
-                run_dir / "cfg" / "target_definition.yaml",
+                run_dir / "cfg" / "ctl" / "target_definition.yaml",
                 only_target["target_definition"],
             )
         if only_target:
@@ -11819,10 +12520,42 @@ def run_pipeline(
                 },
             )
 
+    # §Phase 61(d): ONE frozen spec describing this invocation, from which every
+    # child target's argv is derived. Built here because run_pipeline is the only
+    # place that holds all of it; passing scattered locals into run_targets is how
+    # a flag gets forgotten and a child silently runs differently.
+    run_metadata_now = load_run_metadata(run_dir)
+    child_command_spec = {
+        "ctl_entrypoint": Path(__file__).resolve().parents[3]
+            / "atlas-ctl-orchestrator" / "ctl.py",
+        "ctl_cfg_root": ctl_cfg_root,
+        "ctl_profile": ctl_profile,
+        "ctl_state_local_root": run_metadata_now.get("ctl_state_local_root"),
+        "execution_runtime_mode": execution_runtime_mode,
+        "action": inventory_name,
+        "providers": list(run_providers(execution_context)),
+        "execution_params": dict(execution_params),
+        "provider_options": dict(provider_options or {}),
+        "execution_access_modes": dict(execution_access_modes or {}),
+        "plt_overlays": list(final_plt_overlays or []),
+        "force_skip_execution_identity_preflight_check":
+            list(force_skip_execution_identity_preflight_check or []),
+        "agreed_defer_ctl_state_backend_sync": agreed_defer_ctl_state_backend_sync,
+        "force_skip_ctl_state_backend_sync": force_skip_ctl_state_backend_sync,
+        "force_skip_guardrails": force_skip_guardrails,
+        "force_skip_full_cfg_validation_gate": force_skip_full_cfg_validation_gate,
+        "skip_children_precheck": skip_children_precheck,
+    }
+    write_yaml_file(
+        artifacts_dir / "child_command_spec.yaml",
+        {k: (str(v) if isinstance(v, Path) else v) for k, v in child_command_spec.items()},
+    )
+
     # Run target runs
-    run_steps(
+    run_targets(
         active_target_runs, run_dir, plt_targets_dir_path, execution_context_path,
         inventory_name, execution_context, run_id,
+        child_command_spec=child_command_spec,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,
         provider_adapter=provider_adapter,
@@ -11833,5 +12566,13 @@ def run_pipeline(
         execution_runtime_mode=execution_runtime_mode,
         skip_committed_rerun=skip_committed_rerun,
     )
+
+    # §Phase 61(b3): a WORKFLOW owns ordering, policy and the run verdict — not cfg.
+    # Each child has received its complete derivation, so the workflow-side copy is
+    # dropped rather than published twice.
+    if load_run_metadata(run_dir).get("run_type") == "workflow":
+        workflow_plt_dir = run_dir / "cfg" / "plt"
+        if workflow_plt_dir.exists():
+            shutil.rmtree(workflow_plt_dir)
 
     print_run_summary(run_id, log_file)

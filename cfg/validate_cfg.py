@@ -54,6 +54,8 @@ def main() -> int:
         providers=args.providers,
     )
     common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+    # whole-tree tooling activates every declared domain (see helper)
+    execution_context = common.whole_tree_execution_context(ctl_cfg_root, execution_context)
     scope_params = common.scope_params_from_context(execution_context)
 
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))

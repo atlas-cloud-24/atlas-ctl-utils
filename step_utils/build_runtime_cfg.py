@@ -195,34 +195,49 @@ def resolve_cfg_path(origin_cfg_dir: Path, key: str) -> Path:
     return resolved
 
 
-def iter_cfg_files(origin_cfg_dir: Path, cfg_files: list[str]) -> list[Path]:
+def load_domain_docs(origin_cfg_dir: Path) -> dict[str, dict]:
+    """Load the per-domain views the engine projected into this step's cfg dir.
+
+    §Phase 60: the target delivers `<domain>.yaml` holding exactly the keys it
+    declared; the step then narrows further to its own `cfg_keys`.
+    """
     origin_cfg_dir = origin_cfg_dir.resolve()
-    files: list[Path] = []
-    for key in cfg_files:
-        if key == "*":
-            files.extend(sorted(p for p in origin_cfg_dir.rglob("*") if p.is_file()))
-            continue
+    docs: dict[str, dict] = {}
+    for path in sorted(origin_cfg_dir.glob("*.yaml")):
+        docs[path.stem] = load_yaml_mapping(path)
+    return docs
 
-        if key.endswith("/*"):
-            dir_path = resolve_cfg_path(origin_cfg_dir, key[:-2])
-            if not dir_path.is_dir():
-                raise RuntimeError(f"cfg directory not found for wildcard slice '{key}': {dir_path}")
-            files.extend(sorted(p for p in dir_path.rglob("*") if p.is_file()))
-            continue
 
-        file_path = resolve_cfg_path(origin_cfg_dir, key)
-        if not file_path.is_file():
-            raise RuntimeError(f"cfg file not found: {file_path}")
-        files.append(file_path)
+def project_step_keys(doc: dict, entries: list[str], *, label: str) -> dict:
+    """Narrow one domain view to the step's declared key selectors.
 
-    seen: set[Path] = set()
-    unique: list[Path] = []
-    for path in files:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique.append(path)
-    return unique
+    Assertion 1 + 5 at the step boundary: a key that does not resolve, or a glob
+    that matches nothing, is a stale declaration and an ERROR — never a silently
+    missing Terraform input.
+    """
+    import fnmatch
+
+    projected: dict = {}
+    for entry in entries:
+        if entry == "*":
+            matched = list(doc)
+        elif any(ch in entry for ch in "*?["):
+            matched = sorted(k for k in doc if fnmatch.fnmatchcase(k, entry))
+        else:
+            head = entry.split(".", 1)[0]
+            if head not in doc:
+                raise RuntimeError(
+                    f"{label}: cfg key {entry!r} was not delivered by the target "
+                    f"(delivered: {', '.join(sorted(doc)) or 'none'})"
+                )
+            matched = [head]
+        if not matched:
+            raise RuntimeError(
+                f"{label}: cfg key selector {entry!r} matched nothing (stale declaration)"
+            )
+        for key in matched:
+            projected[key] = doc[key]
+    return projected
 
 
 class Resolver:
@@ -355,17 +370,42 @@ class Resolver:
         return value
 
 
-def build_step_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
+def build_step_values(origin_cfg_dir: Path, cfg_keys: dict, env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
+    docs = load_domain_docs(origin_cfg_dir)
     merged: dict = {}
-    merged_files: list[str] = []
-    for cfg_file in iter_cfg_files(origin_cfg_dir, cfg_files):
-        doc = load_yaml_mapping(cfg_file)
+    merged_domains: list[str] = []
+    for raw_domain, entries in cfg_keys.items():
+        # A domain-GENERIC step (one that serves every domain, e.g. the tfstate
+        # backend) names its domain by execution-context reference rather than
+        # enumerating every domain it could ever serve.
+        domain = raw_domain
+        if "${" in raw_domain:
+            resolved = EXACT_PLACEHOLDER_RE.fullmatch(raw_domain.strip())
+            if not resolved:
+                raise RuntimeError(
+                    f"step cfg_keys domain {raw_domain!r} must be a whole-value "
+                    "${execution_context...} reference"
+                )
+            domain = env_ctx.get(resolved.group(1))
+            if not domain:
+                raise RuntimeError(
+                    f"step cfg_keys domain {raw_domain!r} is unbound in the execution context"
+                )
+        doc = docs.get(domain)
+        if doc is None:
+            raise RuntimeError(
+                f"step declares cfg_keys for domain {domain!r}, which the target did not "
+                f"deliver (delivered: {', '.join(sorted(docs)) or 'none'})"
+            )
         if EXECUTION_CONTEXT_ROOT in doc:
             raise RuntimeError(
-                f"plt payload must not define reserved top-level key {EXECUTION_CONTEXT_ROOT!r}: {cfg_file}"
+                f"plt payload must not define reserved top-level key {EXECUTION_CONTEXT_ROOT!r}: {domain}"
             )
-        merged = merge_values(merged, doc)
-        merged_files.append(str(cfg_file))
+        merged = merge_values(
+            merged,
+            project_step_keys(doc, list(entries), label=f"step cfg_keys[{domain}]"),
+        )
+        merged_domains.append(domain)
 
     resolver = Resolver(merged, env_ctx)
     resolved = {}
@@ -376,7 +416,7 @@ def build_step_values(origin_cfg_dir: Path, cfg_files: list[str], env_ctx: dict[
         resolved[key] = value
 
     resolved = resolve_cfg_entry_refs(resolved)
-    return resolved, merged_files
+    return resolved, merged_domains
 
 
 def shell_value(value) -> str:
@@ -401,20 +441,28 @@ def write_step_env(path: Path, values: dict, values_json_path: Path | None) -> N
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def parse_cfg_files(raw: str) -> list[str]:
+def parse_cfg_keys(raw: str) -> dict:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise argparse.ArgumentTypeError(f"--cfg-files must be valid JSON: {exc}") from exc
-    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise argparse.ArgumentTypeError("--cfg-files must be a JSON list of strings")
+        raise argparse.ArgumentTypeError(f"--cfg-keys must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(domain, str)
+        and isinstance(entries, list)
+        and entries
+        and all(isinstance(e, str) for e in entries)
+        for domain, entries in parsed.items()
+    ):
+        raise argparse.ArgumentTypeError(
+            "--cfg-keys must be a JSON map of domain -> non-empty list of key selectors"
+        )
     return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--origin-cfg-dir", required=True)
-    parser.add_argument("--cfg-files", required=True, type=parse_cfg_files)
+    parser.add_argument("--cfg-keys", required=True, type=parse_cfg_keys)
     parser.add_argument("--values-json-out", required=True)
     parser.add_argument("--step-env-out", required=True)
     parser.add_argument("--execution-context-file", required=True)
@@ -426,7 +474,7 @@ def main() -> int:
     args = parser.parse_args()
 
     origin_cfg_dir = Path(args.origin_cfg_dir).resolve()
-    cfg_files = args.cfg_files
+    cfg_keys = args.cfg_keys
     values_json_out_arg = args.values_json_out
     step_env_out_arg = args.step_env_out
     values_json_out = None if values_json_out_arg == "-" else Path(values_json_out_arg).resolve()
@@ -435,7 +483,7 @@ def main() -> int:
     execution_context_file = Path(args.execution_context_file).resolve()
     env_ctx, execution_context_nested = load_execution_context(execution_context_file)
 
-    step_values, merged_files = build_step_values(origin_cfg_dir, cfg_files, env_ctx)
+    step_values, merged_domains = build_step_values(origin_cfg_dir, cfg_keys, env_ctx)
     # Nested merge + aliases: the whole context under ONE reserved key; the
     # engine never invents flat leaves (flat names exist only via payload aliases).
     step_env_values = dict(step_values)
@@ -450,7 +498,7 @@ def main() -> int:
                         "origin_cfg_dir": str(origin_cfg_dir),
                         "execution_context_file": str(execution_context_file),
                         "execution_context_keys": sorted(env_ctx),
-                        "merged_files": merged_files,
+                        "merged_domains": merged_domains,
                     },
                     "values": step_env_values,
                 },

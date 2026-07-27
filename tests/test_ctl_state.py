@@ -21,7 +21,7 @@ ctl_state_backends:
   env:
     provider: aws
     backend_type: s3
-    bucket_name: ${execution_context.params.main_tag}-${execution_context.params.env_type}-ctl-state
+    bucket_name: ${execution_context.params.main_tag}-${execution_context.params.env.type}-ctl-state
     bucket_region: eu-central-1
     execution_identity:
       account: ctl_plane

@@ -31,7 +31,6 @@ class FanOutMemberSchemaTests(unittest.TestCase):
             "    runs:\n"
             "      - workflow_key: wf/one\n"
             "        fan_out_param_set_key: state_domains\n"
-            "    max_parallel: 1\n"
             "    failure_mode: stop\n"
         ))
         _write(root, "domains.yaml", (
@@ -173,9 +172,10 @@ class SelectorGroupResolverTests(unittest.TestCase):
             )
 
 
-class CfgFileSetGroupInventoryTests(unittest.TestCase):
-    """§Phase 31 3c: a target whose cfg_file_set_key names a group resolves per
-    the execution context at load time; groups cannot be composed."""
+class TargetDomainKeysInventoryTests(unittest.TestCase):
+    """§Phase 60: a target DECLARES the domains it reads and, per domain, the
+    content keys it consumes. A domain-GENERIC target takes its domain from the
+    execution context and stays unresolved without one."""
 
     def _root(self, tmp: str) -> Path:
         root = Path(tmp)
@@ -184,26 +184,13 @@ class CfgFileSetGroupInventoryTests(unittest.TestCase):
             "  bootstrap:\n"
             "    repo_url: https://example.invalid/bootstrap.git\n"
         ))
-        _write(root, "cfg_file_sets.yaml", (
-            "cfg_file_sets:\n"
-            "  state_backend:\n"
-            "    members:\n"
-            "      - cfg_file_set_key: org\n"
-            "        selectors:\n"
-            "          match:\n"
-            "            execution_context.params.domain: org\n"
-            "      - cfg_file_set_key: env_backend\n"
-            "        selectors:\n"
-            "          in:\n"
-            "            execution_context.params.domain: [dev, test]\n"
-            "  org:\n"
-            "    cfg_root: /org\n"
-            "    cfg_files:\n"
-            "      - tfstate.yaml\n"
-            "  env_backend:\n"
-            "    cfg_root: /env\n"
-            "    cfg_files:\n"
-            "      - ctl_state.yaml\n"
+        _write(root, "domains.yaml", "domains:\n  org: {}\n  env: {}\n")
+        _write(root, "cfg_key_sets.yaml", (
+            "cfg_key_sets:\n"
+            "  tfstate_backend_key_set:\n"
+            "    cfg_keys:\n"
+            "      - main_tag\n"
+            "      - tfstate_s3_bucket_name\n"
         ))
         (root / "targets" / "provision").mkdir(parents=True)
         _write(root / "targets" / "provision", "t.yaml", (
@@ -213,46 +200,189 @@ class CfgFileSetGroupInventoryTests(unittest.TestCase):
             "    source_key: bootstrap\n"
             "    ref_key: state_backend\n"
             "    step_sequence_key: tfstate_backend\n"
-            "    cfg_file_set_key: state_backend\n"
+            "    domains: [\"${execution_context.params.domain}\"]\n"
+            "    cfg_key_sets:\n"
+            "      \"${execution_context.params.domain}\": [tfstate_backend_key_set]\n"
         ))
         return root
 
-    def test_group_resolves_with_context(self):
+    def test_generic_domain_resolves_from_the_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
             inv = common.load_inventory_cfg(
                 root, "provision", {"execution_context.params.domain": "org"}
             )
             target = inv["targets"]["lz/tfstate_backend"]
-            self.assertEqual(target["cfg_root"], "/org")
-            self.assertEqual(target["cfg_files"], ["tfstate.yaml"])
+            self.assertEqual(target["domains"], ["org"])
+            # the cfg_key_set expands to its member KEYS
+            self.assertEqual(
+                target["cfg_keys"], {"org": ["main_tag", "tfstate_s3_bucket_name"]}
+            )
 
-    def test_group_unresolved_without_context(self):
+    def test_generic_domain_unresolved_without_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
             inv = common.load_inventory_cfg(root, "provision")
             target = inv["targets"]["lz/tfstate_backend"]
-            self.assertEqual(target["cfg_file_set_group_unresolved"], "state_backend")
-            self.assertEqual(target["cfg_files"], [])
+            self.assertIsNone(target["domains"])
+            self.assertEqual(
+                target["domains_unresolved"], ["execution_context.params.domain"]
+            )
 
-    def test_group_cannot_be_composed(self):
+    def test_unresolved_domains_survive_the_ctl_cfg_snapshot(self):
+        """The snapshot resolves every scalar it walks, so the deferred marker
+        must record AXIS NAMES, never the raw `${...}` template."""
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
-            _write(root, "extra_sets.yaml", (
-                "cfg_file_sets:\n"
-                "  bad_compose:\n"
-                "    cfg_root: /x\n"
-                "    cfg_file_set_keys:\n"
-                "      - state_backend\n"
-                "    cfg_files:\n"
-                "      - a.yaml\n"
-            ))
-            with self.assertRaisesRegex(RuntimeError, "cannot be\\s+composed"):
-                common.resolve_cfg_file_set_files(
-                    "bad_compose",
-                    common.collect_resource(root, "cfg_file_sets"),
-                    root,
+            inv = common.load_inventory_cfg(root, "provision")
+            marker = inv["targets"]["lz/tfstate_backend"]["domains_unresolved"]
+            self.assertEqual(marker, ["execution_context.params.domain"])
+            self.assertFalse(any("${" in entry for entry in marker))
+            # the real failure this guards: run_pipeline snapshots the inventory
+            common.resolve_ctl_structure(inv, {}, label="inventory.provision")
+
+    def test_unknown_domain_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            with self.assertRaisesRegex(RuntimeError, "unknown domain"):
+                common.load_inventory_cfg(
+                    root, "provision", {"execution_context.params.domain": "nope"}
                 )
+
+    def test_cfg_keys_for_an_undeclared_domain_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            _write(root / "targets" / "provision", "t.yaml", (
+                "targets:\n"
+                "  t:\n"
+                "    actions: [provision]\n"
+                "    source_key: bootstrap\n"
+                "    ref_key: r\n"
+                "    step_sequence_key: s\n"
+                "    domains: [env]\n"
+                "    cfg_keys:\n"
+                "      env: [main_tag]\n"
+                "      org: [main_tag]\n"
+            ))
+            with self.assertRaisesRegex(RuntimeError, "not in its domains"):
+                common.load_inventory_cfg(root, "provision", {})
+
+    def test_declared_domain_without_cfg_keys_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            _write(root / "targets" / "provision", "t.yaml", (
+                "targets:\n"
+                "  t:\n"
+                "    actions: [provision]\n"
+                "    source_key: bootstrap\n"
+                "    ref_key: r\n"
+                "    step_sequence_key: s\n"
+                "    domains: [env, org]\n"
+                "    cfg_keys:\n"
+                "      env: [main_tag]\n"
+            ))
+            with self.assertRaisesRegex(RuntimeError, "no\\s+cfg_keys entry"):
+                common.load_inventory_cfg(root, "provision", {})
+
+
+class TargetInputParamsTests(unittest.TestCase):
+    """§Phase 61(a): a target declares the coordinates it reads; instance params
+    must be a SUBSET of them, checked on every members branch."""
+
+    def _root(self, tmp: str, target_body: str) -> Path:
+        root = Path(tmp)
+        _write(root, "target_sources.yaml",
+               "target_sources:\n  bootstrap:\n    repo_url: https://example.invalid/b.git\n")
+        _write(root, "domains.yaml", "domains:\n  env: {}\n")
+        _write(root, "cfg_key_sets.yaml",
+               "cfg_key_sets:\n  k:\n    cfg_keys: [main_tag]\n")
+        _write(root, "param_sets.yaml",
+               "param_sets:\n  base:\n    input_params: [main_tag, landing_zone]\n")
+        (root / "targets" / "provision").mkdir(parents=True)
+        _write(root / "targets" / "provision", "t.yaml",
+               "targets:\n  t:\n    actions: [provision]\n    source_key: bootstrap\n"
+               "    ref_key: r\n    step_sequence_key: s\n    domains: [env]\n"
+               "    cfg_key_sets:\n      env: [k]\n" + target_body)
+        return root
+
+    def test_param_set_expands_and_instance_subset_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_param_sets: [base]\n"
+                "    input_params: [env_type]\n"
+                "    target_instance_params: [env_type]\n")
+            t = common.load_inventory_cfg(root, "provision", {})["targets"]["t"]
+            self.assertEqual(t["input_params"], ["main_tag", "landing_zone", "env_type"])
+            self.assertEqual(t["target_instance_params"], ["env_type"])
+
+    def test_instance_param_not_declared_as_input_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_param_sets: [base]\n"
+                "    target_instance_params: [env_type]\n")
+            with self.assertRaisesRegex(RuntimeError, "not\\s+declared input params"):
+                common.load_inventory_cfg(root, "provision", {})
+
+    def test_unselected_members_branch_is_also_checked(self):
+        """A branch this context does not select must still be valid."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_param_sets: [base]\n"
+                "    input_params: [env_type]\n"
+                "    target_instance_params:\n"
+                "      members:\n"
+                "      - params: [env_type]\n"
+                "        selectors:\n          match:\n            execution_context.params.env.type: dev\n"
+                "      - params: [nope]\n"
+                "        selectors:\n          match:\n            execution_context.params.env.type: prod\n")
+            with self.assertRaisesRegex(RuntimeError, "not\\s+declared input params"):
+                common.load_inventory_cfg(
+                    root, "provision", {"execution_context.params.env.type": "dev"}
+                )
+
+    def test_input_param_and_static_var_may_not_intersect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_params: [main_tag]\n"
+                "    static_vars:\n      main_tag: oxygen\n")
+            with self.assertRaisesRegex(RuntimeError, "BOTH an input param and a"):
+                common.load_inventory_cfg(root, "provision", {})
+
+    def test_static_var_must_be_literal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_params: [main_tag]\n"
+                "    static_vars:\n      mode:\n        members: [a]\n")
+            with self.assertRaisesRegex(RuntimeError, "must be a literal scalar"):
+                common.load_inventory_cfg(root, "provision", {})
+
+
+class CfgKeyProjectionTests(unittest.TestCase):
+    """§Phase 60 assertions 1 + 5 at the projection boundary."""
+
+    DOC = {"main_tag": "oxygen", "foundation": {"networking": {"vpc": 1}, "dns": 2},
+           "plt_a_tfstate_key": "a", "plt_b_tfstate_key": "b"}
+
+    def test_exact_glob_and_dotted_path(self):
+        self.assertEqual(
+            common.project_cfg_keys(self.DOC, ["main_tag"], label="t"), {"main_tag": "oxygen"}
+        )
+        self.assertEqual(
+            sorted(common.project_cfg_keys(self.DOC, ["plt_*"], label="t")),
+            ["plt_a_tfstate_key", "plt_b_tfstate_key"],
+        )
+        self.assertEqual(
+            common.project_cfg_keys(self.DOC, ["foundation.networking"], label="t"),
+            {"foundation": {"networking": {"vpc": 1}}},
+        )
+
+    def test_missing_key_is_an_error(self):
+        with self.assertRaisesRegex(RuntimeError, "does not resolve"):
+            common.project_cfg_keys(self.DOC, ["nope"], label="t")
+
+    def test_glob_matching_nothing_is_a_stale_declaration(self):
+        with self.assertRaisesRegex(RuntimeError, "matched no key"):
+            common.project_cfg_keys(self.DOC, ["zzz_*"], label="t")
 
 
 class FanOutExtraParamsTests(unittest.TestCase):
@@ -269,7 +399,6 @@ class FanOutExtraParamsTests(unittest.TestCase):
             "      - workflow_key: wf/one\n"
             "        fan_out_param_set_key: accounts\n"
             f"{run_extra}"
-            "    max_parallel: 1\n"
             "    failure_mode: stop\n"
         ))
         _write(root, "domains.yaml", "domains:\n  org: {}\n  notifications: {}\n")
@@ -325,7 +454,6 @@ class FanOutExtraParamsTests(unittest.TestCase):
                 "      - workflow_key: wf/one\n"
                 "        extra_params:\n"
                 "          domain: notifications\n"
-                "    max_parallel: 1\n"
                 "    failure_mode: stop\n"
             ))
             _write(root, "domains.yaml", "domains:\n  notifications: {}\n")
@@ -336,3 +464,140 @@ class FanOutExtraParamsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChildTargetCommandTests(unittest.TestCase):
+    """§Phase 61(d): a workflow spawns `ctl.py target` per child. The argv must be
+    ACCEPTED BY THE REAL PARSER — a flag that does not exist, or a dropped one,
+    would make the child run differently rather than fail."""
+
+    SPEC = {
+        "ctl_entrypoint": Path("/x/ctl.py"),
+        "ctl_cfg_root": Path("/cfg"),
+        "ctl_profile": "local_dev",
+        "ctl_state_local_root": "/state",
+        "execution_runtime_mode": "local",
+        "action": "plan",
+        "providers": ["aws"],
+        "execution_params": {"landing_zone": "live", "env.type": "dev"},
+        "provider_options": {"aws.credential_implementation": "profile"},
+        "execution_access_modes": {"aws": "force_bypass"},
+        "plt_overlays": ["db_artificial_populator"],
+        "force_skip_execution_identity_preflight_check": ["aws"],
+        "agreed_defer_ctl_state_backend_sync": False,
+        "force_skip_ctl_state_backend_sync": False,
+        "force_skip_guardrails": False,
+        "force_skip_full_cfg_validation_gate": True,
+    }
+
+    def _argv(self):
+        return common.build_child_target_command(
+            self.SPEC, "env/core/baseline",
+            parent_run_dir=Path("/run"), parent_run_id="PARENT",
+        )
+
+    def test_every_flag_is_accepted_by_the_target_parser(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        common.add_common_args(parser, run_type="target")
+        args = parser.parse_args(self._argv()[3:])   # drop python, ctl.py, "target"
+        self.assertEqual(args.target, "env/core/baseline")
+        self.assertEqual(args.action, "plan")
+        self.assertEqual(args.parent_workflow_run_id, "PARENT")
+
+    def test_no_credential_is_carried_in_argv(self):
+        """The lock grant travels by ENVIRONMENT. argv is visible in `ps` and in
+        the logged command line, so a credential there could be replayed into a
+        concurrent run while the parent is still going."""
+        argv = self._argv()
+        self.assertIn("--parent-workflow-run-id", argv)      # provenance
+        self.assertNotIn("--parent-ctl-state-lock-id", argv)  # never a credential
+
+    def test_settings_are_carried_verbatim(self):
+        argv = self._argv()
+        for expected in ("landing_zone=live", "env.type=dev",
+                         "aws.credential_implementation=profile", "aws=force_bypass",
+                         "db_artificial_populator", "--force-skip-full-cfg-validation-gate"):
+            self.assertIn(expected, argv, f"child would run without {expected!r}")
+        # a false flag must NOT appear
+        self.assertNotIn("--force-skip-guardrails", argv)
+
+
+class RunnerProvidersWiringTests(unittest.TestCase):
+    """A run DECLARES its providers. Every runner must pass them into the
+    selection — `target.py` did not, so `ctl.py target` failed with 'no providers
+    declared' the first time Phase 61(d) used that path. A latent defect in a
+    route nothing exercised; this pins all of them."""
+
+    ORCHESTRATOR = (
+        Path(__file__).resolve().parents[2] / "atlas-ctl-orchestrator" / "runners"
+    )
+
+    def test_every_runner_declares_providers(self):
+        missing = []
+        for name in ("workflow.py", "target.py", "step_sequence.py"):
+            body = (self.ORCHESTRATOR / name).read_text()
+            if "providers=args.providers" not in body:
+                missing.append(name)
+        self.assertEqual(missing, [], f"runners not declaring providers: {missing}")
+
+    def test_run_pipeline_forwards_providers_to_its_own_selection(self):
+        """The path used when a runner passes no preflight_selection."""
+        import inspect
+        source = inspect.getsource(common.run_pipeline)
+        self.assertIn("providers=providers", source)
+
+
+class ChildLockGrantTests(unittest.TestCase):
+    """§Phase 61(d): a child runs under its parent's ctl-state lock only by
+    redeeming a SINGLE-USE grant. The parent run id must NOT authorise anything —
+    it is printed in logs, stored in run metadata and visible in `ps`, so treating
+    it as a credential lets anyone start a concurrent run against the same
+    ctl-state while the parent is still going."""
+
+    def _root(self, tmp):
+        root = Path(tmp)
+        common.write_yaml_file(
+            common.ctl_state_lock_metadata_path(root),
+            {"run_id": "PARENT", "run_type": "workflow"},
+        )
+        return root
+
+    def setUp(self):
+        common._REDEEMED_CHILD_GRANT = None
+
+    def test_grant_is_single_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            grant = common.mint_child_lock_grant(root, child_kind="target", child_key="t/a")
+            self.assertTrue(common.consume_child_lock_grant(
+                root, grant, child_kind="target", child_key="t/a"))
+            common._REDEEMED_CHILD_GRANT = None          # a DIFFERENT process
+            self.assertFalse(common.consume_child_lock_grant(
+                root, grant, child_kind="target", child_key="t/a"),
+                "a spent grant must not be replayable")
+
+    def test_grant_is_bound_to_its_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            grant = common.mint_child_lock_grant(root, child_kind="target", child_key="t/a")
+            self.assertFalse(common.consume_child_lock_grant(
+                root, grant, child_kind="target", child_key="t/OTHER"))
+            self.assertFalse(common.consume_child_lock_grant(
+                root, grant, child_kind="workflow", child_key="t/a"))
+
+    def test_parent_run_id_does_not_authorise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            self.assertFalse(common.consume_child_lock_grant(
+                root, "PARENT", child_kind="target", child_key="t/a"),
+                "the public run id must never grant lock bypass")
+
+    def test_redemption_is_idempotent_within_one_run(self):
+        """The lock decision is asked twice per run; that is not a replay."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp)
+            grant = common.mint_child_lock_grant(root, child_kind="target", child_key="t/a")
+            for _ in range(2):
+                self.assertTrue(common.consume_child_lock_grant(
+                    root, grant, child_kind="target", child_key="t/a"))

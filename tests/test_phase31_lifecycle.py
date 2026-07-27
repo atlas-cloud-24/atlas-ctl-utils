@@ -35,12 +35,10 @@ CFG = {
         "  bootstrap:\n"
         "    repo_url: https://example.invalid/bootstrap.git\n"
     ),
-    "cfg_file_sets.yaml": (
-        "cfg_file_sets:\n"
-        "  env_backend:\n"
-        "    cfg_root: /env\n"
-        "    cfg_files:\n"
-        "      - ctl_state.yaml\n"
+    "domains.yaml": (
+        "domains:\n"
+        "  env:\n"
+        "    description: workload environment platform\n"
     ),
     "workflow.yaml": (
         "workflows:\n"
@@ -55,9 +53,12 @@ TARGETS = (
     "  env/tfstate_backend:\n"
     "    actions: [provision]\n"
     "    source_key: bootstrap\n"
-    "    ref_key: env/${execution_context.params.env_type}\n"
+    "    ref_key: env/${execution_context.params.env.type}\n"
     "    step_sequence_key: tfstate_backend\n"
-    "    cfg_file_set_key: env_backend\n"
+    "    domains: [env]\n"
+    "    input_params: [account, env_type]\n"
+    "    cfg_keys:\n"
+    "      env: [ctl_state_s3_bucket_name]\n"
     "    target_instance_params:\n"
     "      - account\n"
     "      - env_type\n"

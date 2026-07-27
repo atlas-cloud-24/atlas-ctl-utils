@@ -96,7 +96,7 @@ if [[ "$step_write_values_json" == "true" || "$step_write_env_sh" == "true" ]]; 
 
   python3 "${ATLAS_STEP_UTILS_DIR}/ctl/build_runtime_cfg.py" \
     --origin-cfg-dir origin_cfg \
-    --cfg-files "$cfg_files" \
+    --cfg-keys "$cfg_keys" \
     --values-json-out "$values_json_out" \
     --step-env-out "$step_env_out" \
     --execution-context-file "$execution_context_file"

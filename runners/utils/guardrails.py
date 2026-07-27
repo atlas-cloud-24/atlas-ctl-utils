@@ -618,7 +618,6 @@ def materialize_plt_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
-    required_target_paths: set[str] | None = None,
 ) -> list[dict]:
     policies = load_guardrail_policies(plt_cfg_root, owner="plt")
     if not policies:
@@ -635,8 +634,6 @@ def materialize_plt_guardrails(
     scopes_by_target = collections.defaultdict(list)
     for scope in active_scopes:
         target_path = scope["target_path"]
-        if required_target_paths is not None and target_path not in required_target_paths:
-            continue
         scopes_by_target[target_path].append(scope)
     target_paths = set(scopes_by_target)
     active = active_guardrail_policies(
@@ -946,7 +943,6 @@ def verify_plt_guardrails(
     plt_rendered_dir: Path,
     execution_context: dict[str, object],
     scope_params: dict[str, str],
-    required_target_paths: set[str] | None = None,
 ) -> None:
     policies = load_guardrail_policies(plt_cfg_root, owner="plt")
     if not policies:
@@ -964,7 +960,6 @@ def verify_plt_guardrails(
             plt_rendered_dir,
             execution_context,
             scope_params,
-            required_target_paths,
         ),
         baselines,
     )

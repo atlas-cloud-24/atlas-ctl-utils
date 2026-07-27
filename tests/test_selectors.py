@@ -39,7 +39,7 @@ class ExecutionContextTests(unittest.TestCase):
         root = Path(tmp)
         write(root / "execution_params.yaml",
               "execution_params:\n  main_tag: oxygen\n"
-              "  derived: ${execution_context.params.env_type}\n")
+              "  derived: ${execution_context.params.env.type}\n")
         return root
 
     def test_builds_two_namespaces_flat(self):
@@ -47,10 +47,10 @@ class ExecutionContextTests(unittest.TestCase):
             ctx = common.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="commit_required",
                 execution_runtime_mode="local",
-                execution_params={"env_type": "dev"})
+                execution_params={"env.type": "dev"})
         self.assertEqual(ctx["execution_context.ctl.action"], "plan")
         self.assertEqual(ctx["execution_context.ctl.profile"], "commit_required")
-        self.assertEqual(ctx["execution_context.params.env_type"], "dev")
+        self.assertEqual(ctx["execution_context.params.env.type"], "dev")
         self.assertEqual(ctx["execution_context.params.main_tag"], "oxygen")
         self.assertEqual(ctx["execution_context.params.derived"], "dev")
 
@@ -74,7 +74,7 @@ class ExecutionContextTests(unittest.TestCase):
             ctx = common.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="p",
                 execution_runtime_mode="local",
-                execution_params={"env_type": "dev"})
+                execution_params={"env.type": "dev"})
         nested = common.execution_context_nested(ctx)
         self.assertEqual(nested["execution_context"]["ctl"]["action"], "plan")
         self.assertEqual(nested["execution_context"]["params"]["main_tag"], "oxygen")
@@ -84,12 +84,12 @@ class SelectorMatchTests(unittest.TestCase):
     CTX = {
         "execution_context.ctl.action": "plan",
         "execution_context.ctl.profile": "commit_required",
-        "execution_context.params.env_type": "dev",
+        "execution_context.params.env.type": "dev",
     }
 
     def test_fully_qualified_match(self):
         self.assertTrue(common.selector_matches(
-            {"execution_context.params.env_type": ["dev", "test"]}, self.CTX, label="t"))
+            {"execution_context.params.env.type": ["dev", "test"]}, self.CTX, label="t"))
 
     def test_promoted_keys_are_selectable(self):
         self.assertTrue(common.selector_matches(
@@ -108,10 +108,10 @@ class SelectorMatchTests(unittest.TestCase):
             root = Path(tmp)
             write(root / "execution_context_constraints.yaml",
                   "execution_context_constraints:\n"
-                  "  - when_all:\n      - execution_context.params.env_type: [prod]\n"
+                  "  - when_all:\n      - execution_context.params.env.type: [prod]\n"
                   "    allowed_values:\n      execution_context.ctl.action: [provision, plan, readonly]\n")
             ctx = dict(self.CTX)
-            ctx["execution_context.params.env_type"] = "prod"
+            ctx["execution_context.params.env.type"] = "prod"
             ctx["execution_context.ctl.action"] = "destroy"
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
                 common.validate_execution_context_constraints(root, ctx)
@@ -138,12 +138,12 @@ class ProviderNamespacedParamKeyTests(unittest.TestCase):
                 root,
                 action="provision",
                 ctl_profile="local_dev",
-                execution_params={"aws.account": "dev", "env_type": "dev"},
+                execution_params={"aws.account": "dev", "env.type": "dev"},
                 execution_access_modes={"aws": "standard"},
                 execution_runtime_mode="local",
             )
             self.assertEqual(ctx["execution_context.params.aws.account"], "dev")
-            self.assertEqual(ctx["execution_context.params.env_type"], "dev")
+            self.assertEqual(ctx["execution_context.params.env.type"], "dev")
 
     def test_dotted_param_is_selectable(self):
         ctx = {"execution_context.params.aws.account": "dev"}
@@ -165,7 +165,7 @@ class ContainsMatcherTests(unittest.TestCase):
 
     CTX = {
         "execution_context.ctl.providers": ["aws", "azure"],
-        "execution_context.params.env_type": "dev",
+        "execution_context.params.env.type": "dev",
     }
 
     def test_member_matches(self):
@@ -182,11 +182,11 @@ class ContainsMatcherTests(unittest.TestCase):
     def test_contains_and_scalar_predicates_combine(self):
         self.assertTrue(common.selector_matches(
             {"execution_context.ctl.providers": {"contains": "aws"},
-             "execution_context.params.env_type": ["dev"]},
+             "execution_context.params.env.type": ["dev"]},
             self.CTX, label="t"))
         self.assertFalse(common.selector_matches(
             {"execution_context.ctl.providers": {"contains": "aws"},
-             "execution_context.params.env_type": ["prod"]},
+             "execution_context.params.env.type": ["prod"]},
             self.CTX, label="t"))
 
     def test_structured_contains_form(self):
@@ -200,7 +200,7 @@ class ContainsMatcherTests(unittest.TestCase):
 
     def test_scalar_fact_is_treated_as_a_single_member(self):
         self.assertTrue(common.selector_matches(
-            {"execution_context.params.env_type": {"contains": "dev"}},
+            {"execution_context.params.env.type": {"contains": "dev"}},
             self.CTX, label="t"))
 
 
@@ -271,7 +271,7 @@ class ConstraintGateTests(unittest.TestCase):
     """`when_all` (AND) / `when_any` (OR) replace the removed AND-only `when`."""
 
     BASE = {
-        "execution_context.params.env_type": "dev",
+        "execution_context.params.env.type": "dev",
         "execution_context.params.account": "dev",
         "execution_context.ctl.action": "destroy",
     }
@@ -287,7 +287,7 @@ class ConstraintGateTests(unittest.TestCase):
         # Previously this needed TWO duplicated rules, because `when` was AND-only.
         body = ("  - when_any:\n"
                 "      - execution_context.params.account: [prod]\n"
-                "      - execution_context.params.env_type: [prod]\n"
+                "      - execution_context.params.env.type: [prod]\n"
                 "    allowed_values:\n"
                 "      execution_context.ctl.action: [provision, plan, readonly]\n")
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,14 +299,14 @@ class ConstraintGateTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
                 common.validate_execution_context_constraints(root, ctx)
             # only env_type=prod -> gate matches via the SECOND entry
-            ctx = dict(self.BASE, **{"execution_context.params.env_type": "prod"})
+            ctx = dict(self.BASE, **{"execution_context.params.env.type": "prod"})
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
                 common.validate_execution_context_constraints(root, ctx)
 
     def test_when_all_requires_every_entry(self):
         body = ("  - when_all:\n"
                 "      - execution_context.params.account: [prod]\n"
-                "      - execution_context.params.env_type: [prod]\n"
+                "      - execution_context.params.env.type: [prod]\n"
                 "    allowed_values:\n"
                 "      execution_context.ctl.action: [provision]\n")
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,14 +317,14 @@ class ConstraintGateTests(unittest.TestCase):
             # both prod -> gate matches
             ctx = dict(self.BASE, **{
                 "execution_context.params.account": "prod",
-                "execution_context.params.env_type": "prod",
+                "execution_context.params.env.type": "prod",
             })
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
                 common.validate_execution_context_constraints(root, ctx)
 
     def test_when_all_and_when_any_are_anded(self):
         body = ("  - when_all:\n"
-                "      - execution_context.params.env_type: [prod]\n"
+                "      - execution_context.params.env.type: [prod]\n"
                 "    when_any:\n"
                 "      - execution_context.params.account: [prod]\n"
                 "      - execution_context.params.account: [prodlike]\n"
@@ -337,7 +337,7 @@ class ConstraintGateTests(unittest.TestCase):
             common.validate_execution_context_constraints(root, ctx)
             # both satisfied -> match
             ctx = dict(self.BASE, **{
-                "execution_context.params.env_type": "prod",
+                "execution_context.params.env.type": "prod",
                 "execution_context.params.account": "prodlike",
             })
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
@@ -353,7 +353,7 @@ class ConstraintGateTests(unittest.TestCase):
 
     def test_removed_when_key_is_a_migration_error(self):
         body = ("  - when:\n"
-                "      execution_context.params.env_type: [prod]\n"
+                "      execution_context.params.env.type: [prod]\n"
                 "    allowed_values:\n"
                 "      execution_context.ctl.action: [provision]\n")
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,7 +363,7 @@ class ConstraintGateTests(unittest.TestCase):
 
     def test_unknown_field_is_rejected(self):
         body = ("  - when_all:\n"
-                "      - execution_context.params.env_type: [prod]\n"
+                "      - execution_context.params.env.type: [prod]\n"
                 "    when_provider: aws\n")
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, body)
@@ -373,7 +373,7 @@ class ConstraintGateTests(unittest.TestCase):
     def test_gate_must_be_a_non_empty_list_of_mappings(self):
         for body in (
             "  - when_all: []\n    require_present: []\n",
-            "  - when_any:\n      - execution_context.params.env_type: [prod]\n"
+            "  - when_any:\n      - execution_context.params.env.type: [prod]\n"
             "    when_all: not-a-list\n",
         ):
             with tempfile.TemporaryDirectory() as tmp:

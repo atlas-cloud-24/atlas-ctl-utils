@@ -364,9 +364,10 @@ class ForceUnlockBindingTests(unittest.TestCase):
         write(
             root / step_path / "step.yaml",
             """id: destroy/public_dns
-cfg_files:
-- general.yaml
-- tfstate.yaml
+cfg_keys:
+  env:
+  - main_tag
+  - tfstate_s3_bucket_name
 runtime:
   image: infra
 """,
@@ -390,7 +391,7 @@ runtime:
                 (
                     "infra/public_dns",
                     "plt_static_public_dns_tfstate_key",
-                    ["general.yaml", "tfstate.yaml"],
+                    {"env": ["main_tag", "tfstate_s3_bucket_name"]},
                 ),
             )
 

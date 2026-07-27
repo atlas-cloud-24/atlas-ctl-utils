@@ -34,13 +34,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
             },
             "non_prod_deploy": {
                 "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env_type}-deploy",
+                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env.type}-deploy",
                     "expect": {"permission_set_name": "NonProdDeployAccess"},
                 }
             },
             "non_prod_readonly": {
                 "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env_type}-readonly",
+                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env.type}-readonly",
                     "expect": {"permission_set_name": "NonProdReadOnlyAccess"},
                 }
             },
@@ -76,19 +76,19 @@ class AwsAccessResolutionTests(unittest.TestCase):
             },
             "env_deploy": {
                 "provider": "aws",
-                "account": "${execution_context.params.env_type}",
+                "account": "${execution_context.params.env.type}",
                 "roles": {"readwrite": "ctl_target", "readonly": "ctl_target"},
                 "agreed_direct_credential_source_keys": ["non_prod_deploy"],
             },
             "env_readonly": {
                 "provider": "aws",
-                "account": "${execution_context.params.env_type}",
+                "account": "${execution_context.params.env.type}",
                 "roles": {"readwrite": "ctl_target", "readonly": "ctl_target"},
                 "agreed_direct_credential_source_keys": ["non_prod_readonly"],
             },
             "env_no_target_role": {
                 "provider": "aws",
-                "account": "${execution_context.params.env_type}",
+                "account": "${execution_context.params.env.type}",
                 "roles": {"readonly": "ctl_target"},
             },
             # a ctl-state operation block: one role, keyed by OPERATION
@@ -119,7 +119,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         }
         self.context = {
             "execution_context.params.main_tag": "oxygen",
-            "execution_context.params.env_type": "dev",
+            "execution_context.params.env.type": "dev",
             # the action selects the authorization class
             "execution_context.ctl.action": "provision",
             # the run declares its participating providers

@@ -33,7 +33,7 @@ def render(files: dict[str, str], env_ctx: dict) -> Path:
 
 CTX = {
     "execution_context.params.main_tag": "oxygen",
-    "execution_context.params.env_type": "dev",
+    "execution_context.params.env.type": "dev",
 }
 
 

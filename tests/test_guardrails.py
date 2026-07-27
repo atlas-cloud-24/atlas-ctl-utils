@@ -58,7 +58,7 @@ def write_env_scope(plt_root: Path) -> None:
         "target_path: /env\n"
         "selectors:\n"
         "  match:\n"
-        "    execution_context.params.env_type: dev\n"
+        "    execution_context.params.env.type: dev\n"
         "imports: []\n",
     )
 
@@ -148,7 +148,7 @@ class PolicyTest(unittest.TestCase):
                 protected_paths=["/region"],
                 selectors={
                     "match": {
-                        "execution_context.params.env_type": "dev",
+                        "execution_context.params.env.type": "dev",
                     }
                 },
             )
@@ -161,10 +161,10 @@ class PolicyTest(unittest.TestCase):
             write_plt_policy(
                 plt,
                 protected_paths=["/region"],
-                instance_params=["execution_context.params.env_type"],
+                instance_params=["execution_context.params.env.type"],
                 selectors={
                     "match": {
-                        "execution_context.params.env_type": "dev",
+                        "execution_context.params.env.type": "dev",
                     }
                 },
             )
@@ -173,7 +173,7 @@ class PolicyTest(unittest.TestCase):
                 len(
                     guardrails.active_guardrail_policies(
                         policies,
-                        context(env_type="dev"),
+                        context(**{"env.type": "dev"}),
                     )
                 ),
                 1,
@@ -181,7 +181,7 @@ class PolicyTest(unittest.TestCase):
             self.assertEqual(
                 guardrails.active_guardrail_policies(
                     policies,
-                    context(env_type="prod"),
+                    context(**{"env.type": "prod"}),
                 ),
                 [],
             )
@@ -199,8 +199,8 @@ class PolicyTest(unittest.TestCase):
                     root / "ctl",
                     plt,
                     rendered,
-                    context(env_type="dev"),
-                    {"env_type": "dev"},
+                    context(**{"env.type": "dev"}),
+                    {"env.type": "dev"},
                 )
 
 
@@ -213,7 +213,7 @@ class BaselineTest(unittest.TestCase):
                 "target_path": "/env",
                 "instance": {
                     "params": {
-                        "execution_context.params.env_type": "dev",
+                        "execution_context.params.env.type": "dev",
                     }
                 },
             }
@@ -339,7 +339,7 @@ class VerificationTest(unittest.TestCase):
             write_plt_policy(
                 plt,
                 protected_paths=["/settings/regions/0"],
-                instance_params=["execution_context.params.env_type"],
+                instance_params=["execution_context.params.env.type"],
             )
             write_env_scope(plt)
             write(
@@ -353,7 +353,7 @@ class VerificationTest(unittest.TestCase):
                 "target_path": "/env",
                 "instance": {
                     "params": {
-                        "execution_context.params.env_type": "dev",
+                        "execution_context.params.env.type": "dev",
                     }
                 },
             }
@@ -367,8 +367,8 @@ class VerificationTest(unittest.TestCase):
                 plt,
                 baselines,
                 rendered,
-                context(env_type="dev"),
-                {"env_type": "dev"},
+                context(**{"env.type": "dev"}),
+                {"env.type": "dev"},
             )
 
     def test_universal_policy_covers_new_scope_and_fails_without_baseline(self):
@@ -380,7 +380,7 @@ class VerificationTest(unittest.TestCase):
             write_plt_policy(
                 plt,
                 protected_paths=["/region"],
-                instance_params=["execution_context.params.env_type"],
+                instance_params=["execution_context.params.env.type"],
             )
             write(
                 plt / "env" / "test" / common.SCOPE_META_FILENAME,
@@ -388,7 +388,7 @@ class VerificationTest(unittest.TestCase):
                 "target_path: /env\n"
                 "selectors:\n"
                 "  match:\n"
-                "    execution_context.params.env_type: test\n"
+                "    execution_context.params.env.type: test\n"
                 "imports: []\n",
             )
             write(rendered / "env" / "value.yaml", "region: eu-west-2\n")
@@ -398,8 +398,8 @@ class VerificationTest(unittest.TestCase):
                     plt,
                     root / "baselines",
                     rendered,
-                    context(env_type="test"),
-                    {"env_type": "test"},
+                    context(**{"env.type": "test"}),
+                    {"env.type": "test"},
                 )
 
     def test_missing_baseline_fails_closed(self):

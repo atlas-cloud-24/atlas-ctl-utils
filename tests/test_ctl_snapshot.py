@@ -14,7 +14,7 @@ from utils import common  # noqa: E402
 
 CTX = {
     "execution_context.params.main_tag": "oxygen",
-    "execution_context.params.env_type": "dev",
+    "execution_context.params.env.type": "dev",
     "execution_context.ctl.action": "provision",
 }
 
@@ -24,7 +24,7 @@ class ResolveCtlStructureTests(unittest.TestCase):
         raw = {
             "meta": {"name": "commit_required/provision/env/core", "action": "provision"},
             "target_runs": [
-                {"target": "env/core/baseline", "ref": "env/${execution_context.params.env_type}"},
+                {"target": "env/core/baseline", "ref": "env/${execution_context.params.env.type}"},
             ],
             "literal": "no-placeholder",
             "count": 3,
@@ -49,7 +49,7 @@ class WriteCtlCfgSnapshotTests(unittest.TestCase):
                 ctl_profile_policy_cfg={"ref_policy": "commit", "allow_skip_ctl_state_sync": False},
                 inventory_name="provision",
                 workflow_cfg={"meta": {"action": "provision"}, "target_runs": ["env/core/baseline"]},
-                inventory_cfg={"targets": {"env/core/baseline": {"ref_key": "env/${execution_context.params.env_type}"}}},
+                inventory_cfg={"targets": {"env/core/baseline": {"ref_key": "env/${execution_context.params.env.type}"}}},
                 active_target_runs={"env/core/baseline": {"branch": "main", "commit": "abc123"}},
                 refs={"global": {"tooling": {"commit": "def456"}}},
                 execution_context=CTX,

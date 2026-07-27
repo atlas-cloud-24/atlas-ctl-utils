@@ -107,7 +107,7 @@ run_local_step() {
     -e ATLAS_EXECUTION_CONTEXT_FILE \
     -e ATLAS_STEP_UTILS_DIR=/mnt/step_utils \
     -e step_dir="$step_dir" \
-    -e cfg_files \
+    -e cfg_keys \
     -e STEP_WRITE_VALUES_JSON \
     -e STEP_WRITE_ENV_SH \
     -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
