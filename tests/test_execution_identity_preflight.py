@@ -248,16 +248,17 @@ class FullCfgValidationGateTests(unittest.TestCase):
 class PreflightArtifactTests(unittest.TestCase):
     def test_report_is_deterministic_and_target_scoped(self):
         class Adapter:
+            PROVIDER_NAME = "aws"
             def preflight_execution_identity(self, target_run_id, target_run, catalogs, **kwargs):
                 del target_run_id, catalogs, kwargs
                 return {
-                    "execution_identity": target_run["execution_identity"],
+                    "execution_identities": target_run["execution_identities"],
                     "provider": "fixture",
                     "access_mode": "standard",
                     "status": "passed",
                     "provider_path": [
                         {
-                            "display": f"principal: {target_run['execution_identity']['account']}",
+                            "display": f"principal: {target_run['execution_identities']['aws']['account']}",
                             "status": "passed",
                         }
                     ],
@@ -267,8 +268,8 @@ class PreflightArtifactTests(unittest.TestCase):
             "selection_kind": "workflow",
             "selection_key": "example/workflow",
             "active_target_runs": {
-                "one": {"target": "target/one", "execution_identity": {"provider": "aws", "account": "one", "roles": {"readwrite": "ctl_target"}}},
-                "two": {"target": "target/two", "execution_identity": {"provider": "aws", "account": "two", "roles": {"readwrite": "ctl_target"}}},
+                "one": {"target": "target/one", "execution_identities": {"aws": {"account": "one", "roles": {"readwrite": "ctl_target"}}}},
+                "two": {"target": "target/two", "execution_identities": {"aws": {"account": "two", "roles": {"readwrite": "ctl_target"}}}},
             },
             "provider_adapter": Adapter(),
             "provider_catalogs": {},
@@ -303,7 +304,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "results": [
                 {
                     "target_key": "env/core/baseline",
-                    "execution_identity": {"provider": "aws", "account": "dev", "roles": {"readwrite": "ctl_target_deploy"}},
+                    "execution_identities": {"aws": {"account": "dev", "roles": {"readwrite": "ctl_target_deploy"}}},
                     "provider": "aws",
                     "access_mode": "force_bypass",
                     "status": "not_applicable",
@@ -312,7 +313,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 },
                 {
                     "ctl_state_backend": "env",
-                    "execution_identity": None,
+                    "execution_identities": None,
                     "provider": None,
                     "access_mode": "agreed_direct",
                     "status": "not_applicable",
@@ -828,7 +829,7 @@ class AwsPreflightTests(unittest.TestCase):
                 live_check=False,
             )
         self.assertEqual(result["status"], "not_applicable")
-        self.assertEqual(result["execution_identity"], "<unresolved>")
+        self.assertEqual(result["execution_identities"], "<unresolved>")
         self.assertNotIn("do-not-render", str(result))
 
 

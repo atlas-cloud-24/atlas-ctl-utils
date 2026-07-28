@@ -208,35 +208,38 @@ def load_domain_docs(origin_cfg_dir: Path) -> dict[str, dict]:
     return docs
 
 
-def project_step_keys(doc: dict, entries: list[str], *, label: str) -> dict:
-    """Narrow one domain view to the step's declared key selectors.
+def project_step_keys(doc: dict, bindings: dict[str, str], *, label: str) -> dict:
+    """Bind one domain view to the step's declared parameters.
 
-    Assertion 1 + 5 at the step boundary: a key that does not resolve, or a glob
-    that matches nothing, is a stale declaration and an ERROR — never a silently
-    missing Terraform input.
+    A step is a SIGNATURE: `<local name>: <cfg key>`. The local name is what the
+    step's own code sees, the cfg key is what the domain published. The two are
+    separated because cfg disambiguates across every root in one flat namespace
+    (`plt_seed_tfstate_key`) while a root only ever means its own (`tfstate_key`).
+
+    There is no glob and no default. A parameter list that can expand to
+    something the step never named is not a signature, and a key that does not
+    resolve is a stale declaration and an ERROR — never a silently missing
+    Terraform input.
     """
-    import fnmatch
-
     projected: dict = {}
-    for entry in entries:
-        if entry == "*":
-            matched = list(doc)
-        elif any(ch in entry for ch in "*?["):
-            matched = sorted(k for k in doc if fnmatch.fnmatchcase(k, entry))
-        else:
-            head = entry.split(".", 1)[0]
-            if head not in doc:
+    for local_name, cfg_key in bindings.items():
+        segments = cfg_key.split(".")
+        node = doc
+        walked: list[str] = []
+        for segment in segments:
+            if not isinstance(node, dict) or segment not in node:
+                available = ", ".join(sorted(node)) if isinstance(node, dict) else "<not a mapping>"
+                where = ".".join(walked) or "the delivered view"
                 raise RuntimeError(
-                    f"{label}: cfg key {entry!r} was not delivered by the target "
-                    f"(delivered: {', '.join(sorted(doc)) or 'none'})"
+                    f"{label}: cfg key {cfg_key!r} bound to {local_name!r} does not "
+                    f"resolve — {segment!r} is not in {where} (available: {available})"
                 )
-            matched = [head]
-        if not matched:
-            raise RuntimeError(
-                f"{label}: cfg key selector {entry!r} matched nothing (stale declaration)"
-            )
-        for key in matched:
-            projected[key] = doc[key]
+            node = node[segment]
+            walked.append(segment)
+        # A dotted key binds the ENTRY it names, not the collection holding it:
+        # a signature that says `state_backend_cfg.seed` must hand the step that
+        # one entry, or the local name is a lie.
+        projected[local_name] = node
     return projected
 
 
@@ -403,7 +406,7 @@ def build_step_values(origin_cfg_dir: Path, cfg_keys: dict, env_ctx: dict[str, s
             )
         merged = merge_values(
             merged,
-            project_step_keys(doc, list(entries), label=f"step cfg_keys[{domain}]"),
+            project_step_keys(doc, dict(entries), label=f"step cfg_keys[{domain}]"),
         )
         merged_domains.append(domain)
 
@@ -448,13 +451,17 @@ def parse_cfg_keys(raw: str) -> dict:
         raise argparse.ArgumentTypeError(f"--cfg-keys must be valid JSON: {exc}") from exc
     if not isinstance(parsed, dict) or not all(
         isinstance(domain, str)
-        and isinstance(entries, list)
-        and entries
-        and all(isinstance(e, str) for e in entries)
-        for domain, entries in parsed.items()
+        and isinstance(bindings, dict)
+        and bindings
+        and all(
+            isinstance(local_name, str) and isinstance(cfg_key, str)
+            for local_name, cfg_key in bindings.items()
+        )
+        for domain, bindings in parsed.items()
     ):
         raise argparse.ArgumentTypeError(
-            "--cfg-keys must be a JSON map of domain -> non-empty list of key selectors"
+            "--cfg-keys must be a JSON map of domain -> non-empty map of "
+            "local name -> cfg key"
         )
     return parsed
 

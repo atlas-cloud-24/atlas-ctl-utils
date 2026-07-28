@@ -209,8 +209,8 @@ class ProviderCoverageTests(unittest.TestCase):
 
     @staticmethod
     def _run(provider):
-        return {"t": {"execution_identity": {"provider": provider, "account": "a",
-                                    "roles": {"readwrite": "r"}}}}
+        return {"t": {"execution_identities": {provider: {"account": "a",
+                                    "roles": {"readwrite": "r"}}}}}
 
     def test_declared_provider_passes(self):
         common.validate_target_provider_coverage(self._run("aws"), ["aws", "azure"])

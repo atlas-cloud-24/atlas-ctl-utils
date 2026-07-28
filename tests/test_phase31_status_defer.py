@@ -391,7 +391,7 @@ class Phase56OverlayTests(unittest.TestCase):
             "cfg_keys": {"env": ["*"]},
             "target_instance_params": ["account"],
             "requires_plt_overlays": ["tech_jobs"],
-            "execution_identity": {"provider": "aws", "account": "dev"},
+            "execution_identities": {"aws": {"account": "dev"}},
             "repo_path": "/machine/one",
             "token_type": "IGNORED_TOKEN",
         }

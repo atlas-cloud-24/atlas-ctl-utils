@@ -22,48 +22,63 @@ class AccountRegistryTests(unittest.TestCase):
     def _root(self, body: str):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        write(root / "accounts_registry.yaml", "providers:\n  aws:\n    accounts_registry:\n" + body)
+        for landing_zone in ("live", "canary"):
+            write(
+                root / "_inputs" / "aws" / "account_registries" / f"{landing_zone}.yaml",
+                "accounts_registry:\n" + body,
+            )
+        write(
+            root / "ctl_sources.yaml",
+            "ctl_sources:\n  aws.accounts_registry:\n"
+            "    type: map\n"
+            "    conflict_resolution: error\n"
+            "    sources:\n"
+            "    - provider: local\n"
+            "      format: yaml\n"
+            "      file_path:\n"
+            "        members:\n"
+            "        - value: /_inputs/aws/account_registries/live.yaml\n"
+            "          selectors:\n"
+            "            match:\n"
+            "              execution_context.params.landing_zone: live\n"
+            "        - value: /_inputs/aws/account_registries/canary.yaml\n"
+            "          selectors:\n"
+            "            match:\n"
+            "              execution_context.params.landing_zone: canary\n",
+        )
         return temporary, root
 
-    def test_selector_member_resolves_exactly_one_account(self):
-        temporary, root = self._root(
-            "      ctl_plane:\n"
-            "        members:\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
-            "          account_id: '111111111111'\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: canary}}\n"
-            "          account_id: '222222222222'\n"
+    def test_zone_file_is_selected_by_landing_zone(self):
+        """A landing zone is a separate AWS organization, so the zone selects the
+        FILE and each file holds one flat inventory — no selectors, no merging."""
+        temporary, root = self._root("  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n")
+        root_path = Path(temporary.name)
+        write(
+            root_path / "_inputs" / "aws" / "account_registries" / "canary.yaml",
+            "accounts_registry:\n  ctl_plane:\n    slug: ctl-plane\n    account_id: '222222222222'\n",
         )
         with temporary:
-            result = aws.load_aws_account_registry_cfg(
-                root,
-                execution_context={"execution_context.params.landing_zone": "live"},
-            )
-        self.assertEqual(result, {"ctl_plane": "111111111111"})
-
-    def test_selector_member_rejects_zero_and_multiple_matches(self):
-        for second_selector, expected in (("canary", "matched 0"), ("live", "matched 2")):
-            with self.subTest(expected=expected):
-                temporary, root = self._root(
-                    "      ctl_plane:\n"
-                    "        members:\n"
-                    "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
-                    "          account_id: '111111111111'\n"
-                    f"        - selectors: {{match: {{execution_context.params.landing_zone: {second_selector}}}}}\n"
-                    "          account_id: '222222222222'\n"
-                )
-                with temporary, self.assertRaisesRegex(RuntimeError, expected):
+            for landing_zone, expected in (("live", "111111111111"), ("canary", "222222222222")):
+                self.assertEqual(
                     aws.load_aws_account_registry_cfg(
                         root,
-                        execution_context={"execution_context.params.landing_zone": "qa" if expected.endswith("0") else "live"},
-                    )
+                        execution_context={"execution_context.params.landing_zone": landing_zone},
+                    ),
+                    {"ctl_plane": expected},
+                )
+
+    def test_unknown_landing_zone_is_rejected(self):
+        temporary, root = self._root("  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n")
+        with temporary, self.assertRaisesRegex(RuntimeError, "must resolve exactly one member"):
+            aws.load_aws_account_registry_cfg(
+                root, execution_context={"execution_context.params.landing_zone": "qa"}
+            )
 
     def test_selected_placeholder_is_rejected(self):
         temporary, root = self._root(
-            "      ctl_plane:\n"
-            "        members:\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
-            "          account_id: <live-ctl-plane-account-id>\n"
+            "  ctl_plane:\n"
+            "    slug: ctl-plane\n"
+            "    account_id: <live-ctl-plane-account-id>\n"
         )
         with temporary, self.assertRaisesRegex(RuntimeError, "12-digit account id"):
             aws.load_aws_account_registry_cfg(
@@ -73,13 +88,15 @@ class AccountRegistryTests(unittest.TestCase):
 
     def test_catalog_reports_placeholder_as_concrete_binding_failure(self):
         temporary, root = self._root(
-            "      management:\n"
-            "        account_id: <live-management-account-id>\n"
+            "  management:\n"
+            "    slug: management\n"
+            "    account_id: <live-management-account-id>\n"
         )
         with temporary:
             aws.validate_catalog(root)
             findings = aws.collect_provider_cfg_findings(
-                root, execution_context={}
+                root,
+                execution_context={"execution_context.params.landing_zone": "live"},
             )
         self.assertEqual(findings[0]["status"], "failed")
         self.assertFalse(findings[0]["structural"])
@@ -89,12 +106,12 @@ class AccountRegistryTests(unittest.TestCase):
         self,
     ):
         temporary, root = self._root(
-            "      management:\n"
-            "        members:\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
-            "          account_id: <live-management-account-id>\n"
-            "      dev:\n"
-            "        account_id: '111111111111'\n"
+            "  management:\n"
+            "    slug: management\n"
+            "    account_id: <live-management-account-id>\n"
+            "  dev:\n"
+            "    slug: dev\n"
+            "    account_id: '111111111111'\n"
         )
         with temporary:
             context = {
@@ -136,7 +153,7 @@ class AccountRegistryTests(unittest.TestCase):
 
             dev_cfg_result = aws.resolve_target_cfg_references(
                 "dev",
-                {"execution_identity": executions["dev_direct"]},
+                {"execution_identities": {"aws": executions["dev_direct"]}},
                 catalogs,
                 execution_context=context,
                 implementation_key="profile",
@@ -146,7 +163,7 @@ class AccountRegistryTests(unittest.TestCase):
 
             management_cfg_result = aws.resolve_target_cfg_references(
                 "management",
-                {"execution_identity": executions["management_direct"]},
+                {"execution_identities": {"aws": executions["management_direct"]}},
                 catalogs,
                 execution_context=context,
                 implementation_key="profile",
@@ -164,7 +181,7 @@ class AccountRegistryTests(unittest.TestCase):
                 return_value="111111111111",
             ):
                 aws.validate_active_target_access(
-                    {"dev": {"execution_identity": executions["dev_direct"]}},
+                    {"dev": {"execution_identities": {"aws": executions["dev_direct"]}}},
                     catalogs,
                     execution_context=context,
                     implementation_key="profile",
@@ -182,7 +199,7 @@ class AccountRegistryTests(unittest.TestCase):
                 aws.validate_active_target_access(
                     {
                         "management": {
-                            "execution_identity": executions["management_direct"]
+                            "execution_identities": {"aws": executions["management_direct"]}
                         }
                     },
                     catalogs,
@@ -190,18 +207,6 @@ class AccountRegistryTests(unittest.TestCase):
                     implementation_key="profile",
                     execution_access_mode="agreed_direct",
                 )
-
-    def test_duplicate_physical_id_across_branches_is_rejected(self):
-        temporary, root = self._root(
-            "      ctl_plane:\n"
-            "        members:\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: live}}\n"
-            "          account_id: '111111111111'\n"
-            "        - selectors: {match: {execution_context.params.landing_zone: canary}}\n"
-            "          account_id: '111111111111'\n"
-        )
-        with temporary, self.assertRaisesRegex(RuntimeError, "duplicate physical account ids"):
-            aws.load_aws_account_registry_cfg(root)
 
 
 class AccountSlugTests(unittest.TestCase):
@@ -212,20 +217,45 @@ class AccountSlugTests(unittest.TestCase):
     def _root(self, body: str):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
-        write(root / "accounts_registry.yaml", "providers:\n  aws:\n    accounts_registry:\n" + body)
+        for landing_zone in ("live", "canary"):
+            write(
+                root / "_inputs" / "aws" / "account_registries" / f"{landing_zone}.yaml",
+                "accounts_registry:\n" + body,
+            )
+        write(
+            root / "ctl_sources.yaml",
+            "ctl_sources:\n  aws.accounts_registry:\n"
+            "    type: map\n"
+            "    conflict_resolution: error\n"
+            "    sources:\n"
+            "    - provider: local\n"
+            "      format: yaml\n"
+            "      file_path:\n"
+            "        members:\n"
+            "        - value: /_inputs/aws/account_registries/live.yaml\n"
+            "          selectors:\n"
+            "            match:\n"
+            "              execution_context.params.landing_zone: live\n"
+            "        - value: /_inputs/aws/account_registries/canary.yaml\n"
+            "          selectors:\n"
+            "            match:\n"
+            "              execution_context.params.landing_zone: canary\n",
+        )
         return temporary, root
 
     ENTRY = (
-        "      non_prod_email_svc:\n"
-        "        slug: non-prod-email-svc\n"
-        "        account_id: '111111111111'\n"
+        "  non_prod_email_svc:\n"
+        "    slug: non-prod-email-svc\n"
+        "    account_id: '111111111111'\n"
     )
 
     def test_derived_params_publishes_the_slug_for_the_declared_account(self):
         temporary, root = self._root(self.ENTRY)
         with temporary:
             self.assertEqual(
-                aws.derived_params(root, {"aws.account": "non_prod_email_svc"}),
+                aws.derived_params(
+                    root, {"aws.account": "non_prod_email_svc", "landing_zone": "live"}
+                ),
                 {"aws.account_slug": "non-prod-email-svc"},
             )
 
@@ -237,19 +267,19 @@ class AccountSlugTests(unittest.TestCase):
     def test_unknown_account_is_rejected(self):
         temporary, root = self._root(self.ENTRY)
         with temporary, self.assertRaisesRegex(RuntimeError, "cannot derive aws.account_slug"):
-            aws.derived_params(root, {"aws.account": "nope"})
+            aws.derived_params(root, {"aws.account": "nope", "landing_zone": "live"})
 
     def test_missing_slug_is_rejected(self):
-        temporary, root = self._root("      ctl_plane:\n        account_id: '111111111111'\n")
+        temporary, root = self._root("  ctl_plane:\n    account_id: '111111111111'\n")
         with temporary, self.assertRaisesRegex(RuntimeError, r"ctl_plane\.slug is required"):
-            aws.load_aws_account_slugs(root)
+            aws.load_aws_account_slugs(root, "live")
 
     def test_slug_must_be_a_legal_bucket_name_fragment(self):
         temporary, root = self._root(
-            "      ctl_plane:\n        slug: ctl_plane\n        account_id: '111111111111'\n"
+            "  ctl_plane:\n    slug: ctl_plane\n    account_id: '111111111111'\n"
         )
         with temporary, self.assertRaisesRegex(RuntimeError, "separated by single hyphens"):
-            aws.load_aws_account_slugs(root)
+            aws.load_aws_account_slugs(root, "live")
 
 
 class SessionPolicyTests(unittest.TestCase):
@@ -364,10 +394,11 @@ class ForceUnlockBindingTests(unittest.TestCase):
         write(
             root / step_path / "step.yaml",
             """id: destroy/public_dns
+providers: [aws]
 cfg_keys:
   env:
-  - main_tag
-  - tfstate_s3_bucket_name
+    main_tag: main_tag
+    tfstate_s3_bucket_name: tfstate_s3_bucket_name
 runtime:
   image: infra
 """,
@@ -391,7 +422,12 @@ runtime:
                 (
                     "infra/public_dns",
                     "plt_static_public_dns_tfstate_key",
-                    {"env": ["main_tag", "tfstate_s3_bucket_name"]},
+                    {
+                        "env": {
+                            "main_tag": "main_tag",
+                            "tfstate_s3_bucket_name": "tfstate_s3_bucket_name",
+                        }
+                    },
                 ),
             )
 

@@ -351,32 +351,15 @@ def ctl_profile_bool(ctl_cfg_root: Path, ctl_profile: str, key: str) -> bool:
 # the target alone — a `plan` must not run with write authority. Both the classes
 # and this mapping are engine-owned and provider-neutral: a target's
 # `execution.roles` maps each class to a provider role key the adapter resolves.
-ROLE_CLASSES = ("readonly", "readwrite")
-# The role class is the action's ACCESS LEVEL: read-only for a preview, read-write
-# for a mutation. Mutating actions (provision/destroy) are the single source
-# `MUTATING_ACTIONS`, so the map is derived, not duplicated.
-ACTION_ROLE_CLASS = {
-    action: ("readwrite" if action in MUTATING_ACTIONS else "readonly")
-    for action in RUN_ACTIONS
-}
-
-
-def resolve_role_class(action: str | None, *, label: str) -> str:
-    """Map a lifecycle action to the authorization class it requires."""
-    if action is None:
-        raise RuntimeError(f"❌ {label}: an action is required to select the authorization class")
-    role_class = ACTION_ROLE_CLASS.get(str(action).strip())
-    if role_class is None:
-        raise RuntimeError(
-            f"❌ {label}: action {action!r} has no authorization class; "
-            f"known actions: {sorted(ACTION_ROLE_CLASS)}"
-        )
-    return role_class
+# The engine owns ACTIONS; a provider owns its ROLES and the mapping between the
+# two. There is no engine-level authorization class: it would be derived from
+# `MUTATING_ACTIONS` and carry nothing beyond "is this action mutating", while
+# imposing one provider's vocabulary on every target — against the rule that
+# everything below `provider` is opaque and interpreted by that adapter.
 
 
 TARGET_EXECUTION_IDENTITY_FIELDS = frozenset(
     {
-        "provider",
         "account",
         "roles",
         "agreed_direct_credential_source_keys",
@@ -559,12 +542,55 @@ def _resolve_instance_params_members(
     )
 
 
-def validate_target_execution_identity(execution: object, *, label: str) -> dict:
-    """Validate a target's `execution_identity:` block — the provider-tagged payload.
+def validate_target_providers(declared: object, identities: dict, *, label: str) -> list[str]:
+    """A target DECLARES the providers it runs against, and the declaration must
+    agree with the identities it carries.
 
-    The engine reads only `provider` (to pick the adapter) and the generic shape;
-    every value below it (`account`, the role keys, credential source keys) is
-    opaque here and interpreted by that provider's adapter.
+    Declared rather than inferred from `execution_identities`, for the same reason
+    `--providers` is declared for a run: the provider set is a statement about what
+    this target is allowed to reach, and a drifted identity block should fail
+    rather than quietly widen it.
+    """
+    if not isinstance(declared, list) or not declared or not all(
+        isinstance(item, str) and item.strip() for item in declared
+    ):
+        raise RuntimeError(f"❌ {label} providers must be a non-empty list of provider names")
+    if sorted(set(declared)) != sorted(identities):
+        raise RuntimeError(
+            f"❌ {label} declares providers {sorted(set(declared))} but carries "
+            f"execution_identities for {sorted(identities)}; they must agree"
+        )
+    return sorted(set(declared))
+
+
+def validate_target_execution_identities(entries: object, *, label: str) -> dict:
+    """Validate a target's `execution_identities:` — identities KEYED BY PROVIDER.
+
+    A run may span providers, and so may a target: a root that touches two clouds
+    needs credentials for both before a single plan. The provider is the key, so
+    the engine picks N adapters instead of one and everything below each key stays
+    opaque.
+    """
+    if not isinstance(entries, dict) or not entries:
+        raise RuntimeError(
+            f"❌ {label} execution_identities must be a non-empty mapping keyed by provider"
+        )
+    resolved: dict[str, dict] = {}
+    for provider, execution in entries.items():
+        if not isinstance(provider, str) or not provider.strip():
+            raise RuntimeError(f"❌ {label} execution_identities keys must be provider names")
+        resolved[provider] = validate_target_execution_identity(
+            execution, label=f"{label} [{provider}]"
+        )
+    return resolved
+
+
+def validate_target_execution_identity(execution: object, *, label: str) -> dict:
+    """Validate ONE entry of a target's `execution_identities:` block.
+
+    The provider is the KEY, so one target may declare several. The engine reads
+    the generic shape only; every value inside (`account`, the role keys,
+    credential source keys) is opaque here and interpreted by that adapter.
     """
     if not isinstance(execution, dict) or not execution:
         raise RuntimeError(f"❌ {label} execution must be a non-empty mapping")
@@ -576,22 +602,15 @@ def validate_target_execution_identity(execution: object, *, label: str) -> dict
             f"allowed: {sorted(TARGET_EXECUTION_IDENTITY_FIELDS)}"
         )
 
-    for field in ("provider", "account"):
-        value = execution.get(field)
-        if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(f"❌ {label} execution.{field} must be a non-empty string")
+    value = execution.get("account")
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"❌ {label} execution.account must be a non-empty string")
 
     roles = execution.get("roles")
     if not isinstance(roles, dict) or not roles:
         raise RuntimeError(
-            f"❌ {label} execution.roles must be a non-empty mapping of "
-            f"authorization class -> provider role key ({', '.join(ROLE_CLASSES)})"
-        )
-    unknown_classes = sorted(set(roles) - set(ROLE_CLASSES))
-    if unknown_classes:
-        raise RuntimeError(
-            f"❌ {label} execution.roles has unknown authorization classes {unknown_classes}; "
-            f"allowed: {list(ROLE_CLASSES)}"
+            f"❌ {label} execution.roles must be a non-empty mapping; its KEYS are the "
+            "provider's vocabulary, not the engine's"
         )
     for role_class, role_key in roles.items():
         if not isinstance(role_key, str) or not role_key.strip():
@@ -1127,10 +1146,22 @@ def load_yaml(path: Path):
 
 
 def format_path_for_log(path: str | Path, relative_roots: tuple[Path, ...] = ()) -> str:
-    """Prefer a relative display path when the path is under a known root."""
+    """Prefer a relative display path when the path is under a known root.
+
+    A materialized preset is shown by the IMPORT it came from, not by its scratch
+    directory: the scratch is freed at the end of the discovery pass, so its path
+    names nothing a reader could go and look at.
+    """
     path_obj = Path(path).expanduser()
     if not path_obj.is_absolute():
         return str(path_obj)
+
+    for workspace, import_path in _MATERIALIZED_IMPORT_LABELS.items():
+        try:
+            inside = path_obj.relative_to(workspace)
+        except ValueError:
+            continue
+        return f"{import_path.rstrip('/')}/{inside}" if str(inside) != "." else import_path
 
     for root in relative_roots:
         try:
@@ -1736,10 +1767,15 @@ def build_active_target_runs(
             if target_cfg.get(behavior_field) is not None:
                 active_target_run[behavior_field] = target_cfg[behavior_field]
 
-        target_execution_identity = target_override.get("execution_identity") or target_cfg.get("execution_identity")
+        target_execution_identity = target_override.get("execution_identities") or target_cfg.get("execution_identities")
         if target_execution_identity is not None:
-            active_target_run["execution_identity"] = validate_target_execution_identity(
+            active_target_run["execution_identities"] = validate_target_execution_identities(
                 target_execution_identity, label=f"target run {target_run_id!r}"
+            )
+            active_target_run["providers"] = validate_target_providers(
+                target_override.get("providers") or target_cfg.get("providers"),
+                active_target_run["execution_identities"],
+                label=f"target run {target_run_id!r}",
             )
 
         # §Phase 31/32: the declared instance identity must ride on the target_run
@@ -1851,7 +1887,12 @@ def build_active_target_runs(
 
 # After the Phase 2d cutover, targets / workflows / refs are all content-key
 # resources (identified by their top-level key, not by a dir), so nothing is skipped.
-_CONTENT_KEY_SKIP_TOP = ()
+# `_inputs/` holds DATA a consumer reads through a declared input source — not
+# cfg. It is ignored outright: never merged as a content-key resource, never
+# validated as cfg, and reachable only through the locator its consumer declares.
+# Several files in it may carry the same keys (one per landing zone, say), which
+# a content-key merge would treat as a collision.
+_IGNORED_CFG_DIRS = ("_inputs",)
 
 
 def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> dict:
@@ -1865,7 +1906,7 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>` and
     `providers.<name>.<section>.<entry>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
-    `_CONTENT_KEY_SKIP_TOP`) are skipped — they have dedicated loaders.
+    `_IGNORED_CFG_DIRS`) are skipped — they have dedicated loaders.
     """
     merged: dict = {}
     origin: dict = {}
@@ -1891,7 +1932,7 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
 
     for yf in sorted(ctl_cfg_root.rglob("*.yaml")):
         rel = yf.relative_to(ctl_cfg_root)
-        if rel.parts and rel.parts[0] in _CONTENT_KEY_SKIP_TOP:
+        if any(part in _IGNORED_CFG_DIRS for part in rel.parts):
             continue
         data = load_yaml(yf) or {}
         if not isinstance(data, dict):
@@ -1904,6 +1945,52 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
         _merge(merged, section, "", yf)
 
     return merged
+
+
+def load_ctl_sources(ctl_cfg_root: Path) -> dict:
+    """Load `ctl_sources.<key>`: the data ctl SOURCES, by key.
+
+    Engine-generic on purpose. An entry declares WHAT the payload is (`type`),
+    what a collision MEANS (`conflict_resolution`), and a LIST of sources. The
+    engine validates that shape only — it learns no type or policy VALUES, and no
+    provider vocabulary; `provider` sits on the SOURCE, so one input may be
+    assembled from sources belonging to different providers and this collection
+    cannot live inside any one provider's catalog. The consumer of an input
+    validates the values and the source fields it implements.
+    """
+    entries = collect_resource(ctl_cfg_root, "ctl_sources")
+    for source_key, entry in entries.items():
+        label = f"ctl_sources.{source_key}"
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"❌ {label} must be a mapping: {ctl_cfg_root}")
+        unknown = sorted(set(entry) - {"type", "conflict_resolution", "sources"})
+        if unknown:
+            raise RuntimeError(f"❌ {label} has unknown fields {unknown}: {ctl_cfg_root}")
+        for field, why in (
+            ("type", "the combine operation follows from it: a map is merged by key, "
+                     "a list is concatenated"),
+            ("conflict_resolution", "left implicit, source order would silently decide "
+                                    "which value wins"),
+        ):
+            if not isinstance(entry.get(field), str) or not entry[field].strip():
+                raise RuntimeError(
+                    f"❌ {label}.{field} must be declared — {why}: {ctl_cfg_root}"
+                )
+        sources = entry.get("sources")
+        if not isinstance(sources, list) or not sources:
+            raise RuntimeError(f"❌ {label}.sources must be a non-empty list: {ctl_cfg_root}")
+        for index, source in enumerate(sources):
+            if not isinstance(source, dict):
+                raise RuntimeError(f"❌ {label}.sources[{index}] must be a mapping: {ctl_cfg_root}")
+            # Only these two are universal. Everything else is provider-shaped,
+            # so the engine cannot know it and the consumer validates it.
+            for field in ("provider", "format"):
+                if not isinstance(source.get(field), str) or not source[field].strip():
+                    raise RuntimeError(
+                        f"❌ {label}.sources[{index}].{field} must be a non-empty string: "
+                        f"{ctl_cfg_root}"
+                    )
+    return entries
 
 
 def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
@@ -2176,12 +2263,16 @@ def run_provider(execution_context: dict[str, object]) -> str:
     return providers[0]
 
 
-def target_run_provider(target_run: dict) -> str:
-    """The provider a target_run executes against, from its execution_identity block."""
-    provider = ((target_run or {}).get("execution_identity") or {}).get("provider")
-    if not provider:
-        raise RuntimeError("❌ target_run execution_identity block declares no provider")
-    return str(provider)
+def target_run_providers(target_run: dict) -> list[str]:
+    """Every provider a target_run executes against, from its execution_identities.
+
+    A target may declare more than one: a root touching two clouds needs
+    credentials for both before a single plan.
+    """
+    identities = (target_run or {}).get("execution_identities") or {}
+    if not identities:
+        raise RuntimeError("❌ target_run execution_identities declares no provider")
+    return sorted(identities)
 
 
 def provider_inputs(
@@ -2448,19 +2539,24 @@ def parse_comma_list(value: str) -> list[str]:
 def validate_target_provider_coverage(
     active_target_runs: dict, providers: list[str] | tuple[str, ...]
 ) -> None:
-    """Every selected target's provider must be among the run's declared providers.
+    """Every provider a selected target declares must be among the run's.
+
+    A target may declare several identities, so its provider SET must be a subset
+    of `--providers`.
 
     The provider set is DECLARED (--providers), never inferred from the targets, so
     a target reaching for an undeclared provider fails loud instead of silently
     widening the run.
     """
     declared = set(providers or ())
-    offenders = sorted(
-        f"{target_run_id} (provider {(target_run.get('execution') or {}).get('provider')!r})"
-        for target_run_id, target_run in active_target_runs.items()
-        if (target_run.get("execution_identity") or {}).get("provider")
-        and (target_run.get("execution_identity") or {}).get("provider") not in declared
-    )
+    offenders = []
+    for target_run_id, target_run in active_target_runs.items():
+        undeclared = sorted(
+            set(target_run.get("execution_identities") or {}) - declared
+        )
+        if undeclared:
+            offenders.append(f"{target_run_id} (providers {undeclared})")
+    offenders = sorted(offenders)
     if offenders:
         raise RuntimeError(
             "❌ selected target_runs use providers not declared in --providers "
@@ -2489,7 +2585,7 @@ def validate_target_execution_identity_coverage(
         return
     stages_without_execution = sorted(
         target_run_id for target_run_id, target_run in active_target_runs.items()
-        if target_run.get("execution_identity") is None
+        if target_run.get("execution_identities") is None
     )
     if stages_without_execution:
         raise RuntimeError(
@@ -3753,10 +3849,16 @@ def load_inventory_cfg(
                 f"❌ target {target_name!r} uses `execution_identity_key`, which is removed; "
                 "declare an `execution_identity:` block (provider, account, roles) instead"
             )
-        target_execution_identity = target_def.get("execution_identity")
+        target_execution_identity = target_def.get("execution_identities")
+        target_providers = None
         if target_execution_identity is not None:
-            target_execution_identity = validate_target_execution_identity(
+            target_execution_identity = validate_target_execution_identities(
                 target_execution_identity, label=f"target {target_name!r}"
+            )
+            target_providers = validate_target_providers(
+                target_def.get("providers"),
+                target_execution_identity,
+                label=f"target {target_name!r}",
             )
 
         # §Phase 61(a): a target declares the COORDINATES it consumes and the
@@ -3862,7 +3964,8 @@ def load_inventory_cfg(
                 )
             resolved["target_instance_params"] = [p.strip() for p in instance_params]
         if target_execution_identity is not None:
-            resolved["execution_identity"] = target_execution_identity
+            resolved["execution_identities"] = target_execution_identity
+            resolved["providers"] = target_providers
         if "provisions_ctl_state_bucket" in target_def:
             raise RuntimeError(
                 f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
@@ -5183,6 +5286,9 @@ SCOPE_META_SKIP_FILENAMES = {
 # pass frees the previous one, so a long-lived process holds at most one run's
 # worth rather than accumulating them.
 _MATERIALIZED_IMPORT_DIRS: list[tempfile.TemporaryDirectory] = []
+# materialized dir -> the cfg-absolute import path it was composed from, so a log
+# line names the preset rather than a scratch path that will not exist afterwards
+_MATERIALIZED_IMPORT_LABELS: dict[Path, str] = {}
 
 
 def _new_materialization_workspace() -> Path:
@@ -5194,6 +5300,7 @@ def _new_materialization_workspace() -> Path:
 def _release_materialized_imports() -> None:
     while _MATERIALIZED_IMPORT_DIRS:
         _MATERIALIZED_IMPORT_DIRS.pop().cleanup()
+    _MATERIALIZED_IMPORT_LABELS.clear()
 
 def selector_expected_values(expected, *, label: str) -> list[str]:
     if isinstance(expected, str) and expected:
@@ -5209,7 +5316,7 @@ EXECUTION_CONTEXT_ROOT = "execution_context"
 #   params  COORDINATES         identify an instance; become ctl-state path segments
 #   target  the target's own    what it reads (domains) + its constants (static_vars);
 #                               never a coordinate, never a path segment
-EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params", "target")
+EXECUTION_CONTEXT_NAMESPACES = ("ctl", "params", "target", "sourced")
 EXECUTION_CONTEXT_PARAMS_PREFIX = f"{EXECUTION_CONTEXT_ROOT}.params."
 # The key may itself be dotted — that is how provider-specific params are
 # namespaced under their provider. Provider-neutral params keep a single segment
@@ -5500,9 +5607,11 @@ def build_execution_context(
     providers: list[str] | tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Build the flat dotted execution context: the closed, namespaced facts of
-    this execution. Two namespaces — `ctl` (promoted engine args) and `params`
-    (consumer values, merged from --execution-params CLI + the execution_params
-    cfg block). Keys look like 'execution_context.params.env.type'."""
+    this execution. Namespaces: `ctl` (promoted engine args), `params` (consumer
+    values, merged from --execution-params CLI + the execution_params cfg block),
+    and `sourced` (data ctl READ from a declared `ctl_sources` entry, so a
+    consumer never keeps its own copy). Keys look like
+    'execution_context.params.env.type'."""
     context: dict[str, object] = {}
 
     def put_list(namespace: str, key: str, values, *, label: str) -> None:
@@ -5620,9 +5729,47 @@ def build_execution_context(
     # target never declares it. Recording which keys were derived lets the per-target
     # filter pass them through without treating them as declarable inputs.
     put_list("ctl", "derived_params", sorted(derived_param_keys), label="derived params")
+
+    # Declared SOURCES. ctl reads each `ctl_sources` entry once, for the
+    # frozen context, and publishes the payload here — so a consumer references
+    # the fact instead of keeping a second copy of it. The engine names no input
+    # and no key: it asks each participating adapter what it resolved and
+    # flattens whatever comes back. Values are scalars because that is what a
+    # cfg reference can carry.
+    for provider in providers or ():
+        adapter = get_provider_adapter(provider)
+        resolve_sources = getattr(adapter, "resolved_sources", None)
+        if resolve_sources is None:
+            continue
+        for source_key, payload in (resolve_sources(ctl_cfg_root, dict(context)) or {}).items():
+            for leaf_key, leaf_value in _flatten_sourced_payload(
+                payload, prefix=source_key, label=f"provider {provider!r} source {source_key!r}"
+            ).items():
+                put("sourced", leaf_key, leaf_value, label=f"source {source_key!r}")
     return context
 
 
+
+
+def _flatten_sourced_payload(payload, *, prefix: str, label: str) -> dict[str, object]:
+    """Flatten a sourced payload into dotted scalar leaves.
+
+    A cfg reference resolves to a SCALAR, so a nested payload is published leaf by
+    leaf: `accounts_registry.dev.account_id`, never one map under one key.
+    """
+    if isinstance(payload, dict):
+        flat: dict[str, object] = {}
+        for key, value in payload.items():
+            if not isinstance(key, str) or not CONTEXT_KEY_RE.fullmatch(key):
+                raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
+            flat.update(_flatten_sourced_payload(value, prefix=f"{prefix}.{key}", label=label))
+        return flat
+    if isinstance(payload, (str, int, float, bool)):
+        return {prefix: payload}
+    raise RuntimeError(
+        f"❌ {label}: {prefix} must resolve to nested mappings of scalars, "
+        f"got {type(payload).__name__}"
+    )
 
 
 def execution_context_nested(execution_context: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -5993,6 +6140,7 @@ def load_scope_candidate(
         seen_imports.add(src)
 
         materialized = workspace / f"{index:03d}"
+        _MATERIALIZED_IMPORT_LABELS[materialized] = import_path
         cfg_presets.materialize(
             cfg_root,
             import_path,
@@ -6205,7 +6353,7 @@ def target_definition_document(target_run: dict) -> dict:
         "cfg_keys",
         "target_instance_params",
         "requires_plt_overlays",
-        "execution_identity",
+        "execution_identities",
         "provisions_ctl_state_backend",
         "allow_agreed_defer_ctl_state_backend_sync",
         *sorted(target_consent_opt_in_fields()),
@@ -6711,7 +6859,7 @@ def write_target_run_flow_artifact(path: Path, workflow_meta: dict | None, activ
                 "target": target_run.get("target"),
                 "source": target_run.get("source"),
                 "workflow": target_run.get("workflow"),
-                "execution_identity": target_run.get("execution_identity"),
+                "execution_identities": target_run.get("execution_identities"),
                 "branch": target_run.get("branch"),
                 "commit": target_run.get("commit"),
             }
@@ -6933,20 +7081,30 @@ def validate_ctl_state_backend_execution(execution: object, *, label: str, path:
 
 
 def describe_target_execution_identity(execution: object) -> str | None:
-    """Compact report label for a resolved execution_identity block: provider:account:role.
+    """Compact report label for execution identities: provider:account:role.
 
-    Provider-neutral — the engine only joins the declared fields; it does not
+    Accepts either the keyed block (`{provider: {...}}`, one entry per provider)
+    or one already-selected entry. Several providers render one line each, joined
+    by `, ` — a target with two identities reads as two, not as a merged one.
+
+    Provider-neutral: the engine only joins the declared fields; it does not
     interpret them.
     """
     if not isinstance(execution, dict) or not execution:
         return None
-    parts = [str(execution.get("provider") or "?"), str(execution.get("account") or "?")]
-    roles = execution.get("roles")
-    if isinstance(roles, dict) and roles:
-        parts.append("/".join(f"{cls}={key}" for cls, key in sorted(roles.items())))
-    elif execution.get("role"):
-        parts.append(str(execution["role"]))
-    return ":".join(parts)
+
+    def _entry(provider: str | None, entry: dict) -> str:
+        parts = [str(provider or entry.get("provider") or "?"), str(entry.get("account") or "?")]
+        roles = entry.get("roles")
+        if isinstance(roles, dict) and roles:
+            parts.append("/".join(f"{cls}={key}" for cls, key in sorted(roles.items())))
+        elif entry.get("role"):
+            parts.append(str(entry["role"]))
+        return ":".join(parts)
+
+    if all(isinstance(value, dict) for value in execution.values()):
+        return ", ".join(_entry(provider, entry) for provider, entry in sorted(execution.items()))
+    return _entry(None, execution)
 
 
 def ctl_state_backend_operation_execution(
@@ -9148,7 +9306,7 @@ def prepare_target_repo(
         if provider_catalogs is None or execution_context is None or provider_implementation_key is None:
             raise RuntimeError("❌ incomplete provider inputs for target_run preparation")
         adapter_access_mode, adapter_options = provider_inputs(
-            target_run_provider(target_run), execution_access_modes, provider_options
+            provider_adapter.PROVIDER_NAME, execution_access_modes, provider_options
         )
         provider_adapter.materialize_target_binding(
             target_run_id,
@@ -9207,19 +9365,48 @@ def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_
                 f"Step metadata must not use cfg_key_sets — a step declares content keys, "
                 f"and cfg_key_sets is a CTL-cfg catalog the source repo cannot resolve: {step_meta_path}"
             )
+        # A step declares the providers it uses. The target is the CEILING, the
+        # step is the SIGNATURE: without this, every step in a multi-provider
+        # target receives every credential set — a silent over-grant on the one
+        # path that must not widen by default.
+        step_providers = step_meta.get("providers")
+        if not isinstance(step_providers, list) or not step_providers or not all(
+            isinstance(item, str) and item.strip() for item in step_providers
+        ):
+            raise RuntimeError(
+                f"❌ Step metadata providers must be a non-empty list of provider names: "
+                f"{step_meta_path}"
+            )
+
         step_contract = step_meta.get("cfg_keys") or {}
         if not isinstance(step_contract, dict):
             raise RuntimeError(f"Step metadata cfg_keys must be a mapping: {step_meta_path}")
-        for domain, entries in step_contract.items():
-            if not isinstance(entries, list) or not entries:
+        for domain, bindings in step_contract.items():
+            # A step is a SIGNATURE: `<local name>: <cfg key>`. It binds by name,
+            # so a glob — which can expand to a key the step never named — is not
+            # expressible here by construction.
+            if not isinstance(bindings, dict) or not bindings:
                 raise RuntimeError(
-                    f"Step metadata cfg_keys[{domain!r}] must be a non-empty list: {step_meta_path}"
+                    f"Step metadata cfg_keys[{domain!r}] must be a non-empty mapping of "
+                    f"local name -> cfg key: {step_meta_path}"
                 )
+            for local_name, cfg_key in bindings.items():
+                if not isinstance(local_name, str) or not local_name:
+                    raise RuntimeError(
+                        f"Step metadata cfg_keys[{domain!r}] local names must be "
+                        f"non-empty strings: {step_meta_path}"
+                    )
+                if not isinstance(cfg_key, str) or not cfg_key:
+                    raise RuntimeError(
+                        f"Step metadata cfg_keys[{domain!r}][{local_name!r}] must bind a "
+                        f"non-empty cfg key: {step_meta_path}"
+                    )
 
         active.append(
             {
                 "id": step_id,
                 "path": step_path,
+                "providers": sorted(set(step_providers)),
                 "cfg_keys": step_contract,
                 "runtime": {
                     "values_json": values_json,
@@ -9305,11 +9492,16 @@ def resolve_force_unlock_tfstate_binding(
                 )
             binding = (stack_dir, match.group("state_key"))
             merged_keys = bindings.setdefault(binding, {})
-            for domain, entries in (repo_step["cfg_keys"] or {}).items():
-                bucket = merged_keys.setdefault(domain, [])
-                for entry in (entries if isinstance(entries, list) else []):
-                    if entry not in bucket:
-                        bucket.append(entry)
+            for domain, step_bindings in (repo_step["cfg_keys"] or {}).items():
+                bucket = merged_keys.setdefault(domain, {})
+                for local_name, cfg_key in (step_bindings or {}).items():
+                    existing = bucket.get(local_name)
+                    if existing is not None and existing != cfg_key:
+                        raise RuntimeError(
+                            "❌ force-unlock steps bind the same local name to different "
+                            f"cfg keys: {local_name!r} -> {existing!r} and {cfg_key!r}"
+                        )
+                    bucket[local_name] = cfg_key
 
     if not bindings:
         raise RuntimeError(
@@ -10604,31 +10796,33 @@ def validate_execution_access(
     targets = inventory_cfg.get("targets", {})
     for target_name in active_target_names(workflow_cfg):
         target_cfg = targets.get(target_name) or {}
-        execution = target_cfg.get("execution_identity")
-        if execution is None:
+        identities = target_cfg.get("execution_identities")
+        if identities is None:
             continue  # coverage is validated separately
-        provider = execution.get("provider")
-        if not provider or provider not in (execution_access_modes or {}):
-            continue  # provider coverage is validated separately
-        mode = execution_access_modes[str(provider)]
-        consent = get_provider_adapter(str(provider)).target_consent(mode)
-        if not consent:
-            continue
-        opt_in_field = consent["opt_in_field"]
-        opt_in = target_cfg.get(opt_in_field, False)
-        if not isinstance(opt_in, bool):
-            raise RuntimeError(f"❌ target {opt_in_field} must be a boolean")
-        if not opt_in:
-            raise RuntimeError(
-                f"❌ execution access mode {mode!r} was requested, but target "
-                f"{target_name!r} does not set {opt_in_field}: true"
-            )
-        execution_field = consent["execution_field"]
-        if not (execution.get(execution_field) or []):
-            raise RuntimeError(
-                f"❌ execution access mode {mode!r} was requested, but target "
-                f"{target_name!r} declares no execution_identity.{execution_field}"
-            )
+        # A target may declare several identities; consent is asked of EACH
+        # provider that this run actually activates.
+        for provider, execution in sorted((identities or {}).items()):
+            if provider not in (execution_access_modes or {}):
+                continue  # provider coverage is validated separately
+            mode = execution_access_modes[str(provider)]
+            consent = get_provider_adapter(str(provider)).target_consent(mode)
+            if not consent:
+                continue
+            opt_in_field = consent["opt_in_field"]
+            opt_in = target_cfg.get(opt_in_field, False)
+            if not isinstance(opt_in, bool):
+                raise RuntimeError(f"❌ target {opt_in_field} must be a boolean")
+            if not opt_in:
+                raise RuntimeError(
+                    f"❌ execution access mode {mode!r} was requested, but target "
+                    f"{target_name!r} does not set {opt_in_field}: true"
+                )
+            execution_field = consent["execution_field"]
+            if not ((execution or {}).get(execution_field) or []):
+                raise RuntimeError(
+                    f"❌ execution access mode {mode!r} was requested, but target "
+                    f"{target_name!r} declares no execution_identities.{provider}.{execution_field}"
+                )
 
     # ctl-state sync skip (an operation, orthogonal to access mode)
     sync_permission_checks = (
@@ -10786,12 +10980,13 @@ def build_step_sequence_cfg(
         "cfg_keys": {domain: ["*"]},
     }
     if execution_provider:
-        # The synthetic target gets the same execution_identity block a declared target
-        # has; a single --execution-role is bound to the class this action needs.
-        role_class = action_role_class or resolve_role_class(
-            action, label="synthetic step_sequence target"
-        )
-        resolved["execution_identity"] = validate_target_execution_identity(
+        # The synthetic target gets the same execution_identity block a declared
+        # target has; a single --execution-role is bound under the key that
+        # provider uses for this action — the engine asks, it does not decide.
+        role_class = action_role_class or get_provider_adapter(
+            execution_provider
+        )._action_role_key(action, label="synthetic step_sequence target")
+        resolved["execution_identities"] = validate_target_execution_identities(
             {
                 "provider": execution_provider,
                 "account": execution_account,
@@ -11454,7 +11649,7 @@ def build_ctl_state_backend_preflight_result(
     buckets = load_ctl_state_backends_cfg(ctl_cfg_root)
     result: dict = {
         "ctl_state_backend": None,
-        "execution_identity": None,
+        "execution_identities": None,
         "provider": None,
         "access_mode": None,
         "status": "not_applicable",
@@ -11509,7 +11704,7 @@ def build_ctl_state_backend_preflight_result(
     try:
         checked = provider_adapter.preflight_execution_identity(
             f"ctl_state_backend/{namespace_key}",
-            {"execution_identity": operation_execution},
+            {"execution_identities": operation_execution},
             selection["provider_catalogs"],
             execution_context=selection["execution_context"],
             implementation_key=implementation_key,
@@ -11521,7 +11716,7 @@ def build_ctl_state_backend_preflight_result(
             raise RuntimeError("provider preflight returned an invalid result")
     except Exception as error:
         result["status"] = "failed"
-        result["execution_identity"] = operation_execution
+        result["execution_identities"] = operation_execution
         result["failure_reason"] = credential_free_preflight_failure_reason(error)
         return result
     checked = dict(checked)
@@ -11558,7 +11753,7 @@ def build_execution_identity_preflight_report(
     for target_key, (target_run_id, target_run) in target_runs_by_key.items():
         try:
             adapter_access_mode, adapter_options = provider_inputs(
-                target_run_provider(target_run),
+                provider_adapter.PROVIDER_NAME,
                 execution_access_modes,
                 provider_options,
             )
@@ -11570,19 +11765,18 @@ def build_execution_identity_preflight_report(
                 implementation_key=implementation_key,
                 execution_access_mode=adapter_access_mode,
                 provider_options=adapter_options,
-                live_check=target_run_provider(target_run) not in force_skip_providers,
+                live_check=provider_adapter.PROVIDER_NAME not in force_skip_providers,
             )
             if not isinstance(result, dict):
                 raise RuntimeError("provider preflight returned a non-mapping result")
         except Exception as error:
             result = {
-                "execution_identity": target_run.get("execution_identity"),
-                # the target's OWN provider, not a run-global one
-                "provider": (target_run.get("execution_identity") or {}).get("provider"),
+                "execution_identities": target_run.get("execution_identities"),
+                # this adapter's own view: it preflights the identity it owns
+                "provider": provider_adapter.PROVIDER_NAME,
                 "access_mode": execution_access_mode_for(
-                    execution_access_modes,
-                    (target_run.get("execution_identity") or {}).get("provider", ""),
-                ) if (target_run.get("execution_identity") or {}).get("provider") else None,
+                    execution_access_modes, provider_adapter.PROVIDER_NAME
+                ) if (target_run.get("execution_identities") or {}) else None,
                 "status": "failed",
                 "provider_path": [],
                 "failure_reason": credential_free_preflight_failure_reason(error),
@@ -11590,7 +11784,7 @@ def build_execution_identity_preflight_report(
         status = result.get("status")
         if status not in PREFLIGHT_RESULT_STATUSES:
             result = {
-                "execution_identity": result.get("execution_identity"),
+                "execution_identities": result.get("execution_identities"),
                 "provider": result.get("provider"),
                 "access_mode": result.get("access_mode"),
                 "status": "failed",
@@ -11691,7 +11885,7 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         tag = _preflight_status_tag
         if "ctl_state_backend" in result:
             children: list[dict] = []
-            backend_execution = describe_target_execution_identity(result.get("execution_identity"))
+            backend_execution = describe_target_execution_identity(result.get("execution_identities"))
             if backend_execution:
                 children.append(
                     _node(f"execution_identity: {backend_execution} {tag(status)}")
@@ -11708,7 +11902,7 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         # container row carries only passed/failed/not_evaluated; the identity
         # row keeps the raw status (bypassed/skipped/not-applicable count as passed)
         row_status = status if status in ("failed", "not_evaluated") else "passed"
-        identity_key = describe_target_execution_identity(result.get("execution_identity")) or "<unresolved>"
+        identity_key = describe_target_execution_identity(result.get("execution_identities")) or "<unresolved>"
         identity_children: list[dict] = []
         for path_node in result.get("provider_path") or []:
             display = (
@@ -11924,7 +12118,7 @@ def collect_target_consumed_axes(
     # (one dispatch axis per level) is gone with the groups themselves; per-action
     # variation is now `execution.roles`, keyed by authorization class, which
     # consumes no params axis.
-    execution = inventory_target.get("execution_identity")
+    execution = inventory_target.get("execution_identities")
     if isinstance(execution, dict):
         consumed |= _template_param_axes(execution.get("account"))
     return consumed
@@ -11970,7 +12164,7 @@ def build_target_cfg_validation_report(
     for target_key, (target_run_id, target_run) in by_key.items():
         try:
             adapter_access_mode, adapter_options = provider_inputs(
-                target_run_provider(target_run),
+                provider_adapter.PROVIDER_NAME,
                 execution_access_modes,
                 provider_options,
             )

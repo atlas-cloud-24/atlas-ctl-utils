@@ -82,11 +82,252 @@ def normalize_optional_aws_profile(value: str | None) -> str | None:
 # provider names or sections.
 _AWS_PROVIDER_CATALOG_SECTIONS = {
     "credential_sources",
-    "accounts_registry",
     "target_roles",
     "ctl_state_roles",
     "ctl_role_chain",
 }
+
+
+ACCOUNTS_SOURCE_KEY = "aws.accounts_registry"
+ACCOUNTS_PAYLOAD_KEY = "accounts_registry"
+_SUPPORTED_INPUT_SOURCE = {"provider": "local", "source": "repo", "format": "yaml"}
+
+
+def _landing_zone_of(execution_context: dict[str, object] | None) -> str | None:
+    if not execution_context:
+        return None
+    zone = execution_context.get("execution_context.params.landing_zone")
+    return str(zone).strip() if zone else None
+
+
+SUPPORTED_INPUT_TYPES = ("map",)
+SUPPORTED_CONFLICT_RESOLUTIONS = ("error",)
+# Source kinds this adapter can read, keyed by the universal fields plus the
+# provider-shaped `source`. `local` has no service holding it, so it declares no
+# `source`; an aws source names one. Adding a kind is an entry here plus a reader.
+_SOURCE_KINDS = {
+    ("local", None, "yaml"): "_read_local_yaml",
+    ("aws", "s3", "tfstate"): "_read_aws_s3_tfstate",
+}
+
+
+def _source_entry(ctl_cfg_root: Path, source_key: str) -> tuple[dict, str]:
+    entry = common.load_ctl_sources(ctl_cfg_root).get(source_key)
+    label = f"ctl_sources.{source_key}"
+    if not isinstance(entry, dict):
+        raise RuntimeError(f"❌ {label} is not declared: {ctl_cfg_root}")
+    for field, supported in (
+        ("type", SUPPORTED_INPUT_TYPES),
+        ("conflict_resolution", SUPPORTED_CONFLICT_RESOLUTIONS),
+    ):
+        value = entry.get(field)
+        if value not in supported:
+            raise RuntimeError(
+                f"❌ {label}.{field} must be one of {list(supported)}, got {value!r}. "
+                "This adapter implements those only; another value is a new gated path "
+                "here, not a silent reinterpretation."
+            )
+    declared = entry.get("sources")
+    if not isinstance(declared, list) or not declared:
+        raise RuntimeError(f"❌ {label}.sources must be a non-empty list: {ctl_cfg_root}")
+    return entry, label
+
+
+def _resolve_selector_borne(value, *, label: str, execution_context: dict) -> str:
+    """Resolve a locator field that may be SELECTOR-BORNE.
+
+    A plain string is the value. A `members` mapping states each candidate with
+    the selectors that qualify it — scoped to the one field that varies, so the
+    rest of the source is written once. Stated rather than derived: a template
+    like `${...landing_zone}.yaml` only holds while the file name IS the zone
+    name, and when it does not it fails by pointing at a missing file instead of
+    saying that no source applies.
+    """
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict) or set(value) != {"members"}:
+        raise RuntimeError(
+            f"❌ {label} must be a string or a mapping with exactly `members`"
+        )
+    members = value["members"]
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label}.members must be a non-empty list")
+
+    matched: list[str] = []
+    for index, member in enumerate(members):
+        member_label = f"{label}.members[{index}]"
+        if not isinstance(member, dict) or sorted(member) != ["selectors", "value"]:
+            raise RuntimeError(f"❌ {member_label} must declare exactly `value` and `selectors`")
+        common.selector_requirements(
+            member["selectors"], label=f"{member_label}.selectors", structured_only=True
+        )
+        if common.selector_matches(
+            member["selectors"],
+            execution_context,
+            label=f"{member_label}.selectors",
+            structured_only=True,
+        ):
+            matched.append(str(member["value"]))
+    if len(matched) != 1:
+        raise RuntimeError(
+            f"❌ {label} must resolve exactly one member for this run; matched {len(matched)}. "
+            "An input that resolves to nothing is a silently empty read, not an empty input."
+        )
+    return matched[0]
+
+
+def _source_kind(source: dict, *, label: str) -> tuple:
+    if not isinstance(source, dict):
+        raise RuntimeError(f"❌ {label} must be a mapping")
+    kind = (source.get("provider"), source.get("source"), source.get("format"))
+    if kind not in _SOURCE_KINDS:
+        raise RuntimeError(
+            f"❌ {label} declares provider/source/format {kind}; this adapter reads "
+            f"{sorted(_SOURCE_KINDS)} only. Another combination is a new gated reader "
+            "here, not a silent reinterpretation."
+        )
+    return kind
+
+
+def _read_local_yaml(source: dict, *, label: str, ctl_cfg_root: Path, execution_context: dict):
+    """Read a committed file from this cfg repo. No credential: `local` needs none."""
+    unknown = sorted(set(source) - {"provider", "format", "file_path"})
+    if unknown:
+        raise RuntimeError(f"❌ {label} has unknown fields {unknown} for a local source")
+    resolved = _resolve_selector_borne(
+        source.get("file_path"), label=f"{label}.file_path", execution_context=execution_context
+    )
+    relative = common.normalize_cfg_absolute_path(
+        resolved, label=f"{label}.file_path"
+    ).lstrip("/")
+    path = ctl_cfg_root / relative
+    if not path.is_file():
+        raise RuntimeError(f"❌ {label} points at a missing file: {path}")
+    data = common.load_yaml(path) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"❌ {label} must contain a mapping: {path}")
+    return data, str(path)
+
+
+def _read_aws_s3_tfstate(source: dict, *, label: str, ctl_cfg_root: Path, execution_context: dict):
+    """Read a producer's published outputs out of its Terraform state in S3.
+
+    The locator is validated and resolved here so a malformed source fails on its
+    own terms. ACQUIRING the credential is the part that does not exist yet: it
+    happens BEFORE target selection, which is an execution phase ctl does not have,
+    and it needs the declared credential source to be provisioned. Failing loudly
+    is the point — a half-wired reader that silently returned nothing would be the
+    silent-empty-input failure this whole design refuses.
+
+    Note (HashiCorp): reading another root's state grants the WHOLE state snapshot,
+    so `format: tfstate` is the cheap step, not the destination — a published
+    object or SSM parameter is, and that is another kind here, not a redesign.
+    """
+    required = ("bucket", "key", "region", "published_map", "credential_source_key")
+    unknown = sorted(set(source) - {"provider", "source", "format", *required})
+    if unknown:
+        raise RuntimeError(f"❌ {label} has unknown fields {unknown} for an aws/s3/tfstate source")
+    locator = {}
+    for field in required:
+        value = source.get(field)
+        if value is None:
+            raise RuntimeError(f"❌ {label}.{field} is required for an aws/s3/tfstate source")
+        locator[field] = _resolve_selector_borne(
+            value, label=f"{label}.{field}", execution_context=execution_context
+        )
+
+    credential_sources = load_aws_credential_sources_cfg(ctl_cfg_root)
+    credential_source_key = locator["credential_source_key"]
+    if credential_source_key not in credential_sources:
+        raise RuntimeError(
+            f"❌ {label}.credential_source_key {credential_source_key!r} is not declared in "
+            f"providers.aws.credential_sources; declared: "
+            f"{', '.join(sorted(credential_sources)) or 'none'}"
+        )
+
+    raise common.ProviderConfigBlockedError(
+        f"❌ {label}: reading a source from aws/s3/tfstate is declared and validated, "
+        "but credential ACQUISITION for ctl sources is not built. It happens before target "
+        f"selection, and {credential_source_key!r} must be provisioned first. "
+        f"Locator resolved to s3://{locator['bucket']}/{locator['key']} "
+        f"({locator['region']}), published_map {locator['published_map']!r}."
+    )
+
+
+def _read_source(source: dict, *, label: str, ctl_cfg_root: Path, execution_context: dict):
+    """Dispatch to the reader for this source kind and return (payload, origin)."""
+    reader = globals()[_SOURCE_KINDS[_source_kind(source, label=label)]]
+    return reader(
+        source, label=label, ctl_cfg_root=ctl_cfg_root, execution_context=execution_context
+    )
+
+
+def _declared_landing_zones(ctl_cfg_root: Path) -> list[str]:
+    """Every landing zone the declared sources can serve.
+
+    Read from the SELECTORS themselves, so catalog validation covers each zone
+    without the adapter knowing where the files sit or how they are named.
+    """
+    entry, label = _source_entry(ctl_cfg_root, ACCOUNTS_SOURCE_KEY)
+    zones: set[str] = set()
+    for source in entry["sources"]:
+        file_path = source.get("file_path")
+        if not isinstance(file_path, dict):
+            continue
+        for member in file_path.get("members") or []:
+            match = ((member or {}).get("selectors") or {}).get("match") or {}
+            zone = match.get("execution_context.params.landing_zone")
+            if zone:
+                zones.add(str(zone))
+    if not zones:
+        raise RuntimeError(
+            f"❌ {label} declares no landing zone in its locator selectors: {ctl_cfg_root}"
+        )
+    return sorted(zones)
+
+
+def _load_accounts_registry(ctl_cfg_root: Path, landing_zone: str) -> dict:
+    """Assemble the accounts input from every declared source.
+
+    Each source yields a PARTIAL payload; the input is their union, combined the
+    declared way: `type: map` merges by key, and `conflict_resolution: error`
+    makes a key supplied by two sources a failure — an account is created by
+    exactly one root, so a collision means something is wrong, not that someone
+    should win. Sources may be of different kinds, since `provider` sits on the
+    source, not on the entry.
+    """
+    entry, label = _source_entry(ctl_cfg_root, ACCOUNTS_SOURCE_KEY)
+    execution_context = {"execution_context.params.landing_zone": landing_zone}
+    merged: dict = {}
+    origin: dict[str, str] = {}
+    for index, source in enumerate(entry["sources"]):
+        source_label = f"{label}.sources[{index}]"
+        data, source_origin = _read_source(
+            source,
+            label=source_label,
+            ctl_cfg_root=ctl_cfg_root,
+            execution_context=execution_context,
+        )
+        unknown = sorted(set(data) - {ACCOUNTS_PAYLOAD_KEY})
+        if unknown:
+            raise RuntimeError(
+                f"❌ {source_label} has unknown top-level keys {unknown}: {source_origin}"
+            )
+        accounts = data.get(ACCOUNTS_PAYLOAD_KEY)
+        if not isinstance(accounts, dict) or not accounts:
+            raise RuntimeError(
+                f"❌ {source_label} must declare a non-empty {ACCOUNTS_PAYLOAD_KEY} mapping: "
+                f"{source_origin}"
+            )
+        for account_key, account_cfg in accounts.items():
+            if account_key in merged:
+                raise RuntimeError(
+                    f"❌ {label} declares conflict_resolution: error, but account "
+                    f"{account_key!r} is supplied by {source_origin} and {origin[account_key]}"
+                )
+            merged[account_key] = account_cfg
+            origin[account_key] = source_origin
+    return merged
 
 
 def _load_aws_provider_catalog(ctl_cfg_root: Path) -> dict:
@@ -131,21 +372,21 @@ def load_aws_credential_sources_cfg(ctl_cfg_root: Path) -> dict:
 ACCOUNT_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
-def load_aws_account_slugs(ctl_cfg_root: Path) -> dict[str, str]:
+def load_aws_account_slugs(ctl_cfg_root: Path, landing_zone: str) -> dict[str, str]:
     """account_key -> AWS-FACING spelling.
 
     Internal account keys are snake_case; provider-facing names are hyphenated,
     and S3 bucket names reject underscores outright (AWS: bucket names may
     contain only lowercase letters, numbers, periods and hyphens). The slug is
-    landing-zone invariant, so it sits on the registry ENTRY and is read without
-    resolving selector members.
+    landing-zone invariant in VALUE, but the registry is per-zone, so it is read
+    from the zone's own file like every other account fact.
     """
-    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts_registry", {})
+    accounts = _load_accounts_registry(ctl_cfg_root, landing_zone)
     slugs: dict[str, str] = {}
     for account_key, account_cfg in accounts.items():
         if not isinstance(account_cfg, dict):
             continue
-        label = f"providers.aws.accounts_registry.{account_key}.slug"
+        label = f"accounts[{landing_zone}].{account_key}.slug"
         slug = account_cfg.get("slug")
         if slug is None:
             raise RuntimeError(f"❌ {label} is required (the account's AWS-facing spelling)")
@@ -170,15 +411,44 @@ def derived_params(ctl_cfg_root: Path, params: dict[str, str]) -> dict[str, str]
     account_key = params.get("aws.account")
     if not account_key:
         return {}
-    slugs = load_aws_account_slugs(ctl_cfg_root)
+    slugs = load_aws_account_slugs(ctl_cfg_root, str(params.get("landing_zone", "")).strip())
     slug = slugs.get(str(account_key).strip())
     if slug is None:
         available = ", ".join(sorted(slugs)) or "none"
         raise RuntimeError(
-            f"❌ providers.aws.accounts_registry has no account {account_key!r} "
+            f"❌ the aws accounts registry has no account {account_key!r} "
             f"(cannot derive aws.account_slug); declared: {available}"
         )
     return {"aws.account_slug": slug}
+
+
+def resolved_sources(ctl_cfg_root: Path, execution_context: dict[str, object]) -> dict:
+    """Data this adapter SOURCED for the frozen context, published by the engine
+    into `execution_context.sourced.*`.
+
+    The point is that a consumer stops keeping its own copy: plt roots reference
+    `execution_context.sourced.aws.accounts_registry.<key>.account_id` instead of
+    declaring the same ids again, so the cross-boundary duplicate stops existing
+    rather than being watched by a guardrail.
+
+    Placeholders pass through — the 12-digit check belongs to whoever binds a
+    concrete account, not to publishing the fact that the registry states one.
+    """
+    landing_zone = _landing_zone_of(execution_context)
+    if landing_zone is None:
+        return {}
+    registry = load_aws_account_registry_cfg(
+        ctl_cfg_root, execution_context=execution_context, strict_selected=False
+    )
+    if not registry:
+        return {}
+    slugs = load_aws_account_slugs(ctl_cfg_root, landing_zone)
+    return {
+        ACCOUNTS_SOURCE_KEY: {
+            account_key: {"account_id": account_id, "slug": slugs[account_key]}
+            for account_key, account_id in registry.items()
+        }
+    }
 
 
 def load_aws_account_registry_cfg(
@@ -187,95 +457,43 @@ def load_aws_account_registry_cfg(
     execution_context: dict[str, object] | None = None,
     strict_selected: bool = True,
 ) -> dict[str, str]:
-    """Load account_key -> account_id. Selector-membered logical keys are
-    resolved exactly once from the frozen execution context. With no context,
-    the function performs structural validation and returns static entries only.
+    """Load account_key -> account_id for the run's landing zone.
 
-    With `strict_selected=False` a resolved account id that is not 12 digits (a
-    placeholder) is returned as-is instead of raising — the 12-digit check is
-    then the caller's concern (stage-1 cfg validation / per-target resolution),
-    not the whole catalog load's.
+    A landing zone is a separate AWS organization, so the registry is per-zone and
+    the zone selects the FILE. There is no selector resolution: each file holds one
+    flat inventory, which is also the shape a published source would emit.
+
+    With `strict_selected=False` an account id that is not 12 digits (a
+    placeholder) is returned as-is instead of raising — the 12-digit check is then
+    the caller's concern (stage-1 cfg validation / per-target resolution), not the
+    whole catalog load's.
     """
-    accounts = _load_aws_provider_catalog(ctl_cfg_root).get("accounts_registry", {})
+    landing_zone = _landing_zone_of(execution_context)
+    if landing_zone is None:
+        return {}
+    accounts = _load_accounts_registry(ctl_cfg_root, landing_zone)
     registry: dict[str, str] = {}
 
-    def validate_account_id(value: object, label: str, *, selected: bool) -> str:
-        account_id = common._require_non_empty_string(value, label, ctl_cfg_root)
-        if re.fullmatch(r"\d{12}", account_id):
-            return account_id
-        placeholder = re.fullmatch(r"<[^<>]+-account-id>", account_id)
-        if placeholder and (not selected or not strict_selected):
-            return account_id
-        raise RuntimeError(f"❌ {label} must be a 12-digit account id")
-
     for account_key, account_cfg in accounts.items():
+        label = f"accounts[{landing_zone}].{account_key}"
         if not isinstance(account_key, str) or not account_key.strip():
             raise RuntimeError(f"❌ aws account keys must be non-empty strings: {ctl_cfg_root}")
         if not isinstance(account_cfg, dict):
-            raise RuntimeError(f"❌ aws account {account_key!r} must be a mapping: {ctl_cfg_root}")
-        unknown = sorted(set(account_cfg) - {"account_id", "members", "slug"})
+            raise RuntimeError(f"❌ {label} must be a mapping: {ctl_cfg_root}")
+        unknown = sorted(set(account_cfg) - {"account_id", "slug"})
         if unknown:
-            raise RuntimeError(f"❌ aws account {account_key!r} has unknown fields {unknown}: {ctl_cfg_root}")
-        has_static = "account_id" in account_cfg
-        has_members = "members" in account_cfg
-        if has_static == has_members:
-            raise RuntimeError(
-                f"❌ aws account {account_key!r} must declare exactly one of account_id or members"
-            )
-        if has_static:
-            registry[account_key] = validate_account_id(
-                account_cfg.get("account_id"),
-                f"providers.aws.accounts_registry.{account_key}.account_id",
-                selected=True,
-            )
-            continue
+            raise RuntimeError(f"❌ {label} has unknown fields {unknown}: {ctl_cfg_root}")
+        if "account_id" not in account_cfg:
+            raise RuntimeError(f"❌ {label} must declare account_id")
 
-        members = account_cfg.get("members")
-        if not isinstance(members, list) or not members:
-            raise RuntimeError(
-                f"❌ providers.aws.accounts_registry.{account_key}.members must be a non-empty list"
-            )
-        matches: list[str] = []
-        branch_account_ids: list[str] = []
-        for index, member in enumerate(members):
-            label = f"providers.aws.accounts_registry.{account_key}.members[{index}]"
-            if not isinstance(member, dict):
-                raise RuntimeError(f"❌ {label} must be a mapping")
-            unknown_member = sorted(set(member) - {"selectors", "account_id"})
-            if unknown_member:
-                raise RuntimeError(f"❌ {label} has unknown fields {unknown_member}")
-            selectors = member.get("selectors")
-            common.selector_requirements(
-                selectors, label=f"{label}.selectors", structured_only=True
-            )
-            account_id = validate_account_id(
-                member.get("account_id"), f"{label}.account_id", selected=False
-            )
-            branch_account_ids.append(account_id)
-            if execution_context is not None and common.selector_matches(
-                selectors, execution_context, label=f"{label}.selectors", structured_only=True
-            ):
-                matches.append(account_id)
-        duplicates = sorted({
-            account_id
-            for account_id in branch_account_ids
-            if branch_account_ids.count(account_id) > 1
-        })
-        if duplicates:
-            raise RuntimeError(
-                f"❌ providers.aws.accounts_registry.{account_key}.members resolve duplicate "
-                f"physical account ids across selector branches: {duplicates}"
-            )
-        if execution_context is None:
-            continue
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"❌ providers.aws.accounts_registry.{account_key} must resolve exactly one member; "
-                f"matched {len(matches)}"
-            )
-        registry[account_key] = validate_account_id(
-            matches[0], f"providers.aws.accounts_registry.{account_key}.resolved.account_id", selected=True
+        account_id = common._require_non_empty_string(
+            account_cfg.get("account_id"), f"{label}.account_id", ctl_cfg_root
         )
+        if not re.fullmatch(r"\d{12}", account_id):
+            placeholder = re.fullmatch(r"<[^<>]+-account-id>", account_id)
+            if not placeholder or strict_selected:
+                raise RuntimeError(f"❌ {label}.account_id must be a 12-digit account id")
+        registry[account_key] = account_id
     return registry
 
 
@@ -299,14 +517,14 @@ def collect_provider_cfg_findings(
         # registry — one finding under the accounts cfg path.
         return [
             {
-                "cfg_path": "providers.aws.accounts_registry",
+                "cfg_path": f"ctl_sources.{ACCOUNTS_SOURCE_KEY}",
                 "status": "failed",
                 "error": common.credential_free_preflight_failure_reason(error),
                 "structural": True,
             }
         ]
     for account_key, account_id in sorted(registry.items()):
-        cfg_path = f"providers.aws.accounts_registry.{account_key}.account_id"
+        cfg_path = f"ctl_sources.{ACCOUNTS_SOURCE_KEY}.{account_key}.account_id"
         if re.fullmatch(r"\d{12}", account_id):
             findings.append(
                 {"cfg_path": cfg_path, "status": "passed", "structural": False}
@@ -486,7 +704,7 @@ def _validate_profile_expect(
     if "account_id" in expect_cfg:
         raise RuntimeError(
             f"❌ AWS credential source {credential_source_key!r}.{implementation_key}.expect.account_id is deprecated; "
-            "put account IDs in providers.aws.accounts_registry keyed by execution identity account_key"
+            "put account IDs in the accounts_registry input keyed by execution identity account_key"
         )
     if "account_key" in expect_cfg:
         common._require_non_empty_string(
@@ -769,6 +987,29 @@ def _select_agreed_direct_credential_source(
     return matches[0]
 
 
+# This adapter's action -> role-key mapping. Two keys, because the only boundary
+# that corresponds to a different permission set is whether an action may change
+# state: `provision` already needs delete rights (a replacement is a destroy plus
+# a create), so a per-action key would repeat the same permissions under another
+# name. Another provider may key its roles however it likes.
+_ACTION_ROLE_KEY = {
+    action: ("readwrite" if action in common.MUTATING_ACTIONS else "readonly")
+    for action in common.RUN_ACTIONS
+}
+
+
+def _action_role_key(action: str | None, *, label: str) -> str:
+    if action is None:
+        raise RuntimeError(f"❌ {label}: an action is required to select the aws role")
+    role_key = _ACTION_ROLE_KEY.get(str(action).strip())
+    if role_key is None:
+        raise RuntimeError(
+            f"❌ {label}: action {action!r} has no aws role; "
+            f"known actions: {sorted(_ACTION_ROLE_KEY)}"
+        )
+    return role_key
+
+
 def resolve_target_aws_access(
     target_run: dict,
     _execution_identities: dict,
@@ -801,7 +1042,7 @@ def resolve_target_aws_access(
         profile_name = force_bypass_credential_profile(provider_options)
         return {
             "provider": "aws",
-            "execution_identity": {"provider": "aws", "account": "<substitute>"},
+            "execution_identities": {PROVIDER_NAME: {"account": "<substitute>"}},
             "implementation_key": "substitute",
             "credential_provider_kind": "substitute_credential",
             "profile_name": profile_name,
@@ -819,7 +1060,11 @@ def resolve_target_aws_access(
             "is built"
         )
 
-    execution = target_run.get("execution_identity")
+    # A TARGET declares identities keyed by provider and this adapter reads only
+    # its own; a CTL-STATE operation has exactly one identity and passes it bare.
+    execution = (target_run.get("execution_identities") or {}).get(PROVIDER_NAME)
+    if execution is None:
+        execution = target_run.get("execution_identity")
     if execution is None:
         # Coverage is validated by common.validate_target_execution_identity_coverage; a lone
         # resolve call for an execution-less target_run has nothing to resolve.
@@ -836,12 +1081,12 @@ def resolve_target_aws_access(
         if is_ctl_state
         else "target execution"
     )
-    if not is_ctl_state:
-        provider = execution.get("provider")
-        if provider != "aws":
-            raise RuntimeError(
-                f"❌ {identity_label} provider {provider!r} is not implemented by this runner"
-            )
+    if not is_ctl_state and execution is None:
+        # The target declares identities keyed by provider; this adapter is asked
+        # only for its own, so a missing entry means the target does not run here.
+        raise RuntimeError(
+            f"❌ {identity_label} declares no {PROVIDER_NAME!r} execution identity"
+        )
 
     context = dict(execution_context)
     account_key = common.resolve_runtime_scalar(
@@ -860,7 +1105,7 @@ def resolve_target_aws_access(
 
     resolved: dict[str, str] = {
         "provider": "aws",
-        "execution_identity": execution,
+        "execution_identities": execution,
         "account_key": account_key,
         "implementation_key": implementation_key,
         "expected_account_id": expected_account_id,
@@ -1006,9 +1251,10 @@ def resolve_target_aws_access(
     if is_ctl_state:
         target_role_key, state_role_key = None, execution.get("role")
     else:
-        # §Phase 53: the role follows the ACTION's authorization class, so a
-        # `plan` cannot run with deploy authority.
-        role_class = common.resolve_role_class(
+        # The role follows the ACTION, so a `plan` cannot run with deploy
+        # authority. The mapping is THIS adapter's: the engine owns actions and
+        # names no role vocabulary.
+        role_class = _action_role_key(
             execution_context.get(f"{common.EXECUTION_CONTEXT_ROOT}.ctl.action"),
             label=identity_label,
         )
@@ -1222,7 +1468,7 @@ def check_account_expectation(
     expected = (account_registry or {}).get(account_key)
     if not expected or not re.fullmatch(r"\d{12}", str(expected)):
         return {"status": "not_applicable",
-                "reason": f"accounts_registry states no concrete id for {account_key!r}"}
+                "reason": f"the accounts_registry input states no concrete id for {account_key!r}"}
 
     caller = cached_caller_identity(profile_name)
     actual = str(caller.get("Account") or "")
@@ -1256,7 +1502,9 @@ def preflight_execution_identity(
     live_check: bool = True,
 ) -> dict:
     """Resolve one target path and optionally prove it with read-only STS calls."""
-    raw_execution = target_run.get("execution_identity")
+    raw_execution = (target_run.get("execution_identities") or {}).get(PROVIDER_NAME)
+    if raw_execution is None:
+        raw_execution = target_run.get("execution_identity")
     try:
         resolved = resolve_target_aws_access(
             target_run,
@@ -1273,7 +1521,7 @@ def preflight_execution_identity(
         )
     except common.ProviderConfigBlockedError as error:
         return {
-            "execution_identity": raw_execution,
+            "execution_identities": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "not_evaluated",
@@ -1289,7 +1537,7 @@ def preflight_execution_identity(
             if reason.endswith(suffix):
                 reason = reason[: -len(suffix)].rstrip()
         return {
-            "execution_identity": raw_execution,
+            "execution_identities": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "failed",
@@ -1299,7 +1547,7 @@ def preflight_execution_identity(
 
     if not resolved:
         return {
-            "execution_identity": raw_execution,
+            "execution_identities": raw_execution,
             "provider": "aws",
             "access_mode": execution_access_mode,
             "status": "failed",
@@ -1308,9 +1556,9 @@ def preflight_execution_identity(
         }
     if resolved.get("identity_bypass") == "true":
         result = {
-            "execution_identity": (
+            "execution_identities": (
                 raw_execution
-                or resolved.get("execution_identity")
+                or resolved.get("execution_identities")
                 or "<unresolved>"
             ),
             "provider": "aws",
@@ -1353,7 +1601,7 @@ def preflight_execution_identity(
         return result
 
     result = {
-        "execution_identity": resolved.get("execution_identity"),
+        "execution_identities": resolved.get("execution_identities"),
         "provider": "aws",
         "access_mode": execution_access_mode,
         "status": "force_skipped" if not live_check else "passed",
@@ -1551,7 +1799,7 @@ def validate_active_target_run_aws_access(
         execution_context.get(f"{common.EXECUTION_CONTEXT_ROOT}.ctl.providers") or (),
     )
     if execution_access_mode != "force_bypass" and any(
-        target_run.get("execution_identity") is not None for target_run in active_target_runs.values()
+        target_run.get("execution_identities") is not None for target_run in active_target_runs.values()
     ):
         if account_registry is None:
             raise RuntimeError("❌ AWS account registry is required for declared target executions")
@@ -1589,7 +1837,7 @@ def validate_active_target_run_aws_access(
             "Validated AWS access for target_run %s: execution=%s account_key=%s "
             "credential_source_key=%s implementation_key=%s credential_provider_kind=%s",
             target_run_id,
-            common.describe_target_execution_identity(resolved.get("execution_identity")),
+            common.describe_target_execution_identity(resolved.get("execution_identities")),
             account_key,
             resolved["credential_source_key"],
             resolved["implementation_key"],
@@ -1673,7 +1921,7 @@ def configure_target_aws_env(
 
     target_env["AWS_EC2_METADATA_DISABLED"] = "true"
     target_env["ATLAS_AWS_ASSERT_ACCESS"] = "true"
-    target_env["ATLAS_EXECUTION"] = common.describe_target_execution_identity(resolved.get("execution_identity")) or ""
+    target_env["ATLAS_EXECUTION"] = common.describe_target_execution_identity(resolved.get("execution_identities")) or ""
 
     if resolved.get("identity_bypass") == "true":
         target_env.update(export_profile_credentials(resolved["profile_name"]))
@@ -1718,7 +1966,7 @@ def configure_target_aws_env(
         "Resolved AWS access for target_run %s: execution=%s account_key=%s "
         "credential_source_key=%s implementation_key=%s credential_provider_kind=%s expected_account_id=%s",
         target_run_id,
-        common.describe_target_execution_identity(resolved.get("execution_identity")),
+        common.describe_target_execution_identity(resolved.get("execution_identities")),
         resolved["account_key"],
         resolved["credential_source_key"],
         resolved["implementation_key"],
@@ -2070,9 +2318,20 @@ class CtlStateSyncer:
 # ---------------------------------------------------------------------------
 
 def validate_catalog(ctl_cfg_root: Path) -> None:
-    """Validate the complete providers.aws.* structure without requiring bindings."""
+    """Validate the complete providers.aws.* structure without requiring bindings.
+
+    Every landing zone's accounts file is validated, not just the one a run would
+    select — a malformed zone must be a cfg error before anyone runs against it.
+    """
     load_aws_credential_sources_cfg(ctl_cfg_root)
-    load_aws_account_registry_cfg(ctl_cfg_root, strict_selected=False)
+    zones = _declared_landing_zones(ctl_cfg_root)
+    for landing_zone in zones:
+        load_aws_account_registry_cfg(
+            ctl_cfg_root,
+            execution_context={"execution_context.params.landing_zone": landing_zone},
+            strict_selected=False,
+        )
+        load_aws_account_slugs(ctl_cfg_root, landing_zone)
     load_aws_ctl_role_chain_cfg(ctl_cfg_root)
     load_aws_target_roles_cfg(ctl_cfg_root)
     load_aws_ctl_state_roles_cfg(ctl_cfg_root)

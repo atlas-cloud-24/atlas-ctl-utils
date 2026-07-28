@@ -40,7 +40,7 @@ foundation:
                 encoding="utf-8",
             )
 
-            values, _ = build_runtime_cfg.build_step_values(root, {"cfg": ["*"]}, {})
+            values, _ = build_runtime_cfg.build_step_values(root, {"cfg": {"foundation": "foundation"}}, {})
 
         self.assertEqual(
             values["foundation"]["computing"]["asg_cfg"]["app"]["launch_template"],
@@ -68,7 +68,7 @@ foundation:
             )
 
             with self.assertRaisesRegex(RuntimeError, "missing item 'missing'"):
-                build_runtime_cfg.build_step_values(root, {"cfg": ["*"]}, {})
+                build_runtime_cfg.build_step_values(root, {"cfg": {"foundation": "foundation"}}, {})
 
 
 if __name__ == "__main__":

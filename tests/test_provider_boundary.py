@@ -288,15 +288,15 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 )
 
             with self.assertRaisesRegex(RuntimeError, "allow_agreed_direct_execution_access"):
-                check({"execution_identity": execution})
+                check({"execution_identities": {"aws": execution}})
             with self.assertRaisesRegex(RuntimeError, "agreed_direct_credential_source_keys"):
                 check({
                     "allow_agreed_direct_execution_access": True,
-                    "execution_identity": {"provider": "aws"},
+                    "execution_identities": {"aws": {}},
                 })
             check({
                 "allow_agreed_direct_execution_access": True,
-                "execution_identity": execution,
+                "execution_identities": {"aws": execution},
             })
 
     def test_modes_that_resolve_no_identity_are_declared(self):

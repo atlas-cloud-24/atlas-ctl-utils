@@ -136,7 +136,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             return_value="111111111111",
         ):
             resolved = aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -160,7 +160,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             return_value="111111111111",
         ):
             resolved = aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["ctl_state_dev_synchronizer"]},
+                {"execution_identities": {"aws": self.executions["ctl_state_dev_synchronizer"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -174,7 +174,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_direct_mode_requires_direct_credential_source_key(self):
         with self.assertRaisesRegex(RuntimeError, "no agreed_direct_credential_source_keys"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_no_target_role"]},
+                {"execution_identities": {"aws": self.executions["env_no_target_role"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -213,7 +213,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "profile override"):
                 aws_adapter.resolve_target_aws_access(
-                    {"execution_identity": self.executions["env_deploy"]},
+                    {"execution_identities": {"aws": self.executions["env_deploy"]}},
                     self.identities,
                     self.credential_sources,
                     execution_context=self.context,
@@ -243,7 +243,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # validated in cfg but not implemented, so it must fail explicitly.
         with self.assertRaisesRegex(RuntimeError, "is not implemented"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -267,8 +267,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "oxygen-dev-readonly": "222222222222",
         }
         target_runs = {
-            "deploy": {"execution_identity": self.executions["env_deploy"]},
-            "readonly": {"execution_identity": self.executions["env_readonly"]},
+            "deploy": {"execution_identities": {"aws": self.executions["env_deploy"]}},
+            "readonly": {"execution_identities": {"aws": self.executions["env_readonly"]}},
         }
         with mock.patch.object(
             aws_adapter,
@@ -291,7 +291,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_chain_mode_derives_runner_and_target_role_arns(self):
         resolved = aws_adapter.resolve_target_aws_access(
-            {"execution_identity": self.executions["env_deploy"]},
+            {"execution_identities": {"aws": self.executions["env_deploy"]}},
             self.identities,
             self.credential_sources,
             execution_context=self.context,
@@ -317,10 +317,11 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_chain_mode_identity_target_role_override(self):
         resolved = aws_adapter.resolve_target_aws_access(
             {
-                "execution_identity": {
-                    "provider": "aws",
-                    "account": "management",
-                    "roles": {"readwrite": "org_ctl_member_account_roles"},
+                "execution_identities": {
+                    "aws": {
+                        "account": "management",
+                        "roles": {"readwrite": "org_ctl_member_account_roles"},
+                    }
                 }
             },
             self.identities,
@@ -341,7 +342,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # Phase 15: a target identity without ctl_target_role_key is invalid in chain mode
         with self.assertRaisesRegex(RuntimeError, "declares no roles.readwrite"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_no_target_role"]},
+                {"execution_identities": {"aws": self.executions["env_no_target_role"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -355,7 +356,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_chain_mode_requires_ctl_role_chain_cfg(self):
         with self.assertRaisesRegex(RuntimeError, "require providers.aws.ctl_role_chain"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -368,7 +369,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_identity_bypass_uses_substitute_credential_even_with_identity(self):
         resolved = aws_adapter.resolve_target_aws_access(
-            {"execution_identity": self.executions["env_deploy"]},
+            {"execution_identities": {"aws": self.executions["env_deploy"]}},
             self.identities,
             self.credential_sources,
             execution_context=self.context,
@@ -384,7 +385,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_identity_bypass_requires_substitute_credential(self):
         with self.assertRaisesRegex(RuntimeError, "requires the substitute credential"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -404,7 +405,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ) as export:
             aws_adapter.configure_target_aws_env(
                 "test",
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 target_env,
                 self.identities,
                 self.credential_sources,
@@ -457,7 +458,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ):
             aws_adapter.configure_target_aws_env(
                 "target_run",
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 target_env,
                 self.identities,
                 self.credential_sources,
@@ -486,7 +487,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "expect.account_key resolves to"):
                 aws_adapter.resolve_target_aws_access(
-                    {"execution_identity": self.executions["org_admin"]},
+                    {"execution_identities": {"aws": self.executions["org_admin"]}},
                     self.identities,
                     sources,
                     execution_context=self.context,
@@ -503,7 +504,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             r"accounts_registry\.ctl_plane\.account_id must be a 12-digit account id",
         ):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
@@ -524,7 +525,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, r"must declare\s+expect.account_key"):
             aws_adapter.resolve_target_aws_access(
-                {"execution_identity": self.executions["env_deploy"]},
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
                 sources,
                 execution_context=self.context,
@@ -551,14 +552,14 @@ class AwsAccessResolutionTests(unittest.TestCase):
     # --- identity coverage ---
 
     def test_identity_coverage_rejects_missing_identity_without_bypass(self):
-        target_runs = {"declared": {"execution_identity": self.executions["env_deploy"]}, "bare": {}}
+        target_runs = {"declared": {"execution_identities": {"aws": self.executions["env_deploy"]}}, "bare": {}}
         with self.assertRaisesRegex(RuntimeError, "have no execution_identity block"):
             common.validate_target_execution_identity_coverage(
                 target_runs, execution_access_modes={"aws": "standard"}
             )
 
     def test_identity_coverage_allows_anything_under_bypass(self):
-        target_runs = {"declared": {"execution_identity": self.executions["env_deploy"]}, "bare": {}}
+        target_runs = {"declared": {"execution_identities": {"aws": self.executions["env_deploy"]}}, "bare": {}}
         common.validate_target_execution_identity_coverage(
             target_runs, execution_access_modes={"aws": "force_bypass"}
         )
