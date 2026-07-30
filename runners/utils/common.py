@@ -2456,10 +2456,7 @@ def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = (
     # the same action twice is still a mistake.
     seen: set = set()
     for entry in target_runs:
-        signature = (
-            (entry, None) if isinstance(entry, str)
-            else (entry.get("target"), entry.get("action"))
-        )
+        signature = workflow_target_run_signature(entry)
         if signature in seen:
             raise RuntimeError(
                 f"❌ workflow {name!r} has duplicate target key {signature[0]!r} after "
@@ -3654,29 +3651,6 @@ def load_workflow_cfg(
     return cfg
 
 
-def get_ctl_variants_root(ctl_cfg_root: Path) -> Path:
-    """Return ctl variant root dir under variants/."""
-    ctl_variants_root = (ctl_cfg_root / "variants").resolve()
-    if ctl_variants_root.is_dir():
-        return ctl_variants_root
-    raise RuntimeError(f"Ctl variants dir not found under: {ctl_cfg_root}")
-
-
-def get_ctl_variant_root(ctl_cfg_root: Path, ctl_variant: str) -> Path:
-    """Resolve one selected ctl variant path under variants/."""
-    ctl_variants_root = get_ctl_variants_root(ctl_cfg_root)
-    variant_root = (ctl_variants_root / ctl_variant).resolve()
-    try:
-        variant_root.relative_to(ctl_variants_root)
-    except ValueError as exc:
-        raise RuntimeError(f"Ctl variant path escapes variants/: {ctl_variant}") from exc
-    if not variant_root.exists():
-        raise RuntimeError(f"Ctl variant path not found: {variant_root}")
-    if not variant_root.is_dir():
-        raise RuntimeError(f"Ctl variant path must be a directory: {variant_root}")
-    return variant_root
-
-
 def load_optional_yaml_mapping(path: Path) -> dict:
     """Load an optional YAML mapping, returning {} when the file is absent."""
     if not path.is_file():
@@ -3687,43 +3661,52 @@ def load_optional_yaml_mapping(path: Path) -> dict:
     return data
 
 
-def _load_meta_string_list(meta: dict, key: str, item_kind: str, item_label: str) -> list[str]:
-    raw = meta.get(key) or []
-    if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
+def workflow_target_run_signature(target_run_entry) -> tuple[str, str | None]:
+    """Return `(target key, action)` for one workflow target_run entry.
+
+    A bare string is a key with no declared action; a mapping carries both. The
+    pair is the entry's IDENTITY: §Phase 73 lets one key repeat when the actions
+    differ, so neither half alone distinguishes two entries.
+    """
+    if isinstance(target_run_entry, str):
+        return target_run_entry, None
+    if isinstance(target_run_entry, dict):
+        return target_run_entry.get("target"), target_run_entry.get("action")
+    raise RuntimeError(f"❌ invalid workflow target_run entry: {target_run_entry!r}")
+
+
+def workflow_target_run_key(target_run_entry) -> str | None:
+    """Return the TARGET key an entry addresses.
+
+    Distinct from `get_workflow_target_run_id`: `id` is the run's display
+    identity, which the target-run builder may set independently of the target it
+    points at. A placement anchor names a target, so it resolves against this.
+    """
+    return workflow_target_run_signature(target_run_entry)[0]
+
+
+def find_workflow_anchor_index(target_runs: list, anchor: str, *, label: str) -> int | None:
+    """Locate the single entry an anchor target key names; None when absent.
+
+    Ambiguity is REFUSED rather than resolved by position. Since §Phase 73 a key
+    may appear twice with different actions, and picking the first would place a
+    variant before or after an arbitrary one of them — a silent choice about
+    ordering, which is exactly what a placement declares.
+    """
+    matches = [
+        index
+        for index, entry in enumerate(target_runs)
+        if workflow_target_run_key(entry) == anchor
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
         raise RuntimeError(
-            f"❌ {item_kind} '{item_label}' meta key '{key}' must be a list of non-empty strings"
+            f"❌ {label} anchor {anchor!r} matches {len(matches)} entries; a "
+            "placement cannot choose between them. Qualify the anchor or make "
+            "the key unique in this workflow"
         )
-    return raw
-
-
-def validate_ctl_variant_meta(
-    meta: dict,
-    *,
-    variant_label: str,
-    ctl_profile: str,
-    plt_overlays: list[str],
-) -> None:
-    """Validate ctl variant metadata against selected plt overlays."""
-    if not isinstance(meta, dict):
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' __meta__.yaml must contain a mapping")
-
-    allowed_envs = _load_meta_string_list(meta, "allowed_envs", "ctl variant", variant_label)
-    if allowed_envs:
-        if ctl_profile not in allowed_envs:
-            raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' is not allowed for ctl context '{ctl_profile}'; "
-                f"allowed_envs={allowed_envs}"
-            )
-
-    required_plt_overlays = _load_meta_string_list(meta, "requires_plt_overlays", "ctl variant", variant_label)
-    if required_plt_overlays:
-        missing = [overlay for overlay in required_plt_overlays if overlay not in plt_overlays]
-        if missing:
-            raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' requires plt overlays {missing}, "
-                f"but selected plt overlays are {plt_overlays}"
-            )
-
+    return matches[0]
 
 
 def get_workflow_target_run_id(target_run_entry) -> str:
@@ -3735,98 +3718,6 @@ def get_workflow_target_run_id(target_run_entry) -> str:
         if isinstance(target_run_id, str) and target_run_id:
             return target_run_id
     raise RuntimeError(f"❌ invalid workflow target_run entry: {target_run_entry!r}")
-
-
-def validate_ctl_variant_target_run_patch_entry(raw_target_run: dict, variant_label: str) -> tuple[str, dict]:
-    """Validate one ctl variant target_run patch entry and return its op plus target_run payload."""
-    if not isinstance(raw_target_run, dict):
-        raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' workflow patch entries must be mappings"
-        )
-
-    add_before = raw_target_run.get("add_before")
-    add_after = raw_target_run.get("add_after")
-    op_keys = [key for key, value in (("add_before", add_before), ("add_after", add_after)) if value is not None]
-    if len(op_keys) != 1:
-        raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' target_run patch entry must define exactly one of "
-            f"'add_before' or 'add_after': {raw_target_run}"
-        )
-
-    anchor_target_run_id = raw_target_run[op_keys[0]]
-    if not isinstance(anchor_target_run_id, str) or not anchor_target_run_id:
-        raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' {op_keys[0]} value must be a non-empty target_run id"
-        )
-
-    target_run_entry = {k: v for k, v in raw_target_run.items() if k not in ("add_before", "add_after")}
-    target_run_id = target_run_entry.get("id")
-    target_key = target_run_entry.get("target")
-    procedure_override = target_run_entry.get("workflow")
-    if not isinstance(target_run_id, str) or not target_run_id:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' inserted target_run must define non-empty 'id'")
-    if not isinstance(target_key, str) or not target_key:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' must define non-empty 'target'")
-    if not isinstance(procedure_override, str) or not procedure_override:
-        raise RuntimeError(f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' must define non-empty 'workflow'")
-    if target_run_entry.get("branch") and target_run_entry.get("commit"):
-        raise RuntimeError(
-            f"❌ ctl variant '{variant_label}' target_run '{target_run_id}' cannot define both 'branch' and 'commit'"
-        )
-
-    return op_keys[0], target_run_entry
-
-
-def apply_ctl_variant_workflow_patch(
-    workflow_cfg: dict,
-    patch_cfg: dict,
-    *,
-    variant_label: str,
-    patch_label: str,
-) -> dict:
-    """Apply add_before/add_after workflow patch entries from one ctl variant patch file."""
-    target_runs = workflow_cfg.get("target_runs")
-    if not isinstance(target_runs, list):
-        raise RuntimeError(f"❌ workflow cfg must contain a 'target_runs' list before applying ctl variants")
-
-    patch_target_runs = patch_cfg.get("target_runs") or []
-    if not isinstance(patch_target_runs, list):
-        raise RuntimeError(
-            f"❌ ctl variant patch '{patch_label}' must contain a 'target_runs' list"
-        )
-
-    resolved_target_runs = list(target_runs)
-    for raw_target_run in patch_target_runs:
-        op, target_run_entry = validate_ctl_variant_target_run_patch_entry(raw_target_run, variant_label)
-        anchor_target_run_id = raw_target_run[op]
-        target_run_id = target_run_entry["id"]
-
-        target_run_ids = [get_workflow_target_run_id(target_run) for target_run in resolved_target_runs]
-        if anchor_target_run_id not in target_run_ids:
-            raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' patch '{patch_label}' references missing anchor "
-                f"target_run id '{anchor_target_run_id}'"
-            )
-        if target_run_id in target_run_ids:
-            raise RuntimeError(
-                f"❌ ctl variant '{variant_label}' patch '{patch_label}' inserts duplicate target_run id '{target_run_id}'"
-            )
-
-        anchor_index = target_run_ids.index(anchor_target_run_id)
-        insert_index = anchor_index if op == "add_before" else anchor_index + 1
-        resolved_target_runs.insert(insert_index, target_run_entry)
-        logging.info(
-            "Applied ctl variant '%s': %s target_run '%s' %s '%s'",
-            variant_label,
-            op,
-            target_run_id,
-            "before" if op == "add_before" else "after",
-            anchor_target_run_id,
-        )
-
-    patched_workflow_cfg = dict(workflow_cfg)
-    patched_workflow_cfg["target_runs"] = resolved_target_runs
-    return patched_workflow_cfg
 
 
 def load_variants_cfg(ctl_cfg_root: Path) -> dict:
@@ -3843,6 +3734,47 @@ def variant_source_action(action: str) -> str:
 def _selectors_subset(child: dict | None, parent: dict | None):
     """(ok, reason) — True if child selectors are a subset of parent's, per dimension."""
     return selector_subset(child, parent, child_label="variant selectors", parent_label="target selectors")
+
+
+def variant_anchor(variant: dict, *, label: str) -> tuple[str, bool]:
+    """Return `(anchor target key, insert_before)` for one placement.
+
+    The two anchor fields are one choice with two spellings, so exactly one is
+    required and both together is a contradiction rather than a precedence rule.
+    """
+    before, after = variant.get("before_target_key"), variant.get("after_target_key")
+    if before and after:
+        raise RuntimeError(
+            f"❌ {label} cannot set both 'before_target_key' and 'after_target_key'"
+        )
+    if not (before or after):
+        raise RuntimeError(
+            f"❌ {label} must define 'after_target_key' or 'before_target_key'"
+        )
+    return (before, True) if before else (after, False)
+
+
+def variant_target_run_entry(
+    variant: dict, target_name: str, workflow_cfg: dict, *, label: str
+) -> dict:
+    """Build the target_run entry a placement inserts.
+
+    §Phase 73 requires every entry to carry a DECLARED action, so a placement
+    resolves one the same way a member list does: its own `action:`, else the
+    workflow's resolved default. Inserting a bare key would slip past that gate,
+    because normalization has already run by the time a variant applies.
+    """
+    action = variant.get("action") or workflow_cfg.get("default_action")
+    if not action:
+        raise RuntimeError(
+            f"❌ {label} inserts {target_name!r} with no action: the workflow "
+            "declares no `default_action`, so the placement must declare `action:`"
+        )
+    if action not in RUN_ACTIONS:
+        raise RuntimeError(
+            f"❌ {label} declares action {action!r}; expected one of {sorted(RUN_ACTIONS)}"
+        )
+    return {"id": target_name, "target": target_name, "action": action}
 
 
 def apply_ctl_variants_to_workflow_cfg(
@@ -3913,22 +3845,27 @@ def apply_ctl_variants_to_workflow_cfg(
             logging.info("Variant '%s' placement gated off for selectors %s — skipped", name, execution_context)
             continue
 
-        before, after = v.get("before_target_key"), v.get("after_target_key")
-        if before and after:
-            raise RuntimeError(f"❌ variant {name!r} cannot set both 'before_target_key' and 'after_target_key'")
-        anchor = before or after
-        if anchor is None:
-            raise RuntimeError(f"❌ variant {name!r} must define 'after_target_key' or 'before_target_key'")
-        if anchor not in target_runs:
+        anchor, before = variant_anchor(v, label=f"variant {name!r}")
+        index = find_workflow_anchor_index(
+            target_runs, anchor, label=f"variant {name!r}"
+        )
+        if index is None:
             logging.info("Variant '%s' anchor '%s' absent from '%s' — skipped", name, anchor, workflow_name)
             continue
-        if target_name in target_runs:
-            raise RuntimeError(f"❌ variant {name!r} inserts duplicate target {target_name!r}")
-        idx = target_runs.index(anchor)
-        target_runs.insert(idx if before else idx + 1, target_name)
+
+        entry = variant_target_run_entry(
+            v, target_name, workflow_cfg, label=f"variant {name!r}"
+        )
+        signature = workflow_target_run_signature(entry)
+        if signature in {workflow_target_run_signature(e) for e in target_runs}:
+            raise RuntimeError(
+                f"❌ variant {name!r} inserts duplicate target {target_name!r}"
+                + (f" (action {signature[1]})" if signature[1] else "")
+            )
+        target_runs.insert(index if before else index + 1, entry)
         logging.info(
-            "Applied variant '%s': inserted '%s' %s '%s'",
-            name, target_name, "before" if before else "after", anchor,
+            "Applied variant '%s': inserted '%s' (action %s) %s '%s'",
+            name, target_name, signature[1], "before" if before else "after", anchor,
         )
 
     patched = dict(workflow_cfg)
