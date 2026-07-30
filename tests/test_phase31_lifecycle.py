@@ -43,7 +43,7 @@ CFG = {
     "workflow.yaml": (
         "workflows:\n"
         "  env/bootstrap:\n"
-        "    actions: [provision]\n"
+        "    default_action: provision\n"
         "    target_keys:\n"
         "      - env/tfstate_backend\n"
     ),
@@ -113,7 +113,9 @@ class LifecycleWiringTests(unittest.TestCase):
                 ident["address"], "env/tfstate_backend/instances/account=dev/env_type=dev"
             )
 
-    def test_workflow_instance_identity_and_manifest(self):
+    def test_a_workflow_has_no_instance_layer(self):
+        """§Phase 73: a workflow publishes history, so it has no composition
+        digest and no identity document — only the members it ran with."""
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(tmp)
             ident = common.resolve_run_instance_identity(
@@ -121,92 +123,13 @@ class LifecycleWiringTests(unittest.TestCase):
                 execution_params=PARAMS, execution_runtime_mode="local",
                 workflow_name="env/bootstrap",
             )
-            self.assertEqual(len(ident["instance_segments"]), 1)
-            self.assertTrue(ident["instance_segments"][0].startswith("sha256="))
+            self.assertEqual([], ident["instance_segments"])
+            self.assertEqual("env/bootstrap", ident["address"])
+            self.assertIsNone(ident["identity_doc"])
             self.assertEqual(
                 ident["target_addresses"],
                 ["env/tfstate_backend/instances/account=dev/env_type=dev"],
             )
-            doc = ident["identity_doc"]["workflow_instance"]
-            self.assertEqual(doc["workflow"], "env/bootstrap")
-            self.assertNotIn("status", doc)
-
-    def test_run_dirs_nest_under_instance_and_write_identity(self):
-        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as state:
-            root = make_cfg(tmp)
-            ident = common.resolve_run_instance_identity(
-                root, run_type="workflow", action="provision", ctl_profile=None,
-                execution_params=PARAMS, execution_runtime_mode="local",
-                workflow_name="env/bootstrap",
-            )
-            mem = logging.handlers.MemoryHandler(capacity=10)
-            run_dir, _, _ = common.setup_preflight_run_dirs(
-                "0" * 8, "provision", "workflow", "env/bootstrap", Path(state), mem,
-                locator_segments=["live"],
-                instance_segments=ident["instance_segments"],
-                instance_address=ident["address"],
-                target_addresses=ident["target_addresses"],
-                identity_doc=ident["identity_doc"],
-                parent_fan_out_run_id="fo-123",
-            )
-            sha = ident["instance_segments"][0]
-            expected = (
-                Path(state) / "live/provision/workflow/env/bootstrap/instances" / sha
-            )
-            self.assertEqual(run_dir, expected / "runs" / ("0" * 8))
-            self.assertTrue((expected / "identity.yaml").exists())
-            meta = common.load_run_metadata(run_dir)
-            self.assertEqual(meta["ctl_state_namespace"], "live")
-            self.assertEqual(meta["fan_out_run_id"], "fo-123")
-            self.assertEqual(meta["instance"], [sha])
-
-    def test_outdate_is_instance_scoped(self):
-        with tempfile.TemporaryDirectory() as state:
-            root = Path(state)
-            # committed plan results for the SAME target in two instances —
-            # §Phase 31: committed.yaml pointer at the instance dir
-            for env in ("dev", "test"):
-                d = (
-                    root / "live/plan/target/env/tfstate_backend/instances"
-                    / f"account={env}" / f"env_type={env}"
-                )
-                d.mkdir(parents=True)
-                common.write_yaml_file(
-                    d / "committed.yaml",
-                    {"status": "succeeded", "target_keys": ["env/tfstate_backend"]},
-                )
-            # a provision run against dev only
-            run_dir = (
-                root / "live/provision/target/env/tfstate_backend/instances"
-                / "account=dev/env_type=dev/runs/r1"
-            )
-            run_dir.mkdir(parents=True)
-            common.write_run_metadata(
-                run_dir,
-                {
-                    "run_id": "r1", "action": "provision", "run_type": "target",
-                    "result_name": "env/tfstate_backend",
-                    "result_key": "provision/target/env/tfstate_backend",
-                    "ctl_state_local_root": str(root),
-                    "ctl_state_locator": ["live"],
-                    "instance": ["account=dev", "env_type=dev"],
-                    "target_addresses": ["env/tfstate_backend/instances/account=dev/env_type=dev"],
-                    "target_keys": ["env/tfstate_backend"],
-                    "mutation_started": True,
-                },
-            )
-            common.mark_outdated_for_run(run_dir, include_current_result=True)
-            dev = common.load_status_mapping(
-                root / "live/plan/target/env/tfstate_backend/instances"
-                / "account=dev/env_type=dev/committed.yaml"
-            )
-            test = common.load_status_mapping(
-                root / "live/plan/target/env/tfstate_backend/instances"
-                / "account=test/env_type=test/committed.yaml"
-            )
-            self.assertEqual(dev.get("status"), "outdated")
-            self.assertEqual(test.get("status"), "succeeded")
-
 
 if __name__ == "__main__":
     unittest.main()

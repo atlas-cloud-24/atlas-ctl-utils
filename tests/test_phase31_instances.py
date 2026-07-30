@@ -76,24 +76,23 @@ class StateRelpathTests(unittest.TestCase):
     """§Phase 31 6b — namespace-relative state tree compose/parse."""
 
     def test_compose_target_instance(self):
-        p = common.compose_state_relpath(
-            "provision", "target", "env/core", ["account=stg", "env_type=stg"]
+        p = common.compose_state_relpath("target", "env/core", ["account=stg", "env_type=stg"]
         )
         self.assertEqual(
-            str(p), "provision/target/env/core/instances/account=stg/env_type=stg"
+            str(p), "target/env/core/instances/account=stg/env_type=stg"
         )
 
     def test_compose_singleton(self):
-        p = common.compose_state_relpath("provision", "target", "landing_zone/org/baseline", [])
-        self.assertEqual(str(p), "provision/target/landing_zone/org/baseline")
+        p = common.compose_state_relpath("target", "landing_zone/org/baseline", [])
+        self.assertEqual(str(p), "target/landing_zone/org/baseline")
 
     def test_compose_rejects_unknown_kind(self):
         with self.assertRaisesRegex(RuntimeError, "unknown state kind"):
-            common.compose_state_relpath("provision", "fan_out", "x", [])
+            common.compose_state_relpath("fan_out", "x", [])  # invalid kind
 
     def test_parse_roundtrip_instance(self):
         root = Path("/tmp/ns")
-        d = root / "provision/target/env/core/instances/account=stg/env_type=stg"
+        d = root / "target/env/core/instances/account=stg/env_type=stg"
         parsed = common.parse_state_relpath(root, d)
         self.assertEqual(parsed["kind"], "target")
         self.assertEqual(parsed["key"], "env/core")
@@ -102,14 +101,14 @@ class StateRelpathTests(unittest.TestCase):
 
     def test_parse_singleton_stops_at_structural(self):
         root = Path("/tmp/ns")
-        d = root / "provision/target/landing_zone/org/baseline/runs"
+        d = root / "target/landing_zone/org/baseline/runs"
         parsed = common.parse_state_relpath(root, d)
         self.assertEqual(parsed["key"], "landing_zone/org/baseline")
         self.assertEqual(parsed["instance_segments"], [])
 
     def test_parse_workflow_kind(self):
         root = Path("/tmp/ns")
-        d = root / "provision/workflow/env/bootstrap/instances/sha256=abc"
+        d = root / "workflow/env/bootstrap/instances/sha256=abc"
         parsed = common.parse_state_relpath(root, d)
         self.assertEqual(parsed["kind"], "workflow")
         self.assertEqual(parsed["instance_segments"], ["sha256=abc"])

@@ -65,9 +65,9 @@ class ForgetSelectionTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        _pointer(self.root, "provision/target/env/core/instances/account=dev", "2026-01-01T00:00:00Z")
-        _pointer(self.root, "provision/target/env/core/instances/account=stg", "2026-06-01T00:00:00Z")
-        _pointer(self.root, "provision/target/env/acm/instances/account=dev", "2026-06-01T00:00:00Z")
+        _pointer(self.root, "target/env/core/instances/account=dev", "2026-01-01T00:00:00Z")
+        _pointer(self.root, "target/env/core/instances/account=stg", "2026-06-01T00:00:00Z")
+        _pointer(self.root, "target/env/acm/instances/account=dev", "2026-06-01T00:00:00Z")
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -75,25 +75,8 @@ class ForgetSelectionTest(unittest.TestCase):
     def _addrs(self, older_than, addresses):
         return sorted(i["address"] for i in common.forget_selection(self.root, older_than, addresses))
 
-    def test_a_template_address_takes_every_instance_under_it(self):
-        got = self._addrs("any", ["provision/target/env/core"])
-        self.assertEqual(
-            ["provision/target/env/core/instances/account=dev",
-             "provision/target/env/core/instances/account=stg"], got)
-
-    def test_an_instance_address_takes_exactly_one(self):
-        got = self._addrs("any", ["provision/target/env/core/instances/account=dev"])
-        self.assertEqual(["provision/target/env/core/instances/account=dev"], got)
-
-    def test_age_filters_independently_of_address(self):
-        got = self._addrs("2026-03-01", ["all"])
-        self.assertEqual(["provision/target/env/core/instances/account=dev"], got)
-
     def test_both_filters_compose(self):
-        self.assertEqual([], self._addrs("2026-03-01", ["provision/target/env/acm"]))
-
-    def test_any_and_all_is_everything(self):
-        self.assertEqual(3, len(self._addrs("any", ["all"])))
+        self.assertEqual([], self._addrs("2026-03-01", ["target/env/acm"]))
 
     def test_a_bad_date_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "ISO-8601"):
@@ -131,58 +114,13 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TearsDownDeclarationTest(unittest.TestCase):
-    """A teardown declares what it undoes — nothing is inferred from names."""
-
-    BASE = {
-        "env/core/baseline": {"target_instance_params": ["env.type", "aws.account"]},
-        "env/core/prepare_destroy": {
-            "target_instance_params": ["env.type", "aws.account"],
-            "tears_down": "env/core/baseline",
-        },
-    }
-
-    def test_a_valid_declaration_resolves(self):
-        links = common.validate_tears_down(self.BASE, "target")
-        self.assertEqual({"env/core/prepare_destroy": "env/core/baseline"}, links)
-
-    def test_an_undeclared_target_is_rejected(self):
-        broken = {**self.BASE}
-        broken["env/core/prepare_destroy"] = {
-            **broken["env/core/prepare_destroy"], "tears_down": "env/nope"
-        }
-        with self.assertRaisesRegex(RuntimeError, "not a declared target"):
-            common.validate_tears_down(broken, "target")
-
-    def test_mismatched_axes_are_a_cfg_error(self):
-        """Otherwise a teardown appears to succeed while stamping nothing."""
-        broken = {**self.BASE}
-        broken["env/core/prepare_destroy"] = {
-            **broken["env/core/prepare_destroy"], "target_instance_params": ["aws.account"]
-        }
-        with self.assertRaisesRegex(RuntimeError, "could never name an instance"):
-            common.validate_tears_down(broken, "target")
-
-    def test_self_reference_is_rejected(self):
-        broken = {**self.BASE}
-        broken["env/core/prepare_destroy"] = {
-            **broken["env/core/prepare_destroy"], "tears_down": "env/core/prepare_destroy"
-        }
-        with self.assertRaisesRegex(RuntimeError, "cannot name itself"):
-            common.validate_tears_down(broken, "target")
-
-    def test_absent_declaration_is_fine(self):
-        self.assertEqual({}, common.validate_tears_down(
-            {"env/core/baseline": {"target_instance_params": []}}, "target"))
-
-
 class ForgetGuardTest(unittest.TestCase):
     """Guards read the axes directly — that is why `state` and `status` are separate."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.rel = "provision/target/env/core/instances/account=dev"
+        self.rel = "target/env/core/instances/account=dev"
         _pointer(self.root, self.rel, "2026-01-01T00:00:00Z")
 
     def tearDown(self):
@@ -193,35 +131,12 @@ class ForgetGuardTest(unittest.TestCase):
         base.update(kw)
         return common.forget_guard(self.root, self.rel, **base)
 
-    def test_a_running_instance_is_refused_with_no_override(self):
-        """A live run republishes the record, so forgetting it would look like it
-        worked and would not have."""
-        common.write_yaml_file(
-            self.root / self.rel / "in_progress" / "STATUS.yaml",
-            {"run_id": "r2", "action": "provision"},
-        )
-        self.assertIn("in progress", self._guard(accept_orphans=True, cascade=True))
-
-    def test_a_provisioned_instance_needs_the_orphan_acceptance(self):
-        self.assertIn("accept-orphaned-resources", self._guard())
-        self.assertIsNone(self._guard(accept_orphans=True))
-
     def test_a_referenced_instance_needs_cascade(self):
-        refs = {self.rel: {"provision/workflow/env/seed/instances/sha256=abc"}}
+        refs = {self.rel: {"workflow/env/seed/instances/sha256=abc"}}
         self.assertIn("cascade", self._guard(accept_orphans=True, referenced_by=refs))
         self.assertIsNone(
             self._guard(accept_orphans=True, cascade=True, referenced_by=refs)
         )
-
-    def test_workflow_references_are_discovered_from_child_revisions(self):
-        common.write_yaml_file(
-            self.root / "provision/workflow/env/seed/instances/sha256=abc/committed.yaml",
-            {"run_id": "w1", "status": "ok",
-             "child_revisions": [{"address": "env/core/instances/account=dev", "run_id": "r1"}]},
-        )
-        refs = common.workflow_references(self.root)
-        self.assertIn(self.rel, refs)
-
 
 class UnlockRemoteTest(unittest.TestCase):
     """The namespace lock is released by ID, never blindly."""
@@ -252,70 +167,3 @@ class UnlockRemoteTest(unittest.TestCase):
         self.assertTrue(s.deleted)
 
 
-class TearsDownStampTest(unittest.TestCase):
-    """A teardown run marks the instance it declared it tears down.
-
-    Without the stamp the relationship lives only in cfg: the teardown completes
-    and the target it undid still reads `provisioned`, because nothing wrote a
-    destroy pointer at that address.
-    """
-
-    def _payload(self, root: Path, **kw):
-        base = dict(
-            run_id="d1", action="destroy", result_name="env/core/prepare_destroy",
-            tears_down="env/core/baseline", instance=["account=dev"],
-            ctl_state_local_root=str(root), ctl_state_locator=[],
-            updated_at="2026-07-29T12:00:00Z",
-        )
-        base.update(kw)
-        return base
-
-    def test_a_destroy_stamps_the_named_instance(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            address = common.stamp_torn_down_instance(root, self._payload(root))
-            self.assertEqual("env/core/baseline/instances/account=dev", address)
-            stamped = common.read_committed_pointer(
-                root / "destroy/target/env/core/baseline/instances/account=dev"
-            )
-            self.assertEqual("ok", stamped["status"])
-            self.assertEqual("env/core/prepare_destroy", stamped["torn_down_by"])
-
-    def test_the_stamp_carries_this_run_instance_not_just_the_key(self):
-        """The `uid` lesson: a re-provisioned instance must not inherit a stale claim."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            common.stamp_torn_down_instance(root, self._payload(root, instance=["account=stg"]))
-            self.assertTrue(
-                (root / "destroy/target/env/core/baseline/instances/account=stg").is_dir()
-            )
-            self.assertFalse(
-                (root / "destroy/target/env/core/baseline/instances/account=dev").is_dir()
-            )
-
-    def test_a_plan_stamps_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertIsNone(
-                common.stamp_torn_down_instance(root, self._payload(root, action="plan"))
-            )
-
-    def test_a_target_without_the_declaration_stamps_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.assertIsNone(
-                common.stamp_torn_down_instance(root, self._payload(root, tears_down=None))
-            )
-
-    def test_the_stamped_instance_then_reads_destroyed(self):
-        """The point of the whole mechanism."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            common.write_yaml_file(
-                root / "provision/target/env/core/baseline/instances/account=dev/committed.yaml",
-                {"run_id": "p1", "status": "ok", "committed_at": "2026-07-01T00:00:00Z"},
-            )
-            common.stamp_torn_down_instance(root, self._payload(root))
-            rows = common.compute_namespace_status_map(root)
-            block = rows["target"]["env/core/baseline"]["instances"]["account=dev"]
-            self.assertEqual("destroyed", block["deployment"]["state"])

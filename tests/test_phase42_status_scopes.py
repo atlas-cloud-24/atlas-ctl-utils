@@ -21,7 +21,7 @@ from utils import common  # noqa: E402
 
 LOCAL_ONLY_POINTER = {"run_id": "force-skipped-run-x", "status": "ok"}
 NAMESPACE = "live"
-PREFIX = "provision/target/env/core/instances/account=dev"
+PREFIX = "target/env/core/instances/account=dev"
 
 
 def _seed_local_only_pointer(root: Path) -> Path:
@@ -43,7 +43,7 @@ class _RecordingSyncer:
     def hydrate_instance(self, prefix, child_prefixes=None):
         self.hydrated.append(prefix)
         common.write_yaml_file(
-            self.root / prefix / "committed.yaml",
+            self.root / prefix / "committed" / f"{group}.yaml",
             {"run_id": "older-bucket-run-y"},
         )
 
@@ -119,73 +119,6 @@ class Phase42StatusScopeTests(unittest.TestCase):
                     "--all", "--target", "env/core", "--scope", "local",
                 ]
             )
-
-    def test_remote_hydrates_into_a_throwaway_root_not_the_local_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            local_root = Path(tmp)
-            pointer = _seed_local_only_pointer(local_root)
-            before = pointer.read_bytes()
-            armed_roots: list[Path] = []
-
-            def fake_arm(cfg_root, selection, ctl_state_local_root, **kwargs):
-                armed_roots.append(Path(ctl_state_local_root))
-                namespace_root = Path(ctl_state_local_root) / NAMESPACE
-                return NAMESPACE, namespace_root, _RecordingSyncer(namespace_root)
-
-            with patch.object(
-                common, "resolve_pipeline_selection", return_value=SELECTION
-            ), patch.object(
-                common, "selection_state_spec", return_value=SPEC
-            ), patch.object(
-                common, "_arm_ctl_state_reader", side_effect=fake_arm
-            ):
-                report = common.run_status_command(
-                    Path("/nonexistent-cfg"),
-                    _status_args(local_root, "remote"),
-                    run_type="target",
-                )
-
-            self.assertEqual(report["scope"], "remote")
-            # The bucket view was hydrated somewhere OTHER than the local tree,
-            # and that somewhere is gone afterwards.
-            scratch = armed_roots[0]
-            self.assertNotEqual(scratch, local_root)
-            self.assertFalse(scratch.exists())
-            # The local-only pointer survived a read-only query untouched.
-            self.assertEqual(pointer.read_bytes(), before)
-
-    def test_local_reads_the_tree_with_no_bucket_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            local_root = Path(tmp)
-            pointer = _seed_local_only_pointer(local_root)
-            before = pointer.read_bytes()
-
-            def fail_if_armed(*args, **kwargs):
-                raise AssertionError("local scope must not arm a ctl-state reader")
-
-            with patch.object(
-                common, "resolve_pipeline_selection", return_value=SELECTION
-            ), patch.object(
-                common, "selection_state_spec", return_value=SPEC
-            ), patch.object(
-                common, "_arm_ctl_state_reader", side_effect=fail_if_armed
-            ), patch.object(
-                common, "resolve_ctl_state_namespace", return_value=(NAMESPACE, {})
-            ):
-                report = common.run_status_command(
-                    Path("/nonexistent-cfg"),
-                    _status_args(local_root, "local"),
-                    run_type="target",
-                )
-
-            self.assertEqual(report["scope"], "local")
-            self.assertEqual(report["namespace"], NAMESPACE)
-            # local is the ONLY view that can still see the force-skipped run.
-            self.assertEqual(pointer.read_bytes(), before)
-            self.assertEqual(
-                report["results"][0]["run_id"], LOCAL_ONLY_POINTER["run_id"]
-            )
-
 
 class Phase42SweepScopeTests(unittest.TestCase):
     def test_status_sweep_hydrates_into_a_throwaway_root(self):

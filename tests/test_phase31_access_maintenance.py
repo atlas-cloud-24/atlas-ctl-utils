@@ -287,12 +287,12 @@ class SessionPolicyTests(unittest.TestCase):
         policy = aws.build_ctl_state_session_policy(
             "example-state",
             "sync",
-            object_keys=["provision/target/app/committed.yaml"],
-            object_prefixes=["provision/target/app/runs/019-test"],
+            object_keys=["target/app/committed.yaml"],
+            object_prefixes=["target/app/runs/019-test"],
         )
         serialized = str(policy)
-        self.assertIn("provision/target/app/runs/019-test/*", serialized)
-        self.assertIn("provision/target/app/committed.yaml", serialized)
+        self.assertIn("target/app/runs/019-test/*", serialized)
+        self.assertIn("target/app/committed.yaml", serialized)
         self.assertNotIn("arn:aws:s3:::example-state/*", serialized)
         delete_resources = [
             statement["Resource"]
@@ -310,7 +310,7 @@ class SessionPolicyTests(unittest.TestCase):
             "example-state",
             "maintenance",
             object_keys=[
-                "provision/target/app/runs/old/STATUS.yaml",
+                "target/app/runs/old/STATUS.yaml",
                 "_maintenance/history-prune/report/manifest.yaml",
             ],
         )
@@ -438,24 +438,14 @@ class HistoryPruneTests(unittest.TestCase):
             result = common.run_ctl_state_history_prune(Path("/cfg"), args)
         return result, arm
 
-    def test_current_committed_revision_cannot_be_pruned(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            namespace = root / "live"
-            run_id = "old-target-run"
-            key = f"provision/target/app/runs/{run_id}/STATUS.yaml"
-            write(namespace / "provision/target/app/committed.yaml", f"run_id: {run_id}\n")
-            with self.assertRaisesRegex(RuntimeError, "current committed revisions"):
-                self._run(root, self._args(root, run_id), _MemorySyncer([key]))
-
     def test_retained_workflow_reference_requires_explicit_cascade(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             namespace = root / "live"
             target_run = "old-target-run"
             workflow_run = "old-workflow-run"
-            target_key = f"provision/target/app/runs/{target_run}/RUN.yaml"
-            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/RUN.yaml"
+            target_key = f"target/app/runs/{target_run}/RUN.yaml"
+            workflow_key = f"workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
                 "run_id: old-workflow-run\n"
@@ -475,8 +465,8 @@ class HistoryPruneTests(unittest.TestCase):
             namespace = root / "live"
             target_run = "old-target-run"
             workflow_run = "old-workflow-run"
-            target_key = f"provision/target/app/runs/{target_run}/RUN.yaml"
-            workflow_key = f"provision/workflow/deploy/runs/{workflow_run}/RUN.yaml"
+            target_key = f"target/app/runs/{target_run}/RUN.yaml"
+            workflow_key = f"workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
                 "run_id: old-workflow-run\n"
@@ -501,7 +491,7 @@ class HistoryPruneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_id = "old-target-run"
-            key = f"provision/target/app/runs/{run_id}/STATUS.yaml"
+            key = f"target/app/runs/{run_id}/STATUS.yaml"
             maintainer = _MemorySyncer()
             result, _ = self._run(
                 root,

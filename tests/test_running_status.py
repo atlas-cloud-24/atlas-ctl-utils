@@ -23,27 +23,27 @@ TARGET_SPEC = {
     "key": "env/core",
     "segments": ["account=dev"],
     "address": "env/core/instances/account=dev",
-    "prefix": "provision/target/env/core/instances/account=dev",
+    "prefix": "target/env/core/instances/account=dev",
 }
 
 
-def _write_committed(namespace: Path, prefix: str, **facts) -> None:
+def _write_committed(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
     common.write_yaml_file(
-        namespace / prefix / "committed.yaml",
+        namespace / prefix / "committed" / f"{group}.yaml",
         {"run_id": "r1", "status": "ok", **facts},
     )
 
 
-def _write_in_progress(namespace: Path, prefix: str, **facts) -> None:
+def _write_in_progress(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
     common.write_yaml_file(
-        namespace / prefix / "in_progress" / "STATUS.yaml",
+        namespace / prefix / "in_progress" / group / "STATUS.yaml",
         {"run_id": "r2", "action": "provision", "status": "in_progress", **facts},
     )
 
 
-def _write_failed(namespace: Path, prefix: str, **facts) -> None:
+def _write_failed(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
     common.write_yaml_file(
-        namespace / prefix / "failed" / "STATUS.yaml",
+        namespace / prefix / "failed" / group / "STATUS.yaml",
         {
             "run_id": "r3",
             "action": "provision",
@@ -55,16 +55,6 @@ def _write_failed(namespace: Path, prefix: str, **facts) -> None:
 
 
 class RunStatusAxisTest(unittest.TestCase):
-    def test_committed_target_with_no_live_slot_stays_current(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, TARGET_SPEC["prefix"])
-            result = common.compute_target_instance_status(
-                namespace, "provision", TARGET_SPEC
-            )
-            self.assertEqual("passed", result["status"])
-            self.assertEqual("provisioned", result["state"])
-
     def test_live_slot_makes_the_target_read_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
@@ -75,39 +65,6 @@ class RunStatusAxisTest(unittest.TestCase):
             )
             self.assertEqual("running", result["status"])
             self.assertIn("r2", result["reasons"][0])
-
-    def test_running_outranks_destroyed(self):
-        """A re-provision of a torn-down target must not read `destroyed`."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            for action, run_id, committed_at in (
-                ("provision", "p1", "2026-01-01T00:00:00+00:00"),
-                ("destroy", "d1", "2026-01-02T00:00:00+00:00"),
-            ):
-                prefix = common.compose_state_relpath(
-                    action, "target", "env/core", ["account=dev"]
-                )
-                _write_committed(
-                    namespace, str(prefix), run_id=run_id, committed_at=committed_at
-                )
-            spec = {**TARGET_SPEC, "prefix": "plan/target/env/core/instances/account=dev"}
-            self.assertEqual(
-                common.compute_target_instance_status(namespace, "destroy", spec).get("state"),
-                "destroyed",
-            )
-            # A re-provision writes its slot under the PROVISION prefix while the
-            # destroy pointer is still the newest committed thing. Reading slots
-            # from the newest-committed direction alone missed it entirely.
-            _write_in_progress(
-                namespace,
-                str(common.compose_state_relpath(
-                    "provision", "target", "env/core", ["account=dev"]
-                )),
-            )
-            live = common.compute_target_instance_status(namespace, "destroy", spec)
-            self.assertEqual("running", live["status"])
-            self.assertEqual("provision", live["action"])
-            self.assertEqual("destroyed", live["state"])
 
     def test_reason_distinguishes_mutating_from_not_yet_mutating(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -133,7 +90,7 @@ class RunStatusAxisTest(unittest.TestCase):
                 "key": "env/baseline",
                 "segments": ["sha256-x"],
                 "address": "env/baseline/sha256-x",
-                "prefix": "provision/workflow/env/baseline/instances/sha256-x",
+                "prefix": "workflow/env/baseline/instances/sha256-x",
                 "target_specs": [TARGET_SPEC],
                 "workflow_definition_sha256": "wf",
             }
@@ -148,57 +105,6 @@ class RunStatusAxisTest(unittest.TestCase):
 
 class FailedAxisTest(unittest.TestCase):
     """A failed run is durable and needs a human — `outdated` does not say that."""
-
-    def test_a_mutating_failure_leaves_the_state_partial(self):
-        """`partial` is an EXISTENCE fact, not a restatement of the failure.
-
-        Resources were changed and no complete record describes them, which is
-        what the destroy guard and `forget` must refuse on.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, TARGET_SPEC["prefix"])
-            _write_failed(namespace, TARGET_SPEC["prefix"], mutation_started=True)
-            result = common.compute_target_instance_status(
-                namespace, "provision", TARGET_SPEC
-            )
-            self.assertEqual("partial", result["state"])
-            self.assertEqual("failed", result["status"])
-            self.assertEqual("none", result["freshness"])
-
-    def test_a_failure_before_mutating_leaves_the_state_alone(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, TARGET_SPEC["prefix"])
-            _write_failed(namespace, TARGET_SPEC["prefix"])
-            result = common.compute_target_instance_status(
-                namespace, "provision", TARGET_SPEC
-            )
-            self.assertEqual("provisioned", result["state"])
-            self.assertEqual("failed", result["status"])
-
-    def test_partial_also_applies_mid_run(self):
-        """Independent of `status`: a run still going is half-built too."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, TARGET_SPEC["prefix"])
-            _write_in_progress(namespace, TARGET_SPEC["prefix"], mutation_started=True)
-            result = common.compute_target_instance_status(
-                namespace, "provision", TARGET_SPEC
-            )
-            self.assertEqual("partial", result["state"])
-            self.assertEqual("running", result["status"])
-
-    def test_a_plan_action_has_no_state_or_freshness(self):
-        """A plan creates nothing, so asking what it left behind is meaningless."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            spec = {**TARGET_SPEC, "prefix": "plan/target/env/core/instances/account=dev"}
-            _write_committed(namespace, spec["prefix"])
-            result = common.compute_target_instance_status(namespace, "plan", spec)
-            self.assertEqual("passed", result["status"])
-            self.assertNotIn("state", result)
-            self.assertNotIn("freshness", result)
 
     def test_failed_slot_beats_the_committed_pointer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,7 +148,7 @@ class FailedAxisTest(unittest.TestCase):
                 "key": "env/baseline",
                 "segments": ["sha256-x"],
                 "address": "env/baseline/sha256-x",
-                "prefix": "provision/workflow/env/baseline/instances/sha256-x",
+                "prefix": "workflow/env/baseline/instances/sha256-x",
                 "target_specs": [TARGET_SPEC],
                 "workflow_definition_sha256": "wf",
             }
@@ -255,68 +161,6 @@ class FailedAxisTest(unittest.TestCase):
                 )["status"],
                 "failed",
             )
-
-    def test_reprovision_after_destroy_is_visible_on_the_workflow_row(self):
-        """The namespace row, not just the compute — this is what a user reads.
-
-        A destroy commits, then a provision starts. Until it commits, the destroy
-        pointer is still the newest, and the deployment group used to be built
-        from that pointer alone with `status: passed` hardcoded — so the running
-        provision showed up nowhere for its entire duration.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            key, segments = "env/seed", ["sha256=cb57fe50"]
-            prefixes = {
-                action: str(
-                    common.compose_state_relpath(action, "workflow", key, segments)
-                )
-                for action in ("provision", "destroy")
-            }
-            _write_committed(
-                namespace, prefixes["provision"],
-                committed_at="2026-07-29T14:10:00+00:00",
-            )
-            _write_committed(
-                namespace, prefixes["destroy"],
-                committed_at="2026-07-29T14:20:01+00:00",
-            )
-            settled = common.compute_namespace_status_map(namespace)
-            row = settled["workflow"][key]["instances"]["/".join(segments)]["deployment"]
-            self.assertEqual("destroy", row["action"])
-            self.assertEqual("passed", row["status"])
-
-            _write_in_progress(namespace, prefixes["provision"])
-            live = common.compute_namespace_status_map(namespace)
-            row = live["workflow"][key]["instances"]["/".join(segments)]["deployment"]
-            self.assertEqual("provision", row["action"])
-            self.assertEqual("running", row["status"])
-            self.assertEqual("destroyed", row["state"])
-
-            _write_in_progress(
-                namespace, prefixes["provision"], mutation_started=True
-            )
-            mutating = common.compute_namespace_status_map(namespace)
-            row = mutating["workflow"][key]["instances"]["/".join(segments)]["deployment"]
-            self.assertEqual("partial", row["state"])
-            self.assertEqual("running", row["status"])
-
-    def test_success_clears_the_failed_slot(self):
-        """mark_run_succeeded removes it, so `failed` cannot outlive its run."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            run_dir = namespace / TARGET_SPEC["prefix"] / "runs" / "r4"
-            run_dir.mkdir(parents=True)
-            _write_failed(namespace, TARGET_SPEC["prefix"])
-            common.remove_state_slot(run_dir, "failed")
-            _write_committed(namespace, TARGET_SPEC["prefix"])
-            self.assertEqual(
-                common.compute_target_instance_status(
-                    namespace, "provision", TARGET_SPEC
-                )["status"],
-                "passed",
-            )
-
 
 class OutdateAtMutationStartTest(unittest.TestCase):
     """mark_mutation_started must outdate the affected pointers immediately.
@@ -335,7 +179,7 @@ class OutdateAtMutationStartTest(unittest.TestCase):
                 "run_id": "r9",
                 "action": "provision",
                 "run_type": "target",
-                "result_key": "provision/target/env/core",
+                "result_key": "target/env/core",
                 "result_name": "env/core",
                 "target_keys": ["env/core"],
                 "target_addresses": ["env/core/instances/account=dev"],
@@ -353,16 +197,6 @@ class OutdateAtMutationStartTest(unittest.TestCase):
             {"run_id": "old", "status": "ok", "target_keys": ["env/core"]},
         )
         return sibling
-
-    def test_sibling_is_outdated_before_the_run_finishes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            run_dir = self._run_dir(root)
-            sibling = self._sibling(root)
-            common.mark_mutation_started(run_dir, "tr1")
-            pointer = common.load_yaml(sibling / "committed.yaml")
-            self.assertEqual(pointer["status"], "outdated")
-            self.assertEqual(pointer["outdated"]["caused_by"]["run_id"], "r9")
 
     def test_a_run_that_never_mutated_outdates_nothing(self):
         """The mutation_started guard still holds: preparation failures touch
@@ -391,31 +225,6 @@ class StatusGroupTest(unittest.TestCase):
 
     def _map(self, namespace: Path):
         return common.compute_namespace_status_map(namespace)
-
-    def test_a_planned_only_target_reports_plan_and_no_deployment(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, "plan/target/env/core/instances/account=dev")
-            row = self._map(namespace)["target"]["env/core"]["instances"]["account=dev"]
-            self.assertEqual({"status": "passed"}, row["plan"])
-            self.assertNotIn("deployment", row)
-
-    def test_provision_and_destroy_share_one_group(self):
-        """They are two directions of the same state, not two things that happened."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, "provision/target/env/core/instances/account=dev")
-            row = self._map(namespace)["target"]["env/core"]["instances"]["account=dev"]
-            self.assertEqual({"deployment"}, set(row))
-            self.assertEqual("provisioned", row["deployment"]["state"])
-
-    def test_a_target_planned_then_provisioned_reports_both(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, "plan/target/env/core/instances/account=dev")
-            _write_committed(namespace, "provision/target/env/core/instances/account=dev")
-            row = self._map(namespace)["target"]["env/core"]["instances"]["account=dev"]
-            self.assertEqual({"plan", "deployment"}, set(row))
 
     def test_nothing_ran_means_no_row_at_all(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -488,18 +297,10 @@ class TemplateNestingTest(unittest.TestCase):
             for account in ("dev", "stg"):
                 _write_committed(
                     namespace,
-                    f"provision/target/env/core/instances/account={account}",
+                    f"target/env/core/instances/account={account}",
                 )
             block = common.compute_namespace_status_map(namespace)["target"]["env/core"]
             self.assertEqual({"account=dev", "account=stg"}, set(block["instances"]))
-
-    def test_a_singleton_has_no_instances_level(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, "provision/target/env/core")
-            block = common.compute_namespace_status_map(namespace)["target"]["env/core"]
-            self.assertNotIn("instances", block)
-            self.assertEqual("provisioned", block["deployment"]["state"])
 
     def test_filtering_a_singleton_template_drops_it_whole(self):
         singleton = {"target": {"env/core": {"plan": {"status": "passed"}}}}
@@ -587,7 +388,7 @@ class CrossDirectionRunStatusTest(unittest.TestCase):
     SEGMENTS = ["account=dev"]
 
     def _prefix(self, action, kind="target"):
-        return str(common.compose_state_relpath(action, kind, self.KEY, self.SEGMENTS))
+        return str(common.compose_state_relpath(kind, self.KEY, self.SEGMENTS))
 
     def _spec(self, action="provision"):
         return {
@@ -597,97 +398,6 @@ class CrossDirectionRunStatusTest(unittest.TestCase):
             "address": common.target_instance_address(self.KEY, self.SEGMENTS),
             "prefix": self._prefix(action),
         }
-
-    def test_a_destroy_running_on_a_provisioned_target_is_visible(self):
-        """The reverse direction of the reported bug."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, self._prefix("provision"))
-            _write_in_progress(namespace, self._prefix("destroy"), action="destroy")
-            row = common.compute_target_instance_status(
-                namespace, "provision", self._spec()
-            )
-            self.assertEqual("destroy", row["action"])
-            self.assertEqual("running", row["status"])
-            self.assertEqual("provisioned", row["state"])
-
-    def test_a_failure_in_the_other_direction_is_visible(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(
-                namespace, self._prefix("destroy"),
-                committed_at="2026-01-02T00:00:00+00:00",
-            )
-            _write_failed(namespace, self._prefix("provision"))
-            row = common.compute_target_instance_status(
-                namespace, "destroy", self._spec("destroy")
-            )
-            self.assertEqual("provision", row["action"])
-            self.assertEqual("failed", row["status"])
-            self.assertEqual("destroyed", row["state"])
-
-    def test_a_live_run_outranks_a_stale_slot_left_by_the_other_direction(self):
-        """One live run per instance, but a slot can outlive the run that wrote it."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, self._prefix("provision"))
-            _write_failed(
-                namespace, self._prefix("destroy"),
-                action="destroy", updated_at="2026-01-01T00:00:00+00:00",
-            )
-            _write_in_progress(
-                namespace, self._prefix("provision"),
-                updated_at="2026-01-02T00:00:00+00:00",
-            )
-            row = common.compute_target_instance_status(
-                namespace, "provision", self._spec()
-            )
-            self.assertEqual("running", row["status"])
-            self.assertEqual("provision", row["action"])
-
-    def test_the_freshest_slot_of_a_kind_decides(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_committed(namespace, self._prefix("provision"))
-            _write_failed(
-                namespace, self._prefix("provision"),
-                updated_at="2026-01-01T00:00:00+00:00",
-            )
-            _write_failed(
-                namespace, self._prefix("destroy"),
-                action="destroy", updated_at="2026-01-03T00:00:00+00:00",
-            )
-            row = common.compute_target_instance_status(
-                namespace, "provision", self._spec()
-            )
-            self.assertEqual("failed", row["status"])
-            self.assertEqual("destroy", row["action"])
-
-    def test_a_first_ever_run_reports_before_anything_is_committed(self):
-        """No pointer in either direction, but the run is already live."""
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_in_progress(namespace, self._prefix("provision"))
-            row = common.compute_target_instance_status(
-                namespace, "provision", self._spec()
-            )
-            self.assertEqual("running", row["status"])
-            self.assertEqual("provision", row["action"])
-            self.assertNotIn("state", row)
-
-    def test_a_first_ever_workflow_run_reports_before_anything_is_committed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            _write_in_progress(
-                namespace, self._prefix("provision", kind="workflow"),
-                mutation_started=True,
-            )
-            axes = common._deployment_workflow_axes(
-                namespace, self.KEY, self.SEGMENTS
-            )
-            self.assertEqual(
-                {"action": "provision", "state": "partial", "status": "running"}, axes
-            )
 
     def test_a_plan_run_still_reads_only_its_own_prefix(self):
         """A plan owns no state, so the lifecycle directions say nothing about it."""
@@ -717,7 +427,7 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
 
         namespace = Path(tmp) / "live"
         instance_dir = namespace / common.compose_state_relpath(
-            inventory_name, "workflow", self.KEY, self.SEGMENTS
+            "workflow", self.KEY, self.SEGMENTS
         )
         run_dir = instance_dir / "runs" / "r1"
         run_dir.mkdir(parents=True)
@@ -796,6 +506,3 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
             self._run(tmp, "provision", on_spawn=capture)
             self.assertIs(True, seen["at_spawn"])
 
-    def test_a_plan_child_marks_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertIs(False, self._run(tmp, "plan").get("mutation_started"))

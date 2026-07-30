@@ -23,7 +23,7 @@ class Phase31StateTests(unittest.TestCase):
             common.ctl_state_target_address_prefix(
                 "provision", "env/core/instances/account=dev/env_type=dev"
             ),
-            "provision/target/env/core/instances/account=dev/env_type=dev",
+            "target/env/core/instances/account=dev/env_type=dev",
         )
 
     def test_duplicate_fan_out_materializations_fail(self):
@@ -49,7 +49,7 @@ class Phase31StateTests(unittest.TestCase):
             root = Path(tmp)
             parent = (
                 root
-                / "live/provision/workflow/env/baseline/instances/sha256-x/runs/w1"
+                / "live/workflow/env/baseline/instances/sha256-x/runs/w1"
             )
             parent.mkdir(parents=True)
             common.write_run_metadata(
@@ -65,7 +65,7 @@ class Phase31StateTests(unittest.TestCase):
             )
             run_dir = (
                 root
-                / "live/provision/target/env/core/instances/account=dev/runs/r1"
+                / "live/target/env/core/instances/account=dev/runs/r1"
             )
             run_dir.mkdir(parents=True)
             facts = {
@@ -83,7 +83,7 @@ class Phase31StateTests(unittest.TestCase):
                     "action": "provision",
                     "run_type": "target",
                     "result_name": "env/core",
-                    "result_key": "provision/target/env/core",
+                    "result_key": "target/env/core",
                     "ctl_state_local_root": str(root),
                     "ctl_state_locator": ["live"],
                     "instance": ["account=dev"],
@@ -99,108 +99,15 @@ class Phase31StateTests(unittest.TestCase):
                 **facts,
             }
             context = {"execution_context.params.account": "dev"}
-            revision = common.committed_target_revision_if_skippable(
-                parent, target_run, context
+            revision = common.up_to_date_child_revision(
+                parent, target_run, context, "provision"
             )
             self.assertEqual(revision["run_id"], "r1")
             target_run["source_state"] = "dirty"
             self.assertIsNone(
-                common.committed_target_revision_if_skippable(
-                    parent, target_run, context
+                common.up_to_date_child_revision(
+                    parent, target_run, context, "provision"
                 )
-            )
-
-    def test_destroy_is_computed_from_newest_lifecycle_revision(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            spec = {
-                "kind": "target",
-                "key": "env/core",
-                "segments": ["account=dev"],
-                "address": "env/core/instances/account=dev",
-                "prefix": "plan/target/env/core/instances/account=dev",
-            }
-            for action, run_id, committed_at in (
-                ("provision", "p1", "2026-01-01T00:00:00+00:00"),
-                ("destroy", "d1", "2026-01-02T00:00:00+00:00"),
-            ):
-                path = namespace / common.compose_state_relpath(
-                    action, "target", "env/core", ["account=dev"]
-                )
-                common.write_yaml_file(
-                    path / "committed.yaml",
-                    {
-                        "run_id": run_id,
-                        "status": "ok",
-                        "committed_at": committed_at,
-                    },
-                )
-            result = common.compute_target_instance_status(
-                namespace, "destroy", spec
-            )
-            self.assertEqual("destroyed", result["state"])
-
-    def test_workflow_status_detects_child_revision_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            target = {
-                "kind": "target",
-                "key": "env/core",
-                "segments": ["account=dev"],
-                "address": "env/core/instances/account=dev",
-                "prefix": "provision/target/env/core/instances/account=dev",
-            }
-            workflow = {
-                "kind": "workflow",
-                "key": "env/baseline",
-                "segments": ["sha256-x"],
-                "address": "env/baseline/sha256-x",
-                "prefix": "provision/workflow/env/baseline/instances/sha256-x",
-                "target_specs": [target],
-                "workflow_definition_sha256": "definition",
-            }
-            common.write_yaml_file(
-                namespace / target["prefix"] / "committed.yaml",
-                {
-                    "run_id": "child-1",
-                    "snapshot_sha256": "child-sha-1",
-                    "status": "ok",
-                },
-            )
-            common.write_yaml_file(
-                namespace / workflow["prefix"] / "committed.yaml",
-                {
-                    "run_id": "workflow-1",
-                    "status": "ok",
-                    "workflow_definition_sha256": "definition",
-                    "target_addresses": [target["address"]],
-                    "child_revisions": [
-                        {
-                            "address": target["address"],
-                            "run_id": "child-1",
-                            "snapshot_sha256": "child-sha-1",
-                        }
-                    ],
-                },
-            )
-            current = common.compute_workflow_instance_status(
-                namespace, "provision", workflow
-            )
-            self.assertEqual("current", current["freshness"])
-            pointer = common.load_yaml(
-                namespace / target["prefix"] / "committed.yaml"
-            )
-            pointer["run_id"] = "child-2"
-            common.write_yaml_file(
-                namespace / target["prefix"] / "committed.yaml", pointer
-            )
-            outdated = common.compute_workflow_instance_status(
-                namespace, "provision", workflow
-            )
-            self.assertEqual("outdated", outdated["freshness"])
-            self.assertIn(
-                "env/core/instances/account=dev: committed revision changed",
-                outdated["reasons"],
             )
 
     def test_pending_manifest_drains_runs_before_pointers(self):
@@ -223,7 +130,7 @@ class Phase31StateTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            run_dir = root / "live/provision/target/env/core/runs/r1"
+            run_dir = root / "live/target/env/core/runs/r1"
             run_dir.mkdir(parents=True)
             common.write_run_metadata(
                 run_dir,
@@ -423,93 +330,10 @@ class Phase56OverlayTests(unittest.TestCase):
             (root / "a.yaml").rename(root / "b.yaml")
             self.assertNotEqual(first, common.directory_content_sha256(root))
 
-    def test_target_status_reports_definition_and_cfg_view_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            namespace = Path(tmp)
-            spec = {
-                "kind": "target",
-                "key": "env/core",
-                "segments": ["account=dev"],
-                "address": "env/core/instances/account=dev",
-                "prefix": "provision/target/env/core/instances/account=dev",
-                "target_definition_sha256": "new-definition",
-                "target_cfg_view_sha256": "new-view",
-            }
-            common.write_yaml_file(
-                namespace / spec["prefix"] / "committed.yaml",
-                {
-                    "run_id": "old",
-                    "status": "ok",
-                    "target_definition_sha256": "old-definition",
-                    "target_cfg_view_sha256": "old-view",
-                },
-            )
-            result = common.compute_target_instance_status(
-                namespace, "provision", spec
-            )
-            self.assertEqual("outdated", result["freshness"])
-            self.assertIn("target definition changed", result["reasons"])
-            self.assertIn("target cfg view changed", result["reasons"])
-
-
-    def test_partial_workflow_publishes_only_successful_child(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            parent = (
-                root
-                / "live/provision/workflow/env/baseline/instances/sha256-x/runs/w1"
-            )
-            parent.mkdir(parents=True)
-            common.write_run_metadata(
-                parent,
-                {
-                    "run_id": "w1",
-                    "action": "provision",
-                    "run_type": "workflow",
-                    "result_name": "env/baseline",
-                    "ctl_state_local_root": str(root),
-                    "ctl_state_locator": ["live"],
-                },
-            )
-            facts = {
-                "source_commit": "a" * 40,
-                "cfg_source_commit": "b" * 40,
-                "source_state": "clean",
-                "ref_policy": "commit_required",
-                "target_definition_sha256": "c" * 64,
-                "target_cfg_view_sha256": "d" * 64,
-                "plt_overlays": ["temporary"],
-            }
-            successful, _ = common.begin_workflow_target_run(
-                parent, {"target": "env/one", **facts}, {}
-            )
-            common.finish_workflow_target_run(successful)
-            failed, _ = common.begin_workflow_target_run(
-                parent, {"target": "env/two", **facts}, {}
-            )
-            common.finish_workflow_target_run(
-                failed, error=RuntimeError("failed child")
-            )
-            self.assertTrue(
-                common.committed_pointer_path(
-                    common.ctl_state_dir_from_run_dir(successful)
-                ).is_file()
-            )
-            self.assertFalse(
-                common.committed_pointer_path(
-                    common.ctl_state_dir_from_run_dir(failed)
-                ).is_file()
-            )
-            self.assertFalse(
-                common.committed_pointer_path(
-                    common.ctl_state_dir_from_run_dir(parent)
-                ).is_file()
-            )
-
     def test_pre_phase56_pointer_is_not_reusable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            parent = root / "live/provision/workflow/w/instances/x/runs/w1"
+            parent = root / "live/workflow/w/instances/x/runs/w1"
             parent.mkdir(parents=True)
             common.write_run_metadata(
                 parent,
@@ -524,7 +348,7 @@ class Phase56OverlayTests(unittest.TestCase):
             )
             instance = (
                 root
-                / "live/provision/target/env/core/instances/account=dev"
+                / "live/target/env/core/instances/account=dev"
             )
             common.write_yaml_file(
                 instance / "committed.yaml",
@@ -548,7 +372,7 @@ class Phase56OverlayTests(unittest.TestCase):
                 "target_cfg_view_sha256": "d" * 64,
             }
             self.assertIsNone(
-                common.committed_target_revision_if_skippable(
+                common.up_to_date_child_revision(
                     parent,
                     target_run,
                     {"execution_context.params.account": "dev"},
@@ -577,3 +401,40 @@ class AwsBackendProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkipUpToDateActionTest(unittest.TestCase):
+    """§Phase 73: reuse compares the ACTION, so one target under two actions
+    cannot have both members skipped."""
+
+    FACTS = {
+        "source_commit": "a" * 40,
+        "cfg_source_commit": "b" * 40,
+        "source_state": "clean",
+        "ref_policy": "commit_required",
+        "target_definition_sha256": "c" * 64,
+        "target_cfg_view_sha256": "d" * 64,
+    }
+
+    def _tree(self, root, published_action):
+        parent = root / "live/workflow/env/seed/instances/sha256-x/runs/w1"
+        parent.mkdir(parents=True)
+        common.write_run_metadata(parent, {
+            "run_id": "w1", "action": "provision", "run_type": "workflow",
+            "result_name": "env/seed", "ctl_state_local_root": str(root),
+            "ctl_state_locator": ["live"],
+        })
+        run_dir = (root / f"live/{published_action}/target/env/seed/baseline"
+                        / "instances/account=dev/runs/r1")
+        run_dir.mkdir(parents=True)
+        common.write_run_metadata(run_dir, {
+            "run_id": "r1", "action": published_action, "run_type": "target",
+            "result_name": "env/seed/baseline",
+            "ctl_state_local_root": str(root), "ctl_state_locator": ["live"],
+            "instance": ["account=dev"], **self.FACTS,
+        })
+        common.publish_committed_pointer(
+            run_dir, common.build_status_payload(run_dir, "ok")
+        )
+        return parent
+

@@ -38,7 +38,6 @@ TOOLING_DEFAULT_REPO_URLS = {
     "ctl-utils": "https://github.com/atlas-cloud-24/atlas-ctl-utils.git",
     "plt-utils": "https://github.com/atlas-cloud-24/atlas-plt-utils.git",
 }
-RUN_ACTIONS = ("pipeline", "maintenance")
 MAINTENANCE_ACTIONS = ("unlock-ctl-state", "status-sweep", "history-prune", "forget")
 SERVICE_ID = "atlas-ctl-orchestrator-local"
 CTL_RESULTS_LOCK_FILENAME = ".ctl.lock"
@@ -458,12 +457,19 @@ def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
 
     - a params axis → returned (must be declared in target_instance_params
       unless path-encoded via the namespace);
-    - `ctl.action` → safe (the action is its own ctl-state path segment);
+    - `ctl.action` / `ctl.operation` → safe: both determine the instance path.
+      An operation selects the member list, and a workflow instance IS a digest
+      over its members' addresses, so a different operation is a different
+      instance. Where two operations resolve to the same members they still land
+      in different group files;
     - any OTHER ctl.* fact (e.g. ctl.profile) → hard error: it is neither
       path-encoded nor declarable, so two runs differing only in it would
       collapse onto one instance path and self-override."""
     params_prefix = f"{EXECUTION_CONTEXT_ROOT}.params."
-    action_ref = f"{EXECUTION_CONTEXT_ROOT}.ctl.action"
+    safe_refs = {
+        f"{EXECUTION_CONTEXT_ROOT}.ctl.action",
+        f"{EXECUTION_CONTEXT_ROOT}.ctl.operation",
+    }
     axes: set[str] = set()
     for member in members or []:
         if not isinstance(member, dict):
@@ -474,11 +480,11 @@ def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
         for ref in requirements:
             if ref.startswith(params_prefix):
                 axes.add(ref[len(params_prefix):])
-            elif ref != action_ref:
+            elif ref not in safe_refs:
                 raise RuntimeError(
                     f"❌ {label}: dispatch on {ref!r} is not allowed — target "
                     "resolution may dispatch only on declarable params axes or "
-                    "the path-encoded ctl.action"
+                    "the path-determining ctl.action / ctl.operation"
                 )
     return axes
 
@@ -490,6 +496,7 @@ def resolve_list_members(
     value_field: str,
     label: str,
     allow_empty: bool = False,
+    extra_fields: tuple[str, ...] = (),
 ) -> list | None:
     """Resolve a members-shaped LIST-valued declaration
     ({members: [{<value_field>: [...], selectors: {...}}, ...]}) to the ONE
@@ -501,8 +508,14 @@ def resolve_list_members(
     if set(entry) != {"members"} or not isinstance(members, list) or not members:
         raise RuntimeError(f"❌ {label}: members-shaped declaration must be {{members: [...]}}")
     for member in members:
-        if not isinstance(member, dict) or set(member) != {value_field, "selectors"}:
-            raise RuntimeError(f"❌ {label}: each member must be {{{value_field}, selectors}}")
+        allowed = {value_field, "selectors", *extra_fields}
+        if not isinstance(member, dict) or not {value_field, "selectors"} <= set(member) \
+                or not set(member) <= allowed:
+            raise RuntimeError(
+                f"❌ {label}: each member must be {{{value_field}, selectors"
+                + (", " + ", ".join(extra_fields) if extra_fields else "")
+                + "}}"
+            )
         if not isinstance(member[value_field], list) or (
             not member[value_field] and not allow_empty
         ):
@@ -523,6 +536,34 @@ def resolve_list_members(
             f"❌ {label}: exactly one member must match the execution context, matched {len(matches)}"
         )
     return list(matches[0][value_field])
+
+
+def resolve_list_member(
+    entry: dict,
+    execution_context: dict[str, object] | None,
+    *,
+    value_field: str,
+    label: str,
+    extra_fields: tuple[str, ...] = (),
+) -> dict | None:
+    """The matching MEMBER itself, not just its list.
+
+    §Phase 73: a workflow member declares `default_action` for the whole list it
+    carries, so the caller needs the member and not only its keys.
+    """
+    resolved = resolve_list_members(
+        entry, execution_context, value_field=value_field, label=label,
+        extra_fields=extra_fields,
+    )
+    if resolved is None:
+        return None
+    for member in entry.get("members") or []:
+        if list(member.get(value_field) or []) == resolved and selector_matches(
+            member["selectors"], execution_context or {},
+            label=f"{label} member", structured_only=True,
+        ):
+            return member
+    return None
 
 
 def _resolve_instance_params_members(
@@ -557,54 +598,96 @@ def validate_target_providers(declared: object, identities: dict, *, label: str)
     return sorted(set(declared))
 
 
-def validate_tears_down(
-    definitions: dict, kind: str, label: str = "cfg"
-) -> dict[str, str]:
-    """§Phase 67: a teardown DECLARES what it undoes; nothing is inferred by name.
+def validate_workflow_actions_declared(workflows: dict) -> None:
+    """§Phase 73: every workflow entry must be able to resolve an ACTION.
 
-    State is keyed by `(action, kind, key, instance)`, so `env/core/baseline` and
-    `env/core/prepare_destroy` are two unrelated things however similar their
-    names — running the teardown leaves the target reading `provisioned`.
-
-    The declaration sits on the TEMPLATE, because cfg declares templates, and it
-    is like for like: a target names a target, a workflow names a workflow. The
-    binding is per INSTANCE, resolved at run time from the teardown's own
-    instance params — the Kubernetes `uid` lesson, where an owner reference
-    carries the instance and not just the name, so a re-provisioned instance does
-    not inherit a stale teardown claim.
-
-    That resolution is only sound when both sides share the same axes, which is
-    why a mismatch is a cfg error here rather than a silent no-match at run time:
-    otherwise a teardown would appear to succeed while stamping nothing.
+    A list with no `default_action` whose entries carry no `action:` is not
+    runnable — the engine cannot know what to do with those targets. This is a cfg
+    gate rather than a run-time surprise, so a workflow that could never run is
+    refused when the configuration is validated.
     """
-    links: dict[str, str] = {}
-    for key, definition in (definitions or {}).items():
+    for name, workflow in (workflows or {}).items():
+        if not isinstance(workflow, dict):
+            continue
+        declaration = workflow.get("target_keys")
+        lists: list[tuple[list, object]] = []
+        if isinstance(declaration, list):
+            lists.append((declaration, workflow.get("default_action")))
+        elif isinstance(declaration, dict):
+            for member in declaration.get("members") or []:
+                if isinstance(member, dict):
+                    lists.append(
+                        (member.get("target_keys") or [], member.get("default_action"))
+                    )
+        for entries, default_action in lists:
+            if default_action:
+                continue
+            bare = [
+                entry for entry in entries
+                if not (isinstance(entry, dict) and entry.get("action"))
+            ]
+            if bare:
+                raise RuntimeError(
+                    f"❌ workflow {name!r}: {bare} have no action and the list "
+                    "declares no default_action, so the engine cannot know how to "
+                    "run them. Declare `default_action:` for the list — a literal "
+                    "action, or ${execution_context.ctl.operation} to follow the "
+                    "invocation — or `action:` beneath each key"
+                )
+
+
+def validate_distinct_target_signatures(definitions: dict) -> None:
+    """§Phase 73: two targets with the same INPUT SIGNATURE are one target twice.
+
+    They would run identical procedures against identical resources under two
+    separate committed pointers, neither aware of the other — the same hazard the
+    dependency registries exist to catch, but between declarations rather than
+    between resources.
+
+    The signature must be COMPLETE. Comparing only the procedure and the instance
+    params gives false positives: two targets can share a source, a procedure and
+    their params while consuming different cfg, and then legitimately produce
+    different resources.
+
+    A static cfg check. It never observes resources and never decides which
+    declaration is authoritative — it answers only whether a pair may coexist.
+    """
+    def signature(definition: dict) -> tuple:
+        def frozen(value):
+            if isinstance(value, dict):
+                return tuple(sorted((k, frozen(v)) for k, v in value.items()))
+            if isinstance(value, list):
+                return tuple(frozen(v) for v in value)
+            return value
+
+        return (
+            definition.get("source_key"),
+            definition.get("ref_key"),
+            definition.get("procedure_key"),
+            frozen(definition.get("domains")),
+            frozen(definition.get("cfg_keys")),
+            frozen(definition.get("cfg_key_sets")),
+            frozen(definition.get("input_params")),
+            frozen(definition.get("input_param_sets")),
+            frozen(definition.get("target_instance_params")),
+        )
+
+    seen: dict[tuple, str] = {}
+    for key, definition in sorted((definitions or {}).items()):
         if not isinstance(definition, dict):
             continue
-        target = definition.get("tears_down")
-        if target is None:
+        sig = signature(definition)
+        if None in sig[:3]:
             continue
-        if not isinstance(target, str) or not target:
-            raise RuntimeError(f"❌ {label} {key!r}: tears_down must be a non-empty key")
-        if target == key:
-            raise RuntimeError(f"❌ {label} {key!r}: tears_down cannot name itself")
-        if target not in definitions:
+        first = seen.get(sig)
+        if first is not None:
             raise RuntimeError(
-                f"❌ {label} {key!r}: tears_down names {target!r}, which is not a "
-                f"declared {kind}. A teardown names its own kind — a target names "
-                "a target, a workflow names a workflow"
+                f"❌ targets {first!r} and {key!r} declare the same input signature "
+                "(source, ref, procedure, domains, cfg keys, input params, instance "
+                "params). They would run identical work against identical resources "
+                "under two committed pointers; declare one target, or make them differ"
             )
-        own = list((definition.get("target_instance_params") or []))
-        theirs = list((definitions[target].get("target_instance_params") or []))
-        if sorted(own) != sorted(theirs):
-            raise RuntimeError(
-                f"❌ {label} {key!r}: tears_down {target!r} has instance params "
-                f"{theirs} but this one has {own}. The instance binding is resolved "
-                "from these, so a teardown with different axes could never name an "
-                "instance of what it tears down"
-            )
-        links[key] = target
-    return links
+        seen[sig] = key
 
 
 def validate_target_execution_identities(entries: object, *, label: str) -> dict:
@@ -936,21 +1019,21 @@ def ref_policy_requires_commits(ref_policy: str) -> bool:
     return ref_policy == REF_POLICY_COMMIT_REQUIRED
 
 
-def validate_reuse_committed_ref_policy(
-    reuse_committed: bool | None, ref_policy: str, ctl_profile: str
+def validate_skip_up_to_date_ref_policy(
+    skip_up_to_date: bool | None, ref_policy: str, ctl_profile: str
 ) -> None:
-    """Fail loud on a --reuse-committed=true that can never reuse.
+    """Fail loud on a --skip-up-to-date=true that can never reuse.
 
     The reuse gate only reuses a committed result when ref_policy is
     commit_required (a clean, commit-pinned source). Under any other policy
     (e.g. local_dirty_allowed) reuse is structurally impossible, so
-    --reuse-committed true would be a silent no-op — every run re-executes.
+    --skip-up-to-date true would be a silent no-op — every run re-executes.
     Reject it instead of silently ignoring the flag."""
-    if reuse_committed and not ref_policy_requires_commits(ref_policy):
+    if skip_up_to_date and not ref_policy_requires_commits(ref_policy):
         raise RuntimeError(
-            f"❌ --reuse-committed true cannot reuse under ctl profile {ctl_profile!r} "
+            f"❌ --skip-up-to-date true cannot reuse under ctl profile {ctl_profile!r} "
             f"(ref_policy {ref_policy!r}): reuse requires ref_policy 'commit_required' "
-            "(a clean, commit-pinned source). Pass --reuse-committed false, or use a "
+            "(a clean, commit-pinned source). Pass --skip-up-to-date false, or use a "
             "commit_required profile."
         )
 
@@ -1130,16 +1213,16 @@ def finalize_common_args(args: argparse.Namespace) -> None:
             "❌ --execution-identity-preflight-check-only and "
             "--force-skip-execution-identity-preflight-check are mutually exclusive"
         )
-    # --reuse-committed is an explicit true/false with no default. A normal run
+    # --skip-up-to-date is an explicit true/false with no default. A normal run
     # reaches the reuse-vs-rerun decision and must state intent; the exit-early
     # preflight-only mode never does, so it stays optional there.
-    if hasattr(args, "reuse_committed"):
+    if hasattr(args, "skip_up_to_date"):
         exits_before_execution = getattr(
             args, "execution_identity_preflight_check_only", False
         )
-        if args.reuse_committed is None and not exits_before_execution:
+        if args.skip_up_to_date is None and not exits_before_execution:
             raise RuntimeError(
-                "❌ --reuse-committed is required (true or false) for a normal run; "
+                "❌ --skip-up-to-date is required (true or false) for a normal run; "
                 "omit it only with --execution-identity-preflight-check-only"
             )
     args.run_id = generate_uuid7()
@@ -1778,6 +1861,15 @@ def parse_ctl_variants_arg(value: str) -> list[str]:
         item_label="Ctl variant",
     )
 
+def workflow_member_actions(workflow_cfg: dict) -> set[str]:
+    """Every action a workflow's member entries ask of their targets."""
+    actions: set[str] = set()
+    for entry in (workflow_cfg or {}).get("target_runs") or []:
+        if isinstance(entry, dict) and entry.get("action"):
+            actions.add(str(entry["action"]))
+    return actions
+
+
 def build_active_target_runs(
     workflow_cfg: dict,
     inventory_cfg: dict,
@@ -1940,11 +2032,24 @@ def build_active_target_runs(
             "domains": target_domains,
             "cfg_keys": target_cfg_keys,
         }
+        # §Phase 73: a member entry may declare the ACTION this target performs.
+        # Carried onto the run record so the spawn hands the child its own verb
+        # rather than the parent's, and validated against the target's own
+        # allowlist — the workflow may choose, never widen.
+        member_action = target_override.get("action")
+        if member_action is not None:
+            allowed = target_cfg.get("allowed_actions") or []
+            if member_action not in allowed:
+                raise RuntimeError(
+                    f"❌ workflow member {target_key!r} declares action "
+                    f"{member_action!r}, which that target does not allow "
+                    f"(allowed: {', '.join(sorted(allowed)) or 'none'})"
+                )
+            active_target_run["action"] = member_action
         required_overlays = target_cfg.get("requires_plt_overlays")
         if required_overlays:
             active_target_run["requires_plt_overlays"] = list(required_overlays)
         for behavior_field in (
-            "tears_down",
             "provisions_ctl_state_backend",
             "allow_agreed_defer_ctl_state_backend_sync",
             *sorted(target_consent_opt_in_fields()),
@@ -2325,19 +2430,43 @@ def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = (
     if not isinstance(wf, dict):
         raise RuntimeError(f"❌ workflow {name!r} must be a mapping")
     import_keys = wf.get("import_workflow_keys") or []
-    target_keys = wf.get("target_keys") or []
-    for field, values in (("import_workflow_keys", import_keys), ("target_keys", target_keys)):
-        if not isinstance(values, list) or not all(isinstance(value, str) and value for value in values):
-            raise RuntimeError(f"❌ workflow {name!r} {field} must be a list of non-empty strings")
+    if not isinstance(import_keys, list) or not all(
+        isinstance(value, str) and value for value in import_keys
+    ):
+        raise RuntimeError(
+            f"❌ workflow {name!r} import_workflow_keys must be a list of non-empty strings"
+        )
+    # §Phase 73: an entry is a bare key, or a key with its OWN action. A member
+    # without one inherits the invoked operation, which is what keeps every
+    # existing workflow working unchanged.
+    entries = normalize_target_entries(
+        wf.get("target_keys") or [],
+        label=f"workflow {name!r} target_keys",
+        default_action=wf.get("default_action"),
+    )
     target_runs: list = []
     for workflow_key in import_keys:
         target_runs.extend(expand_workflow_imports(action_workflows, workflow_key, (*_stack, name)))
-    target_runs.extend(target_keys)
+    for key, action in entries:
+        target_runs.append(
+            {"id": key, "target": key, "action": action} if action else key
+        )
+    # A key MAY repeat when the actions differ — that is a composition doing two
+    # things to one instance, and order decides the final state. The same key with
+    # the same action twice is still a mistake.
     seen: set = set()
-    for target_key in target_runs:
-        if target_key in seen:
-            raise RuntimeError(f"❌ workflow {name!r} has duplicate target key {target_key!r} after import expansion")
-        seen.add(target_key)
+    for entry in target_runs:
+        signature = (
+            (entry, None) if isinstance(entry, str)
+            else (entry.get("target"), entry.get("action"))
+        )
+        if signature in seen:
+            raise RuntimeError(
+                f"❌ workflow {name!r} has duplicate target key {signature[0]!r} after "
+                "import expansion"
+                + (f" (action {signature[1]})" if signature[1] else "")
+            )
+        seen.add(signature)
     return target_runs
 
 
@@ -3188,15 +3317,30 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Provider-namespaced options, comma-separated and/or repeatable. The "
         "engine only routes them; each provider owns its option vocabulary",
     )
-    # 4) action
-    selector_group.add_argument(
-        "--action",
-        required=True,
-        choices=["provision", "plan", "destroy", "readonly", "maintenance"],
-        help="Lifecycle action. `maintenance` operates on a target WITHOUT\n"
-        "provisioning, planning or destroying it — releasing a tool's state\n"
-        "lock is the case it exists for",
-    )
+    # 4) what to do — spelled for the run type (§Phase 73)
+    if run_type in ("workflow", "fan_out"):
+        # A workflow is invoked with an OPERATION: it says what was asked for,
+        # while each member target carries the ACTION it performs. The two differ
+        # only here, because a workflow is the one level that may mix directions.
+        # A fan-out shares the spelling because it expands workflows and passes the
+        # operation through unchanged — it varies the address, never the verb.
+        selector_group.add_argument(
+            "--operation",
+            dest="action",
+            required=True,
+            choices=list(KNOWN_ACTIONS),
+            help="What to do to this thing. Each member target performs its own\n"
+            "declared action, or inherits this one when it declares none",
+        )
+    else:
+        selector_group.add_argument(
+            "--action",
+            required=True,
+            choices=list(KNOWN_ACTIONS),
+            help="Lifecycle action. `maintenance` operates on a target WITHOUT\n"
+            "provisioning, planning or destroying it — releasing a tool's state\n"
+            "lock is the case it exists for",
+        )
     # 5) run-type selector (--workflow / --fan-out / --target / ... and its
     #    run-specific siblings)
     if run_type == "workflow":
@@ -3211,11 +3355,11 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         _add_fan_out_args(selector_group)
     else:
         raise RuntimeError(f"❌ unknown runner run_type {run_type!r}")
-    # --reuse-committed parametrizes the actual run (reuse committed children vs
+    # --skip-up-to-date parametrizes the actual run (reuse committed children vs
     # re-run), so it lives in the run group — not with the non-executing checks.
     if run_type in {"workflow", "fan_out"}:
         selector_group.add_argument(
-            "--reuse-committed",
+            "--skip-up-to-date",
             default=None,
             type=str2bool,
             metavar="{true,false}",
@@ -3387,10 +3531,24 @@ KNOWN_ACTIONS = ("provision", "plan", "destroy", "readonly", "maintenance")
 
 
 def entry_actions(entry: dict, *, label: str) -> list[str]:
-    """§Phase 33: the REQUIRED `actions:` allowlist on a target/workflow. A
-    missing or empty list is a hard error — availability is default-CLOSED and
-    must be explicit (never inferred from an optional selector)."""
+    """§Phase 33: the REQUIRED allowlist on a target/workflow. A missing or empty
+    list is a hard error — availability is default-CLOSED and must be explicit,
+    never inferred from an optional selector.
+
+    §Phase 73: a WORKFLOW spells it `operations:`, because a workflow is invoked
+    with an operation and its members carry the actions. A target keeps `actions:`.
+    Exactly one spelling per entry — declaring both is a contradiction about which
+    the caller supplies.
+    """
     actions = entry.get("actions")
+    operations = entry.get("operations")
+    if actions is not None and operations is not None:
+        raise RuntimeError(
+            f"❌ {label} declares both 'actions' and 'operations'; a workflow "
+            "declares operations, a target declares actions"
+        )
+    if actions is None:
+        actions = operations
     if (
         not isinstance(actions, list)
         or not actions
@@ -3423,26 +3581,47 @@ def load_workflow_cfg(
     workflows = collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
     if workflow_name not in workflows:
         raise RuntimeError(f"❌ workflow {workflow_name!r} not found")
+    validate_workflow_actions_declared(workflows)
     resolved_workflows: dict = {}
     for name, wf in workflows.items():
         if not isinstance(wf, dict):
             raise RuntimeError(f"❌ workflow {name!r} must be a mapping")
-        if inventory_name not in entry_actions(wf, label=f"workflow {name!r}"):
-            continue
+        # §Phase 73: a workflow declares no allowlist. Its member selectors decide
+        # when it applies, and each member's declared action decides what runs —
+        # an `operations:` list restated the selectors and could contradict them.
         target_keys = wf.get("target_keys")
         if isinstance(target_keys, dict):
-            target_keys = resolve_list_members(
+            member = resolve_list_member(
                 target_keys,
                 execution_context,
                 value_field="target_keys",
                 label=f"workflow {name!r} target_keys",
+                extra_fields=("default_action",),
             )
-            if target_keys is None:
+            if member is None:
                 raise RuntimeError(
                     f"❌ workflow {name!r} members-shaped target_keys did not "
                     "resolve for this execution context"
                 )
-            wf = {**wf, "target_keys": target_keys}
+            # §Phase 73: the member's declared default reaches every entry it
+            # carries, so a list going one direction states its verb once.
+            wf = {
+                **wf,
+                "target_keys": list(member["target_keys"]),
+                "default_action": resolve_default_action(
+                    member.get("default_action"), execution_context,
+                    label=f"workflow {name!r} member",
+                ),
+                "member_selectors": member.get("selectors"),
+            }
+        else:
+            wf = {
+                **wf,
+                "default_action": resolve_default_action(
+                    wf.get("default_action"), execution_context,
+                    label=f"workflow {name!r}",
+                ),
+            }
         resolved_workflows[name] = wf
     if workflow_name not in resolved_workflows:
         raise RuntimeError(
@@ -3461,10 +3640,18 @@ def load_workflow_cfg(
         )
 
     target_runs = expand_workflow_imports(resolved_workflows, workflow_name)
-    return {
+    resolved = resolved_workflows[workflow_name]
+    cfg = {
         "meta": {"name": f"{inventory_name}/{workflow_name}", "action": inventory_name},
         "target_runs": target_runs,
     }
+    # §Phase 73: the matched member's declared default and its selector block travel
+    # with the resolved workflow — the run record carries them, and returning only
+    # meta + target_runs silently dropped both.
+    for field in ("default_action", "member_selectors"):
+        if resolved.get(field):
+            cfg[field] = resolved[field]
+    return cfg
 
 
 def get_ctl_variants_root(ctl_cfg_root: Path) -> Path:
@@ -3932,6 +4119,7 @@ def load_inventory_cfg(
     ctl_cfg_root: Path,
     inventory_name: str,
     execution_context: dict[str, object] | None = None,
+    member_actions: set[str] | None = None,
 ) -> dict:
     """Compose action cfg from target_sources + cfg_key_sets + targets/<action>/*.yaml.
 
@@ -3967,13 +4155,21 @@ def load_inventory_cfg(
     # is the subset allowing this action.
     all_targets = collect_resource(ctl_cfg_root, "targets", entry_depth=1)
     targets = {}
+    # §Phase 73: a workflow member may declare its own action, so the inventory
+    # admits a target that allows the INVOKED action or any action a member asked
+    # of it. Without this a member naming `destroy` on a destroy-only target could
+    # not resolve inside a provision workflow, which is the whole point of letting
+    # a composition mix directions.
+    admitted = {inventory_name, *(member_actions or ())}
     for target_name, target_def in all_targets.items():
         if not isinstance(target_def, dict):
             raise RuntimeError(f"❌ target {target_name!r} must be a mapping")
-        if inventory_name in entry_actions(target_def, label=f"target {target_name!r}"):
+        if admitted & set(entry_actions(target_def, label=f"target {target_name!r}")):
             targets[target_name] = target_def
     if not targets:
         raise RuntimeError(f"❌ no targets allow action {inventory_name!r}")
+
+    validate_distinct_target_signatures(all_targets)
 
     resolved_targets: dict = {}
     for target_name, target_def in targets.items():
@@ -4145,6 +4341,11 @@ def load_inventory_cfg(
             "cfg_keys": cfg_keys,
             "input_params": declared_input_params,
             "static_vars": dict(static_vars),
+            # §Phase 73: the allowlist is carried onto the inventory entry, not
+            # consumed by the filter that built it. A workflow member may name an
+            # action, and the check that it is permitted needs the list at the
+            # point the member is resolved.
+            "allowed_actions": entry_actions(target_def, label=f"target {target_name!r}"),
         }
         if domains is None:
             # Domain-generic target whose domain axis is not bound in this run.
@@ -4421,13 +4622,16 @@ def setup_run_dirs(
     §Phase 31: results nest under the resolved ctl-state NAMESPACE tree
     (`_local` for stateless/synthetic runs), with the target/workflow instance
     layer between the key and `runs/`:
-      <root>/<namespace>/<action>/<run_type>/<key>[/instances/<seg>...]/runs/<id>
+      <root>/<namespace>/<run_type>/<key>[/instances/<seg>...]/runs/<id>
     A parameterized instance writes its authoritative identity.yaml
     (manifest-first ordering, Q2) before any run content."""
     result_name = normalize_result_name(result_name, label="ctl result name")
-    ctl_state_dir = Path(ctl_state_local_root).joinpath(*locator_segments) / action / run_type / result_name
-    if instance_segments:
-        ctl_state_dir = ctl_state_dir.joinpath("instances", *instance_segments)
+    # §Phase 73: composed, never hand-assembled. Building `/ action / run_type /`
+    # here is what kept every real run on the action-prefixed layout while the
+    # readers had already moved — the two agreed with each other and with nothing.
+    ctl_state_dir = Path(ctl_state_local_root).joinpath(
+        *locator_segments
+    ) / compose_state_relpath(run_type, result_name, list(instance_segments or []))
     runs_dir = ctl_state_dir / "runs"
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -4543,14 +4747,17 @@ def setup_preflight_run_dirs(
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
     result_name = normalize_result_name(result_name, label="ctl result name")
-    ctl_state_dir = Path(ctl_state_local_root).joinpath(*locator_segments) / action / run_type / result_name
-    if instance_segments:
-        ctl_state_dir = ctl_state_dir.joinpath("instances", *instance_segments)
-        if identity_doc is not None:
-            identity_path = ctl_state_dir / "identity.yaml"
-            if not identity_path.exists():
-                ctl_state_dir.mkdir(parents=True, exist_ok=True)
-                write_yaml_file(identity_path, identity_doc)
+    # §Phase 73: composed, never hand-assembled. Building `/ action / run_type /`
+    # here is what kept every real run on the action-prefixed layout while the
+    # readers had already moved — the two agreed with each other and with nothing.
+    ctl_state_dir = Path(ctl_state_local_root).joinpath(
+        *locator_segments
+    ) / compose_state_relpath(run_type, result_name, list(instance_segments or []))
+    if instance_segments and identity_doc is not None:
+        identity_path = ctl_state_dir / "identity.yaml"
+        if not identity_path.exists():
+            ctl_state_dir.mkdir(parents=True, exist_ok=True)
+            write_yaml_file(identity_path, identity_doc)
     run_dir = ctl_state_dir / "runs" / run_id
     artifacts_dir = run_dir / "artifacts" / "general"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -4653,17 +4860,104 @@ def update_run_metadata(run_dir: Path, updates: dict) -> dict:
 
 
 def normalize_target_keys(values: list[str], *, label: str) -> list[str]:
+    """Just the keys, in order — the shape the run inventory consumes.
+
+    A key-only view, so it asks for no action: callers that need one go through
+    `normalize_target_entries` with the list's declared default."""
+    keys: list[str] = []
+    for value in values if isinstance(values, list) else []:
+        keys.append(normalize_result_name(
+            value.get("key") if isinstance(value, dict) else value, label=label
+        ))
+    return keys
+
+
+def resolve_default_action(
+    declared: object, execution_context: dict[str, object] | None, *, label: str
+) -> str | None:
+    """A member's declared default action: a literal, or a context reference.
+
+    `${execution_context.ctl.operation}` says "every member does whatever was
+    invoked" — explicitly, in cfg, rather than by an unstated fallback. A literal
+    says the list is one fixed direction whatever was asked.
+    """
+    if declared is None:
+        return None
+    if not isinstance(declared, str) or not declared.strip():
+        raise RuntimeError(f"❌ {label} default_action must be a non-empty string")
+    declared = declared.strip()
+    if declared.startswith("${") and declared.endswith("}"):
+        reference = declared[2:-1].strip()
+        value = (execution_context or {}).get(reference)
+        if value is None:
+            raise RuntimeError(
+                f"❌ {label} default_action references {reference!r}, which is not "
+                "bound in this execution context"
+            )
+        return str(value)
+    return declared
+
+
+def normalize_target_entries(
+    values: list, *, label: str, default_action: str | None = None
+) -> list[tuple[str, str]]:
+    """§Phase 73: a workflow member entry is a KEY or a key with its own ACTION.
+
+        - key: env/ops/ecr
+          action: provision
+
+    The action belongs to the TARGET, never to the member list: a member is a list
+    plus a selector deciding WHEN the list applies, so putting the action on the
+    member would force one member per target purely to vary a verb.
+
+    Every entry states its action; nothing inherits. A key MAY repeat with
+    differing actions. Both entries address one instance, so
+    its pointer is written twice in one run and the last write wins — correct,
+    because after destroy-then-provision the instance is provisioned. Order is
+    therefore load-bearing: with a repeated key it decides the final state, not
+    merely the execution sequence.
+    """
     if not isinstance(values, list):
         raise RuntimeError(f"❌ {label} must be a list")
-    normalized: list[str] = []
-    seen: set[str] = set()
+    entries: list[tuple[str, str | None]] = []
+    seen: set[tuple[str, str | None]] = set()
     for value in values:
-        key = normalize_result_name(value, label=label)
-        if key in seen:
-            raise RuntimeError(f"❌ duplicate target key in {label}: {key}")
-        seen.add(key)
-        normalized.append(key)
-    return normalized
+        if isinstance(value, dict):
+            unknown = sorted(set(value) - {"key", "action"})
+            if unknown:
+                raise RuntimeError(
+                    f"❌ {label} entry has unsupported keys {unknown}; a member "
+                    "entry is a key, or a key with its own action"
+                )
+            key = normalize_result_name(value.get("key"), label=label)
+            action = value.get("action")
+            if action is not None and (
+                not isinstance(action, str) or action not in RUN_ACTIONS
+            ):
+                raise RuntimeError(
+                    f"❌ {label} entry {key!r} declares action {action!r}; expected "
+                    f"one of {sorted(RUN_ACTIONS)}"
+                )
+        else:
+            key, action = normalize_result_name(value, label=label), None
+        # §Phase 73: every entry ends up with a DECLARED action — its own, or the
+        # one its member declares for the whole list. There is no fallback: without
+        # an action the engine does not know how to run the target, and a silent
+        # guess is the one thing a cfg gate exists to prevent.
+        action = action or default_action
+        if action is None:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} has no action, so it is not runnable. "
+                "Declare `default_action:` for the list, or `action:` beneath the key"
+            )
+        if (key, action) in seen:
+            raise RuntimeError(
+                f"❌ duplicate target entry in {label}: {key}"
+                + (f" (action {action})" if action else "")
+            )
+        seen.add((key, action))
+        entries.append((key, action))
+    return entries
 
 
 def target_keys_from_active_target_runs(active_target_runs: dict) -> list[str]:
@@ -4710,8 +5004,15 @@ def write_current_status(run_dir: Path, payload: dict) -> None:
     write_yaml_file(current_status_path(run_dir), payload)
 
 
+def state_slot_dir(instance_dir: Path, state: str, group: str) -> Path:
+    """`<state>/<group>/` — group-scoped for the same reason pointers are: a failed
+    plan and a failed deployment on one instance must not collide."""
+    return Path(instance_dir) / state / group
+
+
 def remove_state_slot(run_dir: Path, state: str) -> None:
-    slot_dir = ctl_state_dir_from_run_dir(run_dir) / state
+    group = action_group(str(load_run_metadata(run_dir).get("action")))
+    slot_dir = state_slot_dir(ctl_state_dir_from_run_dir(run_dir), state, group)
     if slot_dir.exists():
         shutil.rmtree(slot_dir)
 
@@ -4745,7 +5046,8 @@ def cleanup_run_workspace(run_dir: Path) -> None:
 
 
 def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
-    slot_dir = ctl_state_dir_from_run_dir(run_dir) / state
+    group = action_group(str(payload.get("action") or load_run_metadata(run_dir).get("action")))
+    slot_dir = state_slot_dir(ctl_state_dir_from_run_dir(run_dir), state, group)
     slot_payload = dict(payload)
     slot_payload["state_slot"] = state
     slot_payload["run_path"] = f"runs/{run_dir.name}"
@@ -4775,21 +5077,31 @@ COMMITTED_POINTER_NAME = "committed.yaml"
 # target_keys/addresses) is encoded in the instance dir path or duplicated in
 # child_revisions — never denormalized into the pointer (§Phase 31 minimal files).
 _COMMITTED_FACT_KEYS = (
+    # §Phase 73: `action` is recorded because a pointer must say which direction
+    # published it. Without it, reuse eligibility could not compare the action and
+    # a workflow holding one target under two actions skipped both members.
+    "action",
     "child_revisions", "source_commit", "cfg_source_commit",
     "source_state", "ref_policy", "workflow_definition_sha256",
     "target_definition_sha256", "target_cfg_view_sha256",
 )
 
 
-def committed_pointer_path(instance_dir: Path) -> Path:
-    return Path(instance_dir) / COMMITTED_POINTER_NAME
+def committed_pointer_path(instance_dir: Path, group: str) -> Path:
+    """`committed/<group>.yaml` — one published pointer per status group.
+
+    A directory rather than one action-keyed file so publication stays atomic per
+    group: a deployment run writes one file and touches nothing else."""
+    if group not in RESULT_GROUPS:
+        raise RuntimeError(f"❌ unknown state group {group!r} (expected {RESULT_GROUPS})")
+    return Path(instance_dir) / "committed" / f"{group}.yaml"
 
 
 def write_run_snapshot(run_dir: Path, payload: dict) -> str:
     """§consolidated: the run's RUN.yaml IS the snapshot — no separate
     snapshot.yaml. Write the frozen record (this run's payload) to RUN.yaml and
     return its sha256. Self-contained (does not assume write_current_status ran):
-    RUN.yaml on disk always equals the hashed content, and the reuse-committed
+    RUN.yaml on disk always equals the hashed content, and the skip-up-to-date
     check re-reads RUN.yaml and verifies this digest. RUN.yaml must not change
     after commit or that verification breaks."""
     write_yaml_file(Path(run_dir) / RUN_METADATA_FILENAME, payload)
@@ -4797,12 +5109,18 @@ def write_run_snapshot(run_dir: Path, payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def publish_committed_pointer(run_dir: Path, payload: dict) -> Path:
+def publish_committed_pointer(run_dir: Path, payload: dict) -> Path | None:
     """Publish the instance's committed.yaml pointer to this run's snapshot
     (§Phase 31). Writes the snapshot first (manifest-last), then the pointer
     with the denormalized facts + status readers need. The physical
     conditional write to the backend is the syncer's job; locally this is the
     authoritative record."""
+    # §Phase 73: only a state owner publishes. A workflow owns execution, so its
+    # RUN.yaml IS the record — persistent composition status would be a claim
+    # nobody re-checks, because ctl never observes the cloud.
+    if payload.get("run_type") == "workflow":
+        write_run_snapshot(run_dir, payload)
+        return None
     snapshot_sha = write_run_snapshot(run_dir, payload)
     run_id = Path(run_dir).name
     # snapshot key is derivable (runs/<run_id>/snapshot.yaml) — not stored.
@@ -4816,12 +5134,13 @@ def publish_committed_pointer(run_dir: Path, payload: dict) -> Path:
         if payload.get(key) is not None:
             pointer[key] = payload[key]
     instance_dir = ctl_state_dir_from_run_dir(run_dir)
-    write_yaml_file(committed_pointer_path(instance_dir), pointer)
-    return committed_pointer_path(instance_dir)
+    group = action_group(str(payload.get("action")))
+    write_yaml_file(committed_pointer_path(instance_dir, group), pointer)
+    return committed_pointer_path(instance_dir, group)
 
 
-def read_committed_pointer(instance_dir: Path) -> dict | None:
-    path = committed_pointer_path(instance_dir)
+def read_committed_pointer(instance_dir: Path, group: str = "deployment") -> dict | None:
+    path = committed_pointer_path(instance_dir, group)
     if not path.is_file():
         return None
     data = load_yaml(path) or {}
@@ -4830,13 +5149,15 @@ def read_committed_pointer(instance_dir: Path) -> dict | None:
     return data
 
 
-def read_instance_state_slot(instance_dir: Path, state: str) -> dict | None:
+def read_instance_state_slot(
+    instance_dir: Path, state: str, group: str = "deployment"
+) -> dict | None:
     """A run slot sitting beside committed.yaml in the SAME instance dir.
 
     `write_state_slot` anchors slots at `ctl_state_dir_from_run_dir(run_dir)`,
     which is the instance dir, so a status reader needs no run-log scan to learn
     what happened to this instance most recently."""
-    path = Path(instance_dir) / state / "STATUS.yaml"
+    path = state_slot_dir(instance_dir, state, group) / "STATUS.yaml"
     if not path.is_file():
         return None
     data = load_yaml(path) or {}
@@ -4862,7 +5183,11 @@ def failed_verdict_reason(slot: dict) -> str:
 
 
 def rewrite_in_progress_slot_if_present(run_dir: Path, payload: dict) -> None:
-    slot_dir = ctl_state_dir_from_run_dir(run_dir) / "in_progress"
+    slot_dir = state_slot_dir(
+        ctl_state_dir_from_run_dir(run_dir),
+        "in_progress",
+        action_group(str(load_run_metadata(run_dir).get("action"))),
+    )
     if slot_dir.exists():
         write_state_slot(run_dir, "in_progress", payload)
 
@@ -4871,6 +5196,40 @@ def mark_run_started(run_dir: Path) -> None:
     payload = build_status_payload(run_dir, "in_progress")
     write_current_status(run_dir, payload)
     write_state_slot(run_dir, "in_progress", payload)
+
+
+def record_workflow_members(
+    run_dir: Path, active_target_runs: dict, workflow_cfg: dict
+) -> None:
+    """§Phase 73: a workflow run records the composition it ran, as history.
+
+    `targets` mirrors the cfg shape — a bare key when it takes the member's
+    `default_action`, `{key, action}` when it differs — so the record reads like
+    the declaration that produced it. `member_selectors` is the matched member's
+    own block copied verbatim, which points back at that declaration and keeps the
+    engine from needing to know a field called "operation".
+    """
+    default_action = workflow_cfg.get("default_action")
+    targets: list = []
+    for target_run in active_target_runs.values():
+        key = target_run.get("target")
+        if not key:
+            continue
+        action = target_run.get("action")
+        if action and action != default_action:
+            targets.append({"key": key, "action": action})
+        else:
+            targets.append(key)
+    facts: dict = {"targets": targets}
+    if default_action:
+        facts["default_action"] = default_action
+    if workflow_cfg.get("member_selectors"):
+        facts["member_selectors"] = workflow_cfg["member_selectors"]
+    update_run_metadata(run_dir, facts)
+    status = load_current_status(run_dir)
+    if status:
+        status.update({**facts, "updated_at": utc_timestamp()})
+        write_current_status(run_dir, status)
 
 
 def record_run_target_keys(run_dir: Path, target_keys: list[str]) -> None:
@@ -4960,9 +5319,6 @@ def mark_run_succeeded(run_dir: Path) -> None:
     payload = build_status_payload(run_dir, "ok", {"ctl_state_sync": ctl_state_sync_summary()})
     write_current_status(run_dir, payload)
     pointer_path = publish_committed_pointer(run_dir, payload)
-    stamped = stamp_torn_down_instance(run_dir, payload)
-    if stamped:
-        logging.info("stamped torn-down instance %s", stamped)
     remove_state_slot(run_dir, "in_progress")
     remove_state_slot(run_dir, "failed")
     mark_outdated_for_run(run_dir, include_current_result=False)
@@ -5047,7 +5403,7 @@ def iter_committed_status_paths(ctl_state_local_root: Path):
         return
     # §Phase 31: the committed record is the committed.yaml pointer at the
     # instance dir (was committed/STATUS.yaml).
-    yield from sorted(root.rglob(COMMITTED_POINTER_NAME))
+    yield from sorted(root.rglob("committed/*.yaml"))
 
 
 def load_status_mapping(path: Path) -> dict:
@@ -5926,6 +6282,11 @@ def build_execution_context(
 
     if action is not None:
         put("ctl", "action", action, label="promoted --action")
+        # §Phase 73: a WORKFLOW is invoked with an operation and its members carry
+        # the actions, so member selectors gate on `ctl.operation`. It is published
+        # alongside rather than instead of `ctl.action`: a target run still has one
+        # action, and credential selection keys on that.
+        put("ctl", "operation", action, label="promoted --operation")
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
     # One fact per participating provider — the mode is a per-provider decision,
@@ -6648,7 +7009,6 @@ def target_definition_document(target_run: dict) -> dict:
         "domains",
         "cfg_keys",
         "target_instance_params",
-        "tears_down",
         "requires_plt_overlays",
         "execution_identities",
         "provisions_ctl_state_backend",
@@ -8093,7 +8453,7 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 
 def ctl_state_target_address_prefix(action: str, address: str) -> str:
     target_key, segments = split_target_instance_address(address)
-    return compose_state_relpath(action, "target", target_key, segments).as_posix()
+    return compose_state_relpath("target", target_key, segments).as_posix()
 
 
 def selection_state_spec(selection: dict) -> dict:
@@ -8123,8 +8483,7 @@ def selection_state_spec(selection: dict) -> dict:
                 ),
                 "segments": segments,
                 "address": target_instance_address(target_key, segments),
-                "prefix": compose_state_relpath(
-                    action, "target", target_key, segments
+                "prefix": compose_state_relpath("target", target_key, segments
                 ).as_posix(),
             }
         )
@@ -8137,7 +8496,9 @@ def selection_state_spec(selection: dict) -> dict:
             f"❌ status does not support selection kind {selection['selection_kind']!r}"
         )
     addresses = [item["address"] for item in target_specs]
-    digest = workflow_composition_sha256(addresses)
+    digest = workflow_composition_sha256(
+        addresses, [item.get("action") for item in target_specs]
+    )
     key = normalize_result_name(selection["selection_key"], label="status workflow key")
     segments = [f"sha256={digest}"]
     definition_canonical = json.dumps(
@@ -8148,8 +8509,7 @@ def selection_state_spec(selection: dict) -> dict:
         "key": key,
         "segments": segments,
         "address": instance_address(key, segments),
-        "prefix": compose_state_relpath(
-            action, "workflow", key, segments
+        "prefix": compose_state_relpath("workflow", key, segments
         ).as_posix(),
         "target_specs": target_specs,
         "workflow_definition_sha256": hashlib.sha256(
@@ -8178,7 +8538,6 @@ def validate_unique_fan_out_materializations(
     return specs
 
 
-MUTATING_STATE_ACTIONS = ("provision", "destroy")
 
 
 def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
@@ -8187,7 +8546,7 @@ def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
     Meaningful only where a record exists; the caller supplies `none` otherwise.
     """
     if pointer is None:
-        return "none", []
+        return "outdated", []
     reasons: list[str] = []
     if pointer.get("status") == "outdated" or pointer.get("outdated"):
         outdated = pointer.get("outdated") or {}
@@ -8199,10 +8558,12 @@ def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
         expected = spec.get(fact_key)
         if expected is not None and pointer.get(fact_key) != expected:
             reasons.append(reason)
-    return ("outdated" if reasons else "current"), reasons
+    return ("outdated" if reasons else "up_to_date"), reasons
 
 
-def _run_status(instance_dir: Path) -> tuple[str | None, list[str], bool]:
+def _run_status(
+    instance_dir: Path, group: str = "deployment"
+) -> tuple[str | None, list[str], bool]:
     """What the last (or current) run on this instance did.
 
     Returns the status, its reasons, and whether a mutation had begun — the
@@ -8210,14 +8571,14 @@ def _run_status(instance_dir: Path) -> tuple[str | None, list[str], bool]:
     completing leaves the instance half-built whether it is still going or
     already dead.
     """
-    in_progress = read_instance_state_slot(instance_dir, "in_progress")
+    in_progress = read_instance_state_slot(instance_dir, "in_progress", group)
     if in_progress is not None:
         return (
             "running",
             [in_progress_verdict_reason(in_progress)],
             in_progress.get("mutation_started") is True,
         )
-    failed = read_instance_state_slot(instance_dir, "failed")
+    failed = read_instance_state_slot(instance_dir, "failed", group)
     if failed is not None:
         return (
             "failed",
@@ -8227,7 +8588,7 @@ def _run_status(instance_dir: Path) -> tuple[str | None, list[str], bool]:
     # No slot AND no committed pointer means nothing ever ran here. `passed`
     # would be a claim of success nobody made, so the caller gets None and omits
     # the group entirely — absence stays absence.
-    if read_committed_pointer(instance_dir) is None:
+    if read_committed_pointer(instance_dir, group) is None:
         return None, [], False
     return "passed", [], False
 
@@ -8235,71 +8596,48 @@ def _run_status(instance_dir: Path) -> tuple[str | None, list[str], bool]:
 def _mutating_run_status(
     namespace_root: Path, kind: str, key: str, segments: list[str]
 ) -> tuple[str | None, list[str], bool, str | None]:
-    """The live run axes of a deployment instance, across BOTH directions.
+    """The live run axes of a deployment instance.
 
-    Provision and destroy are two directions of ONE state, but on disk they sit
-    under separate action prefixes. Reading run slots from the prefix of the
-    newest COMMITTED pointer makes the run happening RIGHT NOW invisible until
-    it commits: a provision started after a destroy reported
-    `destroy/destroyed/passed` for its whole duration, because the destroy
-    pointer was still the newest thing committed and the provision had written
-    nothing but a slot.
-
-    So the run axes come from whichever direction holds a slot, and the returned
-    action is THAT run's direction rather than the last committed one.
+    §Phase 73: provision and destroy now share one instance directory and one
+    `committed/deployment.yaml`, so there are no longer two direction prefixes to
+    merge — the slot and the pointer are read from one place, and the action comes
+    from whichever record is there.
     """
-    slots: list[tuple[str, str, dict]] = []
-    committed = False
-    for action in MUTATING_STATE_ACTIONS:
-        action_dir = namespace_root / compose_state_relpath(
-            action, kind, key, segments
-        )
-        for state in ("in_progress", "failed"):
-            slot = read_instance_state_slot(action_dir, state)
-            if slot is not None:
-                slots.append((state, action, slot))
-        if read_committed_pointer(action_dir) is not None:
-            committed = True
+    instance_dir = namespace_root / compose_state_relpath(kind, key, segments)
     for state, status, describe in (
         ("in_progress", "running", in_progress_verdict_reason),
         ("failed", "failed", failed_verdict_reason),
     ):
-        matching = [item for item in slots if item[0] == state]
-        if not matching:
-            continue
-        # Locking permits one live run per instance, but a slot left by the other
-        # direction can outlive it; the freshest write is the current one.
-        _, action, slot = max(
-            matching, key=lambda item: str(item[2].get("updated_at") or "")
-        )
-        return status, [describe(slot)], slot.get("mutation_started") is True, action
-    # No slot AND no committed pointer means nothing ever ran here — `passed`
-    # would be a claim of success nobody made.
-    return ("passed" if committed else None), [], False, None
-
+        slot = read_instance_state_slot(instance_dir, state, "deployment")
+        if slot is not None:
+            return (
+                status,
+                [describe(slot)],
+                slot.get("mutation_started") is True,
+                slot.get("action"),
+            )
+    pointer = read_committed_pointer(instance_dir, "deployment")
+    if pointer is None:
+        return None, [], False, None
+    return "passed", [], False, pointer.get("action")
 
 def compute_target_instance_status(
     namespace_root: Path, action: str, spec: dict
 ) -> dict:
-    """Status of one target instance, on orthogonal axes.
+    """Status of one target instance, on the two axes a row carries.
 
-    `status` always applies — every action produces a run. `state` and
-    `freshness` apply only to actions that OWN state: a plan or readonly run
-    creates nothing, so asking what it left behind is a category error.
-
-    Replaces the former single `verdict`, which answered four independent
-    questions by precedence (so `running` hid `outdated`) and duplicated
-    `destroyed` into a second `lifecycle` field.
+    §Phase 73: `state` and `action` are gone. `provisioned`/`destroyed` asserted
+    what exists in the cloud, which ctl never observes — a destroy run directly in
+    the repo empties the tool's own state while ctl kept reporting `provisioned`.
+    A row reports what ctl's own runs did: whether one is live or broken, and
+    whether the published result still matches its inputs.
     """
-    instance_dir = namespace_root / spec["prefix"]
-    pointer = read_committed_pointer(instance_dir)
-    run_action = None
-    if action in MUTATING_STATE_ACTIONS:
-        status, reasons, mutation_started, run_action = _mutating_run_status(
-            namespace_root, "target", spec["key"], spec["segments"]
-        )
-    else:
-        status, reasons, mutation_started = _run_status(instance_dir)
+    group = action_group(action)
+    instance_dir = namespace_root / compose_state_relpath(
+        "target", spec["key"], spec["segments"]
+    )
+    pointer = read_committed_pointer(instance_dir, group)
+    status, reasons, mutation_started = _run_status(instance_dir, group)
 
     result: dict = {
         "kind": "target",
@@ -8308,44 +8646,15 @@ def compute_target_instance_status(
     }
     if status is not None:
         result["status"] = status
-    if action in MUTATING_STATE_ACTIONS:
-        # The newest of the provision/destroy pointers says what is out there.
-        candidates: list[tuple[str, str]] = []
-        for lifecycle_action in MUTATING_STATE_ACTIONS:
-            candidate = read_committed_pointer(
-                namespace_root
-                / compose_state_relpath(
-                    lifecycle_action, "target", spec["key"], spec["segments"]
-                )
-            )
-            if candidate:
-                order = str(
-                    candidate.get("committed_at") or candidate.get("run_id") or ""
-                )
-                candidates.append((order, lifecycle_action))
-        state = None
-        newest_lifecycle_action = None
-        if candidates:
-            newest_lifecycle_action = max(candidates, key=lambda item: item[0])[1]
-            state = "destroyed" if newest_lifecycle_action == "destroy" else "provisioned"
-        # A mutation that started and did not complete outranks either: resources
-        # changed and no complete record describes them.
-        if mutation_started:
-            state = "partial"
-        if state is not None:
-            result["state"] = state
-        # A LIVE run's direction outranks the last committed one: while a
-        # provision runs after a destroy, the thing to report is `provision`,
-        # not the `destroy` whose pointer happens to still be newest.
-        chosen_action = run_action or newest_lifecycle_action
-        if chosen_action:
-            result["action"] = chosen_action
-        freshness, freshness_reasons = _freshness(pointer, spec)
-        if state in (None, "destroyed", "partial"):
-            freshness = "none"
-            freshness_reasons = []
-        result["freshness"] = freshness
-        reasons = reasons + freshness_reasons
+    # Freshness applies to a published result only. An interrupted run changed
+    # resources and committed nothing, so its pointer describes nothing for inputs
+    # to have moved away from; `up_to_date` would be false and `outdated`
+    # understates it.
+    if group == "deployment" and pointer and not mutation_started:
+        if str(pointer.get("action")) != "destroy":
+            freshness, freshness_reasons = _freshness(pointer, spec)
+            result["freshness"] = freshness
+            reasons = reasons + freshness_reasons
 
     if pointer:
         result["run_id"] = pointer.get("run_id")
@@ -8358,21 +8667,21 @@ def compute_target_instance_status(
 def compute_workflow_instance_status(
     namespace_root: Path, action: str, spec: dict
 ) -> dict:
-    """Status of one workflow instance — each axis rolled up by its OWN rule.
+    """Status of one workflow instance, rolled up from its members.
 
-    A single precedence cascade cannot express this: a composition is destroyed
-    only when EVERY member is, but outdated as soon as ANY member is. Collapsing
-    both into one enum is what made the old `verdict` lose information.
+    §Phase 73: a composition reports `status` and `freshness` and nothing else. It
+    holds no `state`, because once members carry their own action a composition can
+    hold a destroy member and a provision member at once and no single word is true
+    of it; and no `action`, for the same reason. Both surviving axes roll up without
+    reference to direction — running or failed when ANY member is, outdated as soon
+    as ANY member is — which is why one row shape serves both kinds.
     """
-    workflow_dir = namespace_root / spec["prefix"]
-    pointer = read_committed_pointer(workflow_dir)
-    run_action = None
-    if action in MUTATING_STATE_ACTIONS:
-        status, reasons, mutation_started, run_action = _mutating_run_status(
-            namespace_root, "workflow", spec["key"], spec["segments"]
-        )
-    else:
-        status, reasons, mutation_started = _run_status(workflow_dir)
+    group = action_group(action)
+    workflow_dir = namespace_root / compose_state_relpath(
+        "workflow", spec["key"], spec["segments"]
+    )
+    pointer = read_committed_pointer(workflow_dir, group)
+    status, reasons, mutation_started = _run_status(workflow_dir, group)
 
     children: list[dict] = []
     recorded = {
@@ -8383,7 +8692,11 @@ def compute_workflow_instance_status(
     drift: list[str] = []
     for target_spec in spec["target_specs"]:
         child = compute_target_instance_status(namespace_root, action, target_spec)
-        child_pointer = read_committed_pointer(namespace_root / target_spec["prefix"])
+        child_pointer = read_committed_pointer(
+            namespace_root
+            / compose_state_relpath("target", target_spec["key"], target_spec["segments"]),
+            group,
+        )
         expected = recorded.get(target_spec["address"])
         if child.get("freshness") == "outdated":
             drift.append(f"{target_spec['address']}: outdated")
@@ -8428,36 +8741,11 @@ def compute_workflow_instance_status(
     }
     if status is not None:
         result["status"] = status
-    if action in MUTATING_STATE_ACTIONS:
-        child_states = [c.get("state") for c in children if c.get("state")]
-        state = None
-        if mutation_started or "partial" in child_states:
-            state = "partial"
-        elif child_states and all(s == "destroyed" for s in child_states):
-            state = "destroyed"
-        elif child_states and "destroyed" in child_states:
-            # A MIXED set: some members exist, some were destroyed on their own.
-            # `provisioned` would overclaim — the composition is no longer whole
-            # — and that is exactly what `partial` already means.
-            state = "partial"
-        elif child_states:
-            state = "provisioned"
-        elif pointer is not None:
-            state = "provisioned"
-        if state is not None:
-            result["state"] = state
-            # A composition's direction is the action it was run under: the
-            # rollup is computed from the provisioning side, so `destroyed` here
-            # means every member was torn down. A live run overrides that — it
-            # is the direction the composition is moving in right now.
-            result["action"] = run_action or (
-                "destroy" if state == "destroyed" else action
-            )
+    if group == "deployment" and pointer is not None and not mutation_started:
         own_freshness, own_reasons = _freshness(pointer, spec)
-        freshness = "outdated" if (drift or own_freshness == "outdated") else own_freshness
-        if state in (None, "destroyed", "partial"):
-            freshness, own_reasons, drift = "none", [], []
-        result["freshness"] = freshness
+        result["freshness"] = (
+            "outdated" if (drift or own_freshness == "outdated") else own_freshness
+        )
         reasons = reasons + own_reasons + drift
 
     if pointer:
@@ -8697,7 +8985,7 @@ def forget_selection(
 
     wanted = None if addresses == ["all"] else [a.strip("/") for a in addresses]
     selected: list[dict] = []
-    for pointer_path in sorted(Path(namespace_root).rglob(COMMITTED_POINTER_NAME)):
+    for pointer_path in sorted(Path(namespace_root).rglob("committed/*.yaml")):
         instance_dir = pointer_path.parent
         rel = instance_dir.relative_to(namespace_root).as_posix()
         if wanted is not None and not any(
@@ -8749,8 +9037,7 @@ def forget_guard(
                 "key": parsed["key"],
                 "segments": list(parsed["instance_segments"]),
                 "address": rel,
-                "prefix": compose_state_relpath(
-                    "provision", "target", parsed["key"], list(parsed["instance_segments"])
+                "prefix": compose_state_relpath("target", parsed["key"], list(parsed["instance_segments"])
                 ).as_posix(),
             },
         )
@@ -8774,13 +9061,13 @@ def workflow_references(namespace_root: Path) -> dict[str, set[str]]:
     `--cascade`.
     """
     references: dict[str, set[str]] = {}
-    for pointer_path in Path(namespace_root).rglob(COMMITTED_POINTER_NAME):
+    for pointer_path in Path(namespace_root).rglob("committed/*.yaml"):
         pointer = read_committed_pointer(pointer_path.parent) or {}
         for child in pointer.get("child_revisions") or []:
             if not isinstance(child, dict) or not child.get("address"):
                 continue
             key, segments = split_target_instance_address(str(child["address"]))
-            rel = compose_state_relpath("provision", "target", key, segments).as_posix()
+            rel = compose_state_relpath("target", key, segments).as_posix()
             references.setdefault(rel, set()).add(
                 pointer_path.parent.relative_to(namespace_root).as_posix()
             )
@@ -8966,7 +9253,7 @@ def run_ctl_state_history_prune(
         )
 
     current_ids = set()
-    for pointer_path in namespace_root.rglob("committed.yaml"):
+    for pointer_path in namespace_root.rglob("committed/*.yaml"):
         pointer = read_committed_pointer(pointer_path.parent)
         if pointer and pointer.get("run_id"):
             current_ids.add(str(pointer["run_id"]))
@@ -9114,6 +9401,19 @@ def run_ctl_state_maintenance_command(
 
 
 
+def _targeted_workflow_status(namespace_root: Path, spec: dict) -> dict:
+    """§Phase 73: a workflow owns execution, so a targeted query reads its LAST RUN.
+
+    Reading a committed pointer here returned an empty row once workflows stopped
+    publishing one — the query answered nothing rather than failing.
+    """
+    result = {"kind": "workflow", "key": spec["key"], "address": spec["address"]}
+    last_run = workflow_last_run(namespace_root, spec["key"])
+    if last_run:
+        result["last_run"] = last_run
+    return result
+
+
 def _compute_status_results(
     namespace_root: Path, action: str, labels: list[str], specs: list[dict]
 ) -> list[dict]:
@@ -9122,7 +9422,7 @@ def _compute_status_results(
         computed = (
             compute_target_instance_status(namespace_root, action, spec)
             if spec["kind"] == "target"
-            else compute_workflow_instance_status(namespace_root, action, spec)
+            else _targeted_workflow_status(namespace_root, spec)
         )
         computed["selection"] = label
         results.append(computed)
@@ -9249,9 +9549,7 @@ def run_status_command(
                 for target_spec in target_specs:
                     for lifecycle_action in ("provision", "destroy"):
                         syncer.pull_object(
-                            compose_state_relpath(
-                                lifecycle_action,
-                                "target",
+                            compose_state_relpath("target",
                                 target_spec["key"],
                                 target_spec["segments"],
                             ).as_posix()
@@ -9315,188 +9613,113 @@ def run_status_command(
 # The action classes a status row is grouped by. `provision` and `destroy` share
 # one group because they are two directions of the SAME state — a destroy is not
 # a separate thing that happened to the instance, it is the instance ending.
+# One representative action per group, for the compute functions that still take
+# an action and derive the group from it.
+STATUS_GROUP_ACTION = {
+    "plan": "plan",
+    "readonly": "readonly",
+    "deployment": "provision",
+    "maintenance": "maintenance",
+}
 STATUS_GROUPS: dict[str, tuple[str, ...]] = {
     "plan": ("plan",),
     "readonly": ("readonly",),
-    "deployment": MUTATING_STATE_ACTIONS,
+    "deployment": MUTATING_ACTIONS,
 }
 
 
-AXIS_ORDER = ("action", "state", "freshness", "status", "at")
+# §Phase 73: one shape for every kind. `status` first because it is the fact a
+# reader acts on, `freshness` second because it qualifies a published result, `at`
+# last because it dates the record rather than describing it.
+AXIS_ORDER = ("status", "freshness", "at")
 
 
 def order_axes(axes: dict[str, str]) -> dict[str, str]:
-    """One canonical order for every emitted group: action, state, freshness,
-    status, at.
-
-    Groups are built on several paths — target, workflow, teardown, plan — and a
-    reader comparing two rows should not have to re-find which line is which.
-    """
+    """One canonical order for every emitted group: status, freshness, at."""
     return {k: axes[k] for k in AXIS_ORDER if k in axes}
 
 
 def _axis_row(computed: dict) -> dict[str, str]:
     """The axes only, for the flat namespace map — no reasons, no children.
 
-    A row carrying neither `state` nor `status` describes nothing that happened,
-    so it collapses to empty and its group is omitted. `freshness: none` alone is
-    not a fact — it is the absence of one.
+    A row carrying no `status` describes nothing that happened, so it collapses to
+    empty and its group is omitted. Freshness alone is not a fact about a run.
     """
     row = {
         axis: computed[axis]
-        for axis in ("action", "state", "freshness", "status")
+        for axis in ("status", "freshness")
         if computed.get(axis)
     }
-    if not row.get("state") and not row.get("status"):
+    if not row.get("status"):
         return {}
     if computed.get("at"):
         row["at"] = computed["at"]
     return order_axes(row)
 
 
-def _workflow_instance_groups(
-    namespace_root: Path, key: str, segments: list[str]
-) -> dict[str, dict[str, str]]:
-    """Status groups for ONE workflow instance, empty when it owns no state.
+def workflow_last_run(namespace_root: Path, key: str) -> dict | None:
+    """The most recent run of a workflow key — its record, not its state.
 
-    Only a DEPLOYABLE COMPOSITION — a key that has ever been provisioned — owns a
-    reconciled deployment group. A destroy-only key (a pure teardown) creates
-    nothing, so it contributes no deployment row: its effect is already recorded
-    on the TARGET rows it destroyed. Teardown runs still persist for audit —
-    that is run history, not reconciled status.
+    §Phase 73: a workflow owns execution, so there is no pointer to read. The row
+    is the last run: what it did, what selected its members, and which members it
+    ran with.
     """
-    groups: dict[str, dict[str, str]] = {}
-    for group, actions in STATUS_GROUPS.items():
-        if group == "deployment":
-            axes = _deployment_workflow_axes(namespace_root, key, segments)
-        else:
-            action = actions[0]
-            instance_dir = namespace_root / compose_state_relpath(
-                action, "workflow", key, segments
-            )
-            pointer = read_committed_pointer(instance_dir)
-            if pointer is None:
-                continue
-            status, _, _ = _run_status(instance_dir)
-            axes = {"status": status} if status else {}
-            if axes and pointer.get("committed_at"):
-                axes["at"] = pointer["committed_at"]
-            axes = order_axes(axes)
-        if axes:
-            groups[group] = axes
-    return groups
+    runs_dir = namespace_root / compose_state_relpath("workflow", key, []) / "runs"
+    if not runs_dir.is_dir():
+        return None
+    records = []
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        metadata = load_run_metadata(run_dir)
+        if not metadata.get("updated_at"):
+            continue
+        records.append(metadata)
+    if not records:
+        return None
+    latest = max(records, key=lambda m: str(m.get("updated_at") or ""))
+    row: dict = {"status": _run_conclusion(latest), "at": latest.get("updated_at")}
+    # The matched member's own selector block, copied verbatim: it points back at
+    # the cfg that produced this run, and nothing depends on the engine knowing a
+    # field called "operation". A member that matched with none omits it.
+    if latest.get("member_selectors"):
+        row["selectors"] = latest["member_selectors"]
+    if latest.get("default_action"):
+        row["default_action"] = latest["default_action"]
+    targets = latest.get("targets")
+    if targets:
+        row["targets"] = targets
+    return row
 
 
-def _deployment_workflow_axes(
-    namespace_root: Path, key: str, segments: list[str]
-) -> dict[str, str]:
-    """The deployment group: newest of the provision/destroy pointers wins.
+def _run_conclusion(metadata: dict) -> str:
+    """A run's outcome, in the vocabulary a target row already uses."""
+    status = str(metadata.get("status") or "")
+    if status == "ok":
+        return "passed"
+    if status == "in_progress":
+        return "running"
+    return "failed" if status else "passed"
 
-    `state`/`freshness`/`at` come from the pointers, but `status` and `action`
-    come from the run slots — a pointer only records what FINISHED, so deciding
-    the status from it hides every run still in flight.
-    """
-    run_status, _, mutation_started, run_action = _mutating_run_status(
-        namespace_root, "workflow", key, segments
-    )
-    candidates: list[tuple[str, str, Path, dict]] = []
-    provision_pointer: dict | None = None
-    for lifecycle_action in MUTATING_STATE_ACTIONS:
-        candidate_dir = namespace_root / compose_state_relpath(
-            lifecycle_action, "workflow", key, segments
-        )
-        pointer = read_committed_pointer(candidate_dir)
-        if pointer:
-            order = str(pointer.get("committed_at") or pointer.get("run_id") or "")
-            candidates.append((order, lifecycle_action, candidate_dir, pointer))
-            if lifecycle_action == "provision":
-                provision_pointer = pointer
-    if provision_pointer is None:
-        if not candidates:
-            # Nothing committed in either direction, but a first run can already
-            # be live — it has written a slot and no pointer yet.
-            if not run_status:
-                return {}
-            axes = {"status": run_status}
-            if run_action:
-                axes["action"] = run_action
-            if mutation_started:
-                axes["state"] = "partial"
-            return order_axes(axes)
-        _, newest_action, newest_dir, newest_pointer = max(
-            candidates, key=lambda item: item[0]
-        )
-        axes = {"status": run_status} if run_status else {}
-        if newest_action == "destroy":
-            # A DESTROY POINTER IS EVIDENCE THE THING EXISTED. Reporting only a
-            # status here would make a torn-down composition indistinguishable
-            # from one that was never deployed.
-            #
-            # Absence of a provision pointer does NOT mean "this key only ever
-            # destroys": a deployable composition destroyed under a hash whose
-            # provision record is not present looks identical. Owning no state is
-            # a property of the declared KEY (which `tears_down` states), not of
-            # which pointers happen to exist — conflating the two is what made a
-            # destroyed instance report nothing.
-            axes["state"] = "partial" if mutation_started else "destroyed"
-            axes["freshness"] = "none"
-        # `state` alone leaves a real ambiguity: `provisioned` + `failed` could be
-        # a failed provision OR a failed destroy that left it provisioned, and
-        # those need different responses. `partial` + `failed` is where it matters
-        # most — which direction it was going is half the diagnosis.
-        axes["action"] = run_action or newest_action
-        if axes and newest_pointer.get("committed_at"):
-            axes["at"] = newest_pointer["committed_at"]
-        return order_axes(axes)
-    _, newest_action, newest_dir, pointer = max(candidates, key=lambda item: item[0])
-    if newest_action == "destroy":
-        # `at` comes from the pointer that decided this state. Omitting it left
-        # the row with no timestamp, which sorts as the empty string — so the
-        # MOST RECENTLY destroyed composition sorted to the very front under
-        # `--sort time:asc`, reading as the oldest thing in the namespace.
-        # `status` MUST come from the run slots, not from the fact that a destroy
-        # pointer is newest. Hardcoding `passed` here meant a provision started
-        # after a destroy reported `destroy/destroyed/passed` until it committed
-        # — the whole run was invisible, on the one row that should have shown it.
-        destroyed = {
-            "action": run_action or "destroy",
-            "state": "partial" if mutation_started else "destroyed",
-            "freshness": "none",
-            "status": run_status or "passed",
-        }
-        if pointer.get("committed_at"):
-            destroyed["at"] = pointer["committed_at"]
-        return order_axes(destroyed)
-    target_specs = []
-    for item in pointer.get("child_revisions") or []:
+
+def _recorded_target_specs(pointer: dict | None) -> list[dict]:
+    """The members a workflow pointer recorded, as target specs."""
+    specs: list[dict] = []
+    for item in (pointer or {}).get("child_revisions") or []:
         if not isinstance(item, dict):
             continue
         child_key, child_segments = split_target_instance_address(
             str(item.get("address"))
         )
-        target_specs.append(
+        specs.append(
             {
                 "kind": "target",
                 "key": child_key,
                 "segments": child_segments,
                 "address": str(item.get("address")),
-                "prefix": compose_state_relpath(
-                    "provision", "target", child_key, child_segments
-                ).as_posix(),
             }
         )
-    spec = {
-        "kind": "workflow",
-        "key": key,
-        "segments": segments,
-        "address": instance_address(key, segments),
-        "prefix": newest_dir.relative_to(namespace_root).as_posix(),
-        "target_specs": target_specs,
-        "workflow_definition_sha256": pointer.get("workflow_definition_sha256"),
-    }
-    return _axis_row(
-        compute_workflow_instance_status(namespace_root, "provision", spec)
-    )
+    return specs
 
 
 def _place_instance(
@@ -9522,39 +9745,49 @@ def _place_instance(
 def compute_namespace_status_map(
     namespace_root: Path,
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
-    """§Phase 50.10: a flat `address -> verdict` map over EVERY target and
-    workflow instance under the namespace root, lifecycle-collapsed to one row
-    per instance. Targets read their own event-driven marker (via the
-    provision-perspective compute, which also folds a newer destroy into
-    `destroyed`); a workflow row is a derived projection over child markers and
-    exists only for a DEPLOYABLE COMPOSITION (a key ever provisioned). Pure
-    teardowns (destroy-only workflow keys) own no reconciled state and never
-    appear — their effect shows on the target rows. Fan-outs own no state and
-    never appear.
+    """Every target and workflow instance under the namespace root, one row per
+    published GROUP.
 
-    Each row is the axis triple, not a single word:
+    §Phase 73: the tree is partitioned by group rather than by action, so an
+    instance appears once and each of its groups reports independently:
 
-        state      partial | provisioned | destroyed
-        freshness  current | outdated | none
-        status     running | passed | failed
+        status      running | passed | failed
+        freshness   up_to_date | outdated     (a published deployment only)
+        at          when the record was published
 
-    `state` and `freshness` come from committed pointers; `status` from the live
-    run slots, and a success clears the failed slot so `failed` cannot outlive
-    the run that caused it."""
+    `status` comes from the live run slots — a success clears the failed slot, so
+    `failed` cannot outlive the run that caused it — and `freshness` from the
+    published pointer. Fan-outs own no state and never appear."""
     namespace_root = Path(namespace_root)
     if not namespace_root.is_dir():
         return {}
     targets: set[tuple[str, tuple[str, ...]]] = set()
-    workflows: set[tuple[str, tuple[str, ...]]] = set()
-    for pointer_path in namespace_root.rglob("committed.yaml"):
-        parsed = parse_state_relpath(namespace_root, pointer_path.parent)
-        if parsed is None:
+    workflows: set[str] = set()
+    # An instance is discovered by anything it has PUBLISHED or is DOING. Scanning
+    # only for committed pointers hid a first-ever run entirely: it has written a
+    # slot and no pointer, so `--all` reported an empty namespace while a run was
+    # in flight.
+    discovered: list[Path] = [
+        pointer.parent.parent for pointer in namespace_root.rglob("committed/*.yaml")
+    ]
+    for state in ("in_progress", "failed"):
+        discovered += [
+            slot.parent.parent.parent
+            for slot in namespace_root.rglob(f"{state}/*/STATUS.yaml")
+        ]
+    for instance_dir in discovered:
+        parsed = parse_state_relpath(namespace_root, instance_dir)
+        if parsed is None or parsed["kind"] != "target":
             continue
-        instance = (parsed["key"], tuple(parsed["instance_segments"]))
-        if parsed["kind"] == "target":
-            targets.add(instance)
-        elif parsed["kind"] == "workflow":
-            workflows.add(instance)
+        targets.add((parsed["key"], tuple(parsed["instance_segments"])))
+    # §Phase 73: a workflow is discovered by its RUNS. It publishes no pointer, so
+    # there is nothing else to find it by.
+    workflow_root = namespace_root / "workflow"
+    if workflow_root.is_dir():
+        for runs_dir in workflow_root.rglob("runs"):
+            parsed = parse_state_relpath(namespace_root, runs_dir.parent)
+            if parsed is not None and parsed["kind"] == "workflow":
+                workflows.add(parsed["key"])
     rows: dict[str, dict[str, dict[str, dict[str, str]]]] = {
         kind: {} for kind in RESULT_KINDS
     }
@@ -9562,22 +9795,17 @@ def compute_namespace_status_map(
         segments = list(seg)
         address = target_instance_address(key, segments)
         groups: dict[str, dict[str, str]] = {}
-        for group, actions in STATUS_GROUPS.items():
-            # One representative action per group: `deployment` computes from the
-            # provisioning side, which already folds a newer destroy into
-            # `state: destroyed`.
-            action = actions[0]
-            spec = {
-                "kind": "target",
-                "key": key,
-                "segments": segments,
-                "address": address,
-                "prefix": compose_state_relpath(
-                    action, "target", key, segments
-                ).as_posix(),
-            }
+        spec = {
+            "kind": "target",
+            "key": key,
+            "segments": segments,
+            "address": address,
+        }
+        for group in RESULT_GROUPS:
             axes = _axis_row(
-                compute_target_instance_status(namespace_root, action, spec)
+                compute_target_instance_status(
+                    namespace_root, STATUS_GROUP_ACTION[group], spec
+                )
             )
             # An empty group means no run of that class ever touched this
             # instance — it is omitted rather than reported as anything.
@@ -9585,10 +9813,10 @@ def compute_namespace_status_map(
                 groups[group] = axes
         if groups:
             _place_instance(rows, "target", key, segments, groups)
-    for key, seg in workflows:
-        groups = _workflow_instance_groups(namespace_root, key, list(seg))
-        if groups:
-            _place_instance(rows, "workflow", key, list(seg), groups)
+    for key in workflows:
+        last_run = workflow_last_run(namespace_root, key)
+        if last_run:
+            rows["workflow"][key] = {"last_run": last_run}
     # Kind is the OUTER key, so a reader sees where the workflows are and where
     # the targets are without parsing a prefix off every address.
     return {
@@ -9660,8 +9888,9 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
     query_group.add_argument(
         "--action",
         default=None,
-        choices=["provision", "destroy"],
-        help="lifecycle view; required for a targeted query, ignored by --all",
+        choices=list(KNOWN_ACTIONS),
+        help="which status GROUP a targeted target query reports (an action names "
+        "its group: provision/destroy -> deployment); ignored by --all",
     )
     # Filters, not selectors: they narrow what --all PRINTS. A breadth argument
     # names ONE instance, so a filter needs its own word rather than a valueless
@@ -9948,7 +10177,18 @@ def filter_status_map(
     A row whose every group is filtered out is DROPPED rather than shown empty —
     an empty row would read as "nothing happened here", which is a different
     claim from "you asked not to see it".
+
+    §Phase 73: groups are a TARGET concept — a workflow publishes history, which
+    has none. Asking for workflows AND a group is therefore a contradiction that
+    can only ever return nothing, so it is refused rather than answered emptily.
     """
+    if groups and kinds and set(kinds) <= GROUPLESS_KINDS:
+        raise RuntimeError(
+            f"❌ --kind {', '.join(sorted(kinds))} cannot be combined with --group: "
+            f"{'a workflow publishes history, which has no status groups'}. "
+            "Drop --group, or ask for --kind target"
+        )
+
     def _keep(row: dict) -> dict:
         return {g: axes for g, axes in row.items() if not groups or g in groups}
 
@@ -10492,7 +10732,9 @@ def prepare_target_repo(
     return repo_path, target_env
 
 
-def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_root: Path) -> list[dict]:
+def _repo_local_active_steps(
+    action_manifest: dict, active_ids: list[str], repo_root: Path, action: str | None = None
+) -> list[dict]:
     active: list[dict] = []
     for step_id in active_ids:
         entry = action_manifest.get(step_id)
@@ -10505,6 +10747,19 @@ def _repo_local_active_steps(action_manifest: dict, active_ids: list[str], repo_
         step_meta_path = repo_root / step_path / "step.yaml"
         if not step_meta_path.is_file():
             raise RuntimeError(f"Step metadata not found: {step_meta_path}")
+        # §Phase 73: the manifest's action grouping is the single source for what a
+        # step does, so nothing re-declares it. What the grouping cannot state is
+        # that the PATH agrees with it — an entry filed under one action may point
+        # at another action's directory — so the path is checked against the
+        # action that reached it.
+        if action is not None:
+            expected_prefix = f"steps/{action}/"
+            if expected_prefix not in f"{step_path}/":
+                raise RuntimeError(
+                    f"❌ step {step_id!r} is declared under action {action!r} but its "
+                    f"path is {step_path!r}; a step's path must sit under "
+                    f"{expected_prefix!r}"
+                )
         step_meta = load_yaml(step_meta_path) or {}
         runtime_cfg = step_meta.get("runtime") or {}
         if not isinstance(runtime_cfg, dict):
@@ -10625,7 +10880,7 @@ def get_repo_local_steps(
             raise RuntimeError(f"Step {step_id!r} not declared in manifest for action {action!r}")
         active_ids.append(step_id)
 
-    return active_ids, _repo_local_active_steps(action_manifest, active_ids, repo_path)
+    return active_ids, _repo_local_active_steps(action_manifest, active_ids, repo_path, action)
 
 
 def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path) -> bool:
@@ -10675,6 +10930,7 @@ def target_instance_dir_for_run(
     parent_run_dir: Path,
     target_run: dict,
     execution_context: dict[str, object],
+    action: str | None = None,
 ) -> tuple[Path, str]:
     metadata = load_run_metadata(parent_run_dir)
     target_key = normalize_result_name(
@@ -10690,9 +10946,7 @@ def target_instance_dir_for_run(
     )
     return (
         namespace_root
-        / compose_state_relpath(
-            str(metadata["action"]), "target", target_key, segments
-        ),
+        / compose_state_relpath("target", target_key, segments),
         target_instance_address(target_key, segments),
     )
 
@@ -10701,6 +10955,7 @@ def latest_child_revision(
     parent_run_dir: Path,
     target_run: dict,
     execution_context: dict[str, object],
+    action: str | None = None,
 ) -> dict | None:
     """§Phase 61(d): the revision a SPAWNED child just committed.
 
@@ -10708,9 +10963,13 @@ def latest_child_revision(
     rather than being told — the same record any later run would consult.
     """
     instance_dir, address = target_instance_dir_for_run(
-        parent_run_dir, target_run, execution_context
+        parent_run_dir, target_run, execution_context, action
     )
-    pointer = read_committed_pointer(instance_dir)
+    # §Phase 73: read the GROUP this child published into. Defaulting to
+    # `deployment` made a plan child invisible to its workflow, which then
+    # committed with no child_revisions at all — a composition recording nothing.
+    resolved_action = action or load_run_metadata(parent_run_dir).get("action")
+    pointer = read_committed_pointer(instance_dir, action_group(str(resolved_action)))
     if not pointer:
         return None
     return {
@@ -10721,12 +10980,19 @@ def latest_child_revision(
     }
 
 
-def committed_target_revision_if_skippable(
+def up_to_date_child_revision(
     parent_run_dir: Path,
     target_run: dict,
     execution_context: dict[str, object],
+    action: str | None = None,
 ) -> dict | None:
-    """Return the current committed child revision only under the Q1d contract."""
+    """The published revision, only when reusing it is still correct.
+
+    §Phase 73: the ACTION is compared like every other identity field. Without it
+    a workflow holding one target under two actions skips BOTH members — the six
+    content fields match either way, because source and cfg are identical — so a
+    run that destroyed and then failed to re-provision reports success while the
+    instance is still destroyed."""
     if target_run.get("ref_policy") != "commit_required":
         return None
     if target_run.get("source_state") != "clean":
@@ -10743,12 +11009,14 @@ def committed_target_revision_if_skippable(
     )):
         return None
     instance_dir, address = target_instance_dir_for_run(
-        parent_run_dir, target_run, execution_context
+        parent_run_dir, target_run, execution_context, action
     )
-    pointer = read_committed_pointer(instance_dir)
+    resolved_action = action or load_run_metadata(parent_run_dir).get("action")
+    pointer = read_committed_pointer(instance_dir, action_group(str(resolved_action)))
     if not pointer or pointer.get("status") == "outdated" or pointer.get("outdated"):
         return None
     expected = {
+        "action": action or load_run_metadata(parent_run_dir).get("action"),
         "source_commit": source_commit,
         "cfg_source_commit": cfg_source_commit,
         "source_state": "clean",
@@ -10804,7 +11072,7 @@ def begin_workflow_target_run(
     locator = list(parent_metadata.get("ctl_state_locator") or [])
     namespace_root = ctl_state_root.joinpath(*locator)
     instance_dir = namespace_root / compose_state_relpath(
-        str(parent_metadata["action"]), "target", target_key, segments
+        "target", target_key, segments
     )
     # a target instance's identity is fully encoded in its path
     # (<key>/instances/<seg>/…) — no identity.yaml is written (§minimal files).
@@ -10843,7 +11111,6 @@ def begin_workflow_target_run(
                 for key in (
                     "source_commit", "cfg_source_commit", "source_state", "ref_policy",
                     "plt_overlays", "target_definition_sha256", "target_cfg_view_sha256",
-                    "tears_down"
                 )
                 if target_run.get(key) is not None
             },
@@ -10851,43 +11118,6 @@ def begin_workflow_target_run(
     )
     mark_run_started(child_run_dir)
     return child_run_dir, address
-
-
-def stamp_torn_down_instance(run_dir: Path, payload: dict) -> str | None:
-    """§Phase 67: a teardown run marks the instance it DECLARES it tears down.
-
-    Without this the relationship exists only in cfg: the teardown completes, and
-    the target it undid still reads `state: provisioned` because nothing wrote a
-    destroy pointer at that address.
-
-    The stamp lands on an INSTANCE address resolved from this run's own instance
-    params — the Kubernetes `uid` lesson, where an owner reference carries the
-    instance rather than only the name, so a re-provisioned instance does not
-    inherit a stale teardown claim.
-
-    Only a destroy run stamps: a plan of a teardown target changes nothing.
-    """
-    if payload.get("action") != "destroy":
-        return None
-    torn_down = payload.get("tears_down")
-    if not torn_down:
-        return None
-    segments = list(payload.get("instance") or [])
-    instance_dir = Path(payload["ctl_state_local_root"]).joinpath(
-        *(payload.get("ctl_state_locator") or [])
-    ) / compose_state_relpath("destroy", "target", str(torn_down), segments)
-    write_yaml_file(
-        committed_pointer_path(instance_dir),
-        {
-            "run_id": payload.get("run_id"),
-            "committed_at": payload.get("updated_at") or utc_timestamp(),
-            "status": "ok",
-            # Named so a reader can tell a stamp from a pointer the target's own
-            # run published: the teardown ran, this target did not.
-            "torn_down_by": payload.get("result_name"),
-        },
-    )
-    return instance_address(str(torn_down), segments)
 
 
 def finish_workflow_target_run(
@@ -10912,9 +11142,6 @@ def finish_workflow_target_run(
     )
     write_current_status(child_run_dir, payload)
     pointer_path = publish_committed_pointer(child_run_dir, payload)
-    stamped = stamp_torn_down_instance(child_run_dir, payload)
-    if stamped:
-        logging.info("stamped torn-down instance %s", stamped)
     remove_state_slot(child_run_dir, "in_progress")
     remove_state_slot(child_run_dir, "failed")
     publish_or_queue_ctl_state_run(
@@ -10979,7 +11206,12 @@ def populate_workflow_child_slice(
 
 
 def build_child_target_command(
-    spec: dict, target_key: str, *, parent_run_dir: Path, parent_run_id: str
+    spec: dict,
+    target_key: str,
+    *,
+    parent_run_dir: Path,
+    parent_run_id: str,
+    action: str | None = None,
 ) -> list[str]:
     """§Phase 61(d): the argv for one workflow child, derived from ONE frozen spec.
 
@@ -10987,6 +11219,11 @@ def build_child_target_command(
     fail — the child would silently run DIFFERENTLY — so the argv is built from a
     single object captured in `run_pipeline`, never assembled from scattered
     locals.
+
+    §Phase 73: the ACTION is the exception, and deliberately so. It comes from the
+    member entry when that entry declares one, because a workflow is the one level
+    that may hold members going different directions. Everything else still comes
+    from the frozen spec.
     """
     argv = [
         sys.executable, str(spec["ctl_entrypoint"]), "target",
@@ -10994,7 +11231,7 @@ def build_child_target_command(
         "--ctl-profile", spec["ctl_profile"],
         "--ctl-state-local-root", str(spec["ctl_state_local_root"]),
         "--execution-runtime-mode", spec["execution_runtime_mode"],
-        "--action", spec["action"],
+        "--action", action or spec["action"],
         "--target", target_key,
         # the child runs UNDER the parent's ctl-state lock. Authorisation is a
         # single-use grant passed by ENVIRONMENT (see CHILD_LOCK_GRANT_ENV); the
@@ -11048,7 +11285,7 @@ def run_targets(
     execution_runtime_mode: str,  # required, no default — the CLI (--execution-runtime-mode) supplies it
     execution_access_modes: dict[str, str] | None = None,
     provider_options: dict[str, str] | None = None,
-    skip_committed_rerun: bool = False,
+    skip_up_to_date: bool = False,
     child_command_spec: dict | None = None,
     credential_refresh_modes: dict | None = None,
 ) -> None:
@@ -11065,9 +11302,9 @@ def run_targets(
     child_revisions: list[dict] = []
     for target_run_id, target_run in active_target_runs.items():
         log_target_run_banner(f"[{inventory_name}] [{target_run_id}]")
-        if skip_committed_rerun:
-            revision = committed_target_revision_if_skippable(
-                run_dir, target_run, execution_context
+        if skip_up_to_date:
+            revision = up_to_date_child_revision(
+                run_dir, target_run, execution_context, inventory_name
             )
             if revision is not None:
                 logging.info(
@@ -11090,6 +11327,7 @@ def run_targets(
             argv = build_child_target_command(
                 child_command_spec, target_key,
                 parent_run_dir=run_dir, parent_run_id=run_id,
+                action=target_run.get("action"),
             )
             logging.info("Spawning child target run: %s", target_key)
             child_env = dict(os.environ)
@@ -11108,7 +11346,9 @@ def run_targets(
                 mark_mutation_started(run_dir, target_run_id)
                 mutation_marked = True
             run_and_log(argv, cwd=str(run_dir), env=child_env)
-            revision = latest_child_revision(run_dir, target_run, execution_context)
+            revision = latest_child_revision(
+                run_dir, target_run, execution_context, inventory_name
+            )
             if revision is not None:
                 child_revisions.append(revision)
             continue
@@ -11595,7 +11835,6 @@ def resolve_target_instance_segments(
 # create); non-mutating runs only check it and fail fast. Stale locks (past
 # expires_at) may be broken; the breaker records broke_lock_of.
 MUTATION_LOCK_RELPATH = "locks/mutation.yaml"
-MUTATING_ACTIONS = ("provision", "destroy")
 MUTATION_LOCK_TTL_SECONDS = 3600
 
 
@@ -11680,19 +11919,35 @@ def target_instance_address(target_key: str, instance_segments: list[str]) -> st
     return instance_address(target_key, instance_segments)
 
 
-def workflow_composition_sha256(target_instance_addresses: list[str]) -> str:
-    """Workflow instance identity (§Phase 31 Q2): SHA-256 over the UTF-8 bytes
-    of a whitespace-free canonical JSON array of the ORDERED resolved
-    target-instance addresses, TRUNCATED to 8 hex chars. The digest is a
-    deterministic index over a tiny per-namespace set (distinct workflow
-    compositions), so 32 bits is ample; the accompanying identity.yaml records
-    the full addresses and stays the authoritative identity source."""
+def workflow_composition_sha256(
+    target_instance_addresses: list[str], actions: list[str] | None = None
+) -> str:
+    """Workflow instance identity: SHA-256 over a whitespace-free canonical JSON
+    array of the ORDERED members, truncated to 8 hex chars.
+
+    §Phase 73: a member is `(address, action)`, not an address alone. Once members
+    carry their own action, hashing addresses only makes two compositions doing
+    OPPOSITE things to one target hash identically — a teardown of A and a deploy
+    of A would share one instance and overwrite each other's pointer.
+
+    The digest indexes a tiny per-namespace set, so 32 bits is ample; identity.yaml
+    records the full members and stays the authoritative identity source.
+    """
     if not isinstance(target_instance_addresses, list) or not target_instance_addresses:
         raise RuntimeError("❌ workflow composition needs a non-empty ordered address list")
     for address in target_instance_addresses:
         if not isinstance(address, str) or not address.strip():
             raise RuntimeError("❌ workflow composition addresses must be non-empty strings")
-    canonical = json.dumps(list(target_instance_addresses), separators=(",", ":"), ensure_ascii=False)
+    if actions is None:
+        members: list = list(target_instance_addresses)
+    else:
+        if len(actions) != len(target_instance_addresses):
+            raise RuntimeError(
+                "❌ workflow composition needs one action per address, got "
+                f"{len(actions)} for {len(target_instance_addresses)}"
+            )
+        members = [[a, act] for a, act in zip(target_instance_addresses, actions)]
+    canonical = json.dumps(members, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
 
 
@@ -11716,24 +11971,48 @@ def build_workflow_identity_doc(
 # Structural names never contain `=`, so they can never be mistaken for an
 # instance segment (Q1j parse boundary).
 RESULT_KINDS = ("target", "workflow")
+# §Phase 73: state is partitioned by status GROUP. Three groups are three
+# independent facts, so they never overwrite one another; provision and destroy
+# are two directions of ONE fact and share the `deployment` file.
+GROUP_BY_ACTION = {
+    "plan": "plan",
+    "readonly": "readonly",
+    "provision": "deployment",
+    "destroy": "deployment",
+    "maintenance": "maintenance",
+}
+RESULT_GROUPS = ("plan", "readonly", "deployment", "maintenance")
+# §Phase 73: kinds that publish history rather than grouped state.
+GROUPLESS_KINDS = frozenset({"workflow"})
+
+
+def action_group(action: str) -> str:
+    """The group an action publishes into; unknown actions fail loud."""
+    group = GROUP_BY_ACTION.get(action)
+    if group is None:
+        raise RuntimeError(
+            f"❌ unknown action {action!r}; expected one of {sorted(GROUP_BY_ACTION)}"
+        )
+    return group
 STATE_STRUCTURAL_NAMES = frozenset({"runs", "committed.yaml", "identity.yaml", "locks"})
 
 
 def compose_state_relpath(
-    action: str, kind: str, key: str, instance_segments: list[str]
+    kind: str, key: str, instance_segments: list[str]
 ) -> Path:
-    """Compose the namespace-relative instance directory for a state owner
-    (§Phase 31): `<action>/<kind>/<key...>/instances/<seg>/<seg>` — or, for a
-    singleton target, `<action>/<kind>/<key...>` with no instances/ layer. The
-    namespace root is prepended by the caller."""
-    if action not in RUN_ACTIONS:
-        raise RuntimeError(f"❌ unknown action {action!r} composing state path")
+    """The namespace-relative instance directory for a state owner (§Phase 73):
+    `<kind>/<key...>/instances/<seg>/<seg>` — or, for a singleton, `<kind>/<key...>`
+    with no instances/ layer. The namespace root is prepended by the caller.
+
+    There is no action segment. A key names a THING, and provision and destroy are
+    two directions of one state, so they share an instance and differ only in the
+    group file they publish."""
     if kind not in RESULT_KINDS:
         raise RuntimeError(f"❌ unknown state kind {kind!r} (expected one of {RESULT_KINDS})")
     key_parts = [p for p in key.split("/") if p]
     if not key_parts:
         raise RuntimeError("❌ state key must be non-empty")
-    parts = [action, kind, *key_parts]
+    parts = [kind, *key_parts]
     if instance_segments:
         parts += ["instances", *instance_segments]
     return Path(*parts)
@@ -11748,9 +12027,9 @@ def parse_state_relpath(namespace_root: Path, state_dir: Path) -> dict | None:
     except ValueError:
         return None
     parts = list(rel.parts)
-    if len(parts) < 3 or parts[0] not in RUN_ACTIONS or parts[1] not in RESULT_KINDS:
+    if len(parts) < 2 or parts[0] not in RESULT_KINDS:
         return None
-    action, kind, rest = parts[0], parts[1], parts[2:]
+    kind, rest = parts[0], parts[1:]
     if "instances" in rest:
         idx = rest.index("instances")
         key_parts = rest[:idx]
@@ -11768,7 +12047,6 @@ def parse_state_relpath(namespace_root: Path, state_dir: Path) -> dict | None:
         return None
     key = "/".join(key_parts)
     return {
-        "action": action,
         "kind": kind,
         "key": key,
         "instance_segments": instance_segments,
@@ -11915,21 +12193,26 @@ def resolve_run_instance_identity(
         ctl_variants=list(ctl_variants),
     )
     addresses: list[str] = []
+    member_actions: list = []
     for entry in workflow_cfg.get("target_runs", []):
         name = entry if isinstance(entry, str) else entry.get("target")
         if not name:
             continue
         addresses.append(target_instance_address(name, target_segments(name)))
+        # §Phase 73: the member's ACTION is part of its identity, so a teardown of
+        # a target and a deploy of the same target are different compositions.
+        member_actions.append(entry.get("action") if isinstance(entry, dict) else None)
     if not addresses:
         raise RuntimeError(f"❌ workflow {workflow_name!r} resolves no target addresses")
-    digest = workflow_composition_sha256(addresses)
+    # §Phase 73: a workflow publishes HISTORY, not state, so it has no instance
+    # layer and no composition digest. Its runs sit directly under the key, and the
+    # members it ran with are recorded on the run.
     return {
-        "instance_segments": [f"sha256={digest}"],
-        "address": instance_address(workflow_name, [f"sha256={digest}"]),
+        "instance_segments": [],
+        "address": workflow_name,
         "target_addresses": addresses,
-        "identity_doc": build_workflow_identity_doc(
-            workflow_name, addresses, dict(execution_params)
-        ),
+        "member_actions": member_actions,
+        "identity_doc": None,
     }
 
 
@@ -12267,13 +12550,23 @@ def expand_fan_out(
     domains = load_domain_registry(ctl_cfg_root)
     children: list[dict] = []
     for i, run in enumerate(runs):
-        workflow_key, target_key = run.get("workflow_key"), run.get("target_key")
-        if bool(workflow_key) == bool(target_key):
+        # §Phase 73: a fan-out expands WORKFLOWS. To fan a target, wrap it in a
+        # workflow, exactly as a step is only reachable through a procedure. One
+        # child kind leaves ONE place in cfg where a target's action is declared
+        # — the workflow member — so the two mechanisms cannot disagree about
+        # what a target does.
+        workflow_key = run.get("workflow_key")
+        if not workflow_key:
             raise RuntimeError(
-                f"❌ fan-out {fan_out_key!r} run[{i}] must set exactly one of workflow_key / target_key"
+                f"❌ fan-out {fan_out_key!r} run[{i}] must set workflow_key"
             )
-        kind = "workflow" if workflow_key else "target"
-        key = workflow_key or target_key
+        if run.get("target_key"):
+            raise RuntimeError(
+                f"❌ fan-out {fan_out_key!r} run[{i}] sets target_key; a fan-out "
+                "expands workflows only. Wrap the target in a workflow and name that"
+            )
+        kind = "workflow"
+        key = workflow_key
         param_set_key = run.get("fan_out_param_set_key")
         # §Phase 59: `extra_params` adds the SAME param to every member of the
         # referenced set, so one account list can serve several domains instead
@@ -12483,7 +12776,11 @@ def resolve_pipeline_selection(
         selection_kind = "procedure"
         selection_key = procedure_run["procedure"]
     elif target_name:
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name, execution_context)
+        # A standalone target run has no members, so the inventory is filtered by
+        # the invoked action alone.
+        inventory_cfg = load_inventory_cfg(
+            ctl_cfg_root, inventory_name, execution_context
+        )
         workflow_cfg = {
             "meta": {
                 "name": f"{ctl_profile}/{inventory_name}/{target_name}",
@@ -12501,7 +12798,10 @@ def resolve_pipeline_selection(
             workflow_name,
             execution_context,
         )
-        inventory_cfg = load_inventory_cfg(ctl_cfg_root, inventory_name, execution_context)
+        inventory_cfg = load_inventory_cfg(
+            ctl_cfg_root, inventory_name, execution_context,
+            member_actions=workflow_member_actions(workflow_cfg),
+        )
         workflow_cfg = apply_ctl_variants_to_workflow_cfg(
             ctl_cfg_root,
             workflow_cfg,
@@ -13721,7 +14021,7 @@ def run_pipeline(
     execution_access_modes: dict[str, str] | None = None,
     force_skip_execution_identity_preflight_check: list[str] | None = None,
     providers: list[str] | tuple[str, ...] = (),
-    skip_committed_rerun: bool = False,
+    skip_up_to_date: bool = False,
     credential_refresh_modes: dict | None = None,
     skip_children_precheck: bool = False,
     parent_graph_provisions_ctl_state_backend: bool = False,
@@ -13786,6 +14086,12 @@ def run_pipeline(
     inventory_cfg = selection["inventory_cfg"]
     refs = selection["refs"]
     active_target_runs = selection["active_target_runs"]
+    # §Phase 73: recorded as soon as the composition is RESOLVED, not after the
+    # cfg and guardrail phases. Those take tens of seconds, and a status read
+    # during them showed a running workflow with no members — the composition
+    # was known the whole time and simply had not been written down.
+    if load_run_metadata(run_dir).get("run_type") == "workflow":
+        record_workflow_members(run_dir, active_target_runs, workflow_cfg)
     provider_adapter = selection["provider_adapter"]
     provider_catalogs = selection["provider_catalogs"]
 
@@ -14064,7 +14370,7 @@ def run_pipeline(
         execution_access_modes=execution_access_modes,
         provider_options=provider_options,
         execution_runtime_mode=execution_runtime_mode,
-        skip_committed_rerun=skip_committed_rerun,
+        skip_up_to_date=skip_up_to_date,
     )
 
     # §Phase 61(b3): a WORKFLOW owns ordering, policy and the run verdict — not cfg.
