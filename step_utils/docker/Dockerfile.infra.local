@@ -16,11 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && pip3 install --no-cache-dir pyyaml jsonschema \
  && rm -rf /var/lib/apt/lists/*
 
-ARG TOFU_VERSION=1.11.0
-RUN curl -fsSL "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip" -o /tmp/tofu.zip \
- && unzip /tmp/tofu.zip -d /usr/local/bin \
- && rm -f /tmp/tofu.zip \
- && tofu -version
+ARG TERRAFORM_VERSION=1.15.8
+ARG TERRAFORM_SHA256=d25ce7b6902013ad905db3d2eab0be4cd905887fe88b81a6171b8d5503c31f3d
+RUN curl -fsSL "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" -o /tmp/terraform.zip \
+ && printf '%s  %s\n' "${TERRAFORM_SHA256}" /tmp/terraform.zip | sha256sum -c - \
+ && unzip /tmp/terraform.zip -d /usr/local/bin \
+ && rm -f /tmp/terraform.zip \
+ && terraform -version
 
 RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip \
  && unzip /tmp/awscliv2.zip -d /tmp \

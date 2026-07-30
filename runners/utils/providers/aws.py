@@ -2341,6 +2341,18 @@ PROVIDER_NAME = "aws"
 CREDENTIAL_SOURCE_NON_IMPLEMENTATION_FIELDS = frozenset({"selectors"})
 
 SUPPORTED_EXECUTION_ACCESS_MODES = ("standard", "agreed_direct", "force_bypass")
+# §Phase 70: the CADENCE is the engine's — it owns the step loop and is the only
+# thing that knows a procedure can outlive one session. WHICH cadences mean
+# anything here is this adapter's, because it depends on how the credential was
+# obtained: only `standard` performs a role assumption it can repeat, so only
+# `standard` can hand back a genuinely new session partway through. The other
+# paths re-use what the run already resolved, which would report a refresh the
+# run does not have.
+SUPPORTED_CREDENTIAL_REFRESH_MODES = ("per_target", "per_step")
+CREDENTIAL_REFRESH_MODE_ACCESS_MODES = {
+    "per_target": SUPPORTED_EXECUTION_ACCESS_MODES,
+    "per_step": ("standard",),
+}
 CREDENTIAL_IMPLEMENTATIONS = ("profile", "web_identity")
 PROVIDER_OPTION_KEYS = {
     "credential_implementation": "profile | web_identity",
@@ -2358,6 +2370,10 @@ PROVIDER_OPTION_PROFILE_GRANTS = {
 PROFILE_POLICY_KEYS = (
     "allowed_execution_access_modes",
     "allowed_credential_implementation",
+    # §Phase 70: which credential refresh cadences this profile authorizes for
+    # aws. Declared here because only a provider knows whether its sessions
+    # expire at all, and therefore whether a cadence means anything.
+    "allowed_credential_refresh_modes",
     *sorted(PROVIDER_OPTION_PROFILE_GRANTS.values()),
 )
 
@@ -2365,6 +2381,20 @@ PROFILE_POLICY_KEYS = (
 def supported_execution_access_modes() -> set[str]:
     """Modes this adapter implements (CSI-style capability advertisement)."""
     return set(SUPPORTED_EXECUTION_ACCESS_MODES)
+
+
+def supported_credential_refresh_modes() -> set[str]:
+    """Cadences this adapter can honour, advertised like the access modes."""
+    return set(SUPPORTED_CREDENTIAL_REFRESH_MODES)
+
+
+def credential_refresh_mode_access_modes(mode: str) -> tuple[str, ...]:
+    """Access modes under which `mode` actually acquires a NEW session.
+
+    The engine asks rather than deciding: whether a fresh session is obtainable
+    is a property of how this provider authenticates, not of the step loop.
+    """
+    return tuple(CREDENTIAL_REFRESH_MODE_ACCESS_MODES.get(mode, ()))
 
 
 def _option_is_true(provider_options: dict[str, str] | None, key: str) -> bool:
@@ -2512,6 +2542,7 @@ def describe() -> dict:
     """
     return {
         "execution_access_modes": sorted(supported_execution_access_modes()),
+        "credential_refresh_modes": sorted(supported_credential_refresh_modes()),
         "identity_preflight": supports_identity_preflight(),
         "normal_execution_access_mode": normal_execution_access_mode(),
         "modes_resolving_execution_identity": sorted(
@@ -2646,6 +2677,14 @@ def materialize_target_binding(
     execution_access_mode: str = "standard",
     provider_options: dict[str, str] | None = None,
 ) -> None:
+    """Bind (or RE-bind) one target_run's credentials into `target_env`.
+
+    Called once while the repo is prepared, and again before each step under
+    `--credential-refresh per_step`. Re-running the whole resolution is what makes
+    the refresh a genuine `sts:AssumeRole` on the role-chain path — calling
+    `aws configure export-credentials` again would return the CLI's CACHED token
+    from `~/.aws/cli/cache` and buy nothing.
+    """
     configure_target_aws_env(
         target_run_id,
         target_run,

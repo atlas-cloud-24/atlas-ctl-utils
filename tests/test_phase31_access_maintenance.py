@@ -361,96 +361,33 @@ class ConditionalPointerTests(unittest.TestCase):
             self.assertEqual(args[args.index("--if-match") + 1], '"etag-1"')
 
 
-class ForceUnlockDispatchTests(unittest.TestCase):
-    def test_target_selects_terraform_lock(self):
-        self.assertEqual(common.force_unlock_resource_kind("env/static/public_dns"), "terraform")
+class ToolLockIsNotTheEngineTest(unittest.TestCase):
+    """Releasing a TOOL's state lock left the engine entirely (§Phase 67).
 
-    def test_missing_target_selects_ctl_state_lock(self):
-        self.assertEqual(common.force_unlock_resource_kind(None), "ctl_state")
+    It used to be a maintenance action against a target, which forced the engine
+    to read the step's SOURCE — grepping `step.sh` for `./bin/tf.sh <dir> init
+    <var>` — to discover where that tool kept its state. That was the only place
+    ctl reached inside a step instead of going through `step.yaml`, and it broke
+    silently whenever a repo renamed the script or wrapped the call.
 
+    A repo now declares an `unlock` procedure and the engine runs it by name.
+    """
 
-class ForceUnlockBindingTests(unittest.TestCase):
-    def _repo(self, stack_dir: str, state_key: str):
-        temporary = tempfile.TemporaryDirectory()
-        root = Path(temporary.name)
-        step_path = "atlas_ctl_adapter/steps/destroy/public_dns"
-        write(
-            root / "atlas_ctl_adapter/manifest.yaml",
-            """manifest:
-  destroy:
-    destroy/public_dns:
-      path: atlas_ctl_adapter/steps/destroy/public_dns
-""",
-        )
-        write(
-            root / "atlas_ctl_adapter/step_sequences.yaml",
-            """step_sequences:
-  destroy:
-    public_dns:
-      steps:
-      - destroy/public_dns
-""",
-        )
-        write(
-            root / step_path / "step.yaml",
-            """id: destroy/public_dns
-providers: [aws]
-cfg_keys:
-  env:
-    main_tag: main_tag
-    tfstate_s3_bucket_name: tfstate_s3_bucket_name
-runtime:
-  image: infra
-""",
-        )
-        write(
-            root / step_path / "src/step.sh",
-            f"./bin/tf.sh {stack_dir} init {state_key}\n",
-        )
-        (root / stack_dir).mkdir(parents=True)
-        return temporary, root
-
-    def test_selected_sequence_resolves_nested_terraform_project(self):
-        temporary, root = self._repo(
-            "infra/public_dns", "plt_static_public_dns_tfstate_key"
-        )
-        with temporary:
-            self.assertEqual(
-                common.resolve_force_unlock_tfstate_binding(
-                    root, "destroy", "public_dns"
-                ),
-                (
-                    "infra/public_dns",
-                    "plt_static_public_dns_tfstate_key",
-                    {
-                        "env": {
-                            "main_tag": "main_tag",
-                            "tfstate_s3_bucket_name": "tfstate_s3_bucket_name",
-                        }
-                    },
-                ),
+    def test_the_binding_resolver_is_gone(self):
+        for name in (
+            "FORCE_UNLOCK_INIT_RE",
+            "resolve_force_unlock_tfstate_binding",
+            "force_unlock_resource_kind",
+        ):
+            self.assertFalse(
+                hasattr(common, name), f"{name} still exists in engine core"
             )
 
-    def test_selected_sequence_rejects_multiple_state_bindings(self):
-        temporary, root = self._repo("infra/public_dns", "public_dns_tfstate_key")
-        with temporary:
-            (root / "infra/other").mkdir(parents=True)
-            script = (
-                root
-                / "atlas_ctl_adapter/steps/destroy/public_dns/src/step.sh"
-            )
-            script.write_text(
-                "./bin/tf.sh infra/public_dns init public_dns_tfstate_key\n"
-                "./bin/tf.sh infra/other init other_tfstate_key\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(
-                RuntimeError, "exactly one Terraform state binding"
-            ):
-                common.resolve_force_unlock_tfstate_binding(
-                    root, "destroy", "public_dns"
-                )
-
+    def test_maintenance_against_a_target_points_at_the_procedure(self):
+        """The error names the replacement rather than only refusing."""
+        source = Path(common.__file__).read_text()
+        self.assertIn("does not operate on a target", source)
+        self.assertIn("--procedure unlock", source)
 
 
 class _MemorySyncer:

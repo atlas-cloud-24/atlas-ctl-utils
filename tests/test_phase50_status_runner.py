@@ -22,7 +22,9 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 from utils import common  # noqa: E402
 
 
-ADDRESS = "env/seed/baseline/env_type=dev/account=dev"
+ADDRESS = "env/seed/baseline/instances/env_type=dev/account=dev"
+TEMPLATE = "env/seed/baseline"
+SEGMENTS = "env_type=dev/account=dev"
 
 
 def _seed_target_pointer(root: Path, action: str, *, status: str, run_id: str, when: str):
@@ -71,7 +73,7 @@ class Phase50SelfOutdateFixTests(unittest.TestCase):
                 when="2026-07-21T14:07:52Z",
             )
             run_dir = (
-                root / "live/provision/workflow/env/seed/instances/sha256-abc/runs/rwf"
+                root / "live/provision/workflow/env/seed/instances/sha256=abc/runs/rwf"
             )
             run_dir.mkdir(parents=True)
             common.write_run_metadata(
@@ -82,7 +84,7 @@ class Phase50SelfOutdateFixTests(unittest.TestCase):
                     "result_key": "provision/workflow/env/seed",
                     "ctl_state_local_root": str(root),
                     "ctl_state_locator": ["live"],
-                    "instance": ["sha256-abc"],
+                    "instance": ["sha256=abc"],
                     "target_addresses": [ADDRESS],
                     "target_keys": ["env/seed/baseline"],
                     "mutation_started": True,
@@ -99,7 +101,7 @@ class Phase50SelfOutdateFixTests(unittest.TestCase):
 
 
 class Phase50NamespaceMapTests(unittest.TestCase):
-    def test_flat_address_verdict_map(self):
+    def test_flat_address_group_map(self):
         with tempfile.TemporaryDirectory() as state:
             root = Path(state)
             _seed_target_pointer(
@@ -108,7 +110,7 @@ class Phase50NamespaceMapTests(unittest.TestCase):
             )
             namespace_root = root / "live"
             rows = common.compute_namespace_status_map(namespace_root)
-            self.assertEqual(rows, {f"target/{ADDRESS}": "current"})
+            self.assertEqual(rows, {"target": {TEMPLATE: {"instances": {SEGMENTS: {"deployment": {"action": "provision", "state": "provisioned", "freshness": "current", "status": "passed", "at": "2026-07-21T16:00:00Z"}}}}}})
 
     def test_newer_destroy_reads_destroyed(self):
         with tempfile.TemporaryDirectory() as state:
@@ -122,7 +124,7 @@ class Phase50NamespaceMapTests(unittest.TestCase):
                 when="2026-07-21T16:00:00Z",
             )
             rows = common.compute_namespace_status_map(root / "live")
-            self.assertEqual(rows[f"target/{ADDRESS}"], "destroyed")
+            self.assertEqual(rows["target"][TEMPLATE]["instances"][SEGMENTS]["deployment"]["state"], "destroyed")
 
     def test_provision_composition_all_children_destroyed_reads_destroyed(self):
         """A deployable composition whose children are ALL destroyed reads
@@ -140,18 +142,24 @@ class Phase50NamespaceMapTests(unittest.TestCase):
             )
             # the provision composition that once deployed that child
             _seed_workflow_pointer(
-                root, "provision", "env/seed", "sha256-abc",
+                root, "provision", "env/seed", "sha256=abc",
                 when="2026-07-21T14:00:01Z",
                 child_revisions=[{"address": ADDRESS, "run_id": "p1", "status": "ok"}],
             )
             rows = common.compute_namespace_status_map(root / "live")
-            self.assertEqual(rows[f"target/{ADDRESS}"], "destroyed")
-            self.assertEqual(rows["workflow/env/seed/sha256-abc"], "destroyed")
+            self.assertEqual(rows["target"][TEMPLATE]["instances"][SEGMENTS]["deployment"]["state"], "destroyed")
+            self.assertEqual(
+                rows["workflow"]["env/seed"]["instances"]["sha256=abc"]["deployment"]["state"], "destroyed"
+            )
 
-    def test_teardown_only_workflow_gets_no_reconciled_row(self):
-        """A destroy-only workflow key (a pure teardown) owns no reconciled state,
-        so it never appears in the map — its effect shows on the target row. The
-        deployable composition (a provision key) still gets its row."""
+    def test_a_destroy_pointer_alone_reads_destroyed(self):
+        """A destroy pointer is EVIDENCE the composition existed.
+
+        Reporting only a status would make a torn-down composition
+        indistinguishable from one never deployed. Owning no state is a property
+        of the declared KEY, not of which pointers happen to exist — conflating
+        those made a destroyed instance report nothing at all.
+        """
         with tempfile.TemporaryDirectory() as state:
             root = Path(state)
             _seed_target_pointer(
@@ -160,20 +168,24 @@ class Phase50NamespaceMapTests(unittest.TestCase):
             )
             # deployable composition — a provision workflow key recording the child
             _seed_workflow_pointer(
-                root, "provision", "env/seed", "sha256-abc",
+                root, "provision", "env/seed", "sha256=abc",
                 when="2026-07-21T16:00:01Z",
                 child_revisions=[{"address": ADDRESS, "run_id": "p1", "status": "ok"}],
             )
             # a pure teardown — destroy-only workflow key over the same child
             _seed_workflow_pointer(
-                root, "destroy", "env/seed/teardown", "sha256-abc",
+                root, "destroy", "env/seed/teardown", "sha256=abc",
                 when="2026-07-21T15:00:00Z",
                 child_revisions=[{"address": ADDRESS, "run_id": "d1", "status": "ok"}],
             )
             rows = common.compute_namespace_status_map(root / "live")
-            self.assertIn("workflow/env/seed/sha256-abc", rows)
-            self.assertNotIn("workflow/env/seed/teardown/sha256-abc", rows)
-            self.assertEqual(rows[f"target/{ADDRESS}"], "current")
+            self.assertIn("env/seed", rows["workflow"])
+            teardown = rows["workflow"]["env/seed/teardown"]["instances"]["sha256=abc"]
+            deployment = teardown["deployment"]
+            self.assertEqual("destroyed", deployment["state"])
+            self.assertEqual("none", deployment["freshness"])
+            self.assertEqual("passed", deployment["status"])
+            self.assertEqual("current", rows["target"][TEMPLATE]["instances"][SEGMENTS]["deployment"]["freshness"])
 
 
 class Phase50FinalizeStatusArgsTests(unittest.TestCase):
@@ -183,6 +195,7 @@ class Phase50FinalizeStatusArgsTests(unittest.TestCase):
             all=False, target=None, workflow=None, fan_out=None,
             action=None, scope="local", ctl_state_local_root="/tmp/x",
             provider_options={}, write_cache=False,
+            structure="nested", sort="address", kinds=None, groups=None,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -262,6 +275,10 @@ class Phase50WriteCacheTests(unittest.TestCase):
                 when="2026-07-21T16:00:00Z",
             )
             args = argparse.Namespace(
+                structure="nested",
+                sort="address",
+                kinds=None,
+                groups=None,
                 execution_param=[("provider", "aws"), ("landing_zone", "live")],
                 all=True, target=None, workflow=None, fan_out=None,
                 action=None, scope="local", ctl_state_local_root=str(root),
@@ -282,7 +299,12 @@ class Phase50WriteCacheTests(unittest.TestCase):
             self.assertEqual(cache["scope"], "local")
             self.assertEqual(cache["source"], "status runner")
             self.assertIn("computed_at", cache)
-            self.assertEqual(cache["instances"], {f"target/{ADDRESS}": "current"})
+            self.assertEqual(
+                cache["target"],
+                {TEMPLATE: {"instances": {SEGMENTS: {"deployment": {"action": "provision", "state": "provisioned", "freshness": "current", "status": "passed", "at": "2026-07-21T16:00:00Z"}}}}},
+            )
+            # kinds sit at the top level — no `instances:` wrapper
+            self.assertNotIn("instances", cache)
             self.assertEqual(report["cache_written"], cache_path.as_posix())
 
     def test_default_writes_nothing(self):
@@ -293,6 +315,10 @@ class Phase50WriteCacheTests(unittest.TestCase):
                 when="2026-07-21T16:00:00Z",
             )
             args = argparse.Namespace(
+                structure="nested",
+                sort="address",
+                kinds=None,
+                groups=None,
                 execution_param=[("provider", "aws"), ("landing_zone", "live")],
                 all=True, target=None, workflow=None, fan_out=None,
                 action=None, scope="local", ctl_state_local_root=str(root),
@@ -310,3 +336,26 @@ class Phase50WriteCacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DestroyedIsNotIndistinguishableTest(unittest.TestCase):
+    """Regression: a destroyed composition must not look like an absent one.
+
+    Phase 67 keyed "owns no state" on the ABSENCE of a provision pointer, which
+    also matches a deployable composition destroyed under a hash whose provision
+    record is not present. The result: `env/seed` at one instance reported
+    `status: passed` with no `state`, so `--all` could not tell "torn down" from
+    "never deployed".
+    """
+
+    def test_destroy_only_instance_reports_destroyed_not_silence(self):
+        with tempfile.TemporaryDirectory() as state:
+            root = Path(state)
+            _seed_workflow_pointer(
+                root, "destroy", "env/seed", "sha256=abc",
+                when="2026-07-27T16:28:18Z",
+            )
+            rows = common.compute_namespace_status_map(root / "live")
+            block = rows["workflow"]["env/seed"]["instances"]["sha256=abc"]["deployment"]
+            self.assertEqual("destroyed", block["state"])
+            self.assertIn("status", block)

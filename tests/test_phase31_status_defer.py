@@ -21,7 +21,7 @@ class Phase31StateTests(unittest.TestCase):
     def test_target_address_maps_to_hive_path(self):
         self.assertEqual(
             common.ctl_state_target_address_prefix(
-                "provision", "env/core/account=dev/env_type=dev"
+                "provision", "env/core/instances/account=dev/env_type=dev"
             ),
             "provision/target/env/core/instances/account=dev/env_type=dev",
         )
@@ -87,7 +87,7 @@ class Phase31StateTests(unittest.TestCase):
                     "ctl_state_local_root": str(root),
                     "ctl_state_locator": ["live"],
                     "instance": ["account=dev"],
-                    "instance_address": "env/core/account=dev",
+                    "instance_address": "env/core/instances/account=dev",
                     **facts,
                 },
             )
@@ -117,7 +117,7 @@ class Phase31StateTests(unittest.TestCase):
                 "kind": "target",
                 "key": "env/core",
                 "segments": ["account=dev"],
-                "address": "env/core/account=dev",
+                "address": "env/core/instances/account=dev",
                 "prefix": "plan/target/env/core/instances/account=dev",
             }
             for action, run_id, committed_at in (
@@ -136,10 +136,9 @@ class Phase31StateTests(unittest.TestCase):
                     },
                 )
             result = common.compute_target_instance_status(
-                namespace, "plan", spec
+                namespace, "destroy", spec
             )
-            self.assertEqual(result["verdict"], "destroyed")
-            self.assertEqual(result["lifecycle"], "destroyed")
+            self.assertEqual("destroyed", result["state"])
 
     def test_workflow_status_detects_child_revision_change(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,7 +147,7 @@ class Phase31StateTests(unittest.TestCase):
                 "kind": "target",
                 "key": "env/core",
                 "segments": ["account=dev"],
-                "address": "env/core/account=dev",
+                "address": "env/core/instances/account=dev",
                 "prefix": "provision/target/env/core/instances/account=dev",
             }
             workflow = {
@@ -187,7 +186,7 @@ class Phase31StateTests(unittest.TestCase):
             current = common.compute_workflow_instance_status(
                 namespace, "provision", workflow
             )
-            self.assertEqual(current["verdict"], "current")
+            self.assertEqual("current", current["freshness"])
             pointer = common.load_yaml(
                 namespace / target["prefix"] / "committed.yaml"
             )
@@ -198,9 +197,9 @@ class Phase31StateTests(unittest.TestCase):
             outdated = common.compute_workflow_instance_status(
                 namespace, "provision", workflow
             )
-            self.assertEqual(outdated["verdict"], "outdated")
+            self.assertEqual("outdated", outdated["freshness"])
             self.assertIn(
-                "env/core/account=dev: committed revision changed",
+                "env/core/instances/account=dev: committed revision changed",
                 outdated["reasons"],
             )
 
@@ -287,7 +286,7 @@ class Phase56OverlayTests(unittest.TestCase):
                     "target": {
                         "source": "source",
                         "ref": "context",
-                        "step_sequence": "steps",
+                        "procedure": "steps",
                         "domains": ["env"],
                         "cfg_keys": {"env": ["*"]},
                         "requires_plt_overlays": ["required"],
@@ -386,7 +385,7 @@ class Phase56OverlayTests(unittest.TestCase):
             "source": "foundation",
             "ref": "env",
             "commit": "a" * 40,
-            "step_sequence": "baseline",
+            "procedure": "baseline",
             "domains": ["env"],
             "cfg_keys": {"env": ["*"]},
             "target_instance_params": ["account"],
@@ -406,7 +405,7 @@ class Phase56OverlayTests(unittest.TestCase):
                 common.target_definition_document(same_definition)
             ),
         )
-        changed = dict(target, step_sequence="other")
+        changed = dict(target, procedure="other")
         self.assertNotEqual(
             first,
             common.canonical_sha256(
@@ -431,7 +430,7 @@ class Phase56OverlayTests(unittest.TestCase):
                 "kind": "target",
                 "key": "env/core",
                 "segments": ["account=dev"],
-                "address": "env/core/account=dev",
+                "address": "env/core/instances/account=dev",
                 "prefix": "provision/target/env/core/instances/account=dev",
                 "target_definition_sha256": "new-definition",
                 "target_cfg_view_sha256": "new-view",
@@ -448,7 +447,7 @@ class Phase56OverlayTests(unittest.TestCase):
             result = common.compute_target_instance_status(
                 namespace, "provision", spec
             )
-            self.assertEqual(result["verdict"], "outdated")
+            self.assertEqual("outdated", result["freshness"])
             self.assertIn("target definition changed", result["reasons"])
             self.assertIn("target cfg view changed", result["reasons"])
 

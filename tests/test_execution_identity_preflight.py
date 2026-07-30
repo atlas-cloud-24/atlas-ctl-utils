@@ -76,7 +76,7 @@ class PreflightPolicyTests(unittest.TestCase):
 
     def test_full_cfg_validation_gate_flag_is_on_every_execution_runner(self):
         for run_type in (
-            "target", "workflow", "fan_out", "step_sequence", "maintenance"
+            "target", "workflow", "fan_out", "procedure", "maintenance"
         ):
             with self.subTest(run_type=run_type):
                 parser = argparse.ArgumentParser()

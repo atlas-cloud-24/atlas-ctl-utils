@@ -80,7 +80,7 @@ SPEC = {
     "kind": "target",
     "key": "env/core",
     "segments": ["account=dev"],
-    "address": "env/core/account=dev",
+    "address": "env/core/instances/account=dev",
     "prefix": PREFIX,
 }
 SELECTION = {

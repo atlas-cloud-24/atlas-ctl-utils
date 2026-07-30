@@ -59,25 +59,105 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verify selected baselines without writing files.",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_assignments",
+        help="Cover every assignment declared in the guardrail repository's "
+        "coverage.yaml for this --mode, instead of the single one given. Each "
+        "assignment is merged over that mode's `common` block and run through "
+        "the same path as a single invocation.",
+    )
     parser.add_argument("--keep-artifacts", action="store_true")
     args = parser.parse_args()
     if args.mode == "ctl" and args.keep_artifacts:
         parser.error("--keep-artifacts is only valid with --mode plt")
+    if args.all_assignments and args.keep_artifacts:
+        parser.error("--keep-artifacts is not supported with --all")
     return args
 
 
-def build_context(args: argparse.Namespace, ctl_cfg_root: Path) -> dict[str, object]:
+def build_context(
+    args: argparse.Namespace,
+    ctl_cfg_root: Path,
+    extra_params: dict[str, str] | None = None,
+) -> dict[str, object]:
     context = common.build_execution_context(
         ctl_cfg_root,
         action=None,
         ctl_profile=None,
-        execution_params=dict(args.execution_param),
+        execution_params={**dict(args.execution_param), **(extra_params or {})},
         execution_runtime_mode=args.execution_runtime_mode,
         providers=args.providers,
     )
     for key, value in args.execution_context:
         context[key] = value
     return context
+
+
+COVERAGE_FILENAME = "coverage.yaml"
+
+
+def load_coverage_assignments(
+    guardrails_cfg_root: Path, mode: str
+) -> list[dict[str, str]]:
+    """The DECLARED assignments needing a baseline, for one mode.
+
+    Read from `coverage.yaml` in the guardrails repository, beside the baselines
+    it governs, so adding an assignment and the baseline it produces land in one
+    commit and one review.
+
+    Deliberately NOT derived from `fan_out_param_sets`: those declare which
+    combinations are DEPLOYED together, which is a different question from which
+    must be GUARDED. Coupling them would widen or narrow coverage silently
+    whenever a fan-out changed for an unrelated reason — and a fan-out list is
+    also not something the guardrail owner controls.
+
+    `common` is merged under each assignment, so an assignment may override a
+    shared axis where it genuinely differs.
+    """
+    path = Path(guardrails_cfg_root) / COVERAGE_FILENAME
+    if not path.is_file():
+        raise RuntimeError(f"--all requires a coverage declaration: {path}")
+    doc = common.load_yaml(path) or {}
+    coverage = doc.get("guardrail_coverage")
+    if not isinstance(coverage, dict):
+        raise RuntimeError(f"{path}: guardrail_coverage must be a mapping")
+    block = coverage.get(mode)
+    if not isinstance(block, dict):
+        raise RuntimeError(f"{path}: no guardrail_coverage.{mode} block")
+    shared = block.get("common") or {}
+    if not isinstance(shared, dict):
+        raise RuntimeError(f"{path}: guardrail_coverage.{mode}.common must be a mapping")
+    declared = block.get("assignments")
+    if not isinstance(declared, list) or not declared:
+        raise RuntimeError(
+            f"{path}: guardrail_coverage.{mode}.assignments must be a non-empty list"
+        )
+    assignments: list[dict[str, str]] = []
+    seen: set[tuple] = set()
+    for index, entry in enumerate(declared):
+        if not isinstance(entry, dict) or not entry:
+            raise RuntimeError(
+                f"{path}: guardrail_coverage.{mode}.assignments[{index}] "
+                "must be a non-empty mapping of params"
+            )
+        merged = {
+            str(k): str(v) for k, v in {**shared, **entry}.items()
+        }
+        fingerprint = tuple(sorted(merged.items()))
+        if fingerprint in seen:
+            raise RuntimeError(
+                f"{path}: guardrail_coverage.{mode}.assignments[{index}] duplicates "
+                "an earlier assignment; each must be distinct"
+            )
+        seen.add(fingerprint)
+        assignments.append(merged)
+    return assignments
+
+
+def format_assignment(params: dict[str, str]) -> str:
+    return ",".join(f"{k}={v}" for k, v in sorted(params.items())) or "<base>"
 
 
 def bound_local_roots(ctl_cfg_root: Path, temp_root: Path) -> tuple[Path, Path]:
@@ -96,6 +176,15 @@ def bound_local_roots(ctl_cfg_root: Path, temp_root: Path) -> tuple[Path, Path]:
     return roots["plt"], roots["guardrails"]
 
 
+class NoMatchingPolicy(RuntimeError):
+    """This assignment activates no guardrail policy.
+
+    A hard error for a single invocation — the caller asked for a baseline that
+    cannot exist. Under `--all` it is an ordinary skip: the declared coverage is
+    broader than any one domain's policies, and `--policy` narrows it further.
+    """
+
+
 def select_entries(
     entries: list[dict],
     policies: list[str] | None,
@@ -110,7 +199,9 @@ def select_entries(
         entry for entry in entries if set(entry["policies"]) & set(policies)
     ]
     if not selected:
-        raise RuntimeError(
+        # Same meaning as "no policy matched": under --all with --policy, most
+        # assignments legitimately contain none of the requested policies.
+        raise NoMatchingPolicy(
             f"no active guardrail subject contains requested policies {policies}"
         )
     return selected
@@ -137,11 +228,21 @@ def write_entries(entries: list[dict], guardrails_cfg_root: Path) -> None:
         print(f"wrote {path} subject={entry['subject']}")
 
 
-def run_plt(args: argparse.Namespace) -> int:
+class NoMatchingPolicy(RuntimeError):
+    """This assignment activates no guardrail policy.
+
+    A hard error for a single invocation — the caller asked for a baseline that
+    cannot exist. Under `--all` it is an ordinary skip: the enumeration is the
+    union of every fan-out's members, so most assignments are irrelevant to any
+    one domain's policies.
+    """
+
+
+def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None) -> int:
     ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"CTL cfg root not found: {ctl_cfg_root}")
-    execution_context = build_context(args, ctl_cfg_root)
+    execution_context = build_context(args, ctl_cfg_root, extra_params)
     common.validate_execution_context_constraints(
         ctl_cfg_root,
         execution_context,
@@ -183,7 +284,7 @@ def run_plt(args: argparse.Namespace) -> int:
         )
         entries = select_entries(entries, args.policies, set(policies))
         if not entries:
-            raise RuntimeError(
+            raise NoMatchingPolicy(
                 f"no active PLT guardrail policy matched params {scope_params}"
             )
         if args.check:
@@ -205,11 +306,11 @@ def run_plt(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_ctl(args: argparse.Namespace) -> int:
+def run_ctl(args: argparse.Namespace, extra_params: dict[str, str] | None = None) -> int:
     ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"CTL cfg root not found: {ctl_cfg_root}")
-    execution_context = build_context(args, ctl_cfg_root)
+    execution_context = build_context(args, ctl_cfg_root, extra_params)
     common.validate_execution_context_constraints(
         ctl_cfg_root,
         execution_context,
@@ -223,7 +324,7 @@ def run_ctl(args: argparse.Namespace) -> int:
     )
     entries = select_entries(entries, args.policies, set(policies))
     if not entries:
-        raise RuntimeError("no active CTL guardrail policy matched this context")
+        raise NoMatchingPolicy("no active CTL guardrail policy matched this context")
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-guardrails-ctl-"))
     try:
         _, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
@@ -243,8 +344,66 @@ def run_ctl(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_all(args: argparse.Namespace) -> int:
+    """Cover every DECLARED assignment for this --mode in one pass.
+
+    The list comes from the guardrail repository's coverage.yaml, so what must be
+    guarded is a decision recorded next to the baselines rather than inferred
+    from run dispatch.
+
+    Each assignment is independent: one that activates no policy is skipped, one
+    that the constraints reject is skipped, and under --check a stale or missing
+    baseline is COLLECTED rather than raised, so the report names every problem
+    instead of dying on the first.
+    """
+    ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
+    if not ctl_cfg_root.is_dir():
+        raise RuntimeError(f"CTL cfg root not found: {ctl_cfg_root}")
+    runner = run_plt if args.mode == "plt" else run_ctl
+    temp_root = Path(tempfile.mkdtemp(prefix="atlas-guardrails-coverage-"))
+    try:
+        _, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
+        assignments = load_coverage_assignments(guardrails_cfg_root, args.mode)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    covered, skipped, failed = [], [], []
+    for params in assignments:
+        label = format_assignment(params)
+        print(f"\n=== {args.mode} :: {label}")
+        try:
+            runner(args, params)
+        except NoMatchingPolicy as exc:
+            skipped.append((label, str(exc)))
+            print(f"skipped: {exc}")
+        except RuntimeError as exc:
+            # A constraint rejecting the combination is also a skip: the union of
+            # every fan-out's members necessarily contains combinations that are
+            # not valid for this mode.
+            if "execution_context_constraints" in str(exc) or "constraint" in str(exc):
+                skipped.append((label, str(exc)))
+                print(f"skipped (constraint): {exc}")
+            else:
+                failed.append((label, str(exc)))
+                print(f"FAILED: {exc}")
+        else:
+            covered.append(label)
+
+    verb = "checked" if args.check else "generated"
+    print(
+        f"\n=== summary ({args.mode}): {len(covered)} {verb}, "
+        f"{len(skipped)} skipped, {len(failed)} failed, "
+        f"{len(assignments)} assignments enumerated"
+    )
+    for label, reason in failed:
+        print(f"  failed: {label}: {reason}")
+    return 1 if failed else 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.all_assignments:
+        return run_all(args)
     return run_plt(args) if args.mode == "plt" else run_ctl(args)
 
 

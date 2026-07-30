@@ -40,8 +40,8 @@ class OperationIdentityTests(unittest.TestCase):
 class ResultsBootstrapDetectionTests(unittest.TestCase):
     INVENTORY = {
         "targets": {
-            "env/ctl-state-backend": {"step_sequence": "env_ctl_state_backend", "provisions_ctl_state_backend": True},
-            "env/core/baseline": {"step_sequence": "baseline"},
+            "env/ctl-state-backend": {"procedure": "env_ctl_state_backend", "provisions_ctl_state_backend": True},
+            "env/core/baseline": {"procedure": "baseline"},
         }
     }
 

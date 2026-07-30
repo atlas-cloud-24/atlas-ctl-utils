@@ -54,7 +54,7 @@ TARGETS = (
     "    actions: [provision]\n"
     "    source_key: bootstrap\n"
     "    ref_key: env/${execution_context.params.env.type}\n"
-    "    step_sequence_key: tfstate_backend\n"
+    "    procedure_key: tfstate_backend\n"
     "    domains: [env]\n"
     "    input_params: [account, env_type]\n"
     "    cfg_keys:\n"
@@ -90,10 +90,10 @@ class LifecycleWiringTests(unittest.TestCase):
             )
             self.assertEqual(loc, ["live"])
 
-    def test_fan_out_and_step_sequence_stay_local(self):
+    def test_fan_out_and_procedure_stay_local(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(tmp)
-            for run_type in ("fan_out", "step_sequence"):
+            for run_type in ("fan_out", "procedure"):
                 loc = common.resolve_run_locator_segments(
                     root, run_type=run_type, action="provision", ctl_profile=None,
                     execution_params=PARAMS, execution_runtime_mode="local",
@@ -110,7 +110,7 @@ class LifecycleWiringTests(unittest.TestCase):
             )
             self.assertEqual(ident["instance_segments"], ["account=dev", "env_type=dev"])
             self.assertEqual(
-                ident["address"], "env/tfstate_backend/account=dev/env_type=dev"
+                ident["address"], "env/tfstate_backend/instances/account=dev/env_type=dev"
             )
 
     def test_workflow_instance_identity_and_manifest(self):
@@ -122,10 +122,10 @@ class LifecycleWiringTests(unittest.TestCase):
                 workflow_name="env/bootstrap",
             )
             self.assertEqual(len(ident["instance_segments"]), 1)
-            self.assertTrue(ident["instance_segments"][0].startswith("sha256-"))
+            self.assertTrue(ident["instance_segments"][0].startswith("sha256="))
             self.assertEqual(
                 ident["target_addresses"],
-                ["env/tfstate_backend/account=dev/env_type=dev"],
+                ["env/tfstate_backend/instances/account=dev/env_type=dev"],
             )
             doc = ident["identity_doc"]["workflow_instance"]
             self.assertEqual(doc["workflow"], "env/bootstrap")
@@ -190,7 +190,7 @@ class LifecycleWiringTests(unittest.TestCase):
                     "ctl_state_local_root": str(root),
                     "ctl_state_locator": ["live"],
                     "instance": ["account=dev", "env_type=dev"],
-                    "target_addresses": ["env/tfstate_backend/account=dev/env_type=dev"],
+                    "target_addresses": ["env/tfstate_backend/instances/account=dev/env_type=dev"],
                     "target_keys": ["env/tfstate_backend"],
                     "mutation_started": True,
                 },

@@ -199,7 +199,7 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
             "    actions: [provision]\n"
             "    source_key: bootstrap\n"
             "    ref_key: state_backend\n"
-            "    step_sequence_key: tfstate_backend\n"
+            "    procedure_key: tfstate_backend\n"
             "    domains: [\"${execution_context.params.domain}\"]\n"
             "    cfg_key_sets:\n"
             "      \"${execution_context.params.domain}\": [tfstate_backend_key_set]\n"
@@ -258,7 +258,7 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "    actions: [provision]\n"
                 "    source_key: bootstrap\n"
                 "    ref_key: r\n"
-                "    step_sequence_key: s\n"
+                "    procedure_key: s\n"
                 "    domains: [env]\n"
                 "    cfg_keys:\n"
                 "      env: [main_tag]\n"
@@ -276,7 +276,7 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "    actions: [provision]\n"
                 "    source_key: bootstrap\n"
                 "    ref_key: r\n"
-                "    step_sequence_key: s\n"
+                "    procedure_key: s\n"
                 "    domains: [env, org]\n"
                 "    cfg_keys:\n"
                 "      env: [main_tag]\n"
@@ -301,7 +301,7 @@ class TargetInputParamsTests(unittest.TestCase):
         (root / "targets" / "provision").mkdir(parents=True)
         _write(root / "targets" / "provision", "t.yaml",
                "targets:\n  t:\n    actions: [provision]\n    source_key: bootstrap\n"
-               "    ref_key: r\n    step_sequence_key: s\n    domains: [env]\n"
+               "    ref_key: r\n    procedure_key: s\n    domains: [env]\n"
                "    cfg_key_sets:\n      env: [k]\n" + target_body)
         return root
 
@@ -488,6 +488,9 @@ class ChildTargetCommandTests(unittest.TestCase):
         "force_skip_ctl_state_backend_sync": False,
         "force_skip_guardrails": False,
         "force_skip_full_cfg_validation_gate": True,
+        # §Phase 70: the cadence has no default, so a child cannot inherit one —
+        # the parent's choice must travel in the frozen spec.
+        "credential_refresh_modes": {"aws": "per_target"},
     }
 
     def _argv(self):
@@ -535,7 +538,7 @@ class RunnerProvidersWiringTests(unittest.TestCase):
 
     def test_every_runner_declares_providers(self):
         missing = []
-        for name in ("workflow.py", "target.py", "step_sequence.py"):
+        for name in ("workflow.py", "target.py", "procedure.py"):
             body = (self.ORCHESTRATOR / name).read_text()
             if "providers=args.providers" not in body:
                 missing.append(name)

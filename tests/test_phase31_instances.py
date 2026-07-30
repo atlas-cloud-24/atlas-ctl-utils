@@ -98,7 +98,7 @@ class StateRelpathTests(unittest.TestCase):
         self.assertEqual(parsed["kind"], "target")
         self.assertEqual(parsed["key"], "env/core")
         self.assertEqual(parsed["instance_segments"], ["account=stg", "env_type=stg"])
-        self.assertEqual(parsed["address"], "target/env/core/account=stg/env_type=stg")
+        self.assertEqual(parsed["address"], "target/env/core/instances/account=stg/env_type=stg")
 
     def test_parse_singleton_stops_at_structural(self):
         root = Path("/tmp/ns")
@@ -109,10 +109,10 @@ class StateRelpathTests(unittest.TestCase):
 
     def test_parse_workflow_kind(self):
         root = Path("/tmp/ns")
-        d = root / "provision/workflow/env/bootstrap/instances/sha256-abc"
+        d = root / "provision/workflow/env/bootstrap/instances/sha256=abc"
         parsed = common.parse_state_relpath(root, d)
         self.assertEqual(parsed["kind"], "workflow")
-        self.assertEqual(parsed["instance_segments"], ["sha256-abc"])
+        self.assertEqual(parsed["instance_segments"], ["sha256=abc"])
 
     def test_parse_outside_root_is_none(self):
         self.assertIsNone(common.parse_state_relpath(Path("/tmp/ns"), Path("/tmp/other/x")))

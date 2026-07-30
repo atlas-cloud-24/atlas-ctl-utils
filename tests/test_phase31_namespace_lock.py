@@ -121,7 +121,7 @@ class FanOutNamespaceGateTests(unittest.TestCase):
 class WorkflowCompositionTests(unittest.TestCase):
     """§Phase 31 item 7 — composition sha + identity doc."""
 
-    ADDRS = ["target/env/tfstate_backend/account=stg/env_type=stg"]
+    ADDRS = ["target/env/tfstate_backend/instances/account=stg/env_type=stg"]
 
     def test_sha_is_deterministic_and_order_sensitive(self):
         a = common.workflow_composition_sha256(["x", "y"])
@@ -146,7 +146,7 @@ class WorkflowCompositionTests(unittest.TestCase):
         self.assertEqual(common.target_instance_address("env/core", []), "env/core")
         self.assertEqual(
             common.target_instance_address("env/core", ["account=dev", "env_type=dev"]),
-            "env/core/account=dev/env_type=dev",
+            "env/core/instances/account=dev/env_type=dev",
         )
 
 
