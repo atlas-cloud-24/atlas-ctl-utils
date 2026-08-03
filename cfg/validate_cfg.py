@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Validate the full bound plt cfg tree and ctl/plt guardrails for one variation."""
+"""Validate the full bound plt cfg tree and ctl/plt guardrails.
+
+One variation by default. `--overlay-sweep` validates the base tree, then each
+overlay this execution context permits on its own, then all of them together —
+linear in the number of overlays rather than 2^N, because overlay application is
+a last-wins merge by file path: the failures that exist are an overlay broken on
+its own and two overlays writing one path, and those two passes cover both.
+"""
 
 from __future__ import annotations
 
@@ -35,8 +42,108 @@ def parse_args() -> argparse.Namespace:
         type=common.parse_comma_list,
         metavar="NAME[,NAME...]",
     )
+    parser.add_argument(
+        "--plt-overlays",
+        dest="plt_overlays",
+        type=common.parse_overlays_arg,
+        default=[],
+        metavar="NAME[,NAME...]",
+        help="Validate the tree with these plt overlays applied.",
+    )
+    parser.add_argument(
+        "--overlay-sweep",
+        action="store_true",
+        help=(
+            "Validate the base tree, then EACH overlay this execution context "
+            "permits on its own, then all of them together. Linear in the number "
+            "of overlays; see the module docstring for why not every subset."
+        ),
+    )
     parser.add_argument("--keep-artifacts", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.plt_overlays and args.overlay_sweep:
+        parser.error("--plt-overlays selects one variation; --overlay-sweep enumerates them")
+    return args
+
+
+def _validate_variation(
+    *,
+    ctl_cfg_root: Path,
+    ctl_profile: str,
+    execution_context: dict,
+    scope_params: dict,
+    plt_overlays: list[str],
+    keep_artifacts: bool,
+) -> None:
+    """One (params, overlays) variation, end to end.
+
+    Guardrails are verified for the BASE tree only. `coverage.yaml` enumerates
+    parameter assignments and knows nothing about overlays, so every baseline
+    describes rendered cfg with none applied; verifying an overlay variation
+    against them would report every intended override as a violation. The overlay
+    runs still exercise what they exist to exercise — that each overlay merges,
+    resolves its references, and does not fight another over one file path.
+    """
+    temp_root = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))
+    label = ",".join(plt_overlays) if plt_overlays else "base (no overlays)"
+    try:
+        roots = common.materialize_cfg_sources(
+            ctl_cfg_root,
+            ref_policy=common.ctl_ref_policy(ctl_cfg_root, ctl_profile),
+            run_cfg_dir=temp_root / "cfg",
+            token=os.getenv("cfg_source_token"),
+        )
+        plt_cfg_root = roots["plt"]
+        guardrails_cfg_root = roots["guardrails"]
+        merged_dir = temp_root / "merged"
+        common.merge_plt_cfg_dirs(
+            plt_cfg_root=plt_cfg_root,
+            plt_merged_dir=merged_dir,
+            ctl_profile="validate-cfg",
+            plt_overlays=plt_overlays,
+            scope_params=scope_params,
+            execution_context=execution_context,
+        )
+        rendered_dir = common.render_plt_cfg(merged_dir, temp_root, execution_context)
+        if plt_overlays:
+            print(f"OK: cfg valid with overlays {label} (guardrails skipped — baselines are base-only)")
+        else:
+            common.verify_guardrails(
+                ctl_cfg_root,
+                plt_cfg_root,
+                guardrails_cfg_root,
+                rendered_dir,
+                execution_context,
+                scope_params,
+            )
+            print(f"OK: full bound plt cfg valid for params {scope_params or '{}'}")
+    finally:
+        if keep_artifacts:
+            print(f"kept artifacts: {temp_root}")
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _sweep_variations(plt_cfg_root: Path, execution_context: dict) -> list[list[str]]:
+    """Base, then each permitted overlay alone, then all of them together.
+
+    NOT every subset. Overlay application is a last-wins merge by file path, so
+    the failures that exist are an overlay broken on its OWN — a stale path, a
+    reference the base no longer defines — and two overlays writing one path.
+    Each-alone catches the first, all-together catches the second, and a subset in
+    between adds nothing while costing 2^N runs.
+    """
+    permitted = sorted(
+        name for name, candidate in common.discover_overlay_candidates(
+            plt_cfg_root, execution_context=execution_context
+        ).items()
+        if candidate.get("matches")
+    )
+    variations: list[list[str]] = [[]]
+    variations += [[name] for name in permitted]
+    if len(permitted) > 1:
+        variations.append(permitted)
+    return variations
 
 
 def main() -> int:
@@ -68,40 +175,30 @@ def main() -> int:
     execution_context = common.whole_tree_execution_context(ctl_cfg_root, execution_context)
     scope_params = common.scope_params_from_context(execution_context)
 
-    temp_root = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))
-    try:
-        roots = common.materialize_cfg_sources(
-            ctl_cfg_root,
-            ref_policy=common.ctl_ref_policy(ctl_cfg_root, args.ctl_profile),
-            run_cfg_dir=temp_root / "cfg",
-            token=os.getenv("cfg_source_token"),
-        )
-        plt_cfg_root = roots["plt"]
-        guardrails_cfg_root = roots["guardrails"]
-        merged_dir = temp_root / "merged"
-        common.merge_plt_cfg_dirs(
-            plt_cfg_root=plt_cfg_root,
-            plt_merged_dir=merged_dir,
-            ctl_profile="validate-cfg",
-            plt_overlays=[],
-            scope_params=scope_params,
+    variations = [args.plt_overlays]
+    if args.overlay_sweep:
+        probe = Path(tempfile.mkdtemp(prefix="atlas-validate-overlays-"))
+        try:
+            roots = common.materialize_cfg_sources(
+                ctl_cfg_root,
+                ref_policy=common.ctl_ref_policy(ctl_cfg_root, args.ctl_profile),
+                run_cfg_dir=probe / "cfg",
+                token=os.getenv("cfg_source_token"),
+            )
+            variations = _sweep_variations(roots["plt"], execution_context)
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
+        print(f"overlay sweep: {len(variations)} variations")
+
+    for plt_overlays in variations:
+        _validate_variation(
+            ctl_cfg_root=ctl_cfg_root,
+            ctl_profile=args.ctl_profile,
             execution_context=execution_context,
+            scope_params=scope_params,
+            plt_overlays=plt_overlays,
+            keep_artifacts=args.keep_artifacts,
         )
-        rendered_dir = common.render_plt_cfg(merged_dir, temp_root, execution_context)
-        common.verify_guardrails(
-            ctl_cfg_root,
-            plt_cfg_root,
-            guardrails_cfg_root,
-            rendered_dir,
-            execution_context,
-            scope_params,
-        )
-        print(f"OK: full bound plt cfg valid for params {scope_params or '{}'}")
-    finally:
-        if args.keep_artifacts:
-            print(f"kept artifacts: {temp_root}")
-        else:
-            shutil.rmtree(temp_root, ignore_errors=True)
     return 0
 
 

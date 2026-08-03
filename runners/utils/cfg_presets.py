@@ -506,21 +506,23 @@ def _references_in(value) -> set[str]:
 def _owns(name: str, defined: set[str]) -> bool:
     """Does the unit own enough of `name` to be allowed to reference it?
 
-    The unit must own the reference, or own a NAMED COLLECTION inside it — a
-    defined prefix of at least two segments. That is what lets a base layer and
-    the layer above it co-define one structure: `all` owns
-    `_common.service_defaults`, so it may read a version field that the env layer
+    The unit must own the reference, or own a COLLECTION it sits inside. That is
+    what lets a base layer and the layer above it co-define one structure: `all`
+    owns `service_defaults`, so it may read a version field that the env layer
     fills into a member of it, whether or not `all` defines that member.
 
-    Owning only the bare top-level namespace does not count.
-    `_common.permissions_boundaries.workload.name` belongs to another unit and
-    merely shares the `_common` root; allowing that would let any reference
-    through as soon as a unit defined one key under a shared top-level name.
+    A ONE-SEGMENT prefix counts (§Phase 80). It did not use to: every helper was
+    wrapped in a shared `_common` root, so owning one key under it proved nothing
+    about `_common.permissions_boundaries.workload.name`, which belonged to a
+    different unit entirely — the rule had to demand two segments to tell a real
+    collection from that shared namespace. With the wrapper removed a top-level
+    key IS the collection, owning it is a real claim, and requiring two segments
+    would instead reject the co-definition case above.
     """
     if name in defined:
         return True
     segments = name.split(".")
-    for size in range(len(segments) - 1, 1, -1):
+    for size in range(len(segments) - 1, 0, -1):
         if ".".join(segments[:size]) in defined:
             return True
     return False

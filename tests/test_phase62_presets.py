@@ -294,15 +294,28 @@ class AliasTest(PresetTestCase):
 
 
 class SelfContainmentTest(PresetTestCase):
-    def test_reaching_into_an_unowned_branch_is_an_error(self):
-        """A6: sharing a top-level namespace is not ownership."""
-        write(self.root / "base" / "a.yaml", "shared:\n  mine:\n    x: 1\n")
-        write(self.root / "base" / "b.yaml", "value: ${shared.theirs.y}\n")
+    def test_reaching_into_an_undefined_name_is_an_error(self):
+        """A6: a name the preset defines nothing under is not ownership.
+
+        §Phase 80 narrowed what this can catch, and the replaced assertion is
+        worth stating. It used to be that sharing a TOP-LEVEL namespace was not
+        ownership: a preset defining `shared.mine` could not reference
+        `shared.theirs`. That rule existed because every helper was wrapped in one
+        `_common` root, so a top-level name was a namespace several unrelated
+        units happened to share and owning one key under it proved nothing.
+
+        With the wrapper gone a top-level key IS a collection, and members filled
+        by different layers is the co-definition case immediately below — the same
+        shape the old rule would now reject. So the check is what it always
+        should have been: you must define SOMETHING under the name you reference.
+        """
+        write(self.root / "base" / "a.yaml", "mine:\n  x: 1\n")
+        write(self.root / "base" / "b.yaml", "value: ${theirs.y}\n")
         write(
             self.root / "consumer" / cfg_presets.IMPORTS_FILENAME,
             'imports:\n  - from: /base\n    import: "*"\n',
         )
-        with self.assertRaisesRegex(cfg_presets.PresetError, r"does not own.*shared\.theirs\.y"):
+        with self.assertRaisesRegex(cfg_presets.PresetError, r"does not own.*theirs\.y"):
             self.materialize("/consumer")
 
     def test_filling_a_leaf_into_an_owned_collection_is_allowed(self):

@@ -66,8 +66,8 @@ class PathShapeTest(unittest.TestCase):
 
     def test_the_pointer_lives_under_its_group(self):
         self.assertEqual(
-            "committed/deployment.yaml",
-            common.committed_pointer_path(Path("i"), "deployment").relative_to("i").as_posix(),
+            "committed/mutative.yaml",
+            common.committed_pointer_path(Path("i"), "mutative").relative_to("i").as_posix(),
         )
 
     def test_an_unknown_group_is_refused(self):
@@ -86,8 +86,8 @@ class PathShapeTest(unittest.TestCase):
 
 class ActionMapsToGroupTest(unittest.TestCase):
     def test_the_two_directions_share_one_group(self):
-        self.assertEqual("deployment", common.action_group("provision"))
-        self.assertEqual("deployment", common.action_group("destroy"))
+        self.assertEqual("mutative", common.action_group("provision"))
+        self.assertEqual("mutative", common.action_group("destroy"))
 
     def test_the_independent_facts_keep_their_own(self):
         self.assertEqual("plan", common.action_group("plan"))
@@ -105,11 +105,11 @@ class GroupsDoNotOverwriteTest(unittest.TestCase):
     def test_a_plan_and_a_deployment_pointer_coexist(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", run_id="provisioned")
+            _publish(namespace, "mutative", run_id="provisioned")
             _publish(namespace, "plan", run_id="planned")
             self.assertEqual(
                 "provisioned",
-                common.read_committed_pointer(_instance(namespace), "deployment")["run_id"],
+                common.read_committed_pointer(_instance(namespace), "mutative")["run_id"],
             )
             self.assertEqual(
                 "planned",
@@ -120,13 +120,13 @@ class GroupsDoNotOverwriteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
             _slot(namespace, "failed", "plan", run_id="p")
-            _slot(namespace, "failed", "deployment", run_id="d")
+            _slot(namespace, "failed", "mutative", run_id="d")
             self.assertEqual(
                 "p", common.read_instance_state_slot(_instance(namespace), "failed", "plan")["run_id"]
             )
             self.assertEqual(
                 "d",
-                common.read_instance_state_slot(_instance(namespace), "failed", "deployment")["run_id"],
+                common.read_instance_state_slot(_instance(namespace), "failed", "mutative")["run_id"],
             )
 
     def test_a_deployment_run_publishes_only_its_own_group(self):
@@ -145,14 +145,14 @@ class GroupsDoNotOverwriteTest(unittest.TestCase):
             published = sorted(
                 q.name for q in (_instance(namespace) / "committed").iterdir()
             )
-            self.assertEqual(["deployment.yaml"], published)
+            self.assertEqual(["mutative.yaml"], published)
 
 
 class RowShapeTest(unittest.TestCase):
     def test_a_row_carries_status_freshness_and_at_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", action="provision")
+            _publish(namespace, "mutative", action="provision")
             row = common.compute_target_instance_status(namespace, "provision", SPEC)
             self.assertEqual("passed", row["status"])
             self.assertEqual("up_to_date", row["freshness"])
@@ -168,8 +168,8 @@ class RowShapeTest(unittest.TestCase):
     def test_a_live_slot_reads_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", action="provision")
-            _slot(namespace, "in_progress", "deployment", action="provision")
+            _publish(namespace, "mutative", action="provision")
+            _slot(namespace, "in_progress", "mutative", action="provision")
             self.assertEqual(
                 "running",
                 common.compute_target_instance_status(namespace, "provision", SPEC)["status"],
@@ -179,7 +179,7 @@ class RowShapeTest(unittest.TestCase):
         """Nothing is left for the inputs to have moved away from."""
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", action="destroy")
+            _publish(namespace, "mutative", action="destroy")
             row = common.compute_target_instance_status(namespace, "provision", SPEC)
             self.assertEqual("passed", row["status"])
             self.assertNotIn("freshness", row)
@@ -187,8 +187,8 @@ class RowShapeTest(unittest.TestCase):
     def test_an_interrupted_run_reports_no_freshness(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", action="provision")
-            _slot(namespace, "failed", "deployment", action="provision", mutation_started=True)
+            _publish(namespace, "mutative", action="provision")
+            _slot(namespace, "failed", "mutative", action="provision", mutation_started=True)
             row = common.compute_target_instance_status(namespace, "provision", SPEC)
             self.assertEqual("failed", row["status"])
             self.assertNotIn("freshness", row)
@@ -204,12 +204,12 @@ class NamespaceMapTest(unittest.TestCase):
     def test_one_instance_reports_each_group_it_published(self):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            _publish(namespace, "deployment", action="provision")
+            _publish(namespace, "mutative", action="provision")
             _publish(namespace, "plan", action="plan")
             rows = common.compute_namespace_status_map(namespace)
             instance = rows["target"][KEY]["instances"]["/".join(SEGMENTS)]
-            self.assertEqual({"plan", "deployment"}, set(instance))
-            self.assertEqual("passed", instance["deployment"]["status"])
+            self.assertEqual({"plan", "mutative"}, set(instance))
+            self.assertEqual("passed", instance["mutative"]["status"])
             self.assertEqual("passed", instance["plan"]["status"])
 
 

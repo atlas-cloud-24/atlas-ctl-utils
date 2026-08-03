@@ -12,6 +12,8 @@ rather than a failure.
 
 import sys
 import tempfile
+import argparse
+import inspect
 import unittest
 from pathlib import Path
 
@@ -31,7 +33,7 @@ def _instance(ns: Path, kind: str, key: str, segments: list[str]) -> Path:
     return ns / common.compose_state_relpath(kind, key, segments)
 
 
-def _publish(ns: Path, kind: str, key: str, segments: list[str], *, group="deployment",
+def _publish(ns: Path, kind: str, key: str, segments: list[str], *, group="mutative",
              action="provision", at="2026-07-30T15:05:34Z", run_id="r1", **facts) -> None:
     common.write_yaml_file(
         common.committed_pointer_path(_instance(ns, kind, key, segments), group),
@@ -52,7 +54,7 @@ def _workflow_run(ns: Path, key: str, *, run_id: str, status: str = "ok",
 
 
 def _slot(ns: Path, kind: str, key: str, segments: list[str], state: str, *,
-          group="deployment", **facts) -> None:
+          group="mutative", **facts) -> None:
     common.write_yaml_file(
         common.state_slot_dir(_instance(ns, kind, key, segments), state, group)
         / "STATUS.yaml",
@@ -80,8 +82,8 @@ class TimelineTest(unittest.TestCase):
             _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "in_progress")
             rows = common.compute_namespace_status_map(ns)
             row = rows["target"][TARGET_KEY]["instances"]["/".join(TARGET_SEGMENTS)]
-            self.assertEqual("running", row["deployment"]["status"])
-            self.assertNotIn("freshness", row["deployment"])
+            self.assertEqual("running", row["mutative"]["status"])
+            self.assertNotIn("freshness", row["mutative"])
 
     def test_a_committed_run_reports_passed_and_up_to_date(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,7 +91,7 @@ class TimelineTest(unittest.TestCase):
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("passed", row["status"])
             self.assertEqual("up_to_date", row["freshness"])
             self.assertEqual("2026-07-30T15:05:34Z", row["at"])
@@ -102,7 +104,7 @@ class TimelineTest(unittest.TestCase):
             _workflow_run(ns, WORKFLOW_KEY, run_id="w1")
             rows = common.compute_namespace_status_map(ns)
             self.assertEqual({"target", "workflow"}, set(rows))
-            self.assertIn("deployment", rows["target"][TARGET_KEY]["instances"][
+            self.assertIn("mutative", rows["target"][TARGET_KEY]["instances"][
                 "/".join(TARGET_SEGMENTS)])
             self.assertEqual("passed", rows["workflow"][WORKFLOW_KEY]["last_run"]["status"])
 
@@ -114,7 +116,7 @@ class TimelineTest(unittest.TestCase):
                   error={"summary": "boom"})
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("failed", row["status"])
 
 
@@ -128,13 +130,13 @@ class GroupIndependenceTest(unittest.TestCase):
                      at="2026-07-30T10:00:00Z")
             before = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS,
                      group="plan", action="plan", at="2026-07-30T11:00:00Z")
             after = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
             ]["/".join(TARGET_SEGMENTS)]
-            self.assertEqual(before, after["deployment"])
+            self.assertEqual(before, after["mutative"])
             self.assertEqual("passed", after["plan"]["status"])
 
     def test_a_destroyed_instance_reports_no_freshness(self):
@@ -143,7 +145,7 @@ class GroupIndependenceTest(unittest.TestCase):
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action="destroy")
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("passed", row["status"])
             self.assertNotIn("freshness", row)
 
@@ -236,7 +238,7 @@ class StatusArgumentsTest(unittest.TestCase):
             ns = Path(tmp)
             self._tree(ns)
             rows = common.filter_status_map(
-                common.compute_namespace_status_map(ns), None, ["deployment"]
+                common.compute_namespace_status_map(ns), None, ["mutative"]
             )
             self.assertEqual(["target"], list(rows))
 
@@ -251,19 +253,39 @@ class StatusArgumentsTest(unittest.TestCase):
             self.assertIn("workflow/env/workload_identity", addresses)
             self.assertTrue(any(a.startswith("target/") for a in addresses))
 
-    def test_asking_for_workflows_and_a_group_is_refused(self):
-        """A contradiction: groups are a target concept, so the pair can only ever
-        return nothing. Answering it emptily would read as 'nothing happened'."""
-        with self.assertRaisesRegex(RuntimeError, "cannot be combined with --group"):
-            common.filter_status_map({}, ["workflow"], ["deployment"])
+    def test_asking_for_workflows_and_a_group_is_answered_not_refused(self):
+        """§Phase 82 replaced the refusal with an answer.
+
+        Phase 73 refused the pair because groups were a target concept and a
+        workflow had none. A workflow's group is now DERIVED from its members'
+        actions, so the question has an answer — and a workflow that provisions
+        is exactly what someone filtering for `mutative` is looking for.
+        """
+        instances = {
+            "workflow": {
+                "env/baseline": {"last_run": {"group": "mutative", "status": "succeeded"}},
+                "env/readonly": {"last_run": {"group": "readonly", "status": "succeeded"}},
+            }
+        }
+        kept = common.filter_status_map(instances, ["workflow"], ["mutative"])
+        self.assertEqual(["env/baseline"], list(kept["workflow"]))
+
+    def test_a_workflow_row_is_kept_whole_or_dropped(self):
+        """A history row has no group partitions to narrow — it records ONE group,
+        so filtering selects the row rather than trimming inside it."""
+        instances = {"workflow": {"env/baseline": {"last_run": {"group": "mutative", "status": "succeeded"}}}}
+        kept = common.filter_status_map(instances, ["workflow"], ["mutative"])
+        self.assertEqual({"last_run": {"group": "mutative", "status": "succeeded"}},
+                         kept["workflow"]["env/baseline"])
+        self.assertEqual({}, common.filter_status_map(instances, ["workflow"], ["plan"]))
 
     def test_workflows_alone_are_fine(self):
         common.filter_status_map({}, ["workflow"], None)
 
     def test_a_group_with_targets_included_is_fine(self):
         """The group narrows the target rows; the workflow rows are unaffected."""
-        common.filter_status_map({}, ["target", "workflow"], ["deployment"])
-        common.filter_status_map({}, None, ["deployment"])
+        common.filter_status_map({}, ["target", "workflow"], ["mutative"])
+        common.filter_status_map({}, None, ["mutative"])
 
 
 class RunIdentityTest(unittest.TestCase):
@@ -281,14 +303,14 @@ class RunIdentityTest(unittest.TestCase):
                  at="2026-08-03T11:12:17Z", run_id="r-provision")
         common.write_yaml_file(
             common.state_slot_dir(
-                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "deployment"
+                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "mutative"
             ) / "STATUS.yaml",
             {"run_id": "r-destroy", "action": "destroy", "status": "failed",
              "updated_at": "2026-08-03T11:22:26Z", "mutation_started": True},
         )
         return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
             "instances"
-        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_at_is_the_failed_runs_time_not_the_last_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -326,7 +348,7 @@ class RunIdentityTest(unittest.TestCase):
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertNotIn("committed_at", row)
             self.assertNotIn("committed_run_id", row)
 
@@ -344,7 +366,7 @@ class LastActionTest(unittest.TestCase):
         _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action=action)
         return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
             "instances"
-        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_a_provisioned_instance_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,7 +388,7 @@ class LastActionTest(unittest.TestCase):
             _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "in_progress")
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("running", row["status"])
             self.assertEqual("provision", row["last_action"])
 
@@ -381,13 +403,13 @@ class LastActionTest(unittest.TestCase):
             common.write_yaml_file(
                 common.state_slot_dir(
                     _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS),
-                    "failed", "deployment") / "STATUS.yaml",
+                    "failed", "mutative") / "STATUS.yaml",
                 {"run_id": "r-bad", "action": "destroy", "status": "failed",
                  "updated_at": "2026-08-03T12:52:50Z", "mutation_started": True},
             )
             row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
-            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("failed", row["status"])
             self.assertEqual("destroy", row["last_action"])
 
@@ -470,14 +492,14 @@ class ParentWorkflowLinkTest(unittest.TestCase):
     def _row(self, ns: Path, **slot_facts) -> dict:
         common.write_yaml_file(
             common.state_slot_dir(
-                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "deployment"
+                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "mutative"
             ) / "STATUS.yaml",
             {"run_id": "r1", "action": "destroy", "status": "failed",
              "updated_at": "2026-08-03T12:52:50Z", **slot_facts},
         )
         return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
             "instances"
-        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_a_spawned_target_names_its_workflow_instance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -553,3 +575,205 @@ class SpawnedChildLearnsItsParentTest(unittest.TestCase):
                 "env/core/baseline", parent_run_dir=parent, parent_run_id="p1",
             )
             self.assertNotIn("--parent-workflow-instance-address", argv)
+
+
+class StatusQueryHistoryTest(unittest.TestCase):
+    """§Phase 82: every `--write-cache` query is kept, dated.
+
+    The point of the split is WHERE. `status` is read-only against ctl-state, so
+    a query record must never land in the synced tree — that would make a read
+    mutate, fail under read-only credentials, and add sync churn for something no
+    run consumes. The local root is already an advisory mirror that is never
+    truth, which is what a query log is.
+    """
+
+    def _run(self, local_root: Path, namespace: str = "live"):
+        args = argparse.Namespace(
+            all=True, scope="local", status="local", write_cache=True,
+            ctl_state_local_root=str(local_root), execution_param=[],
+            execution_params={}, action="readonly", ctl_profile="local_dev",
+            providers=(), execution_access_modes={}, execution_runtime_mode="local",
+            kind=None, group=None, view="flat", sort="time:asc", hydrate_to=None,
+        )
+        return args
+
+    def test_the_latest_stays_at_the_namespace_root_and_history_accumulates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "local"
+            ns = root / "live"
+            (ns / "status_history").mkdir(parents=True)
+            # two queries, written as the runner writes them
+            for stamp in ("2026-08-04T00:00:00Z", "2026-08-04T00:05:00Z"):
+                payload = {"advisory": True, "queried_at": stamp}
+                common.write_yaml_file(ns / "status_cache.yaml", payload)
+                common.write_yaml_file(
+                    ns / "status_history" / f"{stamp.replace(':', '-')}.yaml", payload
+                )
+
+            history = sorted(p.name for p in (ns / "status_history").glob("*.yaml"))
+            self.assertEqual(2, len(history), "each query is kept, not overwritten")
+            latest = common.load_yaml(ns / "status_cache.yaml")
+            self.assertEqual("2026-08-04T00:05:00Z", latest["queried_at"],
+                             "the root file is the LATEST, so a tool reading one "
+                             "stable path does not have to scan history")
+
+    def test_history_lives_under_the_local_root_only(self):
+        """The synced ctl-state must contain no query record at all."""
+        source = inspect.getsource(common.run_status_all_command)
+        self.assertIn("ctl_state_local_root", source)
+        self.assertIn("status_history", source)
+        # the only paths written are built from the local root
+        for line in source.splitlines():
+            if "status_history" in line and "=" in line:
+                self.assertIn("namespace_dir", line)
+
+
+class WorkflowGroupIsDerivedTest(unittest.TestCase):
+    """§Phase 82: a workflow's group comes from what its members DO.
+
+    Derived, never declared: a declared flag can disagree with the composition and
+    nothing would catch it, while the members are already recorded on the run.
+    """
+
+    def test_a_mixed_composition_is_mutative(self):
+        """A workflow that provisions one target and plans another IS a mutation —
+        the plan does not soften it. This is the precedence that matters."""
+        facts = {
+            "default_action": "plan",
+            "target_instances": ["env/static/acm", {"instance": "env/core", "action": "provision"}],
+        }
+        self.assertEqual("mutative", common.workflow_group(facts))
+
+    def test_destroy_is_mutative_too(self):
+        """`deployment` was renamed BECAUSE destroy is not a deployment."""
+        facts = {"default_action": "destroy", "target_instances": ["env/core"]}
+        self.assertEqual("mutative", common.workflow_group(facts))
+
+    def test_a_uniform_composition_takes_its_own_group(self):
+        facts = {"default_action": "plan", "target_instances": ["env/core", "env/seed"]}
+        self.assertEqual("plan", common.workflow_group(facts))
+
+    def test_members_inherit_the_default_action(self):
+        """A bare address took the workflow's default_action (§Phase 73)."""
+        facts = {"default_action": "provision", "target_instances": ["a", "b"]}
+        self.assertEqual(["provision", "provision"], common.recorded_member_actions(facts))
+
+    def test_a_dict_member_without_an_action_also_inherits_it(self):
+        """Both member forms appear in ONE list, so both must fall back the same
+        way — a dict entry that carries only an instance is still a member that
+        took the default."""
+        facts = {
+            "default_action": "provision",
+            "target_instances": [{"instance": "env/core"}, {"instance": "env/seed", "action": "plan"}],
+        }
+        self.assertEqual(["provision", "plan"], common.recorded_member_actions(facts))
+        self.assertEqual("mutative", common.workflow_group(facts))
+
+    def test_an_empty_composition_answers_nothing(self):
+        """None, not a default — a malformed record must not claim a group."""
+        self.assertIsNone(common.workflow_group({"target_instances": []}))
+
+    def test_the_group_is_recorded_with_the_composition(self):
+        """Derived where the members are known, so no reader re-derives it and
+        none can derive it differently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "w1"
+            run_dir.mkdir(parents=True)
+            common.write_yaml_file(run_dir / "metadata.yaml", {"target_addresses": []})
+            common.record_workflow_members(
+                run_dir,
+                {"t1": {"target": "env/core", "action": "provision"}},
+                {"default_action": "provision"},
+            )
+            self.assertEqual("mutative", common.load_run_metadata(run_dir).get("group"))
+
+
+class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
+    """Filter the map `compute_namespace_status_map` ACTUALLY produces.
+
+    This exists because of a bug I shipped and the user found: `--kind workflow
+    --group mutative` silently returned nothing. The group is recorded on the RUN,
+    and a workflow row wraps it as `{"last_run": {...}}`, so a filter reading
+    `row["group"]` finds nothing and drops every workflow — which reads as "no
+    workflows ran", not as "your filter was wrong".
+
+    The tests I wrote first passed anyway, because they hand-built the row shape
+    and I built it wrong in the test the same way I built it wrong in the code.
+    So this one goes through the real producer: state on disk -> the real map ->
+    the real filter.
+    """
+
+    def _namespace(self, tmp: Path, *, default_action: str) -> Path:
+        ns = tmp / "live"
+        run_dir = ns / common.compose_state_relpath("workflow", "env/baseline", []) / "runs" / "r1"
+        run_dir.mkdir(parents=True)
+        common.write_yaml_file(
+            common.run_metadata_path(run_dir),
+            {"run_id": "r1", "run_type": "workflow", "action": default_action,
+             "status": "ok", "updated_at": "2026-08-04T00:00:00Z",
+             "default_action": default_action,
+             "target_instances": ["env/core"],
+             "group": common.action_group(default_action)},
+        )
+        return ns
+
+    def test_a_mutative_workflow_survives_its_own_group_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._namespace(Path(tmp), default_action="provision")
+            rows = common.compute_namespace_status_map(ns)
+            self.assertIn("env/baseline", rows["workflow"], "precondition: the row exists unfiltered")
+
+            kept = common.filter_status_map(rows, ["workflow"], ["mutative"])
+            self.assertIn(
+                "workflow", kept,
+                "a provisioning workflow IS mutative — dropping it here is the bug "
+                "that made `--kind workflow --group mutative` return nothing",
+            )
+            self.assertIn("env/baseline", kept["workflow"])
+
+    def test_a_plan_workflow_is_excluded_by_that_same_filter(self):
+        """The filter must still filter — surviving everything would be the
+        opposite bug and just as invisible."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = self._namespace(Path(tmp), default_action="plan")
+            rows = common.compute_namespace_status_map(ns)
+            self.assertEqual({}, common.filter_status_map(rows, ["workflow"], ["mutative"]))
+            self.assertIn("workflow", common.filter_status_map(rows, ["workflow"], ["plan"]))
+
+    def test_a_run_recorded_before_the_group_existed_still_answers(self):
+        """Runs written before §Phase 82 have no `group` field. Deriving it from
+        the members they DID record is what stops them filtering out as though
+        they had no group at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp) / "live"
+            run_dir = ns / common.compose_state_relpath("workflow", "env/legacy", []) / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            common.write_yaml_file(
+                common.run_metadata_path(run_dir),
+                {"run_id": "r1", "run_type": "workflow", "action": "provision",
+                 "status": "ok", "updated_at": "2026-08-04T00:00:00Z",
+                 "default_action": "provision", "target_instances": ["env/core"]},
+            )
+            rows = common.compute_namespace_status_map(ns)
+            self.assertEqual("mutative", rows["workflow"]["env/legacy"]["last_run"]["group"])
+            self.assertIn("workflow", common.filter_status_map(rows, ["workflow"], ["mutative"]))
+
+
+class StatusHistoryLivesOutsideTheNamespaceTest(unittest.TestCase):
+    """`_local` is a SIBLING of the namespaces, never a child of one.
+
+    My first attempt put history at `<root>/<namespace>/_local/`, which buries a
+    never-synced directory inside a tree that IS synced — the exact thing the
+    reserved segment exists to prevent.
+    """
+
+    def test_the_history_path_is_built_from_the_local_root_not_the_namespace(self):
+        source = inspect.getsource(common.run_status_all_command)
+        start = source.index("history_path")
+        window = source[start:start + 400]
+        self.assertIn("ctl_state_local_root", window)
+        self.assertIn("LOCAL_ONLY_LOCATOR", window)
+        self.assertNotIn(
+            "namespace_dir.joinpath", window,
+            "history under the namespace puts a never-synced dir inside a synced tree",
+        )

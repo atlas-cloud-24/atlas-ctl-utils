@@ -5093,7 +5093,7 @@ def publish_committed_pointer(run_dir: Path, payload: dict) -> Path | None:
     return committed_pointer_path(instance_dir, group)
 
 
-def read_committed_pointer(instance_dir: Path, group: str = "deployment") -> dict | None:
+def read_committed_pointer(instance_dir: Path, group: str = "mutative") -> dict | None:
     path = committed_pointer_path(instance_dir, group)
     if not path.is_file():
         return None
@@ -5104,7 +5104,7 @@ def read_committed_pointer(instance_dir: Path, group: str = "deployment") -> dic
 
 
 def read_instance_state_slot(
-    instance_dir: Path, state: str, group: str = "deployment"
+    instance_dir: Path, state: str, group: str = "mutative"
 ) -> dict | None:
     """A run slot sitting beside committed.yaml in the SAME instance dir.
 
@@ -5191,6 +5191,11 @@ def record_workflow_members(
     facts: dict = {"target_instances": target_instances}
     if default_action:
         facts["default_action"] = default_action
+    # derived here, where the composition is known, so a reader of the record
+    # never has to re-derive it and cannot derive it differently
+    group = workflow_group(facts)
+    if group:
+        facts["group"] = group
     if workflow_cfg.get("member_selectors"):
         facts["member_selectors"] = workflow_cfg["member_selectors"]
     update_run_metadata(run_dir, facts)
@@ -8529,7 +8534,7 @@ def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
     return ("outdated" if reasons else "up_to_date"), reasons
 
 
-def _run_status(instance_dir: Path, group: str = "deployment") -> dict:
+def _run_status(instance_dir: Path, group: str = "mutative") -> dict:
     """What the last (or current) run on this instance did.
 
     Returns `status`, its `reasons`, whether a mutation had begun, and — the part
@@ -8584,7 +8589,7 @@ def _mutating_run_status(
     """The live run axes of a deployment instance.
 
     §Phase 73: provision and destroy now share one instance directory and one
-    `committed/deployment.yaml`, so there are no longer two direction prefixes to
+    `committed/mutative.yaml`, so there are no longer two direction prefixes to
     merge — the slot and the pointer are read from one place, and the action comes
     from whichever record is there.
     """
@@ -8593,7 +8598,7 @@ def _mutating_run_status(
         ("in_progress", "running", in_progress_verdict_reason),
         ("failed", "failed", failed_verdict_reason),
     ):
-        slot = read_instance_state_slot(instance_dir, state, "deployment")
+        slot = read_instance_state_slot(instance_dir, state, "mutative")
         if slot is not None:
             return (
                 status,
@@ -8601,7 +8606,7 @@ def _mutating_run_status(
                 slot.get("mutation_started") is True,
                 slot.get("action"),
             )
-    pointer = read_committed_pointer(instance_dir, "deployment")
+    pointer = read_committed_pointer(instance_dir, "mutative")
     if pointer is None:
         return None, [], False, None
     return "passed", [], False, pointer.get("action")
@@ -8648,7 +8653,7 @@ def compute_target_instance_status(
     # Same rule as `at` and `run_id` — one row, one run.
     if run["action"]:
         result["last_action"] = run["action"]
-    if group == "deployment" and pointer and not mutation_started:
+    if group == "mutative" and pointer and not mutation_started:
         if str(pointer.get("action")) != "destroy":
             freshness, freshness_reasons = _freshness(pointer, spec)
             result["freshness"] = freshness
@@ -8760,7 +8765,7 @@ def compute_workflow_instance_status(
     }
     if status is not None:
         result["status"] = status
-    if group == "deployment" and pointer is not None and not mutation_started:
+    if group == "mutative" and pointer is not None and not mutation_started:
         own_freshness, own_reasons = _freshness(pointer, spec)
         result["freshness"] = (
             "outdated" if (drift or own_freshness == "outdated") else own_freshness
@@ -9643,13 +9648,13 @@ def run_status_command(
 STATUS_GROUP_ACTION = {
     "plan": "plan",
     "readonly": "readonly",
-    "deployment": "provision",
+    "mutative": "provision",
     "maintenance": "maintenance",
 }
 STATUS_GROUPS: dict[str, tuple[str, ...]] = {
     "plan": ("plan",),
     "readonly": ("readonly",),
-    "deployment": MUTATING_ACTIONS,
+    "mutative": MUTATING_ACTIONS,
 }
 
 
@@ -9725,6 +9730,13 @@ def workflow_last_run(
         row["selectors"] = latest["member_selectors"]
     if latest.get("default_action"):
         row["default_action"] = latest["default_action"]
+    # §Phase 82: the group this run belonged to. Read from the record when the
+    # run wrote one, otherwise DERIVED from the members it recorded — a run from
+    # before the field existed still answers, rather than filtering out as though
+    # it had no group at all.
+    group = latest.get("group") or workflow_group(latest)
+    if group:
+        row["group"] = group
     target_instances = latest.get("target_instances")
     if target_instances:
         # Qualified for the same reason the parent link is: these point at the
@@ -10024,9 +10036,12 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         "--write-cache",
         action="store_true",
         help="also persist the computed map as an advisory, self-dated "
-        "status_cache.yaml at the namespace root under --ctl-state-local-root "
-        "(requires --all — the cache is a whole-namespace map). Default: "
-        "print only, write nothing. Never touches committed pointers.",
+        "status_cache.yaml at the namespace root under --ctl-state-local-root, "
+        "and a dated copy under _local/status_history/ so past answers stay "
+        "readable "
+        "(requires --all — the cache is a whole-namespace map). LOCAL ONLY: "
+        "status never writes to ctl-state itself. Default: print only, write "
+        "nothing. Never touches committed pointers.",
     )
 
 
@@ -10232,19 +10247,32 @@ def filter_status_map(
     an empty row would read as "nothing happened here", which is a different
     claim from "you asked not to see it".
 
-    §Phase 73: groups are a TARGET concept — a workflow publishes history, which
-    has none. Asking for workflows AND a group is therefore a contradiction that
-    can only ever return nothing, so it is refused rather than answered emptily.
+    §Phase 73 refused `--kind workflow --group ...` outright: groups were a TARGET
+    concept and a workflow published history, which had none.
+
+    §Phase 82 makes a workflow's group DERIVED from its members' actions, so the
+    question now has an answer and is filtered rather than refused. A workflow row
+    carries its group as a FIELD (it still publishes history, not grouped state),
+    so it is matched on that field while a target row is matched on which group
+    partitions it holds. Two shapes, one question.
     """
-    if groups and kinds and set(kinds) <= GROUPLESS_KINDS:
-        raise RuntimeError(
-            f"❌ --kind {', '.join(sorted(kinds))} cannot be combined with --group: "
-            f"{'a workflow publishes history, which has no status groups'}. "
-            "Drop --group, or ask for --kind target"
-        )
 
     def _keep(row: dict) -> dict:
         return {g: axes for g, axes in row.items() if not groups or g in groups}
+
+    def _keep_groupless(row: dict) -> dict:
+        """A history row is kept whole or dropped, on the group it records.
+
+        The group sits on the RUN, not on the row wrapper — a workflow row is
+        `{"last_run": {...}}` — so it is read one level in. Looking at the wrapper
+        finds nothing and silently drops every workflow, which is exactly what it
+        did on the first attempt.
+        """
+        if not groups:
+            return row
+        run = row.get("last_run") if isinstance(row, dict) else None
+        recorded = run.get("group") if isinstance(run, dict) else None
+        return row if recorded in groups else {}
 
     selected: dict = {}
     for kind, templates in instances.items():
@@ -10254,16 +10282,17 @@ def filter_status_map(
         for template, body in templates.items():
             # A template holds either an `instances` map or, for a singleton, the
             # groups directly.
+            keep = _keep_groupless if kind in GROUPLESS_KINDS else _keep
             if INSTANCES_MARKER in body:
                 kept = {
                     segs: g
                     for segs, row in body[INSTANCES_MARKER].items()
-                    if (g := _keep(row))
+                    if (g := keep(row))
                 }
                 if kept:
                     kept_templates[template] = {INSTANCES_MARKER: kept}
             else:
-                kept = _keep(body)
+                kept = keep(body)
                 if kept:
                     kept_templates[template] = kept
         if kept_templates:
@@ -10345,12 +10374,37 @@ def run_status_all_command(
         # `report` already carries `kinds`/`groups` when a filter was applied, so
         # a filtered cache states which view produced it and cannot be mistaken
         # for a whole-namespace map.
-        cache = {"advisory": True, "source": "status runner", **report}
-        cache_path = (
-            Path(args.ctl_state_local_root) / namespace_key / "status_cache.yaml"
-        )
+        queried_at = utc_timestamp()
+        cache = {"advisory": True, "source": "status runner", "queried_at": queried_at, **report}
+        namespace_dir = Path(args.ctl_state_local_root) / namespace_key
+        cache_path = namespace_dir / "status_cache.yaml"
         write_yaml_file(cache_path, cache)
-        report = {**report, "cache_written": cache_path.as_posix()}
+
+        # §Phase 82: every query is also kept, dated, so a reader can see what
+        # status SAID at a past moment rather than only what it says now.
+        #
+        # LOCAL ONLY, and that is the point. `status` is read-only against
+        # ctl-state; writing a query record into the synced tree would make a read
+        # command mutate, fail under read-only credentials, and add sync churn for
+        # something no other run consumes. The local root is already an advisory
+        # mirror that is never truth, which is exactly what a query log is.
+        #
+        # The LATEST stays at the namespace root under its stable name, so the one
+        # path a tool reads does not move as history accumulates.
+        # `_local` is a SIBLING of the namespaces, not a child of one — the same
+        # place run workspaces live. Nesting it under the namespace would put a
+        # never-synced directory inside a tree that IS synced.
+        history_path = (
+            Path(args.ctl_state_local_root)
+            .joinpath(*LOCAL_ONLY_LOCATOR)
+            / "status_history"
+            / namespace_key
+            / f"{queried_at.replace(':', '-')}.yaml"
+        )
+        write_yaml_file(history_path, cache)
+        report = {**report,
+                  "cache_written": cache_path.as_posix(),
+                  "history_written": history_path.as_posix()}
     print(yaml.safe_dump(report, sort_keys=False).rstrip())
     return report
 
@@ -12047,13 +12101,61 @@ RESULT_KINDS = ("target", "workflow")
 GROUP_BY_ACTION = {
     "plan": "plan",
     "readonly": "readonly",
-    "provision": "deployment",
-    "destroy": "deployment",
+    "provision": "mutative",
+    "destroy": "mutative",
     "maintenance": "maintenance",
 }
-RESULT_GROUPS = ("plan", "readonly", "deployment", "maintenance")
+RESULT_GROUPS = ("plan", "readonly", "mutative", "maintenance")
 # §Phase 73: kinds that publish history rather than grouped state.
 GROUPLESS_KINDS = frozenset({"workflow"})
+
+
+# §Phase 82: a workflow's group is DERIVED from what its members do, never
+# declared. A declared flag can disagree with the composition and nothing would
+# catch it; the members are already recorded, so the answer is already there.
+#
+# Precedence answers "what is the strongest thing this workflow does". A
+# composition that provisions one target and plans another IS a mutation — the
+# plan does not soften it — so mutative wins over everything, and readonly is the
+# weakest claim a workflow can make.
+GROUP_PRECEDENCE = ("mutative", "maintenance", "plan", "readonly")
+
+
+def recorded_member_actions(facts: dict) -> list[str]:
+    """The action each RECORDED member ran.
+
+    Distinct from `workflow_member_actions`, which reads a workflow's CFG. This
+    reads the run record, where a member is already resolved to an instance.
+
+    A member is a bare address when it took the workflow's `default_action`, and
+    `{instance, action}` when it differs (§Phase 73). Both forms appear in one
+    list, so both are read here rather than at every call site.
+    """
+    default_action = facts.get("default_action")
+    actions: list[str] = []
+    for member in facts.get("target_instances") or []:
+        if isinstance(member, dict):
+            action = member.get("action") or default_action
+        else:
+            action = default_action
+        if action:
+            actions.append(str(action))
+    return actions
+
+
+def workflow_group(facts: dict) -> str | None:
+    """The group a workflow belongs to, derived from its members' actions.
+
+    None when the composition records no action at all — an empty or malformed
+    record answers nothing rather than defaulting into a group it may not be in.
+    """
+    groups = {action_group(action) for action in recorded_member_actions(facts)}
+    if not groups:
+        return None
+    for group in GROUP_PRECEDENCE:
+        if group in groups:
+            return group
+    raise RuntimeError(f"❌ workflow members resolve to unknown group(s): {sorted(groups)}")
 
 
 def action_group(action: str) -> str:

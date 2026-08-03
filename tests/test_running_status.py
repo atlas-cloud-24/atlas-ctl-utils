@@ -27,21 +27,21 @@ TARGET_SPEC = {
 }
 
 
-def _write_committed(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
+def _write_committed(namespace: Path, prefix: str, group: str = "mutative", **facts) -> None:
     common.write_yaml_file(
         namespace / prefix / "committed" / f"{group}.yaml",
         {"run_id": "r1", "status": "ok", **facts},
     )
 
 
-def _write_in_progress(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
+def _write_in_progress(namespace: Path, prefix: str, group: str = "mutative", **facts) -> None:
     common.write_yaml_file(
         namespace / prefix / "in_progress" / group / "STATUS.yaml",
         {"run_id": "r2", "action": "provision", "status": "in_progress", **facts},
     )
 
 
-def _write_failed(namespace: Path, prefix: str, group: str = "deployment", **facts) -> None:
+def _write_failed(namespace: Path, prefix: str, group: str = "mutative", **facts) -> None:
     common.write_yaml_file(
         namespace / prefix / "failed" / group / "STATUS.yaml",
         {
@@ -247,14 +247,14 @@ class StatusFilterTest(unittest.TestCase):
                 "instances": {
                     "account=dev": {
                         "plan": {"status": "passed"},
-                        "deployment": {"state": "provisioned", "freshness": "current"},
+                        "mutative": {"state": "provisioned", "freshness": "current"},
                     }
                 }
             },
             "env/acm": {"instances": {"account=dev": {"plan": {"status": "passed"}}}},
         },
         "workflow": {
-            "env/baseline": {"instances": {"sha256=x": {"deployment": {"state": "provisioned"}}}}
+            "env/baseline": {"instances": {"sha256=x": {"mutative": {"state": "provisioned"}}}}
         },
     }
 
@@ -264,13 +264,13 @@ class StatusFilterTest(unittest.TestCase):
         self.assertEqual({"env/baseline"}, set(got["workflow"]))
 
     def test_group_keeps_only_matching_groups(self):
-        got = common.filter_status_map(self.MAP, None, ["deployment"])
-        self.assertEqual({"deployment"}, set(got["target"]["env/core"]["instances"]["account=dev"]))
+        got = common.filter_status_map(self.MAP, None, ["mutative"])
+        self.assertEqual({"mutative"}, set(got["target"]["env/core"]["instances"]["account=dev"]))
 
     def test_a_row_left_with_no_group_is_dropped(self):
         """Not shown empty: an empty row reads as "nothing happened here", a
         different claim from "you asked not to see it"."""
-        got = common.filter_status_map(self.MAP, None, ["deployment"])
+        got = common.filter_status_map(self.MAP, None, ["mutative"])
         self.assertNotIn("env/acm", got["target"])
 
     def test_both_filters_compose(self):
@@ -304,7 +304,7 @@ class TemplateNestingTest(unittest.TestCase):
 
     def test_filtering_a_singleton_template_drops_it_whole(self):
         singleton = {"target": {"env/core": {"plan": {"status": "passed"}}}}
-        self.assertEqual({}, common.filter_status_map(singleton, None, ["deployment"]))
+        self.assertEqual({}, common.filter_status_map(singleton, None, ["mutative"]))
 
 
 class StructureAndSortTest(unittest.TestCase):
@@ -317,10 +317,10 @@ class StructureAndSortTest(unittest.TestCase):
 
     MAP = {
         "target": {
-            "A": {"instances": {"i1": {"deployment": {"status": "passed", "at": "2026-01-01T00:00:00Z"}},
-                                "i2": {"deployment": {"status": "passed", "at": "2026-01-03T00:00:00Z"}}}},
-            "B": {"instances": {"i1": {"deployment": {"status": "passed", "at": "2026-01-02T00:00:00Z"}},
-                                "i2": {"deployment": {"status": "passed", "at": "2026-01-04T00:00:00Z"}}}},
+            "A": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-01T00:00:00Z"}},
+                                "i2": {"mutative": {"status": "passed", "at": "2026-01-03T00:00:00Z"}}}},
+            "B": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-02T00:00:00Z"}},
+                                "i2": {"mutative": {"status": "passed", "at": "2026-01-04T00:00:00Z"}}}},
         }
     }
 
@@ -350,7 +350,7 @@ class StructureAndSortTest(unittest.TestCase):
         mixed = {
             **self.MAP,
             "workflow": {
-                "W": {"instances": {"i1": {"deployment": {"status": "passed", "at": "2026-01-05T00:00:00Z"}}}}
+                "W": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-05T00:00:00Z"}}}}
             },
         }
         got = common.structure_status_map(mixed, "flat", "time:desc")
@@ -360,7 +360,7 @@ class StructureAndSortTest(unittest.TestCase):
     def test_flat_rows_carry_their_own_address_and_group(self):
         row = common.structure_status_map(self.MAP, "flat", "time:asc")["instances"][0]
         self.assertEqual("target/A/instances/i1", row["address"])
-        self.assertEqual("deployment", row["group"])
+        self.assertEqual("mutative", row["group"])
         self.assertEqual("passed", row["status"])
 
     def test_address_sort_is_the_default_direction_ascending(self):

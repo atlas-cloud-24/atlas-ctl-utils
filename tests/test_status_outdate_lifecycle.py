@@ -38,7 +38,7 @@ class Namespace:
         return self.root / common.compose_state_relpath(kind, key, segments)
 
     def publish(self, kind: str, key: str, segments: list[str], *, run_id: str,
-                group: str = "deployment", action: str = "provision",
+                group: str = "mutative", action: str = "provision",
                 at: str = "2026-07-30T10:00:00Z", children: list[dict] | None = None,
                 **facts) -> Path:
         pointer = {
@@ -56,7 +56,7 @@ class Namespace:
         return path
 
     def slot(self, kind: str, key: str, segments: list[str], state: str, *,
-             group: str = "deployment", **facts) -> None:
+             group: str = "mutative", **facts) -> None:
         common.write_yaml_file(
             common.state_slot_dir(self.instance(kind, key, segments), state, group)
             / "STATUS.yaml",
@@ -88,13 +88,13 @@ class Namespace:
 
         for state in ("in_progress", "failed"):
             directory = common.state_slot_dir(
-                self.instance(kind, key, segments), state, "deployment"
+                self.instance(kind, key, segments), state, "mutative"
             )
             if directory.exists():
                 shutil.rmtree(directory)
 
     def outdate(self, kind: str, key: str, segments: list[str], *,
-                group: str = "deployment", reason: str = "a dependency changed") -> None:
+                group: str = "mutative", reason: str = "a dependency changed") -> None:
         path = common.committed_pointer_path(self.instance(kind, key, segments), group)
         common.mark_committed_status_outdated(
             path, common.load_yaml(path) or {}, reason=reason
@@ -105,7 +105,7 @@ class Namespace:
         return common.compute_namespace_status_map(self.root)
 
     def row(self, kind: str, key: str, segments: list[str],
-            group: str = "deployment") -> dict:
+            group: str = "mutative") -> dict:
         instances = self.rows()[kind][key]
         block = instances["instances"]["/".join(segments)] if segments else instances
         return block.get(group, {})
