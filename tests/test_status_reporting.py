@@ -32,10 +32,10 @@ def _instance(ns: Path, kind: str, key: str, segments: list[str]) -> Path:
 
 
 def _publish(ns: Path, kind: str, key: str, segments: list[str], *, group="deployment",
-             action="provision", at="2026-07-30T15:05:34Z", **facts) -> None:
+             action="provision", at="2026-07-30T15:05:34Z", run_id="r1", **facts) -> None:
     common.write_yaml_file(
         common.committed_pointer_path(_instance(ns, kind, key, segments), group),
-        {"run_id": "r1", "status": "ok", "committed_at": at, "action": action, **facts},
+        {"run_id": run_id, "status": "ok", "committed_at": at, "action": action, **facts},
     )
 
 
@@ -264,3 +264,292 @@ class StatusArgumentsTest(unittest.TestCase):
         """The group narrows the target rows; the workflow rows are unaffected."""
         common.filter_status_map({}, ["target", "workflow"], ["deployment"])
         common.filter_status_map({}, None, ["deployment"])
+
+
+class RunIdentityTest(unittest.TestCase):
+    """`status` and `at`/`run_id` must describe ONE run.
+
+    Observed 2026-08-03 on a real namespace: a destroy failed after an earlier
+    provision had committed, and the row reported the failure's status beside the
+    SUCCESS's timestamp and run id — so anyone chasing the failure opened the
+    wrong run directory. While the newest run succeeds the two agree, which is
+    why it went unnoticed; it only diverges once a run fails after a success.
+    """
+
+    def _instance_with_failure_after_success(self, ns: Path) -> dict:
+        _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS,
+                 at="2026-08-03T11:12:17Z", run_id="r-provision")
+        common.write_yaml_file(
+            common.state_slot_dir(
+                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "deployment"
+            ) / "STATUS.yaml",
+            {"run_id": "r-destroy", "action": "destroy", "status": "failed",
+             "updated_at": "2026-08-03T11:22:26Z", "mutation_started": True},
+        )
+        return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+
+    def test_at_is_the_failed_runs_time_not_the_last_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._instance_with_failure_after_success(Path(tmp))
+            self.assertEqual("failed", row["status"])
+            self.assertEqual("2026-08-03T11:22:26Z", row["at"])
+
+    def test_run_id_is_the_failed_run(self):
+        """The worse half: the detailed row carried the SUCCESSFUL run's id, so
+        anyone opening it landed in the wrong run directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            self._instance_with_failure_after_success(ns)
+            detail = common.compute_target_instance_status(
+                ns, "provision",
+                {"key": TARGET_KEY, "segments": TARGET_SEGMENTS,
+                 "address": f"{TARGET_KEY}/instances/" + "/".join(TARGET_SEGMENTS)},
+            )
+            self.assertEqual("failed", detail["status"])
+            self.assertEqual("r-destroy", detail["run_id"])
+            self.assertEqual("r-provision", detail["committed_run_id"])
+
+    def test_the_flat_row_does_not_carry_a_second_timestamp(self):
+        """`committed_at` lives on the DETAILED row only — a field that appears
+        just when a run failed after a success makes the common row harder to
+        scan, and two timestamps invite misreading which is which."""
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._instance_with_failure_after_success(Path(tmp))
+            self.assertEqual(["status", "last_action", "at"], list(row))
+
+    def test_a_clean_row_does_not_repeat_itself(self):
+        """When one run is both newest and committed, there is nothing to add."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
+            row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            self.assertNotIn("committed_at", row)
+            self.assertNotIn("committed_run_id", row)
+
+
+class LastActionTest(unittest.TestCase):
+    """The direction of the last published run is stated, not inferred.
+
+    Before this, a destroyed instance and a provisioned one differed only by
+    `freshness` being ABSENT — a reader had to know that absence meant "the last
+    thing that succeeded was a destroy". `state` stays gone (ctl never observes
+    the cloud); this is what ctl's OWN run did.
+    """
+
+    def _row(self, ns: Path, action: str) -> dict:
+        _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action=action)
+        return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+
+    def test_a_provisioned_instance_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp), "provision")
+            self.assertEqual("provision", row["last_action"])
+            self.assertEqual("up_to_date", row["freshness"])
+
+    def test_a_destroyed_instance_says_so_instead_of_omitting_freshness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp), "destroy")
+            self.assertEqual("destroy", row["last_action"])
+            self.assertNotIn("freshness", row)
+
+    def test_a_running_instance_reports_the_action_in_flight(self):
+        """A run in progress already knows its direction — that is the moment a
+        reader most wants it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "in_progress")
+            row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            self.assertEqual("running", row["status"])
+            self.assertEqual("provision", row["last_action"])
+
+    def test_a_failed_destroy_after_a_good_provision_reports_destroy(self):
+        """The confusing case from a real namespace: `status: failed` beside
+        `last_action: provision` reads as "the provision failed", when the
+        provision succeeded and the DESTROY failed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action="provision",
+                     run_id="r-ok")
+            common.write_yaml_file(
+                common.state_slot_dir(
+                    _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS),
+                    "failed", "deployment") / "STATUS.yaml",
+                {"run_id": "r-bad", "action": "destroy", "status": "failed",
+                 "updated_at": "2026-08-03T12:52:50Z", "mutation_started": True},
+            )
+            row = common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["deployment"]
+            self.assertEqual("failed", row["status"])
+            self.assertEqual("destroy", row["last_action"])
+
+    def test_last_action_reads_before_freshness(self):
+        """It qualifies `status`, so it sits next to it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp), "provision")
+            self.assertEqual(["status", "last_action", "freshness", "at"], list(row))
+
+
+class WorkflowInstanceTest(unittest.TestCase):
+    """A workflow's history is partitioned by the axes its members vary over.
+
+    Before this, one key fanned across environments reported a single row —
+    whichever child finished last — so "did baseline succeed in test?" could not
+    be answered from the workflow at all.
+    """
+
+    def _run(self, ns: Path, segments: list[str], *, run_id: str, status: str,
+             at: str) -> None:
+        run_dir = (
+            ns / common.compose_state_relpath("workflow", WORKFLOW_KEY, segments)
+            / "runs" / run_id
+        )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        common.write_yaml_file(
+            common.run_metadata_path(run_dir),
+            {"run_id": run_id, "run_type": "workflow", "action": "provision",
+             "status": status, "updated_at": at},
+        )
+
+    def test_each_instance_keeps_its_own_last_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            self._run(ns, ["env.type=dev"], run_id="w-dev", status="ok",
+                      at="2026-08-03T10:00:00Z")
+            self._run(ns, ["env.type=test"], run_id="w-test", status="failed",
+                      at="2026-08-03T11:00:00Z")
+            rows = common.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
+            self.assertEqual(
+                {"env.type=dev", "env.type=test"}, set(rows["instances"])
+            )
+            self.assertEqual("passed", rows["instances"]["env.type=dev"]["last_run"]["status"])
+            self.assertEqual("failed", rows["instances"]["env.type=test"]["last_run"]["status"])
+
+    def test_a_later_run_elsewhere_does_not_answer_for_this_instance(self):
+        """The exact failure: dev succeeded, then test failed later, and the one
+        row reported `failed` for the whole key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            self._run(ns, ["env.type=dev"], run_id="w-dev", status="ok",
+                      at="2026-08-03T10:00:00Z")
+            self._run(ns, ["env.type=test"], run_id="w-test", status="failed",
+                      at="2026-08-03T23:00:00Z")
+            dev = common.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY][
+                "instances"]["env.type=dev"]["last_run"]
+            self.assertEqual("passed", dev["status"])
+            self.assertEqual("2026-08-03T10:00:00Z", dev["at"])
+
+    def test_a_workflow_varying_by_nothing_stays_unnested(self):
+        """A singleton keeps the flat shape — no empty instances/ layer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            self._run(ns, [], run_id="w1", status="ok", at="2026-08-03T10:00:00Z")
+            row = common.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
+            self.assertIn("last_run", row)
+            self.assertNotIn("instances", row)
+
+
+class ParentWorkflowLinkTest(unittest.TestCase):
+    """A target instance names the workflow instance that drove it.
+
+    The workflow row already lists the target instances it ran; without the
+    reverse link, "this target failed — which workflow run was that?" meant
+    opening the run directory by hand.
+    """
+
+    PARENT = "env/workload_permissions_boundary/instances/env.type=dev/aws.account=dev"
+
+    def _row(self, ns: Path, **slot_facts) -> dict:
+        common.write_yaml_file(
+            common.state_slot_dir(
+                _instance(ns, "target", TARGET_KEY, TARGET_SEGMENTS), "failed", "deployment"
+            ) / "STATUS.yaml",
+            {"run_id": "r1", "action": "destroy", "status": "failed",
+             "updated_at": "2026-08-03T12:52:50Z", **slot_facts},
+        )
+        return common.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["deployment"]
+
+    def test_a_spawned_target_names_its_workflow_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp), parent_workflow_instance_address=self.PARENT)
+            self.assertEqual(f"workflow/{self.PARENT}", row["parent_workflow"])
+
+    def test_a_directly_invoked_target_names_none(self):
+        """Absent is a real distinction — the run had no parent — not a gap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp))
+            self.assertNotIn("parent_workflow", row)
+
+    def test_the_run_id_goes_under_its_own_key_when_no_address_was_recorded(self):
+        """Older runs recorded only the id. It gets its OWN field: one key meaning
+        "an address, or else an id" makes every reader branch on shape."""
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(Path(tmp), parent_workflow_run_id="019fc756")
+            self.assertNotIn("parent_workflow", row)
+            self.assertEqual("019fc756", row["parent_workflow_run_id"])
+
+
+class SpawnedChildLearnsItsParentTest(unittest.TestCase):
+    """A spawned child must be TOLD its parent's instance address.
+
+    The in-process path recorded it from the parent's metadata directly, so the
+    field looked wired — but a workflow spawns its children as separate
+    processes, and that path passed only `--parent-workflow-run-id`. Every real
+    run therefore recorded the id and no address, and the status row fell back to
+    the id (observed 2026-08-03).
+    """
+
+    def test_the_spawn_argv_carries_the_parents_instance_address(self):
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "runs" / "p1"
+            parent.mkdir(parents=True)
+            common.write_run_metadata(parent, {
+                "run_id": "p1", "run_type": "workflow", "action": "provision",
+                "instance_address": "env/baseline/instances/env.type=dev",
+                "ctl_state_local_root": tmp, "ctl_state_locator": ["live"],
+            })
+            argv = common.build_child_target_command(
+                {"ctl_entrypoint": "ctl.py", "ctl_cfg_root": Path(tmp),
+                 "ctl_profile": "local_dev", "ctl_state_local_root": tmp,
+                 "execution_runtime_mode": "local", "action": "provision",
+                 "providers": ["aws"], "execution_params": {}},
+                "env/core/baseline", parent_run_dir=parent, parent_run_id="p1",
+            )
+            self.assertIn("--parent-workflow-instance-address", argv)
+            self.assertEqual(
+                "env/baseline/instances/env.type=dev",
+                argv[argv.index("--parent-workflow-instance-address") + 1],
+            )
+
+    def test_a_parent_without_an_instance_address_passes_nothing(self):
+        """A workflow varying over nothing has no instance layer; the child then
+        carries only the run id rather than an empty flag."""
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "runs" / "p1"
+            parent.mkdir(parents=True)
+            common.write_run_metadata(parent, {
+                "run_id": "p1", "run_type": "workflow", "action": "provision",
+                "ctl_state_local_root": tmp, "ctl_state_locator": ["live"],
+            })
+            argv = common.build_child_target_command(
+                {"ctl_entrypoint": "ctl.py", "ctl_cfg_root": Path(tmp),
+                 "ctl_profile": "local_dev", "ctl_state_local_root": tmp,
+                 "execution_runtime_mode": "local", "action": "provision",
+                 "providers": ["aws"], "execution_params": {}},
+                "env/core/baseline", parent_run_dir=parent, parent_run_id="p1",
+            )
+            self.assertNotIn("--parent-workflow-instance-address", argv)

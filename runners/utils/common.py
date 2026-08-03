@@ -3488,6 +3488,16 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
+    # §Phase 78: the parent's INSTANCE address, not just its run id. A spawned
+    # child cannot derive it — it knows neither the workflow key nor the axes the
+    # workflow partitions by — so the parent hands it over like every other fact
+    # the child cannot compute. The in-process path already recorded it.
+    parser.add_argument(
+        "--parent-workflow-instance-address",
+        dest="parent_workflow_instance_address",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
 
 def redact_command_argv(argv: list[str]) -> list[str]:
@@ -3644,8 +3654,9 @@ def load_workflow_cfg(
     }
     # §Phase 73: the matched member's declared default and its selector block travel
     # with the resolved workflow — the run record carries them, and returning only
-    # meta + target_runs silently dropped both.
-    for field in ("default_action", "member_selectors"):
+    # meta + target_runs silently dropped both. §Phase 78 adds the instance params
+    # for the same reason: a field the caller needs must survive resolution.
+    for field in ("default_action", "member_selectors", "workflow_instance_params"):
         if resolved.get(field):
             cfg[field] = resolved[field]
     return cfg
@@ -4548,6 +4559,7 @@ def setup_run_dirs(
     locator_segments: list[str],
     parent_fan_out_run_id: str | None = None,
     parent_workflow_run_id: str | None = None,
+    parent_workflow_instance_address: str | None = None,
     instance_segments: list[str] | None = None,
     instance_address: str | None = None,
     target_addresses: list[str] | None = None,
@@ -4642,6 +4654,8 @@ def setup_run_dirs(
             # namespace mutation lock can tell "my parent holds it" from contention.
             **({"parent_workflow_run_id": parent_workflow_run_id}
                if parent_workflow_run_id else {}),
+            **({"parent_workflow_instance_address": parent_workflow_instance_address}
+               if parent_workflow_instance_address else {}),
         },
     )
 
@@ -4680,6 +4694,7 @@ def setup_preflight_run_dirs(
     identity_doc: dict | None = None,
     parent_fan_out_run_id: str | None = None,
     parent_workflow_run_id: str | None = None,
+    parent_workflow_instance_address: str | None = None,
     execution_access_modes: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
@@ -4747,6 +4762,8 @@ def setup_preflight_run_dirs(
             # namespace mutation lock can tell "my parent holds it" from contention.
             **({"parent_workflow_run_id": parent_workflow_run_id}
                if parent_workflow_run_id else {}),
+            **({"parent_workflow_instance_address": parent_workflow_instance_address}
+               if parent_workflow_instance_address else {}),
         },
     )
     logging.info("Using preflight run_dir: %s", run_dir)
@@ -5140,24 +5157,38 @@ def record_workflow_members(
 ) -> None:
     """§Phase 73: a workflow run records the composition it ran, as history.
 
-    `targets` mirrors the cfg shape — a bare key when it takes the member's
-    `default_action`, `{key, action}` when it differs — so the record reads like
-    the declaration that produced it. `member_selectors` is the matched member's
-    own block copied verbatim, which points back at that declaration and keeps the
-    engine from needing to know a field called "operation".
+    §Phase 78: it records target INSTANCES, not keys. A workflow's own instance
+    params are the UNION of its members', so a member varying over fewer axes has
+    a SHORTER address — which cannot be reconstructed from the workflow's segments.
+    The addresses are already resolved on the run (`target_addresses`), so keying
+    by name would throw away a fact the run already holds.
+
+    Each entry mirrors the cfg shape — a bare address when it takes the member's
+    `default_action`, `{instance, action}` when it differs — so the record reads
+    like the declaration that produced it. `member_selectors` is the matched
+    member's own block copied verbatim, which points back at that declaration and
+    keeps the engine from needing to know a field called "operation".
     """
     default_action = workflow_cfg.get("default_action")
-    targets: list = []
+    resolved_addresses = {
+        split_target_instance_address(address)[0]: address
+        for address in (load_run_metadata(run_dir).get("target_addresses") or [])
+        if isinstance(address, str)
+    }
+    target_instances: list = []
     for target_run in active_target_runs.values():
         key = target_run.get("target")
         if not key:
             continue
+        # A key with no resolved address is a singleton target, whose address IS
+        # its key — never a silent omission.
+        address = resolved_addresses.get(key, key)
         action = target_run.get("action")
         if action and action != default_action:
-            targets.append({"key": key, "action": action})
+            target_instances.append({"instance": address, "action": action})
         else:
-            targets.append(key)
-    facts: dict = {"targets": targets}
+            target_instances.append(address)
+    facts: dict = {"target_instances": target_instances}
     if default_action:
         facts["default_action"] = default_action
     if workflow_cfg.get("member_selectors"):
@@ -8498,36 +8529,53 @@ def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
     return ("outdated" if reasons else "up_to_date"), reasons
 
 
-def _run_status(
-    instance_dir: Path, group: str = "deployment"
-) -> tuple[str | None, list[str], bool]:
+def _run_status(instance_dir: Path, group: str = "deployment") -> dict:
     """What the last (or current) run on this instance did.
 
-    Returns the status, its reasons, and whether a mutation had begun — the
-    second value feeds `state`, because a run that changed resources without
-    completing leaves the instance half-built whether it is still going or
-    already dead.
+    Returns `status`, its `reasons`, whether a mutation had begun, and — the part
+    a row must not take from anywhere else — the RUN THAT PRODUCED THAT STATUS.
+
+    `run_id`/`at` travel with `status` because they describe one event. Reading
+    the status from a slot and the timestamp from the committed pointer mixes two
+    different runs: while the newest run succeeds they agree, so it looks correct;
+    the moment a run FAILS after a success the row reports the failure's status
+    beside the success's time and id, and a reader chasing the failure opens the
+    wrong run (observed 2026-08-03).
     """
-    in_progress = read_instance_state_slot(instance_dir, "in_progress", group)
-    if in_progress is not None:
-        return (
-            "running",
-            [in_progress_verdict_reason(in_progress)],
-            in_progress.get("mutation_started") is True,
-        )
-    failed = read_instance_state_slot(instance_dir, "failed", group)
-    if failed is not None:
-        return (
-            "failed",
-            [failed_verdict_reason(failed)],
-            failed.get("mutation_started") is True,
-        )
+    for state, verdict, reason in (
+        ("in_progress", "running", in_progress_verdict_reason),
+        ("failed", "failed", failed_verdict_reason),
+    ):
+        slot = read_instance_state_slot(instance_dir, state, group)
+        if slot is not None:
+            return {
+                "status": verdict,
+                "reasons": [reason(slot)],
+                "mutation_started": slot.get("mutation_started") is True,
+                "run_id": slot.get("run_id"),
+                "at": slot.get("updated_at"),
+                "action": slot.get("action"),
+                "parent_workflow_instance": slot.get("parent_workflow_instance_address"),
+                "parent_workflow_run_id": slot.get("parent_workflow_run_id"),
+            }
     # No slot AND no committed pointer means nothing ever ran here. `passed`
     # would be a claim of success nobody made, so the caller gets None and omits
     # the group entirely — absence stays absence.
-    if read_committed_pointer(instance_dir, group) is None:
-        return None, [], False
-    return "passed", [], False
+    pointer = read_committed_pointer(instance_dir, group)
+    if pointer is None:
+        return {"status": None, "reasons": [], "mutation_started": False,
+                "run_id": None, "at": None, "action": None,
+                "parent_workflow_instance": None, "parent_workflow_run_id": None}
+    return {
+        "status": "passed",
+        "reasons": [],
+        "mutation_started": False,
+        "run_id": pointer.get("run_id"),
+        "at": pointer.get("committed_at"),
+        "action": pointer.get("action"),
+        "parent_workflow_instance": pointer.get("parent_workflow_instance_address"),
+        "parent_workflow_run_id": pointer.get("parent_workflow_run_id"),
+    }
 
 
 def _mutating_run_status(
@@ -8574,7 +8622,8 @@ def compute_target_instance_status(
         "target", spec["key"], spec["segments"]
     )
     pointer = read_committed_pointer(instance_dir, group)
-    status, reasons, mutation_started = _run_status(instance_dir, group)
+    run = _run_status(instance_dir, group)
+    status, reasons, mutation_started = run["status"], run["reasons"], run["mutation_started"]
 
     result: dict = {
         "kind": "target",
@@ -8587,15 +8636,47 @@ def compute_target_instance_status(
     # resources and committed nothing, so its pointer describes nothing for inputs
     # to have moved away from; `up_to_date` would be false and `outdated`
     # understates it.
+    # §Phase 73 removed `state` (`provisioned`/`destroyed`) because that asserts
+    # what exists in the cloud, which ctl never observes. The ACTION is a
+    # different fact and one ctl owns outright. Without it the direction is
+    # inferred from `freshness` being ABSENT, which is an implicit signal.
+    #
+    # It comes from the run that produced `status`, NOT from the committed
+    # pointer: a failed destroy after a successful provision reported
+    # `status: failed` beside `last_action: provision`, which reads as "the
+    # provision failed" when the provision succeeded and the DESTROY failed.
+    # Same rule as `at` and `run_id` — one row, one run.
+    if run["action"]:
+        result["last_action"] = run["action"]
     if group == "deployment" and pointer and not mutation_started:
         if str(pointer.get("action")) != "destroy":
             freshness, freshness_reasons = _freshness(pointer, spec)
             result["freshness"] = freshness
             reasons = reasons + freshness_reasons
 
-    if pointer:
-        result["run_id"] = pointer.get("run_id")
-        result["at"] = pointer.get("committed_at")
+    # The workflow INSTANCE this run belonged to, closing the loop the workflow
+    # row opens: a workflow instance names the target instances it drove, and a
+    # target instance names the workflow instance that drove it. Absent for a
+    # target run invoked directly, which is a real distinction and not a gap.
+    if run["parent_workflow_instance"]:
+        result["parent_workflow"] = qualified_address(
+            "workflow", run["parent_workflow_instance"]
+        )
+    elif run["parent_workflow_run_id"]:
+        # An older run recorded only the id. It goes under its own key: one field
+        # meaning "an address, or else an id" makes every reader branch on shape.
+        result["parent_workflow_run_id"] = run["parent_workflow_run_id"]
+    # `run_id`/`at` come from whichever run produced `status`, never from the
+    # committed pointer when the two are different runs.
+    if run["run_id"]:
+        result["run_id"] = run["run_id"]
+    if run["at"]:
+        result["at"] = run["at"]
+    # The last PUBLISHED result is a separate fact, and only worth stating when
+    # it is not the run above — otherwise it would repeat `at` on every row.
+    if pointer and pointer.get("run_id") != run["run_id"]:
+        result["committed_at"] = pointer.get("committed_at")
+        result["committed_run_id"] = pointer.get("run_id")
     if reasons:
         result["reasons"] = reasons
     return result
@@ -8618,7 +8699,8 @@ def compute_workflow_instance_status(
         "workflow", spec["key"], spec["segments"]
     )
     pointer = read_committed_pointer(workflow_dir, group)
-    status, reasons, mutation_started = _run_status(workflow_dir, group)
+    run = _run_status(workflow_dir, group)
+    status, reasons, mutation_started = run["status"], run["reasons"], run["mutation_started"]
 
     children: list[dict] = []
     recorded = {
@@ -8685,9 +8767,13 @@ def compute_workflow_instance_status(
         )
         reasons = reasons + own_reasons + drift
 
-    if pointer:
-        result["run_id"] = pointer.get("run_id")
-        result["at"] = pointer.get("committed_at")
+    if run["run_id"]:
+        result["run_id"] = run["run_id"]
+    if run["at"]:
+        result["at"] = run["at"]
+    if pointer and pointer.get("run_id") != run["run_id"]:
+        result["committed_at"] = pointer.get("committed_at")
+        result["committed_run_id"] = pointer.get("run_id")
     if reasons:
         result["reasons"] = list(dict.fromkeys(reasons))
     result["children"] = children
@@ -9345,7 +9431,9 @@ def _targeted_workflow_status(namespace_root: Path, spec: dict) -> dict:
     publishing one — the query answered nothing rather than failing.
     """
     result = {"kind": "workflow", "key": spec["key"], "address": spec["address"]}
-    last_run = workflow_last_run(namespace_root, spec["key"])
+    last_run = workflow_last_run(
+        namespace_root, spec["key"], spec.get("segments") or []
+    )
     if last_run:
         result["last_run"] = last_run
     return result
@@ -9568,7 +9656,12 @@ STATUS_GROUPS: dict[str, tuple[str, ...]] = {
 # §Phase 73: one shape for every kind. `status` first because it is the fact a
 # reader acts on, `freshness` second because it qualifies a published result, `at`
 # last because it dates the record rather than describing it.
-AXIS_ORDER = ("status", "freshness", "at")
+# `committed_at`/`committed_run_id` stay OUT of the flat row: a field that
+# appears only when a run failed after a success makes the common row harder to
+# scan, and two timestamps invite misreading which is which. They remain on the
+# detailed row, where a reader is already investigating.
+AXIS_ORDER = ("status", "last_action", "freshness", "at",
+              "parent_workflow", "parent_workflow_run_id")
 
 
 def order_axes(axes: dict[str, str]) -> dict[str, str]:
@@ -9584,24 +9677,33 @@ def _axis_row(computed: dict) -> dict[str, str]:
     """
     row = {
         axis: computed[axis]
-        for axis in ("status", "freshness")
+        for axis in ("status", "last_action", "freshness")
         if computed.get(axis)
     }
     if not row.get("status"):
         return {}
-    if computed.get("at"):
-        row["at"] = computed["at"]
+    for field in ("at", "parent_workflow", "parent_workflow_run_id"):
+        if computed.get(field):
+            row[field] = computed[field]
     return order_axes(row)
 
 
-def workflow_last_run(namespace_root: Path, key: str) -> dict | None:
-    """The most recent run of a workflow key — its record, not its state.
+def workflow_last_run(
+    namespace_root: Path, key: str, segments: list[str] | None = None
+) -> dict | None:
+    """The most recent run of one workflow INSTANCE — its record, not its state.
 
     §Phase 73: a workflow owns execution, so there is no pointer to read. The row
     is the last run: what it did, what selected its members, and which members it
     ran with.
+
+    §Phase 78: per INSTANCE. One key fanned across environments used to report a
+    single row — whichever child finished last — so "did this succeed in test?"
+    was unanswerable from the workflow.
     """
-    runs_dir = namespace_root / compose_state_relpath("workflow", key, []) / "runs"
+    runs_dir = (
+        namespace_root / compose_state_relpath("workflow", key, segments) / "runs"
+    )
     if not runs_dir.is_dir():
         return None
     records = []
@@ -9623,9 +9725,17 @@ def workflow_last_run(namespace_root: Path, key: str) -> dict | None:
         row["selectors"] = latest["member_selectors"]
     if latest.get("default_action"):
         row["default_action"] = latest["default_action"]
-    targets = latest.get("targets")
-    if targets:
-        row["targets"] = targets
+    target_instances = latest.get("target_instances")
+    if target_instances:
+        # Qualified for the same reason the parent link is: these point at the
+        # TARGET rows in this map, and an address a reader can paste back into a
+        # query beats one they have to prefix by hand.
+        row["target_instances"] = [
+            qualified_address("target", entry)
+            if isinstance(entry, str)
+            else {**entry, "instance": qualified_address("target", entry["instance"])}
+            for entry in target_instances
+        ]
     return row
 
 
@@ -9699,7 +9809,7 @@ def compute_namespace_status_map(
     if not namespace_root.is_dir():
         return {}
     targets: set[tuple[str, tuple[str, ...]]] = set()
-    workflows: set[str] = set()
+    workflows: set[tuple[str, tuple[str, ...]]] = set()
     # An instance is discovered by anything it has PUBLISHED or is DOING. Scanning
     # only for committed pointers hid a first-ever run entirely: it has written a
     # slot and no pointer, so `--all` reported an empty namespace while a run was
@@ -9718,13 +9828,15 @@ def compute_namespace_status_map(
             continue
         targets.add((parsed["key"], tuple(parsed["instance_segments"])))
     # §Phase 73: a workflow is discovered by its RUNS. It publishes no pointer, so
-    # there is nothing else to find it by.
+    # there is nothing else to find it by. §Phase 78: the parsed segments are KEPT,
+    # so a key fanned across environments yields one row per environment instead of
+    # collapsing to whichever child ran last.
     workflow_root = namespace_root / "workflow"
     if workflow_root.is_dir():
         for runs_dir in workflow_root.rglob("runs"):
             parsed = parse_state_relpath(namespace_root, runs_dir.parent)
             if parsed is not None and parsed["kind"] == "workflow":
-                workflows.add(parsed["key"])
+                workflows.add((parsed["key"], tuple(parsed["instance_segments"])))
     rows: dict[str, dict[str, dict[str, dict[str, str]]]] = {
         kind: {} for kind in RESULT_KINDS
     }
@@ -9750,9 +9862,14 @@ def compute_namespace_status_map(
                 groups[group] = axes
         if groups:
             _place_instance(rows, "target", key, segments, groups)
-    for key in workflows:
-        last_run = workflow_last_run(namespace_root, key)
-        if last_run:
+    for key, seg in workflows:
+        segments = list(seg)
+        last_run = workflow_last_run(namespace_root, key, segments)
+        if not last_run:
+            continue
+        if segments:
+            _place_instance(rows, "workflow", key, segments, {"last_run": last_run})
+        else:
             rows["workflow"][key] = {"last_run": last_run}
     # Kind is the OUTER key, so a reader sees where the workflows are and where
     # the targets are without parsing a prefix off every address.
@@ -11175,6 +11292,12 @@ def build_child_target_command(
         # run id below is provenance only, and is deliberately not a credential.
         "--parent-workflow-run-id", parent_run_id,
     ]
+    # Read from the parent's own record rather than the frozen spec: the spec is
+    # about how to INVOKE a child, the instance address is a fact about the parent,
+    # and taking it from the record it is written in leaves nothing to drift.
+    parent_instance_address = load_run_metadata(parent_run_dir).get("instance_address")
+    if parent_instance_address:
+        argv += ["--parent-workflow-instance-address", str(parent_instance_address)]
     if spec.get("providers"):
         argv += ["--providers", ",".join(spec["providers"])]
     # The cadence has no default, so a child cannot inherit one: the parent's
@@ -11839,6 +11962,16 @@ def evaluate_mutation_lock(
 INSTANCES_MARKER = "instances"
 
 
+def qualified_address(kind: str, address: str) -> str:
+    """`<kind>/<instance address>` — the form `--structure flat` already emits.
+
+    A cross-reference between kinds must say WHICH kind it points at: without it
+    `env/baseline` is ambiguous between a workflow and a target of the same name,
+    and a reader cannot paste it back into a query.
+    """
+    return address if address.startswith(f"{kind}/") else f"{kind}/{address}"
+
+
 def instance_address(key: str, instance_segments: list[str]) -> str:
     """The canonical instance address: `<key>` for a singleton, otherwise
     `<key>/instances/<seg>/<seg>` — the SAME path form as the state dir layout,
@@ -12058,6 +12191,249 @@ def resolve_run_locator_segments(
     return [namespace_key]
 
 
+def workflow_instance_address(workflow_name: str, segments: list[str]) -> str:
+    """`env/baseline` when a workflow varies by nothing; otherwise the Hive path.
+
+    Same shape as a target instance address, so one addressing scheme covers both
+    kinds and a reader can tell which environment a run belongs to by reading it.
+    """
+    return instance_address(workflow_name, segments)
+
+
+def workflow_target_key_entries(
+    workflow: dict, workflows: dict, *, label: str, _seen: tuple = ()
+) -> list[str]:
+    """Every target key a workflow can run, across ALL its member branches.
+
+    Static: no execution context, so every branch counts rather than the one a
+    run would select — a misdeclaration in an unselected branch is still a
+    misdeclaration. Imports are followed, since an imported workflow's members
+    are this workflow's members too.
+    """
+    name = str(workflow.get("__name__", ""))
+    keys: list[str] = []
+    for imported in workflow.get("import_workflow_keys") or []:
+        if imported in _seen or imported not in workflows:
+            continue
+        keys += workflow_target_key_entries(
+            {**workflows[imported], "__name__": imported},
+            workflows,
+            label=label,
+            _seen=(*_seen, name, imported),
+        )
+    target_keys = workflow.get("target_keys")
+    branches = (
+        [member.get("target_keys") or [] for member in (target_keys.get("members") or [])]
+        if isinstance(target_keys, dict)
+        else [target_keys or []]
+    )
+    for branch in branches:
+        for entry in branch:
+            key = entry.get("key") if isinstance(entry, dict) else entry
+            if isinstance(key, str) and key and key not in keys:
+                keys.append(key)
+    return keys
+
+
+def _selector_branches(declared) -> list[tuple[list[str], dict | None]]:
+    """A params declaration as `(params, selectors)` branches.
+
+    A plain list is ONE branch with no condition — it applies always. A
+    members-shaped declaration is one branch per member.
+    """
+    if declared is None:
+        return [([], None)]
+    if isinstance(declared, dict):
+        return [
+            (list(member.get("params") or []), member.get("selectors"))
+            for member in (declared.get("members") or [])
+        ]
+    if isinstance(declared, list):
+        return [(list(declared), None)]
+    return []
+
+
+def _selectors_can_both_hold(left: dict | None, right: dict | None, *, label: str) -> bool:
+    """Whether one execution context could satisfy both selector blocks.
+
+    Not subset: neither condition contains the other, they merely have to be
+    SATISFIABLE together. Two blocks conflict only where they constrain the same
+    reference to disjoint value sets; a reference only one of them names is free.
+    """
+    left_req = selector_requirements(left, label=label)
+    right_req = selector_requirements(right, label=label)
+    for ref, values in left_req.items():
+        other = right_req.get(ref)
+        if other is not None and not (values & other):
+            return False
+    return True
+
+
+def validate_all_workflow_instance_params(workflows: dict, targets: dict) -> None:
+    """Every workflow's declared instance params, checked STATICALLY.
+
+    The per-run guard is exact but only ever sees the workflow being run, so a
+    misdeclaration elsewhere stays silent until someone runs it. This is the
+    whole-cfg pass: it compares each workflow BRANCH against the target params
+    that apply under that branch's condition, with no execution context and no
+    resolution.
+
+    A target's plain list applies to every branch; a members-shaped target
+    contributes only the branches whose selectors could hold together with the
+    workflow branch's. If SEVERAL branches of one target could hold and they
+    declare different params, the workflow branch does not pin the axis that
+    target dispatches on, and no single declaration can be correct — that is an
+    error rather than a guess.
+    """
+    for name, workflow in sorted(workflows.items()):
+        if not isinstance(workflow, dict):
+            continue
+        label = f"workflow {name!r}"
+        member_keys = workflow_target_key_entries(
+            {**workflow, "__name__": name}, workflows, label=label
+        )
+        for params, selectors in _selector_branches(
+            workflow.get("workflow_instance_params")
+        ):
+            union: list[str] = []
+            for key in member_keys:
+                target = targets.get(key)
+                if not isinstance(target, dict):
+                    continue  # not in this cfg's inventory; the per-run guard sees it
+                applicable = [
+                    branch
+                    for branch in _selector_branches(target.get("target_instance_params"))
+                    if _selectors_can_both_hold(selectors, branch[1], label=label)
+                ]
+                distinct = {tuple(branch[0]) for branch in applicable}
+                if len(distinct) > 1:
+                    raise RuntimeError(
+                        f"❌ {label}: a branch selected by {selectors!r} matches "
+                        f"{len(distinct)} different instance-param branches of target "
+                        f"{key!r} ({sorted(distinct)}). The workflow branch does not pin "
+                        "the axis that target dispatches on, so no single declaration is "
+                        "correct — split the workflow branch the way the target is split"
+                    )
+                for branch_params in applicable:
+                    for param in branch_params[0]:
+                        if param not in union:
+                            union.append(param)
+            missing = sorted(set(union) - set(params))
+            extra = sorted(set(params) - set(union))
+            if missing:
+                raise RuntimeError(
+                    f"❌ {label}: workflow_instance_params branch {params} is missing "
+                    f"{missing}, which its members instance over. Two target instances "
+                    "would share one workflow address and their histories would merge"
+                )
+            if extra:
+                raise RuntimeError(
+                    f"❌ {label}: workflow_instance_params branch {params} declares "
+                    f"{extra}, which no member instances over. That address can never "
+                    "differ, and it tells a reader the workflow varies by an axis it "
+                    "does not"
+                )
+
+
+def workflow_member_instance_params(
+    workflow_cfg: dict, targets: dict, *, label: str
+) -> tuple[list[str], bool]:
+    """The union of the instance params of every target this workflow runs.
+
+    UNION, not intersection: members may instance on different axes — one over
+    two params, another over just one of them — and a workflow must partition by
+    everything ANY member varies over. Otherwise two target instances collapse
+    into one workflow address and their histories merge.
+
+    Returns the union and whether it is COMPLETE — a member missing from this
+    action's inventory contributes unknown axes, so the caller must not conclude
+    that a declared param is spare.
+    """
+    union: list[str] = []
+    complete = True
+    for entry in workflow_cfg.get("target_runs") or []:
+        name = entry if isinstance(entry, str) else entry.get("target")
+        if not name:
+            continue
+        # A member absent from THIS action's inventory contributes no axes. The
+        # sibling resolver is tolerant the same way (`targets.get(name) or {}`);
+        # raising here would turn "this workflow is not runnable for this action"
+        # into a hard failure at identity resolution, which is not this guard's
+        # job — the action allowlist already answers that.
+        target_def = targets.get(name)
+        if target_def is None:
+            # Absent from THIS action's inventory, so its axes are unknown here
+            # and the union is incomplete. Raising would turn "not runnable for
+            # this action" into a hard failure, which the action allowlist
+            # already answers.
+            complete = False
+            continue
+        for param in target_def.get("target_instance_params") or []:
+            if param not in union:
+                union.append(param)
+    return union, complete
+
+
+def validate_workflow_instance_params(
+    declared, workflow_cfg: dict, targets: dict, *, label: str,
+    execution_context: dict[str, object] | None = None,
+) -> list[str]:
+    """A workflow's declared instance params must EQUAL its members' union.
+
+    Declared rather than derived because declared params ARE identity (§Phase 32),
+    and guarded because the value has exactly one correct answer:
+
+        declared < union   two target instances collapse into one workflow
+                           address, so their histories merge and `last_run`
+                           answers for the wrong one
+        declared > union   an address that can never differ, and one that LIES:
+                           a reader concludes the workflow varies by an axis
+                           whose value is the same in every instance
+
+    Both are errors. This is stricter than the target rule (§Phase 32:
+    over-declaration warns) on purpose: a target's params describe a thing that
+    exists, so a spare axis is only slack; a workflow's params are DERIVED from
+    its members, so a spare axis contradicts them.
+    """
+    union, union_is_complete = workflow_member_instance_params(
+        workflow_cfg, targets, label=label
+    )
+    if declared is None:
+        declared_list: list[str] = []
+    elif isinstance(declared, dict):
+        # Members-shaped, exactly as a target's own instance params may be: a
+        # member whose instance axes DISPATCH on a param (a domain, a profile)
+        # has a different union per context, so the workflow above it needs the
+        # same dispatch rather than one list that can only ever be right once.
+        resolved = resolve_list_members(
+            declared, execution_context, value_field="params", label=label
+        )
+        declared_list = list(resolved or [])
+    elif isinstance(declared, list):
+        declared_list = list(declared)
+    else:
+        raise RuntimeError(
+            f"❌ {label}: workflow_instance_params must be a list, or members-shaped"
+        )
+
+    missing = [p for p in union if p not in declared_list]
+    extra = [p for p in declared_list if p not in union]
+    if missing:
+        raise RuntimeError(
+            f"❌ {label}: workflow_instance_params is missing {sorted(missing)}, "
+            f"which its members instance over. Two target instances would share one "
+            f"workflow address and their histories would merge"
+        )
+    if extra and union_is_complete:
+        raise RuntimeError(
+            f"❌ {label}: workflow_instance_params declares {sorted(extra)}, which no "
+            f"member instances over. That address can never differ, and it tells a "
+            f"reader the workflow varies by an axis it does not"
+        )
+    # Declaration order is the ADDRESS order, so it is preserved as written.
+    return declared_list
+
+
 def resolve_run_instance_identity(
     ctl_cfg_root: Path,
     *,
@@ -12141,12 +12517,26 @@ def resolve_run_instance_identity(
         member_actions.append(entry.get("action") if isinstance(entry, dict) else None)
     if not addresses:
         raise RuntimeError(f"❌ workflow {workflow_name!r} resolves no target addresses")
-    # §Phase 73: a workflow publishes HISTORY, not state, so it has no instance
-    # layer and no composition digest. Its runs sit directly under the key, and the
-    # members it ran with are recorded on the run.
+    # §Phase 73: a workflow publishes HISTORY, not state — no composition digest,
+    # no committed pointer. §Phase 78: that history is PARTITIONED by the axes its
+    # members vary over, so one key fanned across environments keeps a separate
+    # `last_run` per environment instead of one row for whichever finished last.
+    # Params, not a hash: params ADDRESS (readable, predictable from cfg, stable
+    # across cfg edits) where a hash IDENTIFIES, and identity is the question
+    # Phase 73 decided ctl must not answer.
+    instance_params = validate_workflow_instance_params(
+        workflow_cfg.get("workflow_instance_params"),
+        workflow_cfg,
+        targets,
+        label=f"workflow {workflow_name!r}",
+        execution_context=execution_context,
+    )
+    segments = resolve_target_instance_segments(
+        instance_params, execution_context, label=f"workflow {workflow_name!r}"
+    )
     return {
-        "instance_segments": [],
-        "address": workflow_name,
+        "instance_segments": segments,
+        "address": workflow_instance_address(workflow_name, segments),
         "target_addresses": addresses,
         "member_actions": member_actions,
         "identity_doc": None,

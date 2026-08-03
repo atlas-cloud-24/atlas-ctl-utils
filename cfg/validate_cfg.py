@@ -54,6 +54,16 @@ def main() -> int:
         providers=args.providers,
     )
     common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+    # §Phase 78: every workflow's instance params, not just the one a run selects.
+    # The per-run guard is exact but sees one workflow, so a misdeclaration
+    # elsewhere stays silent until someone runs it. This pass is static — no
+    # execution context, every branch — and it belongs to the SKIPPABLE gate: a
+    # workflow that is not in the run cannot corrupt it, while the per-run guard
+    # still fires unskippably for the one that is.
+    common.validate_all_workflow_instance_params(
+        common.collect_resource(ctl_cfg_root, "workflows", entry_depth=1),
+        common.collect_resource(ctl_cfg_root, "targets"),
+    )
     # whole-tree tooling activates every declared domain (see helper)
     execution_context = common.whole_tree_execution_context(ctl_cfg_root, execution_context)
     scope_params = common.scope_params_from_context(execution_context)

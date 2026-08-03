@@ -234,7 +234,7 @@ class StatusGroupTest(unittest.TestCase):
         """`passed` is a claim of success; absence of a failure is not one."""
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
-            status, _, _ = common._run_status(namespace / "nowhere")
+            status = common._run_status(namespace / "nowhere")["status"]
             self.assertIsNone(status)
 
 

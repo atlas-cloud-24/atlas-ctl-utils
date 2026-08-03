@@ -44,6 +44,7 @@ CFG = {
         "workflows:\n"
         "  env/bootstrap:\n"
         "    default_action: provision\n"
+        "    workflow_instance_params: [account, env_type]\n"
         "    target_keys:\n"
         "      - env/tfstate_backend\n"
     ),
@@ -113,9 +114,13 @@ class LifecycleWiringTests(unittest.TestCase):
                 ident["address"], "env/tfstate_backend/instances/account=dev/env_type=dev"
             )
 
-    def test_a_workflow_has_no_instance_layer(self):
+    def test_a_workflow_has_no_composition_digest(self):
         """§Phase 73: a workflow publishes history, so it has no composition
-        digest and no identity document — only the members it ran with."""
+        digest and no identity document — only the members it ran with.
+
+        §Phase 78: its history IS partitioned, by the axes its members vary over,
+        so the address carries instance segments — but they are declared params,
+        never a hash of the composition."""
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(tmp)
             ident = common.resolve_run_instance_identity(
@@ -123,13 +128,156 @@ class LifecycleWiringTests(unittest.TestCase):
                 execution_params=PARAMS, execution_runtime_mode="local",
                 workflow_name="env/bootstrap",
             )
-            self.assertEqual([], ident["instance_segments"])
-            self.assertEqual("env/bootstrap", ident["address"])
             self.assertIsNone(ident["identity_doc"])
+            self.assertEqual(["account=dev", "env_type=dev"], ident["instance_segments"])
+            self.assertEqual(
+                "env/bootstrap/instances/account=dev/env_type=dev", ident["address"]
+            )
             self.assertEqual(
                 ident["target_addresses"],
                 ["env/tfstate_backend/instances/account=dev/env_type=dev"],
             )
 
+    def test_a_workflow_must_declare_exactly_its_members_axes(self):
+        """Under-declaring merges two instances' histories; over-declaring makes
+        an address that can never differ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_cfg(tmp)
+            workflows = root / "workflow.yaml"
+            body = workflows.read_text()
+
+            workflows.write_text(body.replace(
+                "    workflow_instance_params: [account, env_type]\n", ""))
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                common.resolve_run_instance_identity(
+                    root, run_type="workflow", action="provision", ctl_profile=None,
+                    execution_params=PARAMS, execution_runtime_mode="local",
+                    workflow_name="env/bootstrap")
+
+            workflows.write_text(body.replace(
+                "[account, env_type]", "[account, env_type, landing_zone]"))
+            with self.assertRaisesRegex(RuntimeError, "declares"):
+                common.resolve_run_instance_identity(
+                    root, run_type="workflow", action="provision", ctl_profile=None,
+                    execution_params=PARAMS, execution_runtime_mode="local",
+                    workflow_name="env/bootstrap")
+
+
+    def test_an_incomplete_union_does_not_flag_a_spare_axis(self):
+        """A member absent from THIS action's inventory contributes unknown axes.
+
+        Found by sweeping real cfg: under `destroy`, workflows whose targets
+        register no destroy resolved an EMPTY union, so every declared param
+        looked spare and five workflows failed the guard. Under-declaration is
+        still checked — a missing axis is real whatever the inventory holds.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_cfg(tmp)
+            # the target declares provision only, so a destroy inventory omits it
+            union, complete = common.workflow_member_instance_params(
+                {"target_runs": ["env/absent_here"]}, {}, label="workflow 'w'"
+            )
+            self.assertEqual([], union)
+            self.assertFalse(complete)
+            # over-declaration is NOT raised while the union is incomplete
+            self.assertEqual(
+                ["account"],
+                common.validate_workflow_instance_params(
+                    ["account"], {"target_runs": ["env/absent_here"]}, {},
+                    label="workflow 'w'",
+                ),
+            )
+
+    def test_under_declaration_is_flagged_even_when_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_cfg(tmp)
+            targets = {"a": {"target_instance_params": ["account"]}}
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                common.validate_workflow_instance_params(
+                    [], {"target_runs": ["a", "gone"]}, targets, label="workflow 'w'"
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaticWorkflowParamsGateTests(unittest.TestCase):
+    """The whole-cfg pass: every workflow, every branch, no execution context.
+
+    The per-run guard is exact but only ever sees the workflow being run, so a
+    misdeclaration elsewhere stayed silent until someone ran it. This one belongs
+    to the SKIPPABLE gate — a workflow absent from a run cannot corrupt it —
+    while the per-run guard still fires unskippably for the one that is.
+    """
+
+    TARGETS = {
+        "wide": {"target_instance_params": ["account", "env_type"]},
+        "narrow": {"target_instance_params": ["account"]},
+        "dispatching": {
+            "target_instance_params": {
+                "members": [
+                    {"params": ["domain", "env_type"],
+                     "selectors": {"match": {"execution_context.params.domain": "env"}}},
+                    {"params": ["domain"],
+                     "selectors": {"match": {"execution_context.params.domain": "org"}}},
+                ]
+            }
+        },
+    }
+
+    def _check(self, workflows):
+        common.validate_all_workflow_instance_params(workflows, self.TARGETS)
+
+    def test_a_correct_declaration_passes(self):
+        self._check({"w": {"workflow_instance_params": ["account", "env_type"],
+                           "target_keys": ["wide", "narrow"]}})
+
+    def test_a_missing_axis_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            self._check({"w": {"workflow_instance_params": ["account"],
+                               "target_keys": ["wide"]}})
+
+    def test_a_spare_axis_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "declares"):
+            self._check({"w": {"workflow_instance_params": ["account", "env_type"],
+                               "target_keys": ["narrow"]}})
+
+    def test_a_branch_is_checked_against_the_target_branch_it_can_hold_with(self):
+        """A members-shaped target contributes only the branches whose selectors
+        could be satisfied together with the workflow branch's."""
+        self._check({"w": {
+            "workflow_instance_params": {"members": [
+                {"params": ["domain", "env_type"],
+                 "selectors": {"match": {"execution_context.params.domain": "env"}}},
+                {"params": ["domain"],
+                 "selectors": {"match": {"execution_context.params.domain": "org"}}},
+            ]},
+            "target_keys": ["dispatching"],
+        }})
+
+    def test_an_unpinned_dispatch_axis_is_refused_rather_than_guessed(self):
+        """One workflow branch matching two different target branches has no
+        single correct declaration."""
+        with self.assertRaisesRegex(RuntimeError, "does not pin"):
+            self._check({"w": {"workflow_instance_params": ["domain"],
+                               "target_keys": ["dispatching"]}})
+
+    def test_a_target_without_selectors_applies_to_every_branch(self):
+        """A plain list means 'always', so it counts under any condition."""
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            self._check({"w": {
+                "workflow_instance_params": {"members": [
+                    {"params": ["account"],
+                     "selectors": {"match": {"execution_context.params.domain": "env"}}},
+                ]},
+                "target_keys": ["wide"],
+            }})
+
+    def test_imported_workflows_contribute_their_members(self):
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            self._check({
+                "base": {"target_keys": ["wide"]},
+                "w": {"workflow_instance_params": ["account"],
+                      "import_workflow_keys": ["base"], "target_keys": []},
+            })

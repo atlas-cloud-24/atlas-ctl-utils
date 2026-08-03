@@ -76,7 +76,7 @@ class Namespace:
         record = {"run_id": run_id, "run_type": "workflow", "action": "provision",
                   "status": status, "updated_at": at}
         if targets is not None:
-            record["targets"] = targets
+            record["target_instances"] = targets
         if default_action:
             record["default_action"] = default_action
         if selectors:
@@ -141,7 +141,8 @@ class OutdateLifecycleTest(unittest.TestCase):
     def test_a_freshly_published_result_is_up_to_date(self):
         self.ns.publish("target", TARGET, TSEG, run_id="r1")
         row = self.ns.row("target", TARGET, TSEG)
-        self.assertEqual({"status": "passed", "freshness": "up_to_date",
+        self.assertEqual({"status": "passed", "last_action": "provision",
+                          "freshness": "up_to_date",
                           "at": "2026-07-30T10:00:00Z"}, row)
 
     def test_outdating_moves_only_that_axis(self):
@@ -210,12 +211,14 @@ class WorkflowHistoryTest(unittest.TestCase):
             "running", self.ns.rows()["workflow"][WORKFLOW]["last_run"]["status"]
         )
 
-    def test_the_record_carries_the_targets_it_ran_with(self):
-        targets = ["env/core/baseline", {"key": "env/ops/app", "action": "destroy"}]
+    def test_the_record_carries_the_target_instances_it_ran_with(self):
+        targets = ["target/env/core/baseline/instances/env.type=dev",
+                   {"instance": "target/env/ops/app/instances/env.type=dev",
+                    "action": "destroy"}]
         self.ns.workflow_run(WORKFLOW, run_id="w1", targets=targets,
                              default_action="provision")
         row = self.ns.rows()["workflow"][WORKFLOW]["last_run"]
-        self.assertEqual(targets, row["targets"])
+        self.assertEqual(targets, row["target_instances"])
         self.assertEqual("provision", row["default_action"])
 
     def test_the_record_carries_the_selectors_that_matched(self):
@@ -394,21 +397,27 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
             / "runs" / "w1"
         )
         self.run_dir.mkdir(parents=True)
+        # §Phase 78: the run already carries its members' resolved INSTANCE
+        # addresses, and the recorder reads them from here.
         common.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
+            "target_addresses": [
+                f"{TARGET}/instances/env.type=dev",
+                f"{OTHER}/instances/env.type=dev",
+            ],
         })
 
     def _record(self, runs: dict, cfg: dict) -> dict:
         common.record_workflow_members(self.run_dir, runs, cfg)
         return self.ns.rows()["workflow"][WORKFLOW]["last_run"]
 
-    def test_a_member_taking_the_default_is_a_bare_key(self):
+    def test_a_member_taking_the_default_is_a_bare_instance(self):
         row = self._record(
             {"a": {"target": TARGET, "action": "provision"}},
             {"default_action": "provision"},
         )
-        self.assertEqual([TARGET], row["targets"])
+        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"], row["target_instances"])
         self.assertEqual("provision", row["default_action"])
 
     def test_a_member_that_differs_carries_its_action(self):
@@ -417,7 +426,45 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
              "b": {"target": OTHER, "action": "destroy"}},
             {"default_action": "provision"},
         )
-        self.assertEqual([TARGET, {"key": OTHER, "action": "destroy"}], row["targets"])
+        self.assertEqual(
+            [f"target/{TARGET}/instances/env.type=dev",
+             {"instance": f"target/{OTHER}/instances/env.type=dev", "action": "destroy"}],
+            row["target_instances"],
+        )
+
+    def test_a_member_varying_over_fewer_axes_keeps_its_shorter_address(self):
+        """The reason keys are not enough: a workflow's params are the UNION of
+        its members', so a narrower member's address cannot be reconstructed from
+        the workflow's own segments."""
+        common.write_run_metadata(self.run_dir, {
+            "run_id": "w1", "run_type": "workflow", "action": "provision",
+            "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
+            "target_addresses": [f"{TARGET}/instances/env.type=dev/aws.account=dev",
+                                 f"{OTHER}/instances/aws.account=dev"],
+        })
+        row = self._record(
+            {"a": {"target": TARGET, "action": "provision"},
+             "b": {"target": OTHER, "action": "provision"}},
+            {"default_action": "provision"},
+        )
+        self.assertEqual(
+            [f"target/{TARGET}/instances/env.type=dev/aws.account=dev",
+             f"target/{OTHER}/instances/aws.account=dev"],
+            row["target_instances"],
+        )
+
+    def test_a_singleton_member_records_its_bare_key(self):
+        """No resolved address means the target varies over nothing, and its
+        address IS its key — never a silent omission."""
+        common.write_run_metadata(self.run_dir, {
+            "run_id": "w1", "run_type": "workflow", "action": "provision",
+            "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
+        })
+        row = self._record(
+            {"a": {"target": TARGET, "action": "provision"}},
+            {"default_action": "provision"},
+        )
+        self.assertEqual([f"target/{TARGET}"], row["target_instances"])
 
     def test_the_matched_selectors_are_recorded_verbatim(self):
         selectors = {"match": {"execution_context.params.intent": "rebuild"}}
@@ -470,6 +517,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         common.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "in_progress", "updated_at": "2026-07-30T10:00:05Z",
+            "target_addresses": [f"{TARGET}/instances/env.type=dev"],
         })
         row = self._record(
             {"a": {"target": TARGET, "action": "provision"}},
@@ -478,6 +526,6 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
                                             "provision"}}},
         )
         self.assertEqual("running", row["status"])
-        self.assertEqual([TARGET], row["targets"])
+        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"], row["target_instances"])
         self.assertEqual("provision", row["default_action"])
         self.assertIn("selectors", row)
