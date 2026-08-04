@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate Mermaid and SVG dependency diagrams from Atlas ctl cfg."""
+"""
+
+
+generate Mermaid and SVG dependency diagrams from Atlas ctl cfg."""
+
 
 from __future__ import annotations
 
@@ -15,12 +19,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
-
+from engine.cfg import resources as cfg_resources
+from engine.run import selectors as run_selectors
 
 ACTION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RUNTIME_REF_RE = re.compile(r"\$\{[^{}]+\}")
@@ -81,7 +84,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def node_id(kind: str, key: str) -> str:
-    digest = hashlib.sha1(f"{kind}:{key}".encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(f"{kind}:{key}".encode()).hexdigest()[:12]
     return f"n_{kind}_{digest}"
 
 
@@ -161,7 +164,7 @@ def workflow_target_keys(
     target_keys = workflow_cfg.get("target_keys") or []
     if isinstance(target_keys, list):
         return target_keys
-    if not common.selector_group_is_group(target_keys):
+    if not run_selectors.selector_group_is_group(target_keys):
         raise RuntimeError(
             f"workflows.{action}.{workflow_key}.target_keys must be a list or "
             "a members-shaped declaration"
@@ -169,7 +172,7 @@ def workflow_target_keys(
     execution_context = {
         "execution_context.ctl.action": action,
     }
-    resolved = common.resolve_list_members(
+    resolved = run_selectors.resolve_list_members(
         target_keys,
         execution_context,
         value_field="target_keys",
@@ -192,9 +195,9 @@ def build_diagram(
 ) -> str:
     if view not in DIAGRAM_VIEWS:
         raise RuntimeError(f"unknown diagram view {view!r}; available: {list(DIAGRAM_VIEWS)}")
-    fan_outs = common.collect_resource(ctl_cfg_root, "fan_outs")
+    fan_outs = cfg_resources.collect_resource(ctl_cfg_root, "fan_outs")
 
-    # §Phase 33: targets/workflows are declared once with an `actions:`
+    # targets/workflows are declared once with an `actions:`
     # allowlist; rebuild the per-action view this diagram renders from it.
     def _by_action(flat: dict) -> dict:
         per_action: dict = {}
@@ -206,14 +209,14 @@ def build_diagram(
         return per_action
 
     workflows = _by_action(
-        common.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+        cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
     )
     targets = _by_action(
-        common.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+        cfg_resources.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
     )
-    sources = common.collect_resource(ctl_cfg_root, "target_sources")
-    identities = common.collect_resource(ctl_cfg_root, "execution_identities")
-    backends = common.collect_resource(ctl_cfg_root, "ctl_state_backends")
+    sources = cfg_resources.collect_resource(ctl_cfg_root, "target_sources")
+    identities = cfg_resources.collect_resource(ctl_cfg_root, "execution_identities")
+    backends = cfg_resources.collect_resource(ctl_cfg_root, "ctl_state_backends")
     actions = selected_actions(workflows, targets, [action])
     focused = True
 
@@ -230,12 +233,12 @@ def build_diagram(
     for key in sorted(fan_outs):
         nodes["fan_out"].append((node_id("fanout", key), mermaid_label(key)))
     for action in actions:
-        for key in sorted((workflows.get(action) or {})):
+        for key in sorted(workflows.get(action) or {}):
             qualified = f"{action}:{key}"
             nodes["workflow"].append(
                 (node_id("workflow", qualified), mermaid_label(action, key))
             )
-        for key in sorted((targets.get(action) or {})):
+        for key in sorted(targets.get(action) or {}):
             qualified = f"{action}:{key}"
             nodes["target"].append((node_id("target", qualified), mermaid_label(action, key)))
     for key, cfg in sorted(sources.items()):
@@ -266,9 +269,9 @@ def build_diagram(
         )
 
     workflow_keys_by_action = {
-        action: set((workflows.get(action) or {})) for action in actions
+        action: set(workflows.get(action) or {}) for action in actions
     }
-    target_keys_by_action = {action: set((targets.get(action) or {})) for action in actions}
+    target_keys_by_action = {action: set(targets.get(action) or {}) for action in actions}
 
     for fan_out_key, fan_out_cfg in sorted(fan_outs.items()):
         if not isinstance(fan_out_cfg, dict) or not isinstance(fan_out_cfg.get("runs"), list):
@@ -577,10 +580,10 @@ def main() -> int:
         raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
     if not 12 <= args.font_size <= 48:
         raise RuntimeError("--font-size must be between 12 and 48")
-    # §Phase 33: available actions come from the flat entries' `actions:` allowlists.
+    # Available actions come from the flat entries' `actions:` allowlists.
     available_actions: set[str] = set()
     for kind in ("workflows", "targets"):
-        for entry in common.collect_resource(ctl_cfg_root, kind, entry_depth=1).values():
+        for entry in cfg_resources.collect_resource(ctl_cfg_root, kind, entry_depth=1).values():
             if isinstance(entry, dict):
                 available_actions.update(entry.get("actions") or [])
     actions = selected_actions(

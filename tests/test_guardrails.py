@@ -5,11 +5,11 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common, guardrails  # noqa: E402
+from engine.cfg import layout as cfg_layout
+from engine.guardrails import policies as guardrails
 
 
 def write(path: Path, content: str) -> None:
@@ -43,7 +43,7 @@ def write_plt_policy(
     if selectors:
         policy["selectors"] = selectors
     write(
-        plt_root / common.PLT_GUARDRAILS_DIRNAME / "env.yaml",
+        plt_root / cfg_layout.PLT_GUARDRAILS_DIRNAME / "env.yaml",
         yaml.safe_dump(
             {"guardrail_policies": {"env": policy}},
             sort_keys=False,
@@ -53,7 +53,7 @@ def write_plt_policy(
 
 def write_env_scope(plt_root: Path) -> None:
     write(
-        plt_root / "env" / "dev" / common.SCOPE_META_FILENAME,
+        plt_root / "env" / "dev" / cfg_layout.SCOPE_META_FILENAME,
         "type: scope\n"
         "target_path: /env\n"
         "selectors:\n"
@@ -68,7 +68,7 @@ class JsonPointerTest(unittest.TestCase):
             "roles": [{"policy/name": {"enabled": True}}],
         }
         self.assertIs(
-            guardrails.json_pointer_get(
+            guardrails.JsonPointer.get(
                 document,
                 "/roles/0/policy~1name/enabled",
                 label="test",
@@ -78,14 +78,14 @@ class JsonPointerTest(unittest.TestCase):
 
     def test_explicit_null_differs_from_missing(self):
         self.assertIsNone(
-            guardrails.json_pointer_get({"value": None}, "/value", label="test")
+            guardrails.JsonPointer.get({"value": None}, "/value", label="test")
         )
         with self.assertRaisesRegex(RuntimeError, "does not exist"):
-            guardrails.json_pointer_get({}, "/value", label="test")
+            guardrails.JsonPointer.get({}, "/value", label="test")
 
     def test_invalid_escape_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "invalid JSON Pointer escape"):
-            guardrails.json_pointer_tokens("/bad~2path", label="test")
+            guardrails.JsonPointer.tokens("/bad~2path", label="test")
 
     def test_overlapping_paths_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,7 +95,7 @@ class JsonPointerTest(unittest.TestCase):
                 protected_paths=["/roles", "/roles/admin"],
             )
             with self.assertRaisesRegex(RuntimeError, "overlapping protected paths"):
-                guardrails.load_guardrail_policies(plt, owner="plt")
+                guardrails.PolicySet(owner="plt").load(plt)
 
 
 class PolicyTest(unittest.TestCase):
@@ -104,7 +104,7 @@ class PolicyTest(unittest.TestCase):
             plt = Path(tmp)
             write_plt_policy(plt, protected_paths=["/region"])
             write(
-                plt / common.PLT_GUARDRAILS_DIRNAME / "arbitrary-name.yaml",
+                plt / cfg_layout.PLT_GUARDRAILS_DIRNAME / "arbitrary-name.yaml",
                 "guardrail_policies:\n"
                 "  identity:\n"
                 "    subject:\n"
@@ -112,14 +112,14 @@ class PolicyTest(unittest.TestCase):
                 "      target_path: /identity\n"
                 "    protected_paths: [/account_id]\n",
             )
-            policies = guardrails.load_guardrail_policies(plt, owner="plt")
+            policies = guardrails.PolicySet(owner="plt").load(plt)
             self.assertEqual(set(policies), {"env", "identity"})
 
     def test_subject_kind_is_owner_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             plt = Path(tmp)
             write(
-                plt / common.PLT_GUARDRAILS_FILENAME,
+                plt / cfg_layout.PLT_GUARDRAILS_FILENAME,
                 "guardrail_policies:\n"
                 "  wrong:\n"
                 "    subject:\n"
@@ -127,17 +127,17 @@ class PolicyTest(unittest.TestCase):
                 "    protected_paths: [/value]\n",
             )
             with self.assertRaisesRegex(RuntimeError, "invalid for plt policies"):
-                guardrails.load_guardrail_policies(plt, owner="plt")
+                guardrails.PolicySet(owner="plt").load(plt)
 
     def test_legacy_collections_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             plt = Path(tmp)
             write(
-                plt / common.PLT_GUARDRAILS_FILENAME,
+                plt / cfg_layout.PLT_GUARDRAILS_FILENAME,
                 "plt_guardrail_policies: {}\n",
             )
             with self.assertRaisesRegex(RuntimeError, "legacy guardrail collections"):
-                guardrails.load_guardrail_policies(plt, owner="plt")
+                guardrails.PolicySet(owner="plt").load(plt)
 
     def test_selector_refs_must_be_instance_params(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,7 +152,7 @@ class PolicyTest(unittest.TestCase):
                 },
             )
             with self.assertRaisesRegex(RuntimeError, "must include every selector ref"):
-                guardrails.load_guardrail_policies(plt, owner="plt")
+                guardrails.PolicySet(owner="plt").load(plt)
 
     def test_conditional_selector_activates_only_its_subset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,10 +167,10 @@ class PolicyTest(unittest.TestCase):
                     }
                 },
             )
-            policies = guardrails.load_guardrail_policies(plt, owner="plt")
+            policies = guardrails.PolicySet(owner="plt").load(plt)
             self.assertEqual(
                 len(
-                    guardrails.active_guardrail_policies(
+                    guardrails.PolicySet.active(
                         policies,
                         context(**{"env.type": "dev"}),
                     )
@@ -178,7 +178,7 @@ class PolicyTest(unittest.TestCase):
                 1,
             )
             self.assertEqual(
-                guardrails.active_guardrail_policies(
+                guardrails.PolicySet.active(
                     policies,
                     context(**{"env.type": "prod"}),
                 ),
@@ -194,11 +194,10 @@ class PolicyTest(unittest.TestCase):
             write_env_scope(plt)
             write(rendered / "env" / "value.yaml", "region: eu-west-2\n")
             with self.assertRaisesRegex(RuntimeError, "active scope selector ref"):
-                guardrails.materialize_plt_guardrails(
+                guardrails.Materializer(context(**{"env.type": "dev"})).plt(
                     root / "ctl",
                     plt,
                     rendered,
-                    context(**{"env.type": "dev"}),
                     {"env.type": "dev"},
                 )
 
@@ -224,14 +223,10 @@ class BaselineTest(unittest.TestCase):
                 "empty_mapping": {},
                 "empty_string": "",
             }
-            guardrails.write_guardrail_baseline(
-                root,
-                subject=subject,
-                values={"/settings": value},
-            )
-            loaded = guardrails.load_guardrail_baselines(root)
+            guardrails.BaselineStore(root).write(subject=subject, values={"/settings": value})
+            loaded = guardrails.BaselineStore(root).load()
             self.assertEqual(
-                loaded[guardrails.subject_identity(subject)]["values"]["/settings"],
+                loaded[guardrails.Subject.identity(subject)]["values"]["/settings"],
                 value,
             )
 
@@ -253,13 +248,13 @@ class BaselineTest(unittest.TestCase):
             },
         }
         self.assertNotEqual(
-            guardrails.subject_identity(string_subject),
-            guardrails.subject_identity(int_subject),
+            guardrails.Subject.identity(string_subject),
+            guardrails.Subject.identity(int_subject),
         )
 
     def test_empty_instance_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "non-empty"):
-            guardrails.subject_identity(
+            guardrails.Subject.identity(
                 {
                     "kind": "ctl_cfg",
                     "instance": {"params": {}},
@@ -290,21 +285,12 @@ class VerificationTest(unittest.TestCase):
                 "settings:\n"
                 "  enabled: true\n",
             )
-            guardrails.write_guardrail_baseline(
-                baselines,
-                subject={"kind": "ctl_cfg"},
-                values={"/settings/enabled": True},
-            )
-            guardrails.write_guardrail_baseline(
-                baselines,
-                subject={"kind": "execution_context"},
-                values={"/params/main_tag": "oxygen"},
-            )
-            guardrails.verify_ctl_guardrails(
+            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={"/settings/enabled": True})
+            guardrails.BaselineStore(baselines).write(subject={"kind": "execution_context"}, values={"/params/main_tag": "oxygen"})
+            guardrails.Verifier(baselines).check_ctl(
                 ctl,
-                baselines,
-                context(main_tag="oxygen"),
-            )
+                context(main_tag="oxygen")
+                )
 
     def test_false_differs_from_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,13 +306,9 @@ class VerificationTest(unittest.TestCase):
                 "    protected_paths: [/settings/enabled]\n",
             )
             write(ctl / "settings.yaml", "settings:\n  enabled: 0\n")
-            guardrails.write_guardrail_baseline(
-                baselines,
-                subject={"kind": "ctl_cfg"},
-                values={"/settings/enabled": False},
-            )
+            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={"/settings/enabled": False})
             with self.assertRaisesRegex(RuntimeError, "guardrail mismatch"):
-                guardrails.verify_ctl_guardrails(ctl, baselines, {})
+                guardrails.Verifier(baselines).check_ctl(ctl, {})
 
     def test_plt_nested_path_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -356,19 +338,14 @@ class VerificationTest(unittest.TestCase):
                     }
                 },
             }
-            guardrails.write_guardrail_baseline(
-                baselines,
-                subject=subject,
-                values={"/settings/regions/0": "eu-west-2"},
-            )
-            guardrails.verify_plt_guardrails(
+            guardrails.BaselineStore(baselines).write(subject=subject, values={"/settings/regions/0": "eu-west-2"})
+            guardrails.Verifier(baselines).check_plt(
                 ctl,
                 plt,
-                baselines,
                 rendered,
                 context(**{"env.type": "dev"}),
-                {"env.type": "dev"},
-            )
+                {"env.type": "dev"}
+                )
 
     def test_universal_policy_covers_new_scope_and_fails_without_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,7 +359,7 @@ class VerificationTest(unittest.TestCase):
                 instance_params=["execution_context.params.env.type"],
             )
             write(
-                plt / "env" / "test" / common.SCOPE_META_FILENAME,
+                plt / "env" / "test" / cfg_layout.SCOPE_META_FILENAME,
                 "type: scope\n"
                 "target_path: /env\n"
                 "selectors:\n"
@@ -391,14 +368,13 @@ class VerificationTest(unittest.TestCase):
                     )
             write(rendered / "env" / "value.yaml", "region: eu-west-2\n")
             with self.assertRaisesRegex(RuntimeError, "has no baseline"):
-                guardrails.verify_plt_guardrails(
+                guardrails.Verifier(root / "baselines").check_plt(
                     ctl,
                     plt,
-                    root / "baselines",
                     rendered,
                     context(**{"env.type": "test"}),
-                    {"env.type": "test"},
-                )
+                    {"env.type": "test"}
+                    )
 
     def test_missing_baseline_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,11 +390,10 @@ class VerificationTest(unittest.TestCase):
             )
             write(ctl / "settings.yaml", "settings:\n  value: stable\n")
             with self.assertRaisesRegex(RuntimeError, "has no baseline"):
-                guardrails.verify_ctl_guardrails(
+                guardrails.Verifier(root / "baselines").check_ctl(
                     ctl,
-                    root / "baselines",
-                    {},
-                )
+                    {}
+                    )
 
     def test_baseline_path_without_policy_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -434,16 +409,13 @@ class VerificationTest(unittest.TestCase):
                 "    protected_paths: [/settings/value]\n",
             )
             write(ctl / "settings.yaml", "settings:\n  value: stable\n")
-            guardrails.write_guardrail_baseline(
-                baselines,
-                subject={"kind": "ctl_cfg"},
-                values={
+            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={
                     "/settings/value": "stable",
                     "/settings/unowned": "bad",
                 },
             )
             with self.assertRaisesRegex(RuntimeError, "have no authored policy"):
-                guardrails.verify_ctl_guardrails(ctl, baselines, {})
+                guardrails.Verifier(baselines).check_ctl(ctl, {})
 
 
 if __name__ == "__main__":

@@ -5,11 +5,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "cfg"))
 
-import generate_ctl_cfg_diagram as diagram  # noqa: E402
+import generate_ctl_cfg_diagram as diagram
 
 
 def write(path: Path, content: str) -> None:

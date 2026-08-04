@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Assert that active AWS credentials match the target account and principal."""
+"""
+
+
+assert that active AWS credentials match the target account and principal."""
+
 
 import json
 import os
 import re
 import subprocess
-
 
 ASSUMED_ROLE_ARN_RE = re.compile(
     r"^arn:[^:]+:sts::(?P<account_id>\d{12}):assumed-role/"
@@ -81,6 +84,7 @@ def get_caller_identity(profile_name: str | None = None) -> dict:
     engine reuses this module (`aws.assert_profile_caller`) to probe a specific
     host profile, which is the one place profiles still exist.
     """
+
     cmd = ["aws", "sts", "get-caller-identity", "--output", "json"]
     if profile_name:
         cmd += ["--profile", profile_name]

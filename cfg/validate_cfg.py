@@ -8,6 +8,7 @@ a last-wins merge by file path: the failures that exist are an overlay broken on
 its own and two overlays writing one path, and those two passes cover both.
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -20,18 +21,27 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.catalog import workflow as catalog_workflow
+from engine.guardrails import verify as guardrails_verify
+from engine.cfg import materialize as cfg_materialize
+from engine.cfg import overlays as cfg_overlays
+from engine.cfg import resources as cfg_resources
+from engine.cfg import tree as cfg_tree
+from engine.execution import run_context as execution_run_context
+from engine.kernel import scalars as kernel_scalars
+from engine.run import policy as run_policy
+from engine.cli import args as cli_args
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ctl-cfg-root", required=True)
     parser.add_argument("--ctl-profile", required=True)
-    parser.add_argument("--execution-runtime-mode", required=True, choices=common.EXECUTION_RUNTIME_MODES)
+    parser.add_argument("--execution-runtime-mode", required=True, choices=run_policy.EXECUTION_RUNTIME_MODES)
     parser.add_argument(
         "--execution-params",
         dest="execution_param",
-        action=common.ExecutionParamsAction,
+        action=cli_args.ExecutionParamsAction,
         default=[],
         metavar="KEY=VALUE[,KEY=VALUE...]",
     )
@@ -39,13 +49,13 @@ def parse_args() -> argparse.Namespace:
         "--providers",
         dest="providers",
         required=True,
-        type=common.parse_comma_list,
+        type=kernel_scalars.parse_comma_list,
         metavar="NAME[,NAME...]",
     )
     parser.add_argument(
         "--plt-overlays",
         dest="plt_overlays",
-        type=common.parse_overlays_arg,
+        type=cli_args.parse_overlays_arg,
         default=[],
         metavar="NAME[,NAME...]",
         help="Validate the tree with these plt overlays applied.",
@@ -87,16 +97,16 @@ def _validate_variation(
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-validate-cfg-"))
     label = ",".join(plt_overlays) if plt_overlays else "base (no overlays)"
     try:
-        roots = common.materialize_cfg_sources(
+        roots = cfg_materialize.materialize_cfg_sources(
             ctl_cfg_root,
-            ref_policy=common.ctl_ref_policy(ctl_cfg_root, ctl_profile),
+            ref_policy=run_policy.ctl_ref_policy(ctl_cfg_root, ctl_profile),
             run_cfg_dir=temp_root / "cfg",
             token=os.getenv("cfg_source_token"),
         )
         plt_cfg_root = roots["plt"]
         guardrails_cfg_root = roots["guardrails"]
         merged_dir = temp_root / "merged"
-        common.merge_plt_cfg_dirs(
+        cfg_tree.merge_plt_cfg_dirs(
             plt_cfg_root=plt_cfg_root,
             plt_merged_dir=merged_dir,
             ctl_profile="validate-cfg",
@@ -104,11 +114,11 @@ def _validate_variation(
             scope_params=scope_params,
             execution_context=execution_context,
         )
-        rendered_dir = common.render_plt_cfg(merged_dir, temp_root, execution_context)
+        rendered_dir = cfg_tree.render_plt_cfg(merged_dir, temp_root, execution_context)
         if plt_overlays:
             print(f"OK: cfg valid with overlays {label} (guardrails skipped — baselines are base-only)")
         else:
-            common.verify_guardrails(
+            guardrails_verify.verify_guardrails(
                 ctl_cfg_root,
                 plt_cfg_root,
                 guardrails_cfg_root,
@@ -133,8 +143,9 @@ def _sweep_variations(plt_cfg_root: Path, execution_context: dict) -> list[list[
     Each-alone catches the first, all-together catches the second, and a subset in
     between adds nothing while costing 2^N runs.
     """
+
     permitted = sorted(
-        name for name, candidate in common.discover_overlay_candidates(
+        name for name, candidate in cfg_overlays.discover_overlay_candidates(
             plt_cfg_root, execution_context=execution_context
         ).items()
         if candidate.get("matches")
@@ -152,7 +163,7 @@ def main() -> int:
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"ctl cfg root not found: {ctl_cfg_root}")
 
-    execution_context = common.build_execution_context(
+    execution_context = execution_run_context.build_execution_context(
         ctl_cfg_root,
         action=None,
         ctl_profile=args.ctl_profile,
@@ -160,28 +171,28 @@ def main() -> int:
         execution_runtime_mode=args.execution_runtime_mode,
         providers=args.providers,
     )
-    common.validate_execution_context_constraints(ctl_cfg_root, execution_context)
-    # §Phase 78: every workflow's instance params, not just the one a run selects.
+    execution_run_context.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+    # Every workflow's instance params, not just the one a run selects.
     # The per-run guard is exact but sees one workflow, so a misdeclaration
     # elsewhere stays silent until someone runs it. This pass is static — no
     # execution context, every branch — and it belongs to the SKIPPABLE gate: a
     # workflow that is not in the run cannot corrupt it, while the per-run guard
     # still fires unskippably for the one that is.
-    common.validate_all_workflow_instance_params(
-        common.collect_resource(ctl_cfg_root, "workflows", entry_depth=1),
-        common.collect_resource(ctl_cfg_root, "targets"),
+    catalog_workflow.validate_all_workflow_instance_params(
+        cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1),
+        cfg_resources.collect_resource(ctl_cfg_root, "targets"),
     )
     # whole-tree tooling activates every declared domain (see helper)
-    execution_context = common.whole_tree_execution_context(ctl_cfg_root, execution_context)
-    scope_params = common.scope_params_from_context(execution_context)
+    execution_context = execution_run_context.whole_tree_execution_context(ctl_cfg_root, execution_context)
+    scope_params = execution_run_context.scope_params_from_context(execution_context)
 
     variations = [args.plt_overlays]
     if args.overlay_sweep:
         probe = Path(tempfile.mkdtemp(prefix="atlas-validate-overlays-"))
         try:
-            roots = common.materialize_cfg_sources(
+            roots = cfg_materialize.materialize_cfg_sources(
                 ctl_cfg_root,
-                ref_policy=common.ctl_ref_policy(ctl_cfg_root, args.ctl_profile),
+                ref_policy=run_policy.ctl_ref_policy(ctl_cfg_root, args.ctl_profile),
                 run_cfg_dir=probe / "cfg",
                 token=os.getenv("cfg_source_token"),
             )

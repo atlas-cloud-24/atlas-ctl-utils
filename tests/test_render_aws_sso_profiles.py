@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 renderer_spec = importlib.util.spec_from_file_location(
     "render_aws_sso_profiles",

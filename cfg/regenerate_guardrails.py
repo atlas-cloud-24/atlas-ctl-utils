@@ -12,7 +12,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common, guardrails  # noqa: E402
+from engine.cfg import materialize as cfg_materialize
+from engine.cfg import tree as cfg_tree
+from engine.execution import run_context as execution_run_context
+from engine.kernel import scalars as kernel_scalars
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import policy as run_policy
+from engine.cli import args as cli_args
+from engine.guardrails import policies as guardrails
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,12 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--execution-runtime-mode",
         required=True,
-        choices=common.EXECUTION_RUNTIME_MODES,
+        choices=run_policy.EXECUTION_RUNTIME_MODES,
     )
     parser.add_argument(
         "--execution-params",
         dest="execution_param",
-        action=common.ExecutionParamsAction,
+        action=cli_args.ExecutionParamsAction,
         default=[],
         metavar="KEY=VALUE[,KEY=VALUE...]",
     )
@@ -39,12 +46,12 @@ def parse_args() -> argparse.Namespace:
         "--providers",
         dest="providers",
         required=True,
-        type=common.parse_comma_list,
+        type=kernel_scalars.parse_comma_list,
         metavar="NAME[,NAME...]",
     )
     parser.add_argument(
         "--execution-context",
-        action=common.ExecutionParamsAction,
+        action=cli_args.ExecutionParamsAction,
         default=[],
         metavar="KEY=VALUE[,KEY=VALUE...]",
     )
@@ -82,7 +89,7 @@ def build_context(
     ctl_cfg_root: Path,
     extra_params: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    context = common.build_execution_context(
+    context = execution_run_context.build_execution_context(
         ctl_cfg_root,
         action=None,
         ctl_profile=None,
@@ -116,10 +123,11 @@ def load_coverage_assignments(
     `common` is merged under each assignment, so an assignment may override a
     shared axis where it genuinely differs.
     """
+
     path = Path(guardrails_cfg_root) / COVERAGE_FILENAME
     if not path.is_file():
         raise RuntimeError(f"--all requires a coverage declaration: {path}")
-    doc = common.load_yaml(path) or {}
+    doc = kernel_yaml_io.load_yaml(path) or {}
     coverage = doc.get("guardrail_coverage")
     if not isinstance(coverage, dict):
         raise RuntimeError(f"{path}: guardrail_coverage must be a mapping")
@@ -161,14 +169,14 @@ def format_assignment(params: dict[str, str]) -> str:
 
 
 def bound_local_roots(ctl_cfg_root: Path, temp_root: Path) -> tuple[Path, Path]:
-    sources = common.load_cfg_sources(ctl_cfg_root)
+    sources = cfg_materialize.load_cfg_sources(ctl_cfg_root)
     remote = [key for key, entry in sources.items() if "repo_path" not in entry]
     if remote:
         raise RuntimeError(
             "guardrail generation requires writable local cfg sources; "
             f"use generated dev CTL cfg (remote entries: {remote})"
         )
-    roots = common.materialize_cfg_sources(
+    roots = cfg_materialize.materialize_cfg_sources(
         ctl_cfg_root,
         ref_policy="local_dirty_allowed",
         run_cfg_dir=temp_root / "cfg",
@@ -183,7 +191,6 @@ class NoMatchingPolicy(RuntimeError):
     cannot exist. Under `--all` it is an ordinary skip: the declared coverage is
     broader than any one domain's policies, and `--policy` narrows it further.
     """
-
 
 def select_entries(
     entries: list[dict],
@@ -228,28 +235,18 @@ def write_entries(entries: list[dict], guardrails_cfg_root: Path) -> None:
         print(f"wrote {path} subject={entry['subject']}")
 
 
-class NoMatchingPolicy(RuntimeError):
-    """This assignment activates no guardrail policy.
-
-    A hard error for a single invocation — the caller asked for a baseline that
-    cannot exist. Under `--all` it is an ordinary skip: the enumeration is the
-    union of every fan-out's members, so most assignments are irrelevant to any
-    one domain's policies.
-    """
-
-
 def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None) -> int:
     ctl_cfg_root = Path(args.ctl_cfg_root).expanduser().resolve()
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"CTL cfg root not found: {ctl_cfg_root}")
     execution_context = build_context(args, ctl_cfg_root, extra_params)
-    common.validate_execution_context_constraints(
+    execution_run_context.validate_execution_context_constraints(
         ctl_cfg_root,
         execution_context,
     )
     # whole-tree tooling activates every declared domain (see helper)
-    execution_context = common.whole_tree_execution_context(ctl_cfg_root, execution_context)
-    scope_params = common.scope_params_from_context(execution_context)
+    execution_context = execution_run_context.whole_tree_execution_context(ctl_cfg_root, execution_context)
+    scope_params = execution_run_context.scope_params_from_context(execution_context)
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-guardrails-plt-"))
     try:
         plt_cfg_root, guardrails_cfg_root = bound_local_roots(
@@ -262,7 +259,7 @@ def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None
                 f"no PLT guardrail policies found under {plt_cfg_root}"
             )
         merged_dir = temp_root / "merged"
-        common.merge_plt_cfg_dirs(
+        cfg_tree.merge_plt_cfg_dirs(
             plt_cfg_root=plt_cfg_root,
             plt_merged_dir=merged_dir,
             ctl_profile="regenerate-guardrails",
@@ -270,7 +267,7 @@ def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None
             scope_params=scope_params,
             execution_context=execution_context,
         )
-        rendered_dir = common.render_plt_cfg(
+        rendered_dir = cfg_tree.render_plt_cfg(
             merged_dir,
             temp_root,
             execution_context,
@@ -311,7 +308,7 @@ def run_ctl(args: argparse.Namespace, extra_params: dict[str, str] | None = None
     if not ctl_cfg_root.is_dir():
         raise RuntimeError(f"CTL cfg root not found: {ctl_cfg_root}")
     execution_context = build_context(args, ctl_cfg_root, extra_params)
-    common.validate_execution_context_constraints(
+    execution_run_context.validate_execution_context_constraints(
         ctl_cfg_root,
         execution_context,
     )

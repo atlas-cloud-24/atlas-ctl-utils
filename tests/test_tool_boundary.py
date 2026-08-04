@@ -1,8 +1,8 @@
-"""§Phase 67: engine core carries no TOOL vocabulary.
+"""Engine core carries no TOOL vocabulary.
 
 The engine has a PROVIDER seam — adapters, a registry, and
 `test_provider_boundary.py` keeping AWS vocabulary out of engine core. It has no
-TOOL seam, and Terraform leaked straight into `common.py`: a regex that greps
+TOOL seam, and Terraform leaked straight into engine core: a regex that greps
 `step.sh` SOURCE for `./bin/tf.sh <dir> init <var>`, a function that extracts a
 Terraform project and state-key variable from it, a literal `"terraform"`, and a
 `TFSTATE_KEY_VAR` env var.
@@ -17,18 +17,20 @@ Every tool interaction belongs inside a step, behind a contract the engine alrea
 has. This test is the ratchet that keeps it there.
 """
 
+
 import re
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# The same files test_provider_boundary.py guards, for the same reason — and by
+# the same walk, IMPORTED rather than repeated here. Two walks are two places for
+# the boundary to be wrong, and they drift apart silently: the loser keeps
+# passing over whatever it still matches. `EngineCoreDiscoveryTests` over there
+# guards the walk for both, so this file inherits the proof that it covers
+# something.
+from test_provider_boundary import engine_core_files
 
-# The same files test_provider_boundary.py guards, for the same reason.
-ENGINE_CORE_FILES = (
-    REPO_ROOT / "runners" / "utils" / "common.py",
-    REPO_ROOT / "cfg" / "validate_cfg.py",
-    REPO_ROOT / "cfg" / "regenerate_guardrails.py",
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # A tool the engine must not name. `tf` alone is too common a fragment to match
 # safely, so the patterns are anchored to how the tool actually appears.
@@ -55,8 +57,9 @@ ALLOWED_LINES: frozenset[str] = frozenset()
 
 
 def _hits(path: Path) -> list[str]:
+    # Located by path, not by name: most of the engine's basenames repeat.
     return [
-        f"{path.name}:{number}: {line.strip()}"
+        f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
         for number, line in enumerate(path.read_text().splitlines(), start=1)
         if FORBIDDEN_TOOL.search(CONTRACT_FILENAMES.sub("", line))
         and line.strip() not in ALLOWED_LINES
@@ -65,7 +68,7 @@ def _hits(path: Path) -> list[str]:
 
 class ToolBoundaryTests(unittest.TestCase):
     def test_engine_core_has_no_tool_tokens(self):
-        hits = [h for path in ENGINE_CORE_FILES for h in _hits(path)]
+        hits = [h for path in engine_core_files() for h in _hits(path)]
         self.assertEqual(
             [],
             hits,
@@ -83,11 +86,12 @@ class ToolBoundaryTests(unittest.TestCase):
         Naming the script is fine and unavoidable — the engine locates and runs
         it. What is forbidden is OPENING it.
         """
+
         offenders = []
-        for path in ENGINE_CORE_FILES:
+        for path in engine_core_files():
             for number, line in enumerate(path.read_text().splitlines(), start=1):
                 if "step.sh" in line and ".read_text" in line:
-                    offenders.append(f"{path.name}:{number}: {line.strip()}")
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}")
         self.assertEqual([], offenders, "\n".join(offenders))
 
 

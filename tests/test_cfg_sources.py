@@ -1,19 +1,23 @@
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.cfg import layout as cfg_layout
+from engine.cfg import materialize as cfg_materialize
+from engine.cfg import validate as cfg_validate
 
 
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+from engine.kernel import git as kernel_git
 
 
 class CfgSourceTests(unittest.TestCase):
@@ -25,7 +29,7 @@ class CfgSourceTests(unittest.TestCase):
             root = Path(tmp)
             self._write_sources(root, "  plt:\n    repo_path: ../plt\n")
             with self.assertRaisesRegex(RuntimeError, "must define exactly"):
-                common.load_cfg_sources(root)
+                cfg_materialize.load_cfg_sources(root)
 
     def test_accepts_local_companion_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -36,7 +40,7 @@ class CfgSourceTests(unittest.TestCase):
                 "  guardrails:\n    repo_path: ../guardrails\n",
             )
             self.assertEqual(
-                common.load_cfg_sources(root)["guardrails"]["repo_path"],
+                cfg_materialize.load_cfg_sources(root)["guardrails"]["repo_path"],
                 "../guardrails",
             )
 
@@ -46,14 +50,14 @@ class CfgSourceTests(unittest.TestCase):
             "guardrails": {"repo_path": "../guardrails"},
         }
         with self.assertRaisesRegex(RuntimeError, "commit-pinned cfg sources"):
-            common.validate_cfg_source_refs(sources, "commit_required")
+            cfg_validate.CommitPinning("commit_required").check_cfg_sources(sources)
 
     def test_commit_policy_accepts_exact_commits(self):
         sources = {
             key: {"repo_url": f"https://example.invalid/{key}.git", "ref": {"commit": "abc123"}}
-            for key in common.CFG_SOURCE_KEYS
+            for key in cfg_layout.CFG_SOURCE_KEYS
         }
-        common.validate_cfg_source_refs(sources, "commit_required")
+        cfg_validate.CommitPinning("commit_required").check_cfg_sources(sources)
 
 
     def test_materializes_bound_local_roots(self):
@@ -67,7 +71,7 @@ class CfgSourceTests(unittest.TestCase):
                 "  plt:\n    repo_path: ../plt\n"
                 "  guardrails:\n    repo_path: ../guardrails\n",
             )
-            roots = common.materialize_cfg_sources(
+            roots = cfg_materialize.materialize_cfg_sources(
                 ctl, ref_policy="local_dirty_allowed", run_cfg_dir=root / "run"
             )
             self.assertEqual(roots["plt"], (root / "plt").resolve())
@@ -88,8 +92,8 @@ class CfgSourceTests(unittest.TestCase):
             def fake_clone(repo_url, branch, commit, destination, token):
                 destination.mkdir(parents=True)
 
-            with mock.patch.object(common, "git_clone", side_effect=fake_clone) as clone:
-                roots = common.materialize_cfg_sources(
+            with mock.patch.object(kernel_git, "git_clone", side_effect=fake_clone) as clone:
+                roots = cfg_materialize.materialize_cfg_sources(
                     ctl, ref_policy="commit_required", run_cfg_dir=root / "run", token="token"
                 )
             self.assertEqual(set(roots), {"plt", "guardrails"})

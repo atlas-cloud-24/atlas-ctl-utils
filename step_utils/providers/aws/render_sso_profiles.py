@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Render AWS CLI SSO profile configuration commands from a normalized model."""
+"""
+
+
+render AWS CLI SSO profile configuration commands from a normalized model."""
+
 
 import argparse
 import json
@@ -7,7 +11,6 @@ import os
 import re
 import shlex
 from pathlib import Path
-
 
 ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

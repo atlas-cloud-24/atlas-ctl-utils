@@ -4,11 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.execution import providers as execution_providers
+from engine.execution import references as execution_references
+from engine.execution import run_context as execution_run_context
+from engine.run import policy as run_policy
+from engine.run import selectors as run_selectors
+from engine.cli import args as cli_args
 
 
 def write(path: Path, content: str) -> None:
@@ -23,7 +27,7 @@ class CtlProfilesTests(unittest.TestCase):
             write(root / "not-a-special-name.yaml",
                   "ctl_profiles:\n  local_dev:\n    ref_policy: local_dirty_allowed\n")
 
-            self.assertEqual(common.ctl_ref_policy(root, "local_dev"), "local_dirty_allowed")
+            self.assertEqual(run_policy.ctl_ref_policy(root, "local_dev"), "local_dirty_allowed")
 
     def test_unknown_profile_lists_known(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,7 +35,7 @@ class CtlProfilesTests(unittest.TestCase):
             write(root / "ctl_profiles.yaml", "ctl_profiles:\n  local_dev:\n    ref_policy: x\n")
 
             with self.assertRaisesRegex(RuntimeError, "known profiles: local_dev"):
-                common.ctl_profile_policy(root, "nope")
+                run_policy.ctl_profile_policy(root, "nope")
 
 
 class ExecutionContextTests(unittest.TestCase):
@@ -44,7 +48,7 @@ class ExecutionContextTests(unittest.TestCase):
 
     def test_builds_two_namespaces_flat(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ctx = common.build_execution_context(
+            ctx = execution_run_context.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="commit_required",
                 execution_runtime_mode="local",
                 execution_params={"env.type": "dev"})
@@ -56,7 +60,7 @@ class ExecutionContextTests(unittest.TestCase):
 
     def test_cfg_param_ref_to_absent_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ctx = common.build_execution_context(
+            ctx = execution_run_context.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="p",
                 execution_runtime_mode="local", execution_params={})
         self.assertNotIn("execution_context.params.derived", ctx)
@@ -64,18 +68,18 @@ class ExecutionContextTests(unittest.TestCase):
     def test_cli_cfg_param_collision_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "collides with a --execution-params"):
-                common.build_execution_context(
+                execution_run_context.build_execution_context(
                     self._ctl_root(tmp), action="plan", ctl_profile="p",
                     execution_runtime_mode="local",
                     execution_params={"main_tag": "other"})
 
     def test_nested_view_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ctx = common.build_execution_context(
+            ctx = execution_run_context.build_execution_context(
                 self._ctl_root(tmp), action="plan", ctl_profile="p",
                 execution_runtime_mode="local",
                 execution_params={"env.type": "dev"})
-        nested = common.execution_context_nested(ctx)
+        nested = execution_references.execution_context_nested(ctx)
         self.assertEqual(nested["execution_context"]["ctl"]["action"], "plan")
         self.assertEqual(nested["execution_context"]["params"]["main_tag"], "oxygen")
 
@@ -88,20 +92,20 @@ class SelectorMatchTests(unittest.TestCase):
     }
 
     def test_fully_qualified_match(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             {"execution_context.params.env.type": ["dev", "test"]}, self.CTX, label="t"))
 
     def test_promoted_keys_are_selectable(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             {"execution_context.ctl.profile": ["commit_required"]}, self.CTX, label="t"))
 
     def test_missing_key_means_no_match(self):
-        self.assertFalse(common.selector_matches(
+        self.assertFalse(run_selectors.selector_matches(
             {"execution_context.params.region": ["eu-west-2"]}, self.CTX, label="t"))
 
     def test_bare_key_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "fully-qualified execution-context path"):
-            common.selector_matches({"env_type": ["dev"]}, self.CTX, label="t")
+            run_selectors.selector_matches({"env_type": ["dev"]}, self.CTX, label="t")
 
     def test_constraints_enforce_allowed_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,27 +118,29 @@ class SelectorMatchTests(unittest.TestCase):
             ctx["execution_context.params.env.type"] = "prod"
             ctx["execution_context.ctl.action"] = "destroy"
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_execution_context_constraints(root, ctx)
+                execution_run_context.validate_execution_context_constraints(root, ctx)
 
 
 class ProviderNamespacedParamKeyTests(unittest.TestCase):
-    """Provider-specific params are namespaced (`aws.account`); neutral params stay
+    """
+
+    provider-specific params are namespaced (`aws.account`); neutral params stay
     single-segment. The context is a flat dotted map, so a dotted key is just a
     longer key and selectors keep matching full paths."""
 
     def test_neutral_and_dotted_keys_are_valid(self):
         for key in ("env_type", "landing_zone", "aws.account", "azure.subscription", "a.b.c"):
-            self.assertTrue(common.CONTEXT_KEY_RE.fullmatch(key), key)
+            self.assertTrue(execution_references.CONTEXT_KEY_RE.fullmatch(key), key)
 
     def test_malformed_dotted_keys_are_rejected(self):
         for key in ("aws.", ".aws", "aws..account", "aws.1account", "aws-account", ""):
-            self.assertFalse(common.CONTEXT_KEY_RE.fullmatch(key), key)
+            self.assertFalse(execution_references.CONTEXT_KEY_RE.fullmatch(key), key)
 
     def test_dotted_param_reaches_the_context_under_its_full_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "execution_params.yaml", "execution_params:\n  main_tag: oxygen\n")
-            ctx = common.build_execution_context(
+            ctx = execution_run_context.build_execution_context(
                 root,
                 action="provision",
                 ctl_profile="local_dev",
@@ -148,12 +154,12 @@ class ProviderNamespacedParamKeyTests(unittest.TestCase):
     def test_dotted_param_is_selectable(self):
         ctx = {"execution_context.params.aws.account": "dev"}
         self.assertTrue(
-            common.selector_matches(
+            run_selectors.selector_matches(
                 {"execution_context.params.aws.account": ["dev"]}, ctx, label="t"
             )
         )
         self.assertFalse(
-            common.selector_matches(
+            run_selectors.selector_matches(
                 {"execution_context.params.aws.account": ["prod"]}, ctx, label="t"
             )
         )
@@ -170,36 +176,36 @@ class ContainsMatcherTests(unittest.TestCase):
 
     def test_member_matches(self):
         for provider in ("aws", "azure"):
-            self.assertTrue(common.selector_matches(
+            self.assertTrue(run_selectors.selector_matches(
                 {"execution_context.ctl.providers": {"contains": provider}},
                 self.CTX, label="t"))
 
     def test_non_member_does_not_match(self):
-        self.assertFalse(common.selector_matches(
+        self.assertFalse(run_selectors.selector_matches(
             {"execution_context.ctl.providers": {"contains": "gcp"}},
             self.CTX, label="t"))
 
     def test_contains_and_scalar_predicates_combine(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             {"execution_context.ctl.providers": {"contains": "aws"},
              "execution_context.params.env.type": ["dev"]},
             self.CTX, label="t"))
-        self.assertFalse(common.selector_matches(
+        self.assertFalse(run_selectors.selector_matches(
             {"execution_context.ctl.providers": {"contains": "aws"},
              "execution_context.params.env.type": ["prod"]},
             self.CTX, label="t"))
 
     def test_structured_contains_form(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             {"contains": {"execution_context.ctl.providers": ["aws"]}},
             self.CTX, label="t"))
 
     def test_missing_fact_does_not_match(self):
-        self.assertFalse(common.selector_matches(
+        self.assertFalse(run_selectors.selector_matches(
             {"execution_context.ctl.providers": {"contains": "aws"}}, {}, label="t"))
 
     def test_scalar_fact_is_treated_as_a_single_member(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             {"execution_context.params.env.type": {"contains": "dev"}},
             self.CTX, label="t"))
 
@@ -213,14 +219,14 @@ class ProviderCoverageTests(unittest.TestCase):
                                     "roles": {"readwrite": "r"}}}}}
 
     def test_declared_provider_passes(self):
-        common.validate_target_provider_coverage(self._run("aws"), ["aws", "azure"])
+        execution_providers.validate_target_provider_coverage(self._run("aws"), ["aws", "azure"])
 
     def test_undeclared_provider_fails_loud(self):
         with self.assertRaisesRegex(RuntimeError, "not declared in --providers"):
-            common.validate_target_provider_coverage(self._run("azure"), ["aws"])
+            execution_providers.validate_target_provider_coverage(self._run("azure"), ["aws"])
 
     def test_execution_less_run_is_ignored(self):
-        common.validate_target_provider_coverage({"t": {}}, ["aws"])
+        execution_providers.validate_target_provider_coverage({"t": {}}, ["aws"])
 
 
 class ProviderOptionsTests(unittest.TestCase):
@@ -229,7 +235,7 @@ class ProviderOptionsTests(unittest.TestCase):
     def test_parses_and_merges_namespaced_keys(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("--provider-options", dest="provider_options",
-                            action=common.ProviderOptionsAction, default={})
+                            action=execution_providers.ProviderOptionsAction, default={})
         args = parser.parse_args([
             "--provider-options", "aws.credential_implementation=profile,aws.x=1",
             "--provider-options", "azure.y=2",
@@ -239,32 +245,32 @@ class ProviderOptionsTests(unittest.TestCase):
 
     def test_key_must_be_provider_namespaced(self):
         with self.assertRaisesRegex(Exception, "provider-namespaced"):
-            common.parse_provider_options("credential_implementation=profile")
+            execution_providers.parse_provider_options("credential_implementation=profile")
 
     def test_malformed_pair_rejected(self):
         with self.assertRaisesRegex(Exception, "<provider>.<key>=<value>"):
-            common.parse_provider_options("aws.bogus")
+            execution_providers.parse_provider_options("aws.bogus")
 
     def test_subset_for_one_provider_strips_the_prefix(self):
         options = {"aws.credential_implementation": "profile", "azure.k": "v"}
-        self.assertEqual(common.provider_options_for(options, "aws"),
+        self.assertEqual(execution_providers.provider_options_for(options, "aws"),
                          {"credential_implementation": "profile"})
-        self.assertEqual(common.provider_options_for(options, "gcp"), {})
+        self.assertEqual(execution_providers.provider_options_for(options, "gcp"), {})
 
     def test_options_must_address_a_declared_provider(self):
         with self.assertRaisesRegex(RuntimeError, "not declared in --providers"):
-            common.validate_provider_options_addressing({"azure.k": "v"}, ["aws"])
-        common.validate_provider_options_addressing({"aws.k": "v"}, ["aws"])
+            execution_providers.validate_provider_options_addressing({"azure.k": "v"}, ["aws"])
+        execution_providers.validate_provider_options_addressing({"aws.k": "v"}, ["aws"])
 
     def test_credential_implementation_is_independent_of_runtime_mode(self):
         # WHERE you run and HOW you authenticate are separate axes.
         self.assertEqual(
-            common.resolve_provider_implementation_key(
+            execution_providers.resolve_provider_implementation_key(
                 {"aws.credential_implementation": "web_identity"}, "aws"),
             "web_identity")
         # REQUIRED — the engine has no implementation to default to
         with self.assertRaisesRegex(RuntimeError, "no credential implementation declared"):
-            common.resolve_provider_implementation_key({}, "aws")
+            execution_providers.resolve_provider_implementation_key({}, "aws")
 
 
 class ConstraintGateTests(unittest.TestCase):
@@ -293,15 +299,15 @@ class ConstraintGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, body)
             # neither axis is prod -> gate does not match -> destroy allowed
-            common.validate_execution_context_constraints(root, dict(self.BASE))
+            execution_run_context.validate_execution_context_constraints(root, dict(self.BASE))
             # only account=prod -> gate matches via the FIRST entry
             ctx = dict(self.BASE, **{"execution_context.params.account": "prod"})
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_execution_context_constraints(root, ctx)
+                execution_run_context.validate_execution_context_constraints(root, ctx)
             # only env_type=prod -> gate matches via the SECOND entry
             ctx = dict(self.BASE, **{"execution_context.params.env.type": "prod"})
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_execution_context_constraints(root, ctx)
+                execution_run_context.validate_execution_context_constraints(root, ctx)
 
     def test_when_all_requires_every_entry(self):
         body = ("  - when_all:\n"
@@ -313,14 +319,14 @@ class ConstraintGateTests(unittest.TestCase):
             root = self._root(tmp, body)
             # only one axis prod -> gate does NOT match
             ctx = dict(self.BASE, **{"execution_context.params.account": "prod"})
-            common.validate_execution_context_constraints(root, ctx)
+            execution_run_context.validate_execution_context_constraints(root, ctx)
             # both prod -> gate matches
             ctx = dict(self.BASE, **{
                 "execution_context.params.account": "prod",
                 "execution_context.params.env.type": "prod",
             })
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_execution_context_constraints(root, ctx)
+                execution_run_context.validate_execution_context_constraints(root, ctx)
 
     def test_when_all_and_when_any_are_anded(self):
         body = ("  - when_all:\n"
@@ -334,14 +340,14 @@ class ConstraintGateTests(unittest.TestCase):
             root = self._root(tmp, body)
             # when_any satisfied but when_all not -> no match
             ctx = dict(self.BASE, **{"execution_context.params.account": "prod"})
-            common.validate_execution_context_constraints(root, ctx)
+            execution_run_context.validate_execution_context_constraints(root, ctx)
             # both satisfied -> match
             ctx = dict(self.BASE, **{
                 "execution_context.params.env.type": "prod",
                 "execution_context.params.account": "prodlike",
             })
             with self.assertRaisesRegex(RuntimeError, "allows execution_context.ctl.action"):
-                common.validate_execution_context_constraints(root, ctx)
+                execution_run_context.validate_execution_context_constraints(root, ctx)
 
     def test_no_gate_means_always_applies(self):
         body = ("  - require_present:\n"
@@ -349,7 +355,7 @@ class ConstraintGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, body)
             with self.assertRaisesRegex(RuntimeError, "requires 'execution_context.params.landing_zone'"):
-                common.validate_execution_context_constraints(root, dict(self.BASE))
+                execution_run_context.validate_execution_context_constraints(root, dict(self.BASE))
 
     def test_removed_when_key_is_a_migration_error(self):
         body = ("  - when:\n"
@@ -359,7 +365,7 @@ class ConstraintGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, body)
             with self.assertRaisesRegex(RuntimeError, r"uses `when`, which is removed"):
-                common.validate_execution_context_constraints(root, dict(self.BASE))
+                execution_run_context.validate_execution_context_constraints(root, dict(self.BASE))
 
     def test_unknown_field_is_rejected(self):
         body = ("  - when_all:\n"
@@ -368,7 +374,7 @@ class ConstraintGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, body)
             with self.assertRaisesRegex(RuntimeError, "unknown fields"):
-                common.validate_execution_context_constraints(root, dict(self.BASE))
+                execution_run_context.validate_execution_context_constraints(root, dict(self.BASE))
 
     def test_gate_must_be_a_non_empty_list_of_mappings(self):
         for body in (
@@ -379,7 +385,7 @@ class ConstraintGateTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = self._root(tmp, body)
                 with self.assertRaisesRegex(RuntimeError, "must be a non-empty list"):
-                    common.validate_execution_context_constraints(root, dict(self.BASE))
+                    execution_run_context.validate_execution_context_constraints(root, dict(self.BASE))
 
 
 class ExecutionParamsArgTests(unittest.TestCase):
@@ -392,7 +398,7 @@ class ExecutionParamsArgTests(unittest.TestCase):
         parser.add_argument(
             "--execution-params",
             dest="execution_param",
-            action=common.ExecutionParamsAction,
+            action=cli_args.ExecutionParamsAction,
             default=[],
         )
         return parser
@@ -426,14 +432,14 @@ class ExecutionParamsArgTests(unittest.TestCase):
     def test_result_feeds_selectors_to_map_unchanged(self):
         args = self._parser().parse_args(["--execution-params", "a=1,b=2"])
         self.assertEqual(
-            common.selectors_to_map(args.execution_param, label="execution param"),
+            run_selectors.selectors_to_map(args.execution_param, label="execution param"),
             {"a": "1", "b": "2"},
         )
 
     def test_duplicate_key_still_rejected_downstream(self):
         args = self._parser().parse_args(["--execution-params", "a=1,a=2"])
         with self.assertRaisesRegex(RuntimeError, "duplicate execution param selector"):
-            common.selectors_to_map(args.execution_param, label="execution param")
+            run_selectors.selectors_to_map(args.execution_param, label="execution param")
 
     def test_malformed_pair_is_a_parser_error(self):
         with self.assertRaises(SystemExit):

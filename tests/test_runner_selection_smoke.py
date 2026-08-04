@@ -12,6 +12,7 @@ every standalone target run — including every workflow child — died with an
 UnboundLocalError. 487 unit tests and full cfg validation were green.
 """
 
+
 import os
 import sys
 import unittest
@@ -20,7 +21,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.catalog import targets as catalog_targets
+from engine.cfg import resources as cfg_resources
+from engine.commands import selection as commands_selection
 
 DEV_CFG = Path("/home/valerii/programs/atlas/cfg/oxygen/oxygen-ctl-cfg-dev")
 
@@ -58,7 +61,7 @@ class SelectionResolvesForEveryKindTest(unittest.TestCase):
 
     def _resolve(self, action: str, *, workflow: str | None = None,
                  target: str | None = None) -> dict:
-        return common.resolve_pipeline_selection(
+        return commands_selection.resolve_pipeline_selection(
             DEV_CFG,
             "local_dev",
             dict(PARAMS),
@@ -84,9 +87,12 @@ class SelectionResolvesForEveryKindTest(unittest.TestCase):
         self.assertIn("env/core/baseline", selection["active_target_runs"])
 
     def test_a_standalone_target_resolves(self):
-        """The branch that was broken: it has no workflow cfg of its own, so a
+        """
+
+        the branch that was broken: it has no workflow cfg of its own, so a
         change threaded into it read an unassigned local and every target run —
         including every workflow CHILD — died before doing anything."""
+
         selection = self._resolve("plan", target="env/core/baseline")
         self.assertEqual("target", selection["selection_kind"])
         self.assertIn("env/core/baseline", selection["active_target_runs"])
@@ -104,12 +110,15 @@ class SelectionResolvesForEveryKindTest(unittest.TestCase):
         self.assertEqual("destroy", runs["env/core/prepare_destroy"]["action"])
 
     def test_every_declared_workflow_resolves_for_each_operation(self):
-        """Breadth over depth: one pass across the whole cfg reaches shapes a
+        """
+
+        breadth over depth: one pass across the whole cfg reaches shapes a
         hand-picked example never would."""
-        workflows = common.collect_resource(DEV_CFG, "workflows", entry_depth=1)
+
+        workflows = cfg_resources.collect_resource(DEV_CFG, "workflows", entry_depth=1)
         checked = 0
         for name, definition in sorted(workflows.items()):
-            for action in common.entry_actions(definition, label=f"workflow {name!r}"):
+            for action in catalog_targets.entry_actions(definition, label=f"workflow {name!r}"):
                 try:
                     self._resolve(action, workflow=name)
                 except RuntimeError:
@@ -118,10 +127,10 @@ class SelectionResolvesForEveryKindTest(unittest.TestCase):
         self.assertGreater(checked, 5)
 
     def test_every_declared_target_resolves_standalone(self):
-        targets = common.collect_resource(DEV_CFG, "targets", entry_depth=1)
+        targets = cfg_resources.collect_resource(DEV_CFG, "targets", entry_depth=1)
         checked = 0
         for name, definition in sorted(targets.items()):
-            for action in common.entry_actions(definition, label=f"target {name!r}"):
+            for action in catalog_targets.entry_actions(definition, label=f"target {name!r}"):
                 try:
                     self._resolve(action, target=name)
                 except RuntimeError:

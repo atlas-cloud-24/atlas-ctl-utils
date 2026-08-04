@@ -10,6 +10,7 @@ the importer asked for.
 Read-only. Writes a `.mmd` file (and an SVG when Mermaid CLI is available).
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import cfg_presets  # noqa: E402
+from engine.cfg import presets as cfg_presets
 
 REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?::-.*?)?\}")
 EXECUTION_CONTEXT_PREFIX = "execution_context."
@@ -125,7 +126,10 @@ class Graph:
         return sorted(self.units - set(self.scopes))
 
     def reachable_from(self, unit: str, seen: tuple[str, ...] = ()) -> list[str]:
-        """Every unit reached by following this unit's imports, depth-first."""
+        """
+
+        every unit reached by following this unit's imports, depth-first."""
+
         if unit in seen:
             return []
         out: list[str] = []
@@ -169,7 +173,7 @@ class Graph:
                     key for key in top_level
                     if any(ref == key or ref.startswith(key + ".") for ref in own_refs)
                 }
-                # a scope may import a preset purely to PUBLISH what it provides
+                # A scope may import a preset purely to PUBLISH what it provides
                 republished = bool(top_level & own_defined) or unit in self.scopes
                 if not touched and not republished:
                     findings.append((
@@ -188,10 +192,8 @@ class Graph:
         # An import declared where it is not used, while a preset BELOW it does use
         # it, is the dynamic-scoping shape: the importer carries a dependency on its
         # child's behalf, and the child looks satisfied only because of that.
-        #
         # Matched on FULL paths. Comparing top-level keys collides on shared roots
         # like `_common`, which is the same mistake A6 originally made.
-        #
         # Scopes are checked too. A scope carrying an import on a preset's behalf is
         # precisely the defect this catches, and exempting scopes because they also
         # publish would exempt the only place the defect occurs.
@@ -264,7 +266,10 @@ class Graph:
         return findings
 
     def composition_of(self, scope: str) -> list[str]:
-        """Every unit in one scope's composition, the scope included."""
+        """
+
+        every unit in one scope's composition, the scope included."""
+
         return sorted({scope, *self.reachable_from(scope)})
 
     def _depth(self, scope: str) -> dict[str, int]:
@@ -296,6 +301,7 @@ class Graph:
         name for the same thing and stops the diagram being greppable against
         the files it describes.
         """
+
         return unit
 
     def scope_mermaid(self, scope: str) -> str:
@@ -304,6 +310,7 @@ class Graph:
         Edges are drawn preset -> importer, which is the direction values flow and
         the direction merge order runs, so the diagram reads the way the cfg does.
         """
+
         units = self.composition_of(scope)
         depth = self._depth(scope)
 
@@ -347,6 +354,7 @@ class Graph:
         The inverse of `composition_of`: that answers "what does this scope pull
         in", this answers "who breaks if I change this preset".
         """
+
         return sorted(
             unit
             for unit in list(self.scopes) + self.presets
@@ -360,6 +368,7 @@ class Graph:
         still reads as "values flow this way", and the diagram is the same graph
         seen from the other end.
         """
+
         consumers = self.consumers_of(preset)
         units = [preset, *consumers]
 
@@ -372,7 +381,7 @@ class Graph:
             "  classDef subject fill:#8250df,stroke:#4c1d95,color:#ffffff,font-weight:bold;",
             "  classDef scope fill:#1f6feb,stroke:#0b3d91,color:#ffffff;",
             "  classDef preset fill:#f6f8fa,stroke:#8b949e,color:#24292f;",
-            f'  subgraph SUBJ["preset"]',
+            '  subgraph SUBJ["preset"]',
             "    direction LR",
             f'    {node_id(preset)}("{self._label(preset)}")',
             "  end",
@@ -400,7 +409,10 @@ class Graph:
         return "\n".join(lines) + "\n"
 
     def preset_consumers_text(self, preset: str) -> str:
-        """The same answer as a flat list, for reading in a terminal."""
+        """
+
+        the same answer as a flat list, for reading in a terminal."""
+
         consumers = self.consumers_of(preset)
         lines = [preset, ""]
         if not consumers:
@@ -413,7 +425,10 @@ class Graph:
         return "\n".join(lines) + "\n"
 
     def scope_tree(self, scope: str) -> str:
-        """The same composition as an indented text tree, for reading in a terminal."""
+        """
+
+        the same composition as an indented text tree, for reading in a terminal."""
+
         lines = [scope]
 
         def walk(unit: str, prefix: str, seen: tuple[str, ...]) -> None:

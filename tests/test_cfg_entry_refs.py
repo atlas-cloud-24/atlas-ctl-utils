@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 CTL_UTILS_ROOT = Path(__file__).resolve().parents[1]
 
 

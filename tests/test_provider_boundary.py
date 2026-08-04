@@ -1,11 +1,20 @@
-"""Engine-core provider-boundary tests (Phase 13).
+"""Engine-core provider-boundary tests.
 
-The engine core (runners/utils/common.py and the engine cfg tools) must carry
-no AWS vocabulary: no provider-named CLI arguments, field validation, branches,
-ARN construction, subprocess invocations, target_run env handling, or user-facing
-errors. AWS lives only in utils/providers/aws.py, its tests, providers.aws.*
-cfg, and labelled documentation examples.
+The engine core (the engine library under `runners/` and the engine cfg tools
+under `cfg/`) must carry no AWS vocabulary: no provider-named CLI arguments,
+field validation, branches, ARN construction, subprocess invocations, target_run
+env handling, or user-facing errors. AWS lives only in the adapter repository,
+its tests, providers.aws.* cfg, and labelled documentation examples.
+
+Which files that covers is DISCOVERED, not enumerated. A by-name list narrows
+itself the moment engine code moves: `common.py` splitting into a
+`runners/engine/` package would leave the boundary guarding whichever files kept
+the listed names, and the suite would stay green while covering a fraction of the
+engine. The walk below covers a module the moment it exists.
 """
+
+
+import functools
 import os
 import re
 import subprocess
@@ -16,40 +25,173 @@ import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
-from utils import common  # noqa: E402
-import atlas_ctl_adapter_aws as aws_adapter  # noqa: E402
-from utils.providers import get_adapter  # noqa: E402
+import atlas_ctl_adapter_aws as aws_adapter
+import ctl_cfg_fixture
+from engine.run import policy as run_policy
+from engine.execution.adapters import get_adapter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ENGINE_CORE_FILES = (
-    REPO_ROOT / "runners" / "utils" / "common.py",
-    REPO_ROOT / "cfg" / "validate_cfg.py",
-    REPO_ROOT / "cfg" / "regenerate_guardrails.py",
+
+# The engine's SOURCE ROOTS, walked whole. `runners/` is the engine library and
+# its entry points; `cfg/` is the engine cfg tooling. Both are walked rather than
+# listed so that a package which does not exist yet is covered on the day it
+# lands, with no edit here.
+ENGINE_SOURCE_ROOTS = (REPO_ROOT / "runners", REPO_ROOT / "cfg")
+
+# No subtree of the engine is exempt. The provider registry used to be — it held
+# an engine-side list of loadable providers — but the registry is the cfg
+# declaration now, so there is no longer anywhere in the engine that a provider
+# name is allowed to appear.
+EXCLUDED_SUBTREES = ()
+
+# Directory NAMES dropped wherever in the walk they occur.
+EXCLUDED_DIR_NAMES = frozenset(
+    {
+        # Generated copies of source, not source — and a stale .pyc has produced a
+        # false green in this repo before.
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        # Tests NAME the vocabulary they keep out of engine core: this very file
+        # says "aws" dozens of times. Scanning them would forbid the rule from
+        # stating itself.
+        "tests",
+    }
 )
+
+# The provider ADAPTER package needs no exclusion entry: it implements the
+# provider contract, so naming AWS is its job, and it lives in its own repository
+# (`atlas-ctl-adapter-aws`) outside every source root above. That is structural,
+# not incidental — `test_the_adapter_package_is_outside_every_source_root` holds
+# it there, so vendoring the adapter back under `runners/` goes red rather than
+# quietly turning the boundary into a self-contradiction.
+
 FORBIDDEN = re.compile(r"(?i)(\baws\b|aws_|_aws|-aws|arn:|s3://|\bsts\b|\bboto)")
 # §12: the AWS-implementation term ctl_role_chain must not leak into engine-core
 FORBIDDEN_PUBLIC = re.compile(r"(ctl_role_chain|role.chain|skip_ctl_role_chain)")
 
 
+@functools.cache
+def engine_core_files() -> tuple[Path, ...]:
+    """Every engine-core module, discovered by walking the source roots.
+
+    Raises instead of returning nothing. A walk that matches zero files satisfies
+    every assertion built on top of it, so silence here would read as a pass — the
+    one failure mode a discovery-based rule has that an enumerated list does not.
+    """
+
+    found: list[Path] = []
+    for root in ENGINE_SOURCE_ROOTS:
+        if not root.is_dir():
+            raise RuntimeError(
+                f"engine source root does not exist: {root} — the provider boundary "
+                "would cover nothing and every test below it would pass vacuously"
+            )
+        before = len(found)
+        for dirpath, dirnames, filenames in os.walk(root):
+            here = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in EXCLUDED_DIR_NAMES and (here / name) not in EXCLUDED_SUBTREES
+            )
+            found.extend(here / name for name in sorted(filenames) if name.endswith(".py"))
+        if len(found) == before:
+            raise RuntimeError(
+                f"engine source root contributed no modules: {root} — either it moved "
+                "or an exclusion swallowed it whole"
+            )
+    return tuple(found)
+
+
+class EngineCoreDiscoveryTests(unittest.TestCase):
+    """Guards the walk itself, which every boundary assertion below trusts.
+
+    Without this the walk is free to match nothing — a mistyped root, an
+    exclusion that grew too wide, a package that moved — and the boundary tests
+    would iterate an empty tuple and report success.
+    """
+
+    # What the walk finds today. A floor, not a list: it is raised when the engine
+    # grows, and a drop below it means coverage was lost, not that code was tidied.
+    MINIMUM_ENGINE_CORE_FILES = 10
+
+    # The files the boundary used to name explicitly, kept as a SUBSET check so a
+    # rewrite of the walk can only ever widen coverage, never quietly narrow it.
+    HISTORICALLY_ENUMERATED = (
+        REPO_ROOT / "cfg" / "validate_cfg.py",
+        REPO_ROOT / "cfg" / "regenerate_guardrails.py",
+    )
+
+    def test_the_walk_finds_the_engine(self):
+        files = engine_core_files()
+        self.assertGreaterEqual(
+            len(files),
+            self.MINIMUM_ENGINE_CORE_FILES,
+            f"the walk found {len(files)} engine-core modules, fewer than the "
+            f"{self.MINIMUM_ENGINE_CORE_FILES} it must cover:\n"
+            + "\n".join(str(path) for path in files),
+        )
+
+    def test_the_engine_core_package_is_covered(self):
+        """The walk must provably reach the engine, not merely find SOME file.
+
+        Asserted against the package rather than a filename: a filename check
+        answers a question the split already made meaningless, while a package
+        that contributes nothing means the walk missed the engine entirely.
+        """
+
+        package = REPO_ROOT / "runners" / "engine"
+        covered = [path for path in engine_core_files() if package in path.parents]
+        self.assertTrue(
+            covered, f"the walk reached no module under {package}"
+        )
+        self.assertIn(package / "commands" / "pipeline.py", set(covered))
+
+    def test_the_walk_still_covers_what_the_old_list_named(self):
+        covered = set(engine_core_files())
+        missing = [str(path) for path in self.HISTORICALLY_ENUMERATED if path not in covered]
+        self.assertEqual(
+            [], missing, "coverage lost versus the old by-name list:\n" + "\n".join(missing)
+        )
+
+    def test_the_adapter_package_is_outside_every_source_root(self):
+        """The adapter is excluded by ROLE — it implements the provider contract —
+        and that exclusion is enforced by WHERE it lives, not by a skip rule."""
+
+        adapter = Path(aws_adapter.__file__).resolve().parent
+        for root in ENGINE_SOURCE_ROOTS:
+            self.assertFalse(
+                adapter.is_relative_to(root),
+                f"the provider adapter moved inside engine core: {adapter} under {root}",
+            )
+
+
 class ProviderBoundaryTests(unittest.TestCase):
     def test_engine_core_has_no_provider_tokens(self):
-        for path in ENGINE_CORE_FILES:
+        for path in engine_core_files():
             text = path.read_text()
+            label = path.relative_to(REPO_ROOT)
             hits = [
-                f"{path.name}:{number}: {line.strip()}"
+                f"{label}:{number}: {line.strip()}"
                 for number, line in enumerate(text.splitlines(), start=1)
                 if FORBIDDEN.search(line)
             ]
             self.assertEqual(hits, [], "engine-core provider tokens:\n" + "\n".join(hits))
             public_hits = [
-                f"{path.name}:{number}: {line.strip()}"
+                f"{label}:{number}: {line.strip()}"
                 for number, line in enumerate(text.splitlines(), start=1)
                 if FORBIDDEN_PUBLIC.search(line) and "removed" not in line
             ]
             self.assertEqual(public_hits, [], "engine-core role-chain leakage:\n" + "\n".join(public_hits))
 
     def test_unknown_provider_is_a_hard_error(self):
-        with self.assertRaisesRegex(RuntimeError, "no provider adapter registered"):
+        """Unknown means UNDECLARED. The engine holds no adapter list to be absent
+        from, so the only registry a provider can be missing from is the cfg
+        declaration, and the error has to say which one it read."""
+
+        ctl_cfg_fixture.cfg_root(self, "aws")
+        with self.assertRaisesRegex(RuntimeError, "is not declared in ctl_providers.yaml"):
             get_adapter("gcp")
 
     def test_adapter_contract_operations_exist(self):
@@ -83,6 +225,8 @@ class ProviderBoundaryTests(unittest.TestCase):
 class ContractWrapperTests(unittest.TestCase):
     @unittest.mock.patch.dict(os.environ, {}, clear=True)
     def test_validate_and_bind_wrappers_run_in_bypass_mode(self):
+        # the wrappers dispatch back through the engine's provider lookup
+        ctl_cfg_fixture.cfg_root(self, "aws")
         catalogs = {
             "execution_identities": {},
             "credential_sources": {},
@@ -122,7 +266,6 @@ class ContractWrapperTests(unittest.TestCase):
 
 class CtlRoleChainLoaderTests(unittest.TestCase):
     def test_rejects_removed_target_role_key(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "providers" / "aws").mkdir(parents=True)
@@ -163,9 +306,8 @@ class ProfileBindingTests(unittest.TestCase):
     def test_incomplete_export_fails_loud(self):
         with unittest.mock.patch.object(
             aws_adapter.credentials, "_run_aws_json", return_value={"AccessKeyId": "AKIA"}
-        ):
-            with self.assertRaisesRegex(RuntimeError, "SecretAccessKey"):
-                aws_adapter.export_profile_credentials("wanted")
+        ), self.assertRaisesRegex(RuntimeError, "SecretAccessKey"):
+            aws_adapter.export_profile_credentials("wanted")
 
 
 
@@ -214,7 +356,6 @@ class CredentialPathIteratorTests(unittest.TestCase):
 
 class ExecutionAccessModeTests(unittest.TestCase):
     def test_profile_modes_default_and_gate(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
@@ -224,12 +365,13 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 "    aws:\n      allowed_execution_access_modes: [standard, agreed_direct]\n"
                 "      allowed_credential_implementation: [profile]\n"
             )
+            ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
             # provider policy is DECLARED: no allowed_providers is a hard error
             with self.assertRaisesRegex(RuntimeError, "must declare allowed_providers"):
-                common.ctl_allowed_providers(root, "strict")
-            self.assertEqual(common.ctl_allowed_providers(root, "boot"), ["aws"])
+                run_policy.ctl_allowed_providers(root, "strict")
+            self.assertEqual(run_policy.ctl_allowed_providers(root, "boot"), ["aws"])
             # the block is opaque to the engine; the adapter reads it
-            policy = common.ctl_profile_provider_policy(root, "boot", "aws")
+            policy = run_policy.ctl_profile_provider_policy(root, "boot", "aws")
             self.assertEqual(
                 policy["allowed_execution_access_modes"], ["standard", "agreed_direct"]
             )
@@ -259,7 +401,6 @@ class ExecutionAccessModeTests(unittest.TestCase):
     def test_consent_needs_both_the_opt_in_and_the_sources(self):
         # declaring the sources is NOT opting in: a target may name sources it
         # uses elsewhere while withholding consent to be run this way.
-        import tempfile
 
         workflow = {"target_runs": ["target"]}
         execution = {
@@ -274,9 +415,10 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 "    aws:\n      allowed_execution_access_modes: [agreed_direct]\n"
                 "      allowed_credential_implementation: [profile]\n"
             )
+            ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
 
             def check(target_cfg):
-                common.validate_execution_access(
+                run_policy.validate_execution_access(
                     root,
                     "boot",
                     workflow,
@@ -344,7 +486,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
 
 
 class AdapterInternalLayeringTest(unittest.TestCase):
-    """§Phase 74: the AWS adapter is three parts and the direction is one way.
+    """The AWS adapter is three parts and the direction is one way.
 
         _base <- credentials <- {execution, ctl_state} <- catalog
 
@@ -372,7 +514,10 @@ class AdapterInternalLayeringTest(unittest.TestCase):
         return Path(pkg.__file__).parent
 
     def test_the_three_parts_exist(self):
-        """Guards the suite: a flat module would make everything below vacuous."""
+        """
+
+        guards the suite: a flat module would make everything below vacuous."""
+
         for name in self.ALLOWED:
             self.assertTrue((self._package() / f"{name}.py").is_file(), name)
 
@@ -398,15 +543,19 @@ class AdapterInternalLayeringTest(unittest.TestCase):
         """`import *` drops every underscored name, and most of this adapter's
         internals are underscored — the first split lost `_run_aws_json` and 38
         tests with it, silently."""
+
         for part in self.ALLOWED:
             body = (self._package() / f"{part}.py").read_text()
             with self.subTest(part=part):
                 self.assertNotIn("import *", body)
 
     def test_the_facade_still_exposes_the_flat_surface(self):
-        """The adapter contract is module-level callables. Splitting the file must
+        """
+
+        the adapter contract is module-level callables. Splitting the file must
         not move a name in the contract, so every engine-facing callable and every
         internal the tests reach for stays reachable on `utils.providers.aws`."""
+
         import atlas_ctl_adapter_aws as pkg
 
         for name in ("validate_catalog", "describe", "materialize_target_binding",
@@ -418,7 +567,7 @@ class AdapterInternalLayeringTest(unittest.TestCase):
 
 
 class AdapterActivationTest(unittest.TestCase):
-    """§Phase 74: building a context puts the adapter on the import path.
+    """Building a context puts the adapter on the import path.
 
     Once the adapter became its own repository, reaching it stopped being free —
     something has to activate the declared checkout before the first adapter
@@ -456,6 +605,7 @@ class AdapterActivationTest(unittest.TestCase):
 
     def _run_clean(self, body: str) -> subprocess.CompletedProcess:
         """A python that knows only `runners` — no conftest, no adapter path."""
+
         script = (
             f"import sys\nsys.path.insert(0, {str(REPO_ROOT / 'runners')!r})\n"
             f"PARAMS = {self.PARAMS!r}\n"
@@ -468,16 +618,19 @@ class AdapterActivationTest(unittest.TestCase):
         )
 
     def test_the_adapter_is_not_importable_without_activation(self):
-        """Guards the test below: if a bare python could already import the
+        """
+
+        guards the test below: if a bare python could already import the
         adapter, that test would pass while proving nothing."""
+
         done = self._run_clean("import atlas_ctl_adapter_aws\nprint('IMPORTED')\n")
         self.assertNotEqual(0, done.returncode, f"unexpectedly importable: {done.stdout}")
         self.assertIn("ModuleNotFoundError", done.stderr)
 
     def test_building_a_context_makes_the_adapter_importable(self):
         done = self._run_clean(
-            "from utils import common\n"
-            f"common.activate_provider_adapters({str(self._dev_cfg_root())!r})\n"
+            "from engine.execution import providers\n"
+            f"providers.activate_provider_adapters({str(self._dev_cfg_root())!r})\n"
             "import atlas_ctl_adapter_aws\n"
             "print('IMPORTED')\n"
         )
@@ -485,14 +638,17 @@ class AdapterActivationTest(unittest.TestCase):
         self.assertIn("IMPORTED", done.stdout)
 
     def test_context_building_activates_before_it_reaches_an_adapter(self):
-        """The real path: `build_execution_context` must not need a caller to
+        """
+
+        the real path: `build_execution_context` must not need a caller to
         have activated first. Run for its IMPORT behaviour only — the call is
         expected to fail on missing params, and MUST NOT fail on the adapter."""
+
         done = self._run_clean(
             "from pathlib import Path\n"
-            "from utils import common\n"
+            "from engine.execution import run_context\n"
             "try:\n"
-            "    common.build_execution_context(\n"
+            "    run_context.build_execution_context(\n"
             f"        Path({str(self._dev_cfg_root())!r}), action=None,\n"
             "        ctl_profile='local_dev', execution_params=dict(PARAMS),\n"
             "        execution_runtime_mode='local', providers=['aws'])\n"

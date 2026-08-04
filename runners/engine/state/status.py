@@ -1,0 +1,1104 @@
+"""What the recorded state MEANS: fresh, stale, failed, absent.
+
+A verdict is computed from run records, never stored, so it cannot drift from
+them. Only the forward side of a paired action can go stale — a destroy record
+describes an instance that is gone, and nothing can make that answer stale."""
+
+import hashlib
+import json
+import logging
+
+from datetime import UTC, datetime
+from enum import StrEnum
+from pathlib import Path
+
+from engine.cfg import resources as cfg_resources
+from engine.kernel import ids as kernel_ids
+from engine.kernel import paths as kernel_paths
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import actions as run_actions
+from engine.run import addressing as run_addressing
+from engine.state import run_store as state_run_store
+
+
+class Verdict(StrEnum):
+    """The `status` axis of a row: what a reader acts on.
+
+    Computed, never stored, and deliberately NOT the record's own vocabulary — a
+    record says `ok`, a row says `passed`, because a row answers about an INSTANCE
+    and may reach its verdict from a child rather than from any record of its own.
+    """
+
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+
+
+class Freshness(StrEnum):
+    """The `freshness` axis: does the published result still match its inputs?
+
+    A second axis rather than a `status` value, because the two are independent —
+    a published result can be `passed` and `outdated` at once, and collapsing them
+    would let a live verdict hide a stale one.
+    """
+
+    UP_TO_DATE = "up_to_date"
+    OUTDATED = "outdated"
+
+
+def build_status_payload(
+    run_dir: Path, status: state_run_store.RunStatus, extra: dict | None = None
+) -> dict:
+    payload = dict(state_run_store.load_run_metadata(run_dir))
+    payload["run_id"] = Path(run_dir).name
+    payload["status"] = status
+    payload["updated_at"] = kernel_ids.utc_timestamp()
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def in_progress_verdict_reason(slot: dict) -> str:
+    run_id = slot.get("run_id") or "unknown"
+    action = slot.get("action") or "run"
+    if slot.get("mutation_started") is True:
+        return f"{action} mutating under run {run_id}"
+    return f"{action} in progress under run {run_id} (not yet mutating)"
+
+
+def failed_verdict_reason(slot: dict) -> str:
+    run_id = slot.get("run_id") or "unknown"
+    action = slot.get("action") or "run"
+    summary = (slot.get("error") or {}).get("summary")
+    mutated = " after mutation started" if slot.get("mutation_started") is True else ""
+    return f"{action} failed{mutated} under run {run_id}" + (
+        f": {summary}" if summary else ""
+    )
+
+
+def status_result_info(ctl_state_local_root: Path, status_path: Path, status: dict) -> dict | None:
+    # committed.yaml lives directly in the instance dir (its parent),
+    # unlike the old committed/STATUS.yaml (parent.parent).
+    result_dir = status_path.parent
+    parsed = run_addressing.parse_result_dir(ctl_state_local_root, result_dir)
+    if parsed is None:
+        return None
+    info = dict(parsed)
+    for key in ("action", "run_type", "result_name", "result_key"):
+        if isinstance(status.get(key), str) and status[key]:
+            info[key] = status[key]
+    return info
+
+
+def status_target_keys(status: dict) -> list[str]:
+    raw = status.get("target_keys") or []
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str) and item]
+
+
+def mark_committed_status_outdated(status_path: Path, status: dict, *, reason: str, caused_by: dict | None = None) -> None:
+    # The outdate marker is written onto the committed.yaml pointer
+    # itself (the target-instance's committed record, Q1c) — no separate slot.
+    payload = dict(status)
+    payload["status"] = state_run_store.RunStatus.OUTDATED
+    payload["updated_at"] = kernel_ids.utc_timestamp()
+    outdated = {
+        "reason": reason,
+        "at": payload["updated_at"],
+    }
+    if caused_by is not None:
+        outdated["caused_by"] = caused_by
+    payload["outdated"] = outdated
+    kernel_yaml_io.write_yaml_file(status_path, payload)
+
+
+def mark_outdated_for_run(run_dir: Path, *, include_current_result: bool, force: bool = False) -> None:
+    metadata = state_run_store.load_run_metadata(run_dir)
+    action = metadata.get("action")
+    if action not in run_actions.MUTATING_ACTIONS:
+        return
+    if not force and metadata.get("mutation_started") is not True:
+        return
+
+    affected_target_keys = status_target_keys(metadata)
+    if not affected_target_keys:
+        return
+    affected = set(affected_target_keys)
+
+    ctl_state_local_root = metadata.get("ctl_state_local_root")
+    current_result_key = metadata.get("result_key")
+    if not isinstance(ctl_state_local_root, str) or not ctl_state_local_root:
+        return
+
+    caused_by = {
+        "action": metadata.get("action"),
+        "run_type": metadata.get("run_type"),
+        "result_name": metadata.get("result_name"),
+        "result_key": metadata.get("result_key"),
+        "run_id": metadata.get("run_id") or Path(run_dir).name,
+        "target_keys": affected_target_keys,
+    }
+
+    # A mutation outdates results in ITS OWN namespace tree only,
+    # and only for the SAME target-instance addresses (Q1c: sibling ACTIONS of
+    # one instance, never sibling instances — dev's mutation must not touch
+    # test's results even though the target keys match).
+    locator = metadata.get("ctl_state_locator") or []
+    scan_root = Path(ctl_state_local_root).joinpath(*locator)
+    affected_addresses = {
+        a for a in (metadata.get("target_addresses") or []) if isinstance(a, str)
+    }
+    run_instance = metadata.get("instance") or []
+
+    for status_path in state_run_store.iter_committed_status_paths(scan_root):
+        status = state_run_store.load_status_mapping(status_path)
+        info = status_result_info(Path(ctl_state_local_root), status_path, status)
+        if info is None:
+            continue
+        if info.get("action") == "readonly":
+            continue
+        if not include_current_result and info.get("result_key") == current_result_key:
+            continue
+        if affected_addresses:
+            # instance-aware matching: a candidate target result matches when
+            # its own address is affected; a candidate workflow result matches
+            # when it shares this run's instance (its own sibling actions).
+            candidate_address = info.get("address")
+            candidate_instance = info.get("instance") or []
+            candidate_is_run_sibling = (
+                info.get("result_name") == metadata.get("result_name")
+                and candidate_instance == run_instance
+            )
+            if candidate_address not in affected_addresses and not candidate_is_run_sibling:
+                continue
+            #.9: never outdate a result THIS run graph just committed
+            # on its OWN action. A workflow provision commits its child target
+            # provision pointers, then sweeps — without this guard it re-marks
+            # its own fresh output stale (the child's own earlier sweep had
+            # protected that pointer, but only via its own result_key, which the
+            # workflow-level sweep does not match). Cross-action supersession
+            # (this provision outdating the sibling DESTROY pointer) still fires,
+            # because that pointer's action differs from this run's action.
+            if (
+                not include_current_result
+                and info.get("action") == action
+                and candidate_address in affected_addresses
+            ):
+                continue
+        else:
+            # Legacy metadata without addresses: match by target-key overlap
+            committed_keys = set(status_target_keys(status))
+            if not committed_keys or not committed_keys.intersection(affected):
+                continue
+        mark_committed_status_outdated(
+            status_path,
+            status,
+            reason="affected_by_mutating_run",
+            caused_by=caused_by,
+        )
+
+
+def mark_removed_definitions_outdated(ctl_state_local_root: Path, ctl_cfg_root: Path) -> None:
+    try:
+        workflows = cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+    except Exception as exc:
+        logging.warning("Skipping definition_removed scan: failed to load workflows: %s", exc)
+        workflows = {}
+    try:
+        targets = cfg_resources.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+    except Exception as exc:
+        logging.warning("Skipping definition_removed scan: failed to load targets: %s", exc)
+        targets = {}
+
+    for status_path in state_run_store.iter_committed_status_paths(Path(ctl_state_local_root)):
+        status = state_run_store.load_status_mapping(status_path)
+        info = status_result_info(Path(ctl_state_local_root), status_path, status)
+        if info is None:
+            continue
+        run_type = info.get("run_type")
+        action = info.get("action")
+        result_name = info.get("result_name")
+        if run_type == "workflow":
+            entry = workflows.get(result_name)
+            exists = isinstance(entry, dict) and action in (entry.get("actions") or [])
+        elif run_type == "target":
+            entry = targets.get(result_name)
+            exists = isinstance(entry, dict) and action in (entry.get("actions") or [])
+        else:
+            continue
+        if exists or status.get("status") == state_run_store.RunStatus.OUTDATED:
+            continue
+        mark_committed_status_outdated(
+            status_path,
+            status,
+            reason="definition_removed",
+            caused_by={
+                "action": action,
+                "run_type": run_type,
+                "result_name": result_name,
+                "result_key": info.get("result_key"),
+            },
+        )
+
+
+def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
+    """
+
+    does the committed record still match what is declared?
+
+    Meaningful only where a record exists; the caller supplies `none` otherwise.
+    """
+
+    if pointer is None:
+        return Freshness.OUTDATED, []
+    reasons: list[str] = []
+    if pointer.get("status") == state_run_store.RunStatus.OUTDATED or pointer.get("outdated"):
+        outdated = pointer.get("outdated") or {}
+        reasons.append(str(outdated.get("reason") or "target marker"))
+    for fact_key, reason in (
+        ("target_definition_sha256", "target definition changed"),
+        ("target_cfg_view_sha256", "target cfg view changed"),
+    ):
+        expected = spec.get(fact_key)
+        if expected is not None and pointer.get(fact_key) != expected:
+            reasons.append(reason)
+    return (Freshness.OUTDATED if reasons else Freshness.UP_TO_DATE), reasons
+
+
+def _run_status(instance_dir: Path, group: str = "mutative") -> dict:
+    """What the last (or current) run on this instance did.
+
+    Returns `status`, its `reasons`, whether a mutation had begun, and — the part
+    a row must not take from anywhere else — the RUN THAT PRODUCED THAT STATUS.
+
+    `run_id`/`at` travel with `status` because they describe one event. Reading
+    the status from a slot and the timestamp from the committed pointer mixes two
+    different runs: while the newest run succeeds they agree, so it looks correct;
+    the moment a run FAILS after a success the row reports the failure's status
+    beside the success's time and id, and a reader chasing the failure opens the
+    wrong run (observed 2026-08-03).
+    """
+
+    for state, verdict, reason in (
+        (state_run_store.StateSlot.IN_PROGRESS, Verdict.RUNNING, in_progress_verdict_reason),
+        (state_run_store.StateSlot.FAILED, Verdict.FAILED, failed_verdict_reason),
+    ):
+        slot = state_run_store.read_instance_state_slot(instance_dir, state, group)
+        if slot is not None:
+            return {
+                "status": verdict,
+                "reasons": [reason(slot)],
+                "mutation_started": slot.get("mutation_started") is True,
+                "run_id": slot.get("run_id"),
+                "at": slot.get("updated_at"),
+                "action": slot.get("action"),
+                "parent_workflow_instance": slot.get("parent_workflow_instance_address"),
+                "parent_workflow_run_id": slot.get("parent_workflow_run_id"),
+            }
+    # No slot AND no committed pointer means nothing ever ran here. `passed`
+    # Would be a claim of success nobody made, so the caller gets None and omits
+    # the group entirely — absence stays absence.
+    pointer = state_run_store.read_committed_pointer(instance_dir, group)
+    if pointer is None:
+        return {"status": None, "reasons": [], "mutation_started": False,
+                "run_id": None, "at": None, "action": None,
+                "parent_workflow_instance": None, "parent_workflow_run_id": None}
+    return {
+        "status": Verdict.PASSED,
+        "reasons": [],
+        "mutation_started": False,
+        "run_id": pointer.get("run_id"),
+        "at": pointer.get("committed_at"),
+        "action": pointer.get("action"),
+        "parent_workflow_instance": pointer.get("parent_workflow_instance_address"),
+        "parent_workflow_run_id": pointer.get("parent_workflow_run_id"),
+    }
+
+
+def _mutating_run_status(
+    namespace_root: Path, kind: str, key: str, segments: list[str]
+) -> tuple[str | None, list[str], bool, str | None]:
+    """The live run axes of a deployment instance.
+
+    provision and destroy now share one instance directory and one
+    `committed/mutative.yaml`, so there are no longer two direction prefixes to
+    merge — the slot and the pointer are read from one place, and the action comes
+    from whichever record is there.
+    """
+    instance_dir = namespace_root / run_addressing.compose_state_relpath(kind, key, segments)
+    for state, status, describe in (
+        (state_run_store.StateSlot.IN_PROGRESS, Verdict.RUNNING, in_progress_verdict_reason),
+        (state_run_store.StateSlot.FAILED, Verdict.FAILED, failed_verdict_reason),
+    ):
+        slot = state_run_store.read_instance_state_slot(instance_dir, state, "mutative")
+        if slot is not None:
+            return (
+                status,
+                [describe(slot)],
+                slot.get("mutation_started") is True,
+                slot.get("action"),
+            )
+    pointer = state_run_store.read_committed_pointer(instance_dir, "mutative")
+    if pointer is None:
+        return None, [], False, None
+    return Verdict.PASSED, [], False, pointer.get("action")
+
+
+def compute_target_instance_status(
+    namespace_root: Path, action: str, spec: dict
+) -> dict:
+    """Status of one target instance, on the two axes a row carries.
+
+    `state` and `action` are gone. `provisioned`/`destroyed` asserted
+    what exists in the cloud, which ctl never observes — a destroy run directly in
+    the repo empties the tool's own state while ctl kept reporting `provisioned`.
+    A row reports what ctl's own runs did: whether one is live or broken, and
+    whether the published result still matches its inputs.
+    """
+
+    group = run_actions.action_group(action)
+    instance_dir = namespace_root / run_addressing.compose_state_relpath(
+        "target", spec["key"], spec["segments"]
+    )
+    pointer = state_run_store.read_committed_pointer(instance_dir, group)
+    run = _run_status(instance_dir, group)
+    status, reasons, mutation_started = run["status"], run["reasons"], run["mutation_started"]
+
+    result: dict = {
+        "kind": "target",
+        "key": spec["key"],
+        "address": spec["address"],
+    }
+    if status is not None:
+        result["status"] = status
+    # Freshness applies to a published result only. An interrupted run changed
+    # resources and committed nothing, so its pointer describes nothing for inputs
+    # to have moved away from; `up_to_date` would be false and `outdated`
+    # Understates it.
+    # `state` (`provisioned`/`destroyed`) because that asserts
+    # what exists in the cloud, which ctl never observes. The ACTION is a
+    # different fact and one ctl owns outright. Without it the direction is
+    # inferred from `freshness` being ABSENT, which is an implicit signal.
+    # It comes from the run that produced `status`, NOT from the committed
+    # pointer: a failed destroy after a successful provision reported
+    # `status: failed` beside `last_action: provision`, which reads as "the
+    # provision failed" when the provision succeeded and the DESTROY failed.
+    # Same rule as `at` and `run_id` — one row, one run.
+    if run["action"]:
+        result["last_action"] = run["action"]
+    if pointer and not mutation_started:
+        if run_actions.action_can_go_stale(str(pointer.get("action"))):
+            freshness, freshness_reasons = _freshness(pointer, spec)
+            result["freshness"] = freshness
+            reasons = reasons + freshness_reasons
+
+    # The workflow INSTANCE this run belonged to, closing the loop the workflow
+    # row opens: a workflow instance names the target instances it drove, and a
+    # target instance names the workflow instance that drove it. Absent for a
+    # target run invoked directly, which is a real distinction and not a gap.
+    if run["parent_workflow_instance"]:
+        result["parent_workflow"] = run_addressing.qualified_address(
+            "workflow", run["parent_workflow_instance"]
+        )
+    elif run["parent_workflow_run_id"]:
+        # An older run recorded only the id. It goes under its own key: one field
+        # meaning "an address, or else an id" makes every reader branch on shape.
+        result["parent_workflow_run_id"] = run["parent_workflow_run_id"]
+    # `run_id`/`at` come from whichever run produced `status`, never from the
+    # committed pointer when the two are different runs.
+    if run["run_id"]:
+        result["run_id"] = run["run_id"]
+    if run["at"]:
+        result["at"] = run["at"]
+    # The last PUBLISHED result is a separate fact, and only worth stating when
+    # it is not the run above — otherwise it would repeat `at` on every row.
+    if pointer and pointer.get("run_id") != run["run_id"]:
+        result["committed_at"] = pointer.get("committed_at")
+        result["committed_run_id"] = pointer.get("run_id")
+    if reasons:
+        result["reasons"] = reasons
+    return result
+
+
+def compute_workflow_instance_status(
+    namespace_root: Path, action: str, spec: dict
+) -> dict:
+    """Status of one workflow instance, rolled up from its members.
+
+    a composition reports `status` and `freshness` and nothing else. It
+    holds no `state`, because once members carry their own action a composition can
+    hold a destroy member and a provision member at once and no single word is true
+    of it; and no `action`, for the same reason. Both surviving axes roll up without
+    reference to direction — running or failed when ANY member is, outdated as soon
+    as ANY member is — which is why one row shape serves both kinds.
+    """
+
+    group = run_actions.action_group(action)
+    workflow_dir = namespace_root / run_addressing.compose_state_relpath(
+        "workflow", spec["key"], spec["segments"]
+    )
+    pointer = state_run_store.read_committed_pointer(workflow_dir, group)
+    run = _run_status(workflow_dir, group)
+    status, reasons, mutation_started = run["status"], run["reasons"], run["mutation_started"]
+
+    children: list[dict] = []
+    recorded = {
+        item.get("address"): item
+        for item in ((pointer or {}).get("child_revisions") or [])
+        if isinstance(item, dict)
+    }
+    drift: list[str] = []
+    for target_spec in spec["target_specs"]:
+        child = compute_target_instance_status(namespace_root, action, target_spec)
+        child_pointer = state_run_store.read_committed_pointer(
+            namespace_root
+            / run_addressing.compose_state_relpath("target", target_spec["key"], target_spec["segments"]),
+            group,
+        )
+        expected = recorded.get(target_spec["address"])
+        if child.get("freshness") == Freshness.OUTDATED:
+            drift.append(f"{target_spec['address']}: outdated")
+        elif expected is None:
+            drift.append(f"{target_spec['address']}: not recorded by workflow")
+        elif (
+            expected.get("run_id") != (child_pointer or {}).get("run_id")
+            or expected.get("snapshot_sha256")
+            != (child_pointer or {}).get("snapshot_sha256")
+        ):
+            drift.append(f"{target_spec['address']}: committed revision changed")
+        children.append(child)
+
+    if pointer is not None:
+        if pointer.get("workflow_definition_sha256") != spec[
+            "workflow_definition_sha256"
+        ]:
+            drift.append("workflow definition changed")
+        pointer_addresses = [
+            str(item.get("address"))
+            for item in (pointer.get("child_revisions") or [])
+            if isinstance(item, dict)
+        ]
+        if pointer_addresses != [item["address"] for item in spec["target_specs"]]:
+            drift.append("workflow target order or set changed")
+
+    # status: a live or broken child makes the composition live or broken.
+    if status in (None, Verdict.PASSED):
+        running = [c for c in children if c.get("status") == Verdict.RUNNING]
+        failed = [c for c in children if c.get("status") == Verdict.FAILED]
+        if running:
+            status = Verdict.RUNNING
+            reasons = [f"{c['address']}: running" for c in running]
+        elif failed:
+            status = Verdict.FAILED
+            reasons = [f"{c['address']}: failed" for c in failed]
+
+    result: dict = {
+        "kind": "workflow",
+        "key": spec["key"],
+        "address": spec["address"],
+    }
+    if status is not None:
+        result["status"] = status
+    if group == "mutative" and pointer is not None and not mutation_started:
+        own_freshness, own_reasons = _freshness(pointer, spec)
+        result["freshness"] = (
+            Freshness.OUTDATED if (drift or own_freshness == Freshness.OUTDATED) else own_freshness
+        )
+        reasons = reasons + own_reasons + drift
+
+    if run["run_id"]:
+        result["run_id"] = run["run_id"]
+    if run["at"]:
+        result["at"] = run["at"]
+    if pointer and pointer.get("run_id") != run["run_id"]:
+        result["committed_at"] = pointer.get("committed_at")
+        result["committed_run_id"] = pointer.get("run_id")
+    if reasons:
+        result["reasons"] = list(dict.fromkeys(reasons))
+    result["children"] = children
+    return result
+
+
+def forget_selection(
+    namespace_root: Path,
+    older_than: str,
+    addresses: list[str],
+) -> list[dict]:
+    """Resolve the two filters to instance directories.
+
+    Both filters are always supplied — neither defaults — so a forget always
+    states both dimensions and nothing is removed on a filter the caller did not
+    write down. `any` and `all` are the explicit wide values.
+
+    An ADDRESS may name a template or an instance: depth decides scope, so
+    `.../env/core/baseline` selects every instance under it and
+    `.../instances/env.type=dev/...` selects one.
+    """
+
+    cutoff = None
+    if older_than != "any":
+        try:
+            cutoff = datetime.fromisoformat(older_than)
+        except ValueError as error:
+            raise RuntimeError("❌ --older-than must be `any` or ISO-8601") from error
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+
+    wanted = None if addresses == ["all"] else [a.strip("/") for a in addresses]
+    selected: list[dict] = []
+    for pointer_path in sorted(Path(namespace_root).rglob("committed/*.yaml")):
+        instance_dir = pointer_path.parent
+        rel = instance_dir.relative_to(namespace_root).as_posix()
+        if wanted is not None and not any(
+            rel == a or rel.startswith(a + "/") for a in wanted
+        ):
+            continue
+        pointer = state_run_store.read_committed_pointer(instance_dir) or {}
+        when = pointer.get("committed_at")
+        if cutoff is not None:
+            if not when:
+                continue
+            try:
+                stamp = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=UTC)
+            if stamp >= cutoff:
+                continue
+        selected.append({"address": rel, "dir": instance_dir, "at": when})
+    return selected
+
+
+def forget_guard(
+    namespace_root: Path,
+    rel: str,
+    *,
+    accept_orphans: bool,
+    cascade: bool,
+    referenced_by: dict[str, set[str]],
+) -> str | None:
+    """Why this instance may not be forgotten, or None.
+
+    Read straight off the status axes rather than joined from a collapsed
+    summary — which is the whole reason `state` and `status` are separate fields.
+    """
+    instance_dir = namespace_root / rel
+    if state_run_store.read_instance_state_slot(instance_dir, state_run_store.StateSlot.IN_PROGRESS) is not None:
+        # No override: the run republishes the record moments later, so forgetting
+        # it now would look like it worked and would not have.
+        return "a run is in progress on it"
+    parsed = run_addressing.parse_state_relpath(namespace_root, instance_dir)
+    if parsed and parsed["kind"] == "target":
+        computed = compute_target_instance_status(
+            namespace_root,
+            "provision",
+            {
+                "kind": "target",
+                "key": parsed["key"],
+                "segments": list(parsed["instance_segments"]),
+                "address": rel,
+                "prefix": run_addressing.compose_state_relpath("target", parsed["key"], list(parsed["instance_segments"])
+                ).as_posix(),
+            },
+        )
+        state = computed.get("state")
+        if state in ("provisioned", "partial") and not accept_orphans:
+            return f"state is {state}; pass --accept-orphaned-resources"
+    referrers = referenced_by.get(rel, set())
+    if referrers and not cascade:
+        return (
+            "referenced by retained workflow runs "
+            f"({', '.join(sorted(referrers))}); pass --cascade"
+        )
+    return None
+
+
+def workflow_references(namespace_root: Path) -> dict[str, set[str]]:
+    """Which retained workflow runs point at each instance address.
+
+    Forgetting a record a workflow still names leaves that workflow describing a
+    member that no longer exists, so it is refused unless the caller says
+    `--cascade`.
+    """
+    references: dict[str, set[str]] = {}
+    for pointer_path in Path(namespace_root).rglob("committed/*.yaml"):
+        pointer = state_run_store.read_committed_pointer(pointer_path.parent) or {}
+        for child in pointer.get("child_revisions") or []:
+            if not isinstance(child, dict) or not child.get("address"):
+                continue
+            key, segments = run_addressing.split_target_instance_address(str(child["address"]))
+            rel = run_addressing.compose_state_relpath("target", key, segments).as_posix()
+            references.setdefault(rel, set()).add(
+                pointer_path.parent.relative_to(namespace_root).as_posix()
+            )
+    return references
+
+
+def _targeted_workflow_status(namespace_root: Path, spec: dict) -> dict:
+    """A workflow owns execution, so a targeted query reads its LAST RUN.
+
+    Reading a committed pointer here returned an empty row once workflows stopped
+    publishing one — the query answered nothing rather than failing.
+    """
+
+    result = {"kind": "workflow", "key": spec["key"], "address": spec["address"]}
+    last_run = workflow_last_run(
+        namespace_root, spec["key"], spec.get("segments") or []
+    )
+    if last_run:
+        result["last_run"] = last_run
+    return result
+
+
+def _compute_status_results(
+    namespace_root: Path, action: str, labels: list[str], specs: list[dict]
+) -> list[dict]:
+    results = []
+    for label, spec in zip(labels, specs):
+        computed = (
+            compute_target_instance_status(namespace_root, action, spec)
+            if spec["kind"] == "target"
+            else _targeted_workflow_status(namespace_root, spec)
+        )
+        computed["selection"] = label
+        results.append(computed)
+    return results
+
+
+def workflow_last_run(
+    namespace_root: Path, key: str, segments: list[str] | None = None
+) -> dict | None:
+    """The most recent run of one workflow INSTANCE — its record, not its state.
+
+    a workflow owns execution, so there is no pointer to read. The row
+    is the last run: what it did, what selected its members, and which members it
+    ran with.
+
+    per INSTANCE. One key fanned across environments used to report a
+    single row — whichever child finished last — so "did this succeed in test?"
+    was unanswerable from the workflow.
+    """
+    runs_dir = (
+        namespace_root / run_addressing.compose_state_relpath("workflow", key, segments) / "runs"
+    )
+    if not runs_dir.is_dir():
+        return None
+    records = []
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        metadata = state_run_store.load_run_metadata(run_dir)
+        if not metadata.get("updated_at"):
+            continue
+        records.append(metadata)
+    if not records:
+        return None
+    latest = max(records, key=lambda m: str(m.get("updated_at") or ""))
+    row: dict = {"status": _run_conclusion(latest), "at": latest.get("updated_at")}
+    # The matched member's own selector block, copied verbatim: it points back at
+    # the cfg that produced this run, and nothing depends on the engine knowing a
+    # field called "operation". A member that matched with none omits it.
+    if latest.get("member_selectors"):
+        row["selectors"] = latest["member_selectors"]
+    if latest.get("default_action"):
+        row["default_action"] = latest["default_action"]
+    # The group this run belonged to. Read from the record when the
+    # run wrote one, otherwise DERIVED from the members it recorded — a run from
+    # before the field existed still answers, rather than filtering out as though
+    # it had no group at all.
+    group = latest.get("group") or run_addressing.workflow_group(latest)
+    if group:
+        row["group"] = group
+    target_instances = latest.get("target_instances")
+    if target_instances:
+        # Qualified for the same reason the parent link is: these point at the
+        # TARGET rows in this map, and an address a reader can paste back into a
+        # query beats one they have to prefix by hand.
+        row["target_instances"] = [
+            run_addressing.qualified_address("target", entry)
+            if isinstance(entry, str)
+            else {**entry, "instance": run_addressing.qualified_address("target", entry["instance"])}
+            for entry in target_instances
+        ]
+    return row
+
+
+def _run_conclusion(metadata: dict) -> str:
+    """A run's outcome, in the vocabulary a target row already uses."""
+
+    status = str(metadata.get("status") or "")
+    if status == state_run_store.RunStatus.OK:
+        return Verdict.PASSED
+    if status == state_run_store.RunStatus.IN_PROGRESS:
+        return Verdict.RUNNING
+    return Verdict.FAILED if status else Verdict.PASSED
+
+
+def compute_namespace_status_map(
+    namespace_root: Path,
+) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
+    """Every target and workflow instance under the namespace root, one row per
+    published GROUP.
+
+    the tree is partitioned by group rather than by action, so an
+    instance appears once and each of its groups reports independently:
+
+        status      running | passed | failed
+        freshness   up_to_date | outdated     (a published deployment only)
+        at          when the record was published
+
+    `status` comes from the live run slots — a success clears the failed slot, so
+    `failed` cannot outlive the run that caused it — and `freshness` from the
+    published pointer. Fan-outs own no state and never appear."""
+    namespace_root = Path(namespace_root)
+    if not namespace_root.is_dir():
+        return {}
+    targets: set[tuple[str, tuple[str, ...]]] = set()
+    workflows: set[tuple[str, tuple[str, ...]]] = set()
+    # An instance is discovered by anything it has PUBLISHED or is DOING. Scanning
+    # only for committed pointers hid a first-ever run entirely: it has written a
+    # slot and no pointer, so `--all` reported an empty namespace while a run was
+    # in flight.
+    discovered: list[Path] = [
+        pointer.parent.parent for pointer in namespace_root.rglob("committed/*.yaml")
+    ]
+    for state in state_run_store.STATE_SLOT_NAMES:
+        discovered += [
+            slot.parent.parent.parent
+            for slot in namespace_root.rglob(f"{state}/*/STATUS.yaml")
+        ]
+    for instance_dir in discovered:
+        parsed = run_addressing.parse_state_relpath(namespace_root, instance_dir)
+        if parsed is None or parsed["kind"] != "target":
+            continue
+        targets.add((parsed["key"], tuple(parsed["instance_segments"])))
+    # A workflow is discovered by its RUNS. It publishes no pointer, so
+    # there is nothing else to find it by. the parsed segments are KEPT,
+    # so a key fanned across environments yields one row per environment instead of
+    # collapsing to whichever child ran last.
+    workflow_root = namespace_root / "workflow"
+    if workflow_root.is_dir():
+        for runs_dir in workflow_root.rglob("runs"):
+            parsed = run_addressing.parse_state_relpath(namespace_root, runs_dir.parent)
+            if parsed is not None and parsed["kind"] == "workflow":
+                workflows.add((parsed["key"], tuple(parsed["instance_segments"])))
+    rows: dict[str, dict[str, dict[str, dict[str, str]]]] = {
+        kind: {} for kind in run_actions.RESULT_KINDS
+    }
+    for key, seg in targets:
+        segments = list(seg)
+        address = run_addressing.target_instance_address(key, segments)
+        groups: dict[str, dict[str, str]] = {}
+        spec = {
+            "kind": "target",
+            "key": key,
+            "segments": segments,
+            "address": address,
+        }
+        for group in run_actions.RESULT_GROUPS:
+            axes = run_addressing._axis_row(
+                compute_target_instance_status(
+                    namespace_root, run_actions.STATUS_GROUP_ACTION[group], spec
+                )
+            )
+            # An empty group means no run of that class ever touched this
+            # instance — it is omitted rather than reported as anything.
+            if axes:
+                groups[group] = axes
+        if groups:
+            run_addressing._place_instance(rows, "target", key, segments, groups)
+    for key, seg in workflows:
+        segments = list(seg)
+        last_run = workflow_last_run(namespace_root, key, segments)
+        if not last_run:
+            continue
+        if segments:
+            run_addressing._place_instance(rows, "workflow", key, segments, {"last_run": last_run})
+        else:
+            rows["workflow"][key] = {"last_run": last_run}
+    # Kind is the OUTER key, so a reader sees where the workflows are and where
+    # the targets are without parsing a prefix off every address.
+    return {
+        kind: dict(sorted(instances.items()))
+        for kind, instances in rows.items()
+        if instances
+    }
+
+
+class SortField(StrEnum):
+    """What `--sort` may order a status map by.
+
+    Two, because a row has exactly two things every kind of row carries: WHEN it
+    happened and WHAT it is about.
+    """
+
+    TIME = "time"
+    ADDRESS = "address"
+
+
+class SortDirection(StrEnum):
+    """The optional `:asc|desc` half of `--sort`."""
+
+    ASC = "asc"
+    DESC = "desc"
+
+
+class StatusStructure(StrEnum):
+    """The shape `--all` emits.
+
+    A tree cannot express a globally chronological order, so the two shapes are a
+    real choice and neither is a default.
+    """
+
+    NESTED = "nested"
+    FLAT = "flat"
+
+
+SORT_FIELDS = tuple(SortField)
+STATUS_STRUCTURES = tuple(StatusStructure)
+
+
+def parse_sort(raw: str) -> tuple[str, bool]:
+    """`<field>[:asc|desc]` -> (field, descending). Direction defaults to asc."""
+    field, _, direction = raw.partition(":")
+    if field not in SORT_FIELDS:
+        raise RuntimeError(
+            f"❌ --sort field {field!r} unknown; expected one of {', '.join(SORT_FIELDS)}"
+        )
+    if direction not in ("", SortDirection.ASC, SortDirection.DESC):
+        raise RuntimeError(f"❌ --sort direction {direction!r} must be asc or desc")
+    return field, direction == SortDirection.DESC
+
+
+def structure_status_map(instances: dict, structure: str, sort: str) -> dict:
+    """Order and shape a status map.
+
+    `nested` keeps the kind -> template -> instances tree and sorts on TWO levels:
+    templates by their newest instance, instances by their newest group. A tree
+    cannot express a globally chronological order — grouping and global ordering
+    are in conflict — so `flat` exists for that: a LIST of one row per group,
+    each carrying its own address, which can be ordered strictly by time.
+    """
+    field, descending = parse_sort(sort)
+
+    if structure == StatusStructure.FLAT:
+        # ONE list. Splitting by kind would break global chronological order for
+        # the same reason template nesting does, and the kind is already a path
+        # segment of the address, so it needs no field of its own.
+        rows = []
+        for kind, templates in instances.items():
+            for template, body in templates.items():
+                bodies = (
+                    list(body[run_addressing.INSTANCES_MARKER].items())
+                    if run_addressing.INSTANCES_MARKER in body
+                    else [(None, body)]
+                )
+                for segs, row in bodies:
+                    address = "/".join(
+                        [kind, run_addressing.instance_address(template, segs.split("/") if segs else [])]
+                    )
+                    for group, axes in row.items():
+                        rows.append({"address": address, "group": group, **axes})
+        key = (
+            (lambda r: (r.get("at") or ""))
+            if field == SortField.TIME
+            else (lambda r: (r["address"], r["group"]))
+        )
+        return {"instances": sorted(rows, key=key, reverse=descending)}
+
+    ordered: dict = {}
+    for kind, templates in instances.items():
+        def template_key(item):
+            template, body = item
+            if field == SortField.ADDRESS:
+                return template
+            rows = (
+                body[run_addressing.INSTANCES_MARKER].values()
+                if run_addressing.INSTANCES_MARKER in body
+                else [body]
+            )
+            return max((kernel_paths._newest(r) for r in rows), default="")
+
+        kind_out: dict = {}
+        for template, body in sorted(templates.items(), key=template_key, reverse=descending):
+            if run_addressing.INSTANCES_MARKER in body:
+                rows = body[run_addressing.INSTANCES_MARKER]
+                instance_key = (
+                    (lambda kv: kernel_paths._newest(kv[1])) if field == SortField.TIME else (lambda kv: kv[0])
+                )
+                kind_out[template] = {
+                    run_addressing.INSTANCES_MARKER: dict(
+                        sorted(rows.items(), key=instance_key, reverse=descending)
+                    )
+                }
+            else:
+                kind_out[template] = body
+        ordered[kind] = kind_out
+    return ordered
+
+
+def filter_status_map(
+    instances: dict,
+    kinds: list[str] | None,
+    groups: list[str] | None,
+) -> dict:
+    """Narrow a namespace map by row kind and status group.
+
+    A row whose every group is filtered out is DROPPED rather than shown empty —
+    an empty row would read as "nothing happened here", which is a different
+    claim from "you asked not to see it".
+
+ `--kind workflow --group ...` outright: groups were a TARGET
+    concept and a workflow published history, which had none.
+
+ a workflow's group DERIVED from its members' actions, so the
+    question now has an answer and is filtered rather than refused. A workflow row
+    carries its group as a FIELD (it still publishes history, not grouped state),
+    so it is matched on that field while a target row is matched on which group
+    partitions it holds. Two shapes, one question.
+    """
+
+    def _keep(row: dict) -> dict:
+        return {g: axes for g, axes in row.items() if not groups or g in groups}
+
+    def _keep_groupless(row: dict) -> dict:
+        """A history row is kept whole or dropped, on the group it records.
+
+        The group sits on the RUN, not on the row wrapper — a workflow row is
+        `{"last_run": {...}}` — so it is read one level in. Looking at the wrapper
+        finds nothing and silently drops every workflow, which is exactly what it
+        did on the first attempt.
+        """
+
+        if not groups:
+            return row
+        run = row.get("last_run") if isinstance(row, dict) else None
+        recorded = run.get("group") if isinstance(run, dict) else None
+        return row if recorded in groups else {}
+
+    selected: dict = {}
+    for kind, templates in instances.items():
+        if kinds and kind not in kinds:
+            continue
+        kept_templates: dict = {}
+        for template, body in templates.items():
+            # A template holds either an `instances` map or, for a singleton, the
+            # groups directly.
+            keep = _keep_groupless if kind in run_actions.GROUPLESS_KINDS else _keep
+            if run_addressing.INSTANCES_MARKER in body:
+                kept = {
+                    segs: g
+                    for segs, row in body[run_addressing.INSTANCES_MARKER].items()
+                    if (g := keep(row))
+                }
+                if kept:
+                    kept_templates[template] = {run_addressing.INSTANCES_MARKER: kept}
+            else:
+                kept = keep(body)
+                if kept:
+                    kept_templates[template] = kept
+        if kept_templates:
+            selected[kind] = kept_templates
+    return selected
+
+
+def latest_child_revision(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+    action: str | None = None,
+) -> dict | None:
+    """The revision a SPAWNED child just committed.
+
+    The child publishes its own committed pointer, so the parent reads it back
+    rather than being told — the same record any later run would consult.
+    """
+    instance_dir, address = state_run_store.target_instance_dir_for_run(
+        parent_run_dir, target_run, execution_context, action
+    )
+    # Read the GROUP this child published into. Defaulting to
+    # `deployment` made a plan child invisible to its workflow, which then
+    # committed with no child_revisions at all — a composition recording nothing.
+    resolved_action = action or state_run_store.load_run_metadata(parent_run_dir).get("action")
+    pointer = state_run_store.read_committed_pointer(instance_dir, run_actions.action_group(str(resolved_action)))
+    if not pointer:
+        return None
+    return {
+        "address": address,
+        "run_id": pointer.get("run_id"),
+        "snapshot_sha256": pointer.get("snapshot_sha256"),
+        "status": pointer.get("status"),
+    }
+
+
+def up_to_date_child_revision(
+    parent_run_dir: Path,
+    target_run: dict,
+    execution_context: dict[str, object],
+    action: str | None = None,
+) -> dict | None:
+    """The published revision, only when reusing it is still correct.
+
+    the ACTION is compared like every other identity field. Without it
+    a workflow holding one target under two actions skips BOTH members — the six
+    content fields match either way, because source and cfg are identical — so a
+    run that destroyed and then failed to re-provision reports success while the
+    instance is still destroyed."""
+
+    if target_run.get("ref_policy") != "commit_required":
+        return None
+    if target_run.get("source_state") != "clean":
+        return None
+    source_commit = target_run.get("source_commit")
+    cfg_source_commit = target_run.get("cfg_source_commit")
+    target_definition_sha256 = target_run.get("target_definition_sha256")
+    target_cfg_view_sha256 = target_run.get("target_cfg_view_sha256")
+    if not all((
+        source_commit,
+        cfg_source_commit,
+        target_definition_sha256,
+        target_cfg_view_sha256,
+    )):
+        return None
+    instance_dir, address = state_run_store.target_instance_dir_for_run(
+        parent_run_dir, target_run, execution_context, action
+    )
+    resolved_action = action or state_run_store.load_run_metadata(parent_run_dir).get("action")
+    pointer = state_run_store.read_committed_pointer(instance_dir, run_actions.action_group(str(resolved_action)))
+    if not pointer or pointer.get("status") == state_run_store.RunStatus.OUTDATED or pointer.get("outdated"):
+        return None
+    expected = {
+        "action": action or state_run_store.load_run_metadata(parent_run_dir).get("action"),
+        "source_commit": source_commit,
+        "cfg_source_commit": cfg_source_commit,
+        "source_state": "clean",
+        "ref_policy": "commit_required",
+        "target_definition_sha256": target_definition_sha256,
+        "target_cfg_view_sha256": target_cfg_view_sha256,
+    }
+    if any(pointer.get(key) != value for key, value in expected.items()):
+        return None
+    snapshot_path = (
+        instance_dir / "runs" / str(pointer.get("run_id") or "") / state_run_store.RUN_METADATA_FILENAME
+    )
+    if not snapshot_path.is_file():
+        return None
+    snapshot = kernel_yaml_io.load_yaml(snapshot_path) or {}
+    if not isinstance(snapshot, dict):
+        return None
+    canonical = json.dumps(
+        snapshot, separators=(",", ":"), sort_keys=True, default=str
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != pointer.get(
+        "snapshot_sha256"
+    ):
+        return None
+    return {
+        "address": address,
+        "run_id": pointer.get("run_id"),
+        "snapshot_sha256": pointer.get("snapshot_sha256"),
+        "status": pointer.get("status"),
+        "skipped_committed_rerun": True,
+    }

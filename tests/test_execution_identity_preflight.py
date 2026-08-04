@@ -1,26 +1,39 @@
 import argparse
 import logging
 import logging.handlers
+import sys
 import tempfile
 import unittest
-import sys
 from pathlib import Path
 from unittest import mock
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
-from utils import common
 import atlas_ctl_adapter_aws as aws_adapter
+import ctl_cfg_fixture
+from engine.catalog import workflow as catalog_workflow
+from engine.commands import selection as commands_selection
+from engine.execution import run_context as execution_run_context
+from engine.kernel import process as kernel_process
+from engine.preflight import checks as preflight_checks
+from engine.preflight import render as preflight_render
+from engine.preflight import reports as preflight_reports
+from engine.run import policy as run_policy
+from engine.state import run_store as state_run_store
+from engine.cli import args as cli_args
+
+
+from engine.cfg import validate as cfg_validate
 
 
 class PreflightRollupTests(unittest.TestCase):
-    """Container status ladder: failed > (partial | not_evaluated) > passed —
+    """
+
+    container status ladder: failed > (partial | not_evaluated) > passed —
     a container is NEVER a false green, and mixed passed/blocked is `partial`,
     not `not_evaluated` (which is reserved for fully-blocked containers)."""
 
     def test_status_ladder(self):
-        f = common.aggregate_execution_identity_preflight_status
+        f = preflight_reports.aggregate_execution_identity_preflight_status
         self.assertEqual(f(["passed", "passed"]), "passed")
         self.assertEqual(f([]), "passed")
         self.assertEqual(f(["force_skipped", "passed"]), "passed")
@@ -36,7 +49,7 @@ class PreflightRollupTests(unittest.TestCase):
         self.assertEqual(f(["passed", "skipped"]), "passed")
 
     def test_partial_tag_renders(self):
-        self.assertEqual(common._preflight_status_tag("partial"), "[ partial ⚠️ ]")
+        self.assertEqual(preflight_render._preflight_status_tag("partial"), "[ partial ⚠️ ]")
 
 
 class PreflightPolicyTests(unittest.TestCase):
@@ -53,23 +66,23 @@ class PreflightPolicyTests(unittest.TestCase):
 """
             )
             self.assertFalse(
-                common.ctl_allows_force_skip_execution_identity_preflight_check(
+                run_policy.Permissions.FORCE_SKIP_EXECUTION_IDENTITY_PREFLIGHT_CHECK.granted(
                     root, "strict"
                 )
             )
             self.assertTrue(
-                common.ctl_allows_force_skip_execution_identity_preflight_check(
+                run_policy.Permissions.FORCE_SKIP_EXECUTION_IDENTITY_PREFLIGHT_CHECK.granted(
                     root, "debug"
                 )
             )
 
             self.assertFalse(
-                common.ctl_allows_force_skip_full_cfg_validation_gate(
+                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(
                     root, "strict"
                 )
             )
             self.assertTrue(
-                common.ctl_allows_force_skip_full_cfg_validation_gate(
+                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(
                     root, "debug"
                 )
             )
@@ -80,7 +93,7 @@ class PreflightPolicyTests(unittest.TestCase):
         ):
             with self.subTest(run_type=run_type):
                 parser = argparse.ArgumentParser()
-                common.add_common_args(parser, run_type=run_type)
+                cli_args.add_common_args(parser, run_type=run_type)
                 action = next(
                     item
                     for item in parser._actions
@@ -92,6 +105,8 @@ class PreflightPolicyTests(unittest.TestCase):
                 )
 
     def test_check_only_and_force_skip_are_mutually_exclusive(self):
+        # finalizing args asks each declared provider's adapter about its modes
+        ctl_cfg_fixture.cfg_root(self, "aws")
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
                 execution_param=[],
@@ -103,9 +118,10 @@ class PreflightPolicyTests(unittest.TestCase):
                 force_skip_execution_identity_preflight_check=["aws"],
             )
             with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
-                common.finalize_common_args(args)
+                cli_args.finalize_common_args(args)
 
     def test_provider_options_must_match_the_mode_they_imply(self):
+        ctl_cfg_fixture.cfg_root(self, "aws")
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
                 execution_param=[],
@@ -120,9 +136,10 @@ class PreflightPolicyTests(unittest.TestCase):
                 force_skip_execution_identity_preflight_check=[],
             )
             with self.assertRaisesRegex(RuntimeError, "only valid in execution access mode"):
-                common.finalize_common_args(args)
+                cli_args.finalize_common_args(args)
 
     def test_bypass_and_force_skip_are_incompatible(self):
+        ctl_cfg_fixture.cfg_root(self, "aws")
         with tempfile.TemporaryDirectory() as tmp:
             args = argparse.Namespace(
                 execution_param=[],
@@ -137,11 +154,11 @@ class PreflightPolicyTests(unittest.TestCase):
                 force_skip_execution_identity_preflight_check=["aws"],
             )
             with self.assertRaisesRegex(RuntimeError, "without resolving an execution identity"):
-                common.finalize_common_args(args)
+                cli_args.finalize_common_args(args)
 
     def test_force_skip_requires_profile_permission(self):
         workflow = {"target_runs": ["target"]}
-        inventory = {"targets": {"target": {}}}
+        action = {"targets": {"target": {}}}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
@@ -154,11 +171,11 @@ class PreflightPolicyTests(unittest.TestCase):
                 RuntimeError,
                 "allow_force_skip_execution_identity_preflight_check",
             ):
-                common.validate_execution_access(
+                run_policy.validate_execution_access(
                     root,
                     "strict",
                     workflow,
-                    inventory,
+                    action,
                     execution_context={},
                     execution_access_modes={"aws": "standard"},
                     agreed_defer_ctl_state_backend_sync=False,
@@ -170,7 +187,7 @@ class PreflightPolicyTests(unittest.TestCase):
 
     def test_full_cfg_validation_gate_skip_requires_profile_permission(self):
         workflow = {"target_runs": ["target"]}
-        inventory = {"targets": {"target": {}}}
+        action = {"targets": {"target": {}}}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ctl_profiles.yaml").write_text(
@@ -183,11 +200,11 @@ class PreflightPolicyTests(unittest.TestCase):
                 RuntimeError,
                 "allow_force_skip_full_cfg_validation_gate",
             ):
-                common.validate_execution_access(
+                run_policy.validate_execution_access(
                     root,
                     "strict",
                     workflow,
-                    inventory,
+                    action,
                     execution_context={
                         "execution_context.ctl.force_skip_full_cfg_validation_gate": True
                     },
@@ -201,7 +218,7 @@ class PreflightPolicyTests(unittest.TestCase):
 class FullCfgValidationGateTests(unittest.TestCase):
     @staticmethod
     def _report(*, structural=False):
-        return common.build_cfg_validation_report(
+        return preflight_checks.CFG_VALIDATION.build(
             [
                 {
                     "cfg_path": "providers.example.bindings.unused",
@@ -214,35 +231,35 @@ class FullCfgValidationGateTests(unittest.TestCase):
 
     def test_failed_full_cfg_binding_blocks_by_default(self):
         report = self._report()
-        common.apply_full_cfg_validation_gate(report, force_skip=False)
+        preflight_checks.CFG_VALIDATION.apply_gate(report, force_skip=False)
         self.assertEqual(report["gate"]["status"], "failed")
         with self.assertRaisesRegex(RuntimeError, "full cfg validation failed"):
-            common.assert_full_cfg_validation_gate_accepted(report)
+            preflight_checks.CFG_VALIDATION.assert_accepted(report)
 
     def test_authorized_force_skips_only_the_aggregate_gate(self):
         report = self._report()
-        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        preflight_checks.CFG_VALIDATION.apply_gate(report, force_skip=True)
         self.assertEqual(report["status"], "failed")
         self.assertEqual(report["gate"]["status"], "force_skipped")
-        common.assert_full_cfg_validation_gate_accepted(report)
-        rendered = "\n".join(common._cfg_validation_text_lines(report))
+        preflight_checks.CFG_VALIDATION.assert_accepted(report)
+        rendered = "\n".join(preflight_render._cfg_validation_text_lines(report))
         self.assertIn(
             "full cfg validation gate [ skipped ⏭ ]", rendered
         )
 
     def test_unclassified_failure_cannot_be_force_skipped(self):
-        report = common.build_cfg_validation_report(
+        report = preflight_checks.CFG_VALIDATION.build(
             [{"cfg_path": "providers.future", "status": "failed"}]
         )
-        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        preflight_checks.CFG_VALIDATION.apply_gate(report, force_skip=True)
         self.assertEqual(report["gate"]["status"], "failed")
 
     def test_structural_failure_cannot_be_force_skipped(self):
         report = self._report(structural=True)
-        common.apply_full_cfg_validation_gate(report, force_skip=True)
+        preflight_checks.CFG_VALIDATION.apply_gate(report, force_skip=True)
         self.assertEqual(report["gate"]["status"], "failed")
         with self.assertRaisesRegex(RuntimeError, "full cfg validation failed"):
-            common.assert_full_cfg_validation_gate_accepted(report)
+            preflight_checks.CFG_VALIDATION.assert_accepted(report)
 
 
 class PreflightArtifactTests(unittest.TestCase):
@@ -275,7 +292,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "provider_catalogs": {},
             "execution_context": {},
         }
-        report = common.build_execution_identity_preflight_report(
+        report = preflight_reports.build_execution_identity_preflight_report(
             selection,
             implementation_key="profile",
             execution_access_modes={"aws": "standard"},
@@ -289,7 +306,7 @@ class PreflightArtifactTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             artifacts = Path(tmp)
-            common.write_execution_identity_preflight_artifacts(artifacts, report)
+            preflight_checks.EXECUTION_IDENTITY_PREFLIGHT.write_artifacts(artifacts, report)
             self.assertFalse(
                 (artifacts / "execution_identity_preflight.yaml").exists()
             )
@@ -322,7 +339,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 },
             ],
         }
-        rendered = "\n".join(common._preflight_text_lines(report))
+        rendered = "\n".join(preflight_render._preflight_text_lines(report))
         self.assertIn("workflow: env/baseline [ passed ✅ ]", rendered)
         self.assertIn("target: env/core/baseline [ passed ✅ ]", rendered)
         self.assertIn(
@@ -343,22 +360,22 @@ class PreflightArtifactTests(unittest.TestCase):
             "selection_kind": "workflow",
             "selection_key": "landing_zone/bootstrap",
             "workflow_cfg": {"target_runs": ["target"]},
-            "inventory_cfg": {"targets": {"target": {}}},
+            "action_cfg": {"targets": {"target": {}}},
             "execution_context": {},
             "active_target_runs": {},
         }
         with mock.patch.object(
-            common,
+            run_policy,
             "validate_target_policy_constraints_for_target",
             side_effect=RuntimeError("commit-required policy"),
         ), mock.patch.object(
-            common, "validate_execution_access"
+            run_policy, "validate_execution_access"
         ), mock.patch.object(
-            common, "validate_execution_runtime_mode"
+            run_policy, "validate_execution_runtime_mode"
         ), mock.patch.object(
-            common, "validate_target_runs_have_commits"
+            cfg_validate.CommitPinning, "check_target_runs"
         ):
-            policy_report = common.build_ctl_policy_preflight_report(
+            policy_report = preflight_reports.build_ctl_policy_preflight_report(
                 selection,
                 ctl_cfg_root=Path("/unused"),
                 ctl_profile="local_dev",
@@ -407,7 +424,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        dev = common.wrap_fan_out_preflight_child(
+        dev = catalog_workflow.wrap_fan_out_preflight_child(
             workflow_report,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -431,7 +448,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        test = common.wrap_fan_out_preflight_child(
+        test = catalog_workflow.wrap_fan_out_preflight_child(
             failed_workflow,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -441,14 +458,14 @@ class PreflightArtifactTests(unittest.TestCase):
         )
         report = {
             "selection": {"kind": "fan_out", "key": "env/bootstrap_non_prod"},
-            "status": common.aggregate_execution_identity_preflight_status(
+            "status": preflight_reports.aggregate_execution_identity_preflight_status(
                 [dev["status"], test["status"]]
             ),
             "children": [dev, test],
         }
         self.assertEqual(report["status"], "failed")
         with tempfile.TemporaryDirectory() as tmp:
-            common.write_execution_identity_preflight_artifacts(Path(tmp), report)
+            preflight_checks.EXECUTION_IDENTITY_PREFLIGHT.write_artifacts(Path(tmp), report)
             rendered = (
                 Path(tmp) / "execution_identity_preflight.txt"
             ).read_text()
@@ -477,7 +494,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        self.assertIs(common.wrap_fan_out_preflight_child(report, child), report)
+        self.assertIs(catalog_workflow.wrap_fan_out_preflight_child(report, child), report)
 
     def test_unparameterized_fan_out_child_shows_effective_params(self):
         report = {
@@ -493,7 +510,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        wrapped = common.wrap_fan_out_preflight_child(
+        wrapped = catalog_workflow.wrap_fan_out_preflight_child(
             report,
             child,
             effective_params={
@@ -502,7 +519,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 "region": "eu-west-2",
             },
         )
-        rendered = "\n".join(common._preflight_text_lines(wrapped))
+        rendered = "\n".join(preflight_render._preflight_text_lines(wrapped))
         # An unparameterized child has no per-member params, so nothing folds onto
         # its workflow line; run-constant params live on the fan-out header instead.
         self.assertIn(
@@ -518,14 +535,13 @@ class PreflightArtifactTests(unittest.TestCase):
                 "params": {"account": "dev", "env_type": "dev"},
             }
         ]
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                r"non_prod_accounts\.dev.*account.*--execution-params",
-            ):
-                common.validate_fan_out_param_collisions(
-                    Path(tmp), children, {"account": "test"}
-                )
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            RuntimeError,
+            r"non_prod_accounts\.dev.*account.*--execution-params",
+        ):
+            catalog_workflow.validate_fan_out_param_collisions(
+                Path(tmp), children, {"account": "test"}
+            )
 
     def test_fan_out_params_cannot_override_ctl_execution_params(self):
         children = [
@@ -542,7 +558,7 @@ class PreflightArtifactTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 RuntimeError, r"eu_west_2.*region.*ctl execution_params"
             ):
-                common.validate_fan_out_param_collisions(root, children, {})
+                catalog_workflow.validate_fan_out_param_collisions(root, children, {})
 
     def test_non_overlapping_fan_out_params_are_allowed(self):
         children = [
@@ -556,21 +572,21 @@ class PreflightArtifactTests(unittest.TestCase):
             (root / "execution_params.yaml").write_text(
                 "execution_params:\n  main_tag: oxygen\n"
             )
-            common.validate_fan_out_param_collisions(
+            catalog_workflow.validate_fan_out_param_collisions(
                 root, children, {"landing_zone": "live"}
             )
 
     def test_preflight_only_dirs_do_not_materialize_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
-            run_dir, artifacts_dir, log_file = common.setup_preflight_run_dirs(
+            run_dir, artifacts_dir, log_file = commands_selection.setup_preflight_run_dirs(
                 "run-id",
                 "plan",
                 "target",
                 "example",
                 Path(tmp),
                 memory,
-                locator_segments=list(common.LOCAL_ONLY_LOCATOR),
+                locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
             )
             self.assertTrue(artifacts_dir.is_dir())
             self.assertTrue(log_file.is_file())
@@ -579,17 +595,20 @@ class PreflightArtifactTests(unittest.TestCase):
             self.assertFalse((run_dir / "step_utils").exists())
 
     def test_run_metadata_records_execution_access_modes_for_degraded_audit(self):
-        """Each provider's access mode must be persisted structurally in RUN.yaml
+        """
+
+        each provider's access mode must be persisted structurally in RUN.yaml
         (not only in the logged command) so a later audit of committed run
         records shows which runs escalated, and for which provider."""
+
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
-            run_dir, _artifacts, _log = common.setup_preflight_run_dirs(
+            run_dir, _artifacts, _log = commands_selection.setup_preflight_run_dirs(
                 "run-id", "plan", "target", "example", Path(tmp), memory,
-                locator_segments=list(common.LOCAL_ONLY_LOCATOR),
+                locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
                 execution_access_modes={"aws": "force_bypass"},
             )
-            meta = common.load_run_metadata(run_dir)
+            meta = state_run_store.load_run_metadata(run_dir)
             self.assertEqual(
                 meta.get("execution_access_modes"), {"aws": "force_bypass"}
             )
@@ -597,14 +616,14 @@ class PreflightArtifactTests(unittest.TestCase):
     def test_command_log_redacts_provider_option_values(self):
         # the engine cannot tell which of an adapter's option keys is sensitive,
         # so every provider-option VALUE is redacted
-        rendered = common.redact_command_argv(
+        rendered = kernel_process.redact_command_argv(
             ["runner.py", "--provider-options", "aws.x=sensitive-selector"]
         )
         self.assertEqual(
             rendered,
             ["runner.py", "--provider-options", "<redacted>"],
         )
-        rendered = common.redact_command_argv(
+        rendered = kernel_process.redact_command_argv(
             ["runner.py", "--provider-options=aws.x=sensitive-selector"]
         )
         self.assertEqual(rendered, ["runner.py", "--provider-options=<redacted>"])
@@ -612,7 +631,7 @@ class PreflightArtifactTests(unittest.TestCase):
 
     def test_failure_reason_redacts_secret_values(self):
         error = RuntimeError("token=visible password:also-visible")
-        rendered = common.credential_free_preflight_failure_reason(error)
+        rendered = execution_run_context.credential_free_preflight_failure_reason(error)
         self.assertNotIn("visible", rendered)
         self.assertIn("<redacted>", rendered)
 

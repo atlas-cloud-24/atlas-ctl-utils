@@ -1,6 +1,6 @@
 """Test-time path setup, in ONE place.
 
-§Phase 74 moved the AWS adapter into its own repository, so it is no longer a
+ moved the AWS adapter into its own repository, so it is no longer a
 subpackage of the engine. Its location is DECLARED — `ctl-adapter-aws` is a
 tooling ref, and the dev cfg reflection resolves it to a local checkout in
 `local_repos.yaml` — so the tests read that declaration instead of guessing at
@@ -10,6 +10,7 @@ Falling back to the sibling checkout by NAME (never a glob) keeps the suite
 runnable before the dev cfg has been generated; discovering adapters by scanning
 what sits beside the engine is exactly what the declaration exists to replace.
 """
+
 
 import sys
 from pathlib import Path

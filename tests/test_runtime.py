@@ -1,4 +1,4 @@
-"""Execution-runtime tests (Phase 26).
+"""Execution-runtime tests.
 
 CTL owns the execution box: it selects one runtime per run and invokes the
 ctl-owned dispatcher (step_utils/run_step.sh) — never a per-target_run run script.
@@ -6,14 +6,18 @@ Target runs declare only their box (step.yaml runtime.image / docker_build) and 
 runtime constraint (supported_execution_runtime_modes); CTL reconciles the selected runtime
 against the ctl profile and every active target_run.
 """
-import re
+
+
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
-from utils import common  # noqa: E402
+from engine.cfg import materialize as cfg_materialize
+from engine.kernel import process as kernel_process
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import policy as run_policy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # atlas-stack root (…/atlas-stack) holds the plt-* consumer repos with target_runs.
@@ -22,9 +26,9 @@ ATLAS_STACK = REPO_ROOT.parent
 
 class RuntimePrimitivesTests(unittest.TestCase):
     def test_step_supported_execution_runtimes_default_and_validate(self):
-        self.assertEqual(common.step_supported_execution_runtime_modes({}, label="x"), {"local", "ci"})
+        self.assertEqual(run_policy.step_supported_execution_runtime_modes({}, label="x"), {"local", "ci"})
         self.assertEqual(
-            common.step_supported_execution_runtime_modes({"supported_execution_runtime_modes": ["ci"]}, label="x"), {"ci"}
+            run_policy.step_supported_execution_runtime_modes({"supported_execution_runtime_modes": ["ci"]}, label="x"), {"ci"}
         )
         for bad in (
             {"supported_execution_runtime_modes": ["teleport"]},
@@ -32,7 +36,7 @@ class RuntimePrimitivesTests(unittest.TestCase):
             {"supported_execution_runtime_modes": "ci"},
         ):
             with self.assertRaises(RuntimeError):
-                common.step_supported_execution_runtime_modes(bad, label="x")
+                run_policy.step_supported_execution_runtime_modes(bad, label="x")
 
     def test_ctl_allowed_execution_runtimes_default_and_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -42,8 +46,8 @@ class RuntimePrimitivesTests(unittest.TestCase):
                 "  open: { ref_policy: commit_required }\n"
                 "  local_only: { ref_policy: commit_required, allowed_execution_runtime_modes: [local] }\n"
             )
-            self.assertEqual(common.ctl_allowed_execution_runtime_modes(root, "open"), {"local", "ci"})
-            self.assertEqual(common.ctl_allowed_execution_runtime_modes(root, "local_only"), {"local"})
+            self.assertEqual(run_policy.ctl_allowed_execution_runtime_modes(root, "open"), {"local", "ci"})
+            self.assertEqual(run_policy.ctl_allowed_execution_runtime_modes(root, "local_only"), {"local"})
 
     def test_validate_execution_runtime_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,13 +57,13 @@ class RuntimePrimitivesTests(unittest.TestCase):
                 "  open: { ref_policy: commit_required }\n"
                 "  local_only: { ref_policy: commit_required, allowed_execution_runtime_modes: [local] }\n"
             )
-            common.validate_execution_runtime_mode(root, "open", "local")  # ok
-            common.validate_execution_runtime_mode(root, "open", "ci")  # ok
-            common.validate_execution_runtime_mode(root, "local_only", "local")  # ok
+            run_policy.validate_execution_runtime_mode(root, "open", "local")  # ok
+            run_policy.validate_execution_runtime_mode(root, "open", "ci")  # ok
+            run_policy.validate_execution_runtime_mode(root, "local_only", "local")  # ok
             with self.assertRaisesRegex(RuntimeError, "not allowed by ctl profile"):
-                common.validate_execution_runtime_mode(root, "local_only", "ci")
+                run_policy.validate_execution_runtime_mode(root, "local_only", "ci")
             with self.assertRaisesRegex(RuntimeError, "unknown execution runtime"):
-                common.validate_execution_runtime_mode(root, "open", "teleport")
+                run_policy.validate_execution_runtime_mode(root, "open", "teleport")
 
     def test_ctl_ref_policy_validates_against_closed_set(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,18 +76,18 @@ class RuntimePrimitivesTests(unittest.TestCase):
                 "  empty: { ref_policy: '' }\n"
             )
             # both known values resolve
-            self.assertEqual(common.ctl_ref_policy(root, "strict"), "commit_required")
-            self.assertEqual(common.ctl_ref_policy(root, "loose"), "local_dirty_allowed")
+            self.assertEqual(run_policy.ctl_ref_policy(root, "strict"), "commit_required")
+            self.assertEqual(run_policy.ctl_ref_policy(root, "loose"), "local_dirty_allowed")
             # a typo fails loud instead of silently degrading to permissive
             with self.assertRaisesRegex(RuntimeError, "unknown ref_policy"):
-                common.ctl_ref_policy(root, "typo")
+                run_policy.ctl_ref_policy(root, "typo")
             # empty is still caught by the non-empty guard
             with self.assertRaisesRegex(RuntimeError, "non-empty ref_policy"):
-                common.ctl_ref_policy(root, "empty")
+                run_policy.ctl_ref_policy(root, "empty")
 
     def test_step_box_name_valid_and_unique(self):
-        a = common._step_box_name("landing_zone/org/baseline", "provision/infra")
-        b = common._step_box_name("env/ops/app", "provision/ecr")
+        a = kernel_process._step_box_name("landing_zone/org/baseline", "provision/infra")
+        b = kernel_process._step_box_name("env/ops/app", "provision/ecr")
         for name in (a, b):
             self.assertRegex(name, r"^[a-z0-9._-]+$")
             self.assertFalse(name.startswith("-") or name.endswith("-"))
@@ -91,7 +95,9 @@ class RuntimePrimitivesTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
-    """The target_run/CTL boundary is enforced, not conventional."""
+    """
+
+    the target_run/CTL boundary is enforced, not conventional."""
 
     def _step_yamls(self):
         return sorted(ATLAS_STACK.glob("*/atlas_ctl_adapter/steps/*/*/step.yaml"))
@@ -105,10 +111,10 @@ class RuntimeContractTests(unittest.TestCase):
         step_yamls = self._step_yamls()
         self.assertTrue(step_yamls, "no step.yaml files discovered")
         for sy in step_yamls:
-            meta = common.load_yaml(sy) or {}
+            meta = kernel_yaml_io.load_yaml(sy) or {}
             runtime_cfg = meta.get("runtime") or {}
             self.assertIn(
-                runtime_cfg.get("image"), common.STEP_IMAGES,
+                runtime_cfg.get("image"), cfg_materialize.STEP_IMAGES,
                 f"{sy} runtime.image missing/invalid",
             )
             self.assertIsInstance(
@@ -116,7 +122,7 @@ class RuntimeContractTests(unittest.TestCase):
                 f"{sy} runtime.docker_build must be bool",
             )
             # supported_execution_runtime_modes (if present) must validate
-            common.step_supported_execution_runtime_modes(runtime_cfg, label=str(sy))
+            run_policy.step_supported_execution_runtime_modes(runtime_cfg, label=str(sy))
 
     def test_steps_do_not_invoke_docker_directly(self):
         # src/step.sh is runtime-neutral work; only ecr/frontend legitimately use

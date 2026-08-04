@@ -1,4 +1,4 @@
-"""§Phase 69: `--all` covers the assignments DECLARED in coverage.yaml.
+"""`--all` covers the assignments DECLARED in coverage.yaml.
 
 The list lives in the guardrail repository, beside the baselines it governs, so
 adding an assignment and the baseline it produces land in one commit and one
@@ -10,6 +10,7 @@ exists but is no longer declared would never be regenerated and would go stale
 without anything noticing. That is exactly how the pre-Phase-65 `iam_role_accounts`
 baselines survived.
 """
+
 
 import sys
 import tempfile
@@ -23,7 +24,7 @@ ATLAS_ROOT = REPO_ROOT.parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 sys.path.insert(0, str(REPO_ROOT / "cfg"))
 
-import regenerate_guardrails as rg  # noqa: E402
+import regenerate_guardrails as rg
 
 GUARDRAILS_REPO = ATLAS_ROOT / "cfg" / "oxygen" / "oxygen-cfg-guardrails"
 
@@ -62,6 +63,7 @@ class LoadCoverageTest(unittest.TestCase):
 
     def test_an_assignment_may_override_a_common_axis(self):
         """`common` is a default, not a lock — a genuinely different axis wins."""
+
         second = rg.load_coverage_assignments(self.root, "plt")[1]
         self.assertEqual("us-east-1", second["aws.region"])
 

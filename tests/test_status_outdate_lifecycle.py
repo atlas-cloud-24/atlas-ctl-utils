@@ -16,6 +16,7 @@ and the COUNTS across the namespace at each step, because a status view is read
 for "how many things need attention", not one row at a time.
 """
 
+
 import sys
 import tempfile
 import unittest
@@ -24,7 +25,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.catalog import workflow as catalog_workflow
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import addressing as run_addressing
+from engine.state import lifecycle as state_lifecycle
+from engine.state import run_store as state_run_store
+from engine.state import status as state_status
 
 
 class Namespace:
@@ -35,7 +41,7 @@ class Namespace:
 
     # ── construction ────────────────────────────────────────────────────────
     def instance(self, kind: str, key: str, segments: list[str]) -> Path:
-        return self.root / common.compose_state_relpath(kind, key, segments)
+        return self.root / run_addressing.compose_state_relpath(kind, key, segments)
 
     def publish(self, kind: str, key: str, segments: list[str], *, run_id: str,
                 group: str = "mutative", action: str = "provision",
@@ -51,14 +57,14 @@ class Namespace:
         }
         if children is not None:
             pointer["child_revisions"] = children
-        path = common.committed_pointer_path(self.instance(kind, key, segments), group)
-        common.write_yaml_file(path, pointer)
+        path = state_run_store.committed_pointer_path(self.instance(kind, key, segments), group)
+        kernel_yaml_io.write_yaml_file(path, pointer)
         return path
 
     def slot(self, kind: str, key: str, segments: list[str], state: str, *,
              group: str = "mutative", **facts) -> None:
-        common.write_yaml_file(
-            common.state_slot_dir(self.instance(kind, key, segments), state, group)
+        kernel_yaml_io.write_yaml_file(
+            state_run_store.state_slot_dir(self.instance(kind, key, segments), state, group)
             / "STATUS.yaml",
             {"run_id": "live", "action": "provision", "status": state, **facts},
         )
@@ -69,7 +75,7 @@ class Namespace:
                      selectors: dict | None = None) -> None:
         """A workflow publishes HISTORY: its RUN.yaml is the record."""
         run_dir = (
-            self.root / common.compose_state_relpath("workflow", key, [])
+            self.root / run_addressing.compose_state_relpath("workflow", key, [])
             / "runs" / run_id
         )
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -81,13 +87,13 @@ class Namespace:
             record["default_action"] = default_action
         if selectors:
             record["member_selectors"] = selectors
-        common.write_yaml_file(common.run_metadata_path(run_dir), record)
+        kernel_yaml_io.write_yaml_file(state_run_store.run_metadata_path(run_dir), record)
 
     def clear_slots(self, kind: str, key: str, segments: list[str]) -> None:
         import shutil
 
         for state in ("in_progress", "failed"):
-            directory = common.state_slot_dir(
+            directory = state_run_store.state_slot_dir(
                 self.instance(kind, key, segments), state, "mutative"
             )
             if directory.exists():
@@ -95,14 +101,14 @@ class Namespace:
 
     def outdate(self, kind: str, key: str, segments: list[str], *,
                 group: str = "mutative", reason: str = "a dependency changed") -> None:
-        path = common.committed_pointer_path(self.instance(kind, key, segments), group)
-        common.mark_committed_status_outdated(
-            path, common.load_yaml(path) or {}, reason=reason
+        path = state_run_store.committed_pointer_path(self.instance(kind, key, segments), group)
+        state_status.mark_committed_status_outdated(
+            path, kernel_yaml_io.load_yaml(path) or {}, reason=reason
         )
 
     # ── reading ─────────────────────────────────────────────────────────────
     def rows(self) -> dict:
-        return common.compute_namespace_status_map(self.root)
+        return state_status.compute_namespace_status_map(self.root)
 
     def row(self, kind: str, key: str, segments: list[str],
             group: str = "mutative") -> dict:
@@ -181,7 +187,7 @@ class OutdateLifecycleTest(unittest.TestCase):
 
 
 class WorkflowHistoryTest(unittest.TestCase):
-    """§Phase 73: a workflow publishes history. Its row is the LAST RUN — what it
+    """A workflow publishes history. Its row is the LAST RUN — what it
     did, what selected its members, and which members it ran with. It holds no
     state, so nothing about it is rolled up from members or goes stale."""
 
@@ -322,7 +328,7 @@ if __name__ == "__main__":
 
 
 class SkipUpToDateUnderHistoryTest(unittest.TestCase):
-    """§Phase 73: skipping reads the CHILD's pointer, so removing the workflow's
+    """Skipping reads the CHILD's pointer, so removing the workflow's
     changes nothing. A workflow always runs; skipping happens per member."""
 
     FACTS = {
@@ -336,28 +342,28 @@ class SkipUpToDateUnderHistoryTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
         self.parent = (
-            root / "live" / common.compose_state_relpath("workflow", WORKFLOW, [])
+            root / "live" / run_addressing.compose_state_relpath("workflow", WORKFLOW, [])
             / "runs" / "w1"
         )
         self.parent.mkdir(parents=True)
-        common.write_run_metadata(self.parent, {
+        state_run_store.write_run_metadata(self.parent, {
             "run_id": "w1", "action": "provision", "run_type": "workflow",
             "result_name": WORKFLOW, "ctl_state_local_root": str(root),
             "ctl_state_locator": ["live"],
         })
         child = (
             root / "live"
-            / common.compose_state_relpath("target", TARGET, ["account=dev"])
+            / run_addressing.compose_state_relpath("target", TARGET, ["account=dev"])
             / "runs" / "r1"
         )
         child.mkdir(parents=True)
-        common.write_run_metadata(child, {
+        state_run_store.write_run_metadata(child, {
             "run_id": "r1", "action": "provision", "run_type": "target",
             "result_name": TARGET, "ctl_state_local_root": str(root),
             "ctl_state_locator": ["live"], "instance": ["account=dev"], **self.FACTS,
         })
-        common.publish_committed_pointer(
-            child, common.build_status_payload(child, "ok")
+        state_run_store.publish_committed_pointer(
+            child, state_status.build_status_payload(child, "ok")
         )
         self.target_run = {
             "target": TARGET, "target_instance_params": ["account"], **self.FACTS
@@ -365,7 +371,7 @@ class SkipUpToDateUnderHistoryTest(unittest.TestCase):
         self.context = {"execution_context.params.account": "dev"}
 
     def _revision(self, action):
-        return common.up_to_date_child_revision(
+        return state_status.up_to_date_child_revision(
             self.parent, self.target_run, self.context, action
         )
 
@@ -393,13 +399,13 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.ns = Namespace(self.root)
         self.run_dir = (
-            self.root / common.compose_state_relpath("workflow", WORKFLOW, [])
+            self.root / run_addressing.compose_state_relpath("workflow", WORKFLOW, [])
             / "runs" / "w1"
         )
         self.run_dir.mkdir(parents=True)
-        # §Phase 78: the run already carries its members' resolved INSTANCE
+        # the run already carries its members' resolved INSTANCE
         # addresses, and the recorder reads them from here.
-        common.write_run_metadata(self.run_dir, {
+        state_run_store.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
             "target_addresses": [
@@ -409,7 +415,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         })
 
     def _record(self, runs: dict, cfg: dict) -> dict:
-        common.record_workflow_members(self.run_dir, runs, cfg)
+        state_lifecycle.record_workflow_members(self.run_dir, runs, cfg)
         return self.ns.rows()["workflow"][WORKFLOW]["last_run"]
 
     def test_a_member_taking_the_default_is_a_bare_instance(self):
@@ -436,7 +442,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         """The reason keys are not enough: a workflow's params are the UNION of
         its members', so a narrower member's address cannot be reconstructed from
         the workflow's own segments."""
-        common.write_run_metadata(self.run_dir, {
+        state_run_store.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
             "target_addresses": [f"{TARGET}/instances/env.type=dev/aws.account=dev",
@@ -456,7 +462,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
     def test_a_singleton_member_records_its_bare_key(self):
         """No resolved address means the target varies over nothing, and its
         address IS its key — never a silent omission."""
-        common.write_run_metadata(self.run_dir, {
+        state_run_store.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "ok", "updated_at": "2026-07-30T10:00:05Z",
         })
@@ -484,12 +490,13 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
     def test_the_resolved_workflow_carries_its_member_fields(self):
         """`load_workflow_cfg` returned only meta + target_runs, dropping both —
         so the recorder had nothing to record and every row looked bare."""
+
         import tempfile as _tempfile
 
         with _tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "workflows").mkdir()
-            common.write_yaml_file(root / "workflows" / "w.yaml", {"workflows": {
+            kernel_yaml_io.write_yaml_file(root / "workflows" / "w.yaml", {"workflows": {
                 "env/x": {
                     "operations": ["destroy"],
                     "target_keys": {"members": [{
@@ -500,7 +507,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
                     }]},
                 }
             }})
-            cfg = common.load_workflow_cfg(
+            cfg = catalog_workflow.load_workflow_cfg(
                 root, "p", "destroy", "env/x",
                 {"execution_context.ctl.operation": "destroy"},
             )
@@ -514,7 +521,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         """Recorded at RESOLUTION, not after the slow cfg and guardrail phases —
         otherwise a status read during them shows a running workflow with no
         members, while the composition was known the whole time."""
-        common.write_run_metadata(self.run_dir, {
+        state_run_store.write_run_metadata(self.run_dir, {
             "run_id": "w1", "run_type": "workflow", "action": "provision",
             "status": "in_progress", "updated_at": "2026-07-30T10:00:05Z",
             "target_addresses": [f"{TARGET}/instances/env.type=dev"],

@@ -12,13 +12,14 @@ weak guard. This is the cheap one: the property is static, so it is checked
 statically, on every run, in milliseconds.
 """
 
+
 import ast
 import builtins
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-COMMON = REPO_ROOT / "runners/utils/common.py"
+SELECTION = REPO_ROOT / "runners/engine/commands/selection.py"
 
 
 def _bound_by(node: ast.AST) -> set[str]:
@@ -69,6 +70,7 @@ def _scan(body: list[ast.stmt], bound: set[str], report: list[str], where: str) 
     reads, and claiming more would produce false positives on the common
     assign-in-every-branch shape.
     """
+
     bound = set(bound)
     for statement in body:
         if isinstance(statement, ast.If):
@@ -116,7 +118,7 @@ def _scan(body: list[ast.stmt], bound: set[str], report: list[str], where: str) 
 
 
 class BranchesDoNotShareLocalsTest(unittest.TestCase):
-    MODULE = COMMON
+    MODULE = SELECTION
 
     def _violations(self) -> list[str]:
         tree = ast.parse(self.MODULE.read_text())

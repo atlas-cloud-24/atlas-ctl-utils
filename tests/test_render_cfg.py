@@ -5,11 +5,10 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine.cfg import tree as cfg_tree
 
 
 def write_tree(root: Path, files: dict[str, str]) -> None:
@@ -27,7 +26,7 @@ def render(files: dict[str, str], env_ctx: dict) -> Path:
     rendered.mkdir()
     for entry in sorted(merged.iterdir()):
         if entry.is_dir():
-            common.render_scope_tree(entry, rendered / entry.name, env_ctx)
+            cfg_tree.render_scope_tree(entry, rendered / entry.name, env_ctx)
     return rendered
 
 

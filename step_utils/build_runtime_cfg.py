@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 import re
 import shlex
 from copy import deepcopy
 from pathlib import Path
 
 import yaml
-
 
 VAR_NAME_RE = r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 PLACEHOLDER_RE = re.compile(rf"\$\{{({VAR_NAME_RE})(?::-(.*?))?\}}")
@@ -60,7 +58,10 @@ EXECUTION_CONTEXT_ROOT = "execution_context"
 
 
 def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
-    """Load the nested execution_context file; return (flat dotted map, nested)."""
+    """
+
+    load the nested execution_context file; return (flat dotted map, nested)."""
+
     data = load_yaml_mapping(path)
     nested = data.get(EXECUTION_CONTEXT_ROOT)
     if not isinstance(nested, dict):
@@ -198,7 +199,7 @@ def resolve_cfg_path(origin_cfg_dir: Path, key: str) -> Path:
 def load_domain_docs(origin_cfg_dir: Path) -> dict[str, dict]:
     """Load the per-domain views the engine projected into this step's cfg dir.
 
-    §Phase 60: the target delivers `<domain>.yaml` holding exactly the keys it
+    the target delivers `<domain>.yaml` holding exactly the keys it
     declared; the step then narrows further to its own `cfg_keys`.
     """
     origin_cfg_dir = origin_cfg_dir.resolve()
@@ -237,7 +238,7 @@ def project_step_keys(doc: dict, bindings: dict[str, str], *, label: str) -> dic
             node = node[segment]
             walked.append(segment)
         # A dotted key binds the ENTRY it names, not the collection holding it:
-        # a signature that says `state_backend_cfg.seed` must hand the step that
+        # A signature that says `state_backend_cfg.seed` must hand the step that
         # one entry, or the local name is a lie.
         projected[local_name] = node
     return projected

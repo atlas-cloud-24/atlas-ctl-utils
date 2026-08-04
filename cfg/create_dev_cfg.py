@@ -24,6 +24,7 @@ Examples:
         --force
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -37,7 +38,6 @@ import tempfile
 from pathlib import Path
 
 import yaml
-
 
 REF_SPEC_RE = re.compile(r"^(?P<source>.+)@(?P<kind>branch|tag|commit)=(?P<value>.+)$")
 TARGET_SOURCE_LINE_RE = re.compile(r"^  (?P<target_run>[^:\n]+):\s*$")

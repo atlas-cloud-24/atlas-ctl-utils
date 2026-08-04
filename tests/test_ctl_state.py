@@ -3,12 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
-import atlas_ctl_adapter_aws as aws_adapter  # noqa: E402
+import atlas_ctl_adapter_aws as aws_adapter
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import policy as run_policy
+from engine.state import run_store as state_run_store
+from engine.state import sync as state_sync
 
 
 def write(path: Path, content: str) -> None:
@@ -55,20 +57,20 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
             root = Path(tmp)
             write(root / "not-a-special-name.yaml", CTL_STATE_BACKENDS_YAML)
 
-            cfg = common.load_ctl_state_backends_cfg(root)
+            cfg = state_sync.CtlStateBackends.load(root)
             self.assertEqual(set(cfg), {"env", "deployments"})
             self.assertEqual(cfg["deployments"]["bucket_region"], "us-east-1")
 
     def test_absent_resource_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(common.load_ctl_state_backends_cfg(Path(tmp)))
+            self.assertIsNone(state_sync.CtlStateBackends.load(Path(tmp)))
 
     def test_accepts_consumer_defined_domain(self):
         # domains are consumer vocabulary; the engine accepts any snake_case key
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "ctl_state.yaml", "ctl_state_backends:\n  org:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n")
-            cfg = common.load_ctl_state_backends_cfg(root)
+            cfg = state_sync.CtlStateBackends.load(root)
             self.assertEqual(set(cfg), {"org"})
 
 
@@ -78,7 +80,7 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root / "ctl_state.yaml", "ctl_state_buckets:\n  env:\n    bucket_name: x\n    bucket_region: y\n")
-            self.assertIsNone(common.load_ctl_state_backends_cfg(root))
+            self.assertIsNone(state_sync.CtlStateBackends.load(root))
 
     def test_rejects_non_snake_domain(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,7 +88,7 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
             write(root / "ctl_state.yaml", "ctl_state_backends:\n  Org-State:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n")
 
             with self.assertRaisesRegex(RuntimeError, "must be a snake_case key"):
-                common.load_ctl_state_backends_cfg(root)
+                state_sync.CtlStateBackends.load(root)
 
     def test_rejects_missing_region(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,11 +96,11 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
             write(root / "ctl_state.yaml", "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n")
 
             with self.assertRaisesRegex(RuntimeError, "bucket_region must be a non-empty string"):
-                common.load_ctl_state_backends_cfg(root)
+                state_sync.CtlStateBackends.load(root)
 
 
 class RunRecordPublicationTests(unittest.TestCase):
-    """§Phase 57: a run prefix publishes a RECORD, never the whole run dir."""
+    """A run prefix publishes a RECORD, never the whole run dir."""
 
     def test_push_filters_are_an_allowlist(self):
         captured = {}
@@ -129,11 +131,11 @@ class RunRecordPublicationTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--exclude") + 1], "*")
         self.assertLess(argv.index("--exclude"), argv.index("--include"))
         included = {argv[i + 1] for i, a in enumerate(argv) if a == "--include"}
-        for member in common.RUN_RECORD_MEMBERS:
+        for member in state_run_store.RUN_RECORD_MEMBERS:
             self.assertIn(member, included)
             self.assertIn(f"{member}/*", included)
         # §gates: the run's verdicts are a published record member
-        self.assertIn("gates", common.RUN_RECORD_MEMBERS)
+        self.assertIn("gates", state_run_store.RUN_RECORD_MEMBERS)
         # the build workspace is not a record member, under any spelling
         self.assertNotIn("target_sources", included)
         self.assertNotIn("target_sources/*", included)
@@ -143,11 +145,11 @@ class RunRecordPublicationTests(unittest.TestCase):
             root = Path(tmp)
             run_dir = root / "ns" / "provision" / "workflow" / "wf" / "runs" / "rid"
             run_dir.mkdir(parents=True)
-            common.write_yaml_file(
-                run_dir / common.RUN_METADATA_FILENAME,
+            kernel_yaml_io.write_yaml_file(
+                run_dir / state_run_store.RUN_METADATA_FILENAME,
                 {"run_id": "rid", "ctl_state_local_root": str(root)},
             )
-            workspace = common.run_workspace_dir(run_dir)
+            workspace = state_run_store.run_workspace_dir(run_dir)
             self.assertEqual(
                 workspace, root / "_local" / "workspaces" / "rid"
             )
@@ -158,8 +160,8 @@ class RunRecordPublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "runs" / "rid"
             run_dir.mkdir(parents=True)
-            self.assertIsNone(common.run_workspace_dir(run_dir))
-            common.cleanup_run_workspace(run_dir)  # tolerated, not an error
+            self.assertIsNone(state_run_store.run_workspace_dir(run_dir))
+            state_run_store.cleanup_run_workspace(run_dir)  # tolerated, not an error
 
 
 class CtlStateSkipPolicyTests(unittest.TestCase):
@@ -174,22 +176,22 @@ class CtlStateSkipPolicyTests(unittest.TestCase):
     def test_defaults_to_strict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "")
-            self.assertFalse(common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx"))
-            self.assertFalse(common.ctl_allows_force_skip_ctl_state_backend_sync(root, "test_ctx"))
+            self.assertFalse(run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
+            self.assertFalse(run_policy.Permissions.FORCE_SKIP_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
             # provider policy has no engine-granted default: it is declared
             with self.assertRaisesRegex(RuntimeError, "must declare allowed_providers"):
-                common.ctl_allowed_providers(root, "test_ctx")
+                run_policy.ctl_allowed_providers(root, "test_ctx")
 
     def test_reads_profile_bool(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "    allow_agreed_defer_ctl_state_backend_sync: true\n")
-            self.assertTrue(common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx"))
+            self.assertTrue(run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
 
     def test_rejects_non_bool(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "    allow_agreed_defer_ctl_state_backend_sync: sometimes\n")
             with self.assertRaisesRegex(RuntimeError, "must be a bool"):
-                common.ctl_allows_agreed_defer_ctl_state_backend_sync(root, "test_ctx")
+                run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx")
 
 
 if __name__ == "__main__":

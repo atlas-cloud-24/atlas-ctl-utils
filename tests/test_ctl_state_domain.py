@@ -3,18 +3,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from utils import common  # noqa: E402
+from engine_surface import engine_defines
+from engine.run import selectors as run_selectors
+from engine.state import sync as state_sync
 
 
 class OperationIdentityTests(unittest.TestCase):
     def _load(self, body: str) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "ctl_state.yaml").write_text(body, encoding="utf-8")
-            return common.load_ctl_state_backends_cfg(Path(tmp))
+            return state_sync.CtlStateBackends.load(Path(tmp))
 
     def test_operation_identities_are_optional_for_structural_loading(self):
         cfg = self._load(
@@ -47,23 +48,23 @@ class ResultsBootstrapDetectionTests(unittest.TestCase):
 
     def test_true_when_a_bootstrap_target_is_in_the_run(self):
         wf = {"target_runs": ["env/ctl-state-backend"]}
-        self.assertTrue(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
+        self.assertTrue(state_sync.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_true_when_mixed_workflow_includes_a_bootstrap_target(self):
         wf = {"target_runs": ["env/core/baseline", {"target": "env/ctl-state-backend"}]}
-        self.assertTrue(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
+        self.assertTrue(state_sync.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_false_for_a_normal_run(self):
         wf = {"target_runs": ["env/core/baseline"]}
-        self.assertFalse(common.run_provisions_ctl_state_backend(wf, self.INVENTORY))
+        self.assertFalse(state_sync.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_false_when_target_missing_or_no_flag(self):
-        self.assertFalse(common.run_provisions_ctl_state_backend({"target_runs": ["unknown"]}, self.INVENTORY))
-        self.assertFalse(common.run_provisions_ctl_state_backend({"target_runs": []}, self.INVENTORY))
+        self.assertFalse(state_sync.run_provisions_ctl_state_backend({"target_runs": ["unknown"]}, self.INVENTORY))
+        self.assertFalse(state_sync.run_provisions_ctl_state_backend({"target_runs": []}, self.INVENTORY))
 
 
 class ScopeConditionTests(unittest.TestCase):
-    """§Phase 60/61: a plt scope declares its own CONDITION and activates iff the
+    """/61: a plt scope declares its own CONDITION and activates iff the
     run reads its domain. The former `required_target_paths` filter decided the
     same thing from the other side and was removed — two mechanisms deciding one
     thing can disagree."""
@@ -71,18 +72,18 @@ class ScopeConditionTests(unittest.TestCase):
     SCOPE = {"contains": {"execution_context.target.domains": "env"}}
 
     def test_scope_activates_when_the_run_reads_its_domain(self):
-        self.assertTrue(common.selector_matches(
+        self.assertTrue(run_selectors.selector_matches(
             self.SCOPE, {"execution_context.target.domains": ["env", "org"]}, label="t"))
 
     def test_scope_is_dropped_when_it_does_not(self):
-        self.assertFalse(common.selector_matches(
+        self.assertFalse(run_selectors.selector_matches(
             self.SCOPE, {"execution_context.target.domains": ["org"]}, label="t"))
 
     def test_scope_is_dropped_when_no_domains_are_declared(self):
-        self.assertFalse(common.selector_matches(self.SCOPE, {}, label="t"))
+        self.assertFalse(run_selectors.selector_matches(self.SCOPE, {}, label="t"))
 
     def test_the_removed_filter_is_gone(self):
-        self.assertFalse(hasattr(common, "required_target_paths_for_target_runs"))
+        self.assertFalse(engine_defines("required_target_paths_for_target_runs"))
 
 
 if __name__ == "__main__":
