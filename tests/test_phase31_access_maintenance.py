@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from utils import common  # noqa: E402
-from utils.providers import aws  # noqa: E402
+import atlas_ctl_adapter_aws as aws  # noqa: E402
 
 
 def write(path: Path, text: str) -> None:
@@ -176,7 +176,7 @@ class AccountRegistryTests(unittest.TestCase):
             )
 
             with mock.patch.object(
-                aws,
+                aws.credentials,
                 "resolve_configured_profile_account_id",
                 return_value="111111111111",
             ):

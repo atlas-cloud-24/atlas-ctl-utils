@@ -119,17 +119,13 @@ class FanOutNamespaceGateTests(unittest.TestCase):
 
 
 class WorkflowCompositionTests(unittest.TestCase):
-    """§Phase 31 item 7 — composition sha + identity doc."""
+    """§Phase 31 item 7 — the workflow identity doc.
+
+    The composition sha it also covered is gone (§Phase 83): a workflow instance
+    is addressed by declared params, not by a digest over its members.
+    """
 
     ADDRS = ["target/env/tfstate_backend/instances/account=stg/env_type=stg"]
-
-    def test_sha_is_deterministic_and_order_sensitive(self):
-        a = common.workflow_composition_sha256(["x", "y"])
-        b = common.workflow_composition_sha256(["x", "y"])
-        c = common.workflow_composition_sha256(["y", "x"])
-        self.assertEqual(a, b)
-        self.assertNotEqual(a, c)
-        self.assertEqual(len(a), 8)
 
     def test_identity_doc_facts_only(self):
         doc = common.build_workflow_identity_doc(
@@ -162,16 +158,24 @@ class MutationLockTests(unittest.TestCase):
         out = common.evaluate_mutation_lock(None, action="plan", run_id="r1")
         self.assertEqual(out["decision"], "proceed")
 
-    def test_live_lock_blocks_everyone(self):
+    def test_a_live_lock_blocks_another_mutation(self):
         live = common.build_mutation_lock_doc("holder", "provision")
         self.assertEqual(
             common.evaluate_mutation_lock(live, action="provision", run_id="r2"),
             {"decision": "blocked", "holder": "holder"},
         )
-        self.assertEqual(
-            common.evaluate_mutation_lock(live, action="plan", run_id="r2")["decision"],
-            "blocked",
-        )
+
+    def test_a_live_lock_does_not_block_a_reader(self):
+        """§Phase 83 Q3: a non-mutating action never acquires this lock, so
+        blocking it only ever denied a read — and denied exactly the read worth
+        having, since `status` reports on the run holding the lock."""
+        live = common.build_mutation_lock_doc("holder", "provision")
+        for action in ("plan", "readonly", "maintenance"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    "proceed",
+                    common.evaluate_mutation_lock(live, action=action, run_id="r2")["decision"],
+                )
 
     def test_stale_lock_broken_by_mutating_only(self):
         stale = common.build_mutation_lock_doc("dead", "provision")
@@ -267,8 +271,10 @@ class _FakeSyncer:
         self.lock = existing
         self.create_wins = create_wins
         self.deleted = 0
+        self.reads = 0
 
     def read_mutation_lock(self):
+        self.reads += 1
         return self.lock
 
     def write_mutation_lock(self, doc):
@@ -307,8 +313,15 @@ class MutationLockGateTests(unittest.TestCase):
         syncer = _FakeSyncer(existing=live)
         with self.assertRaisesRegex(RuntimeError, "locked by run 'holder'"):
             common.enforce_mutation_lock(syncer, action="provision", run_id="r2")
-        with self.assertRaisesRegex(RuntimeError, "locked by run 'holder'"):
-            common.enforce_mutation_lock(syncer, action="plan", run_id="r2")
+
+    def test_a_reader_is_not_blocked_and_does_not_even_look(self):
+        """§Phase 83 Q3: reading the lock object cost a GET per query to answer a
+        question whose only possible outcome was to refuse the caller."""
+        live = common.build_mutation_lock_doc("holder", "provision")
+        syncer = _FakeSyncer(existing=live)
+        before = syncer.reads
+        common.enforce_mutation_lock(syncer, action="readonly", run_id="r2")
+        self.assertEqual(before, syncer.reads, "a reader still fetched the lock object")
 
     def test_stale_lock_broken_and_recorded(self):
         stale = common.build_mutation_lock_doc("dead", "provision")
@@ -358,3 +371,104 @@ class DuplicateSelectorGuardTests(unittest.TestCase):
                 },
                 label="grp",
             )
+
+
+class MutationLockTtlTest(unittest.TestCase):
+    """§Phase 83 Q3: the TTL is what makes a lock BREAKABLE.
+
+    At one hour a long apply outlived its own lock, the next mutating run broke
+    it, and the result was the two concurrent mutators the lock exists to prevent.
+    The default is now past any single apply, and a namespace holding a slower
+    estate may declare its own.
+    """
+
+    def test_the_default_outlasts_a_long_apply(self):
+        """The number is the point: an hour is inside the range of a real apply,
+        so the old default broke live locks as a matter of course."""
+        self.assertGreaterEqual(common.MUTATION_LOCK_TTL_SECONDS, 4 * 3600)
+
+    def test_a_namespace_may_declare_its_own(self):
+        self.assertEqual(
+            900, common.backend_mutation_lock_ttl({"mutation_lock_ttl_seconds": 900})
+        )
+
+    def test_a_namespace_that_declares_none_takes_the_default(self):
+        for entry in ({}, {"bucket_name": "b"}, None):
+            with self.subTest(entry=entry):
+                self.assertEqual(
+                    common.MUTATION_LOCK_TTL_SECONDS,
+                    common.backend_mutation_lock_ttl(entry),
+                )
+
+    def test_a_nonsense_ttl_is_refused(self):
+        """Silently falling back to the default would give a namespace a lock
+        window its author did not choose and does not know about."""
+        for bad in ("3600", 0, -1, 1.5, True, [3600]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RuntimeError):
+                    common.backend_mutation_lock_ttl({"mutation_lock_ttl_seconds": bad})
+
+    def test_the_declared_ttl_reaches_the_lock_document(self):
+        doc = common.build_mutation_lock_doc("r1", "provision", ttl_seconds=60)
+        acquired = datetime.fromisoformat(doc["acquired_at"])
+        expires = datetime.fromisoformat(doc["expires_at"])
+        self.assertEqual(60, doc["ttl_seconds"])
+        self.assertAlmostEqual(60, (expires - acquired).total_seconds(), delta=2)
+
+    def test_a_lock_taken_under_a_long_ttl_is_not_stale_after_an_hour(self):
+        """The regression itself: this is the run that used to have its own lock
+        broken out from under it."""
+        doc = common.build_mutation_lock_doc("slow-apply", "provision")
+        an_hour_in = datetime.now(timezone.utc) + timedelta(seconds=3601)
+        self.assertFalse(common.mutation_lock_is_stale(doc, now=an_hour_in))
+
+    def test_a_lock_is_still_breakable_once_its_own_ttl_passes(self):
+        """Longer, not infinite — an abandoned lock must still clear."""
+        doc = common.build_mutation_lock_doc("abandoned", "provision", ttl_seconds=60)
+        later = datetime.now(timezone.utc) + timedelta(seconds=61)
+        self.assertTrue(common.mutation_lock_is_stale(doc, now=later))
+
+    def _namespace_root(self, tmp, ttl):
+        root = Path(tmp)
+        entry = {
+            "provider": "aws", "backend_type": "s3",
+            "bucket_name": "b", "bucket_region": "eu-west-2",
+            "selectors": {"match": {"execution_context.params.lz": "live"}},
+        }
+        if ttl is not None:
+            entry["mutation_lock_ttl_seconds"] = ttl
+        common.write_yaml_file(
+            root / "ctl_state_backends.yaml", {"ctl_state_backends": {"live": entry}}
+        )
+        return root
+
+    def test_a_namespace_is_allowed_to_declare_the_field_at_all(self):
+        """Backend entries are key-ALLOWLISTED, so a new field is refused until it
+        is listed. Without this the whole option is dead cfg: declaring it fails
+        at load with `unsupported keys`, and every other test here works on dicts
+        that never went through the loader."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._namespace_root(tmp, 900)
+            _, entry = common.resolve_ctl_state_namespace(
+                root, {"execution_context.params.lz": "live"}
+            )
+            self.assertEqual(900, common.backend_mutation_lock_ttl(entry))
+
+    def test_a_malformed_ttl_fails_at_cfg_load(self):
+        """Not at the moment a mutating run reaches for the lock: by then the run
+        has done its setup and the failure reads as a lock problem. At LOAD,
+        where every other field of the entry is checked and where the value is
+        carried onto the resolved entry.
+
+        Matched on the VALUE complaint, not on the field name: the name alone also
+        appears in the loader's `unsupported keys` error, and this test passed
+        against that unrelated failure until mutation exposed it.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._namespace_root(tmp, "not-a-number")
+            with self.assertRaisesRegex(RuntimeError, "must be a positive integer"):
+                common.resolve_ctl_state_namespace(
+                    root, {"execution_context.params.lz": "live"}
+                )

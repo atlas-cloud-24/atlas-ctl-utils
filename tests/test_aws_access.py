@@ -10,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from utils import common  # noqa: E402
-from utils.providers import aws as aws_adapter  # noqa: E402
+import atlas_ctl_adapter_aws as aws_adapter  # noqa: E402
 
 
 assert_spec = importlib.util.spec_from_file_location(
@@ -131,7 +131,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_resolves_profile_account_and_principal(self):
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ):
@@ -155,7 +155,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_interpolates_identity_account_key(self):
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ):
@@ -207,7 +207,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "custom-dev-deploy": "222222222222",
         }
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             side_effect=account_ids.__getitem__,
         ):
@@ -271,7 +271,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             "readonly": {"execution_identities": {"aws": self.executions["env_readonly"]}},
         }
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             side_effect=account_ids.__getitem__,
         ):
@@ -399,7 +399,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # substitute profile's host-resolved env credentials
         target_env = {"AWS_ACCESS_KEY_ID": "inherited-ambient"}
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "export_profile_credentials",
             return_value={"AWS_ACCESS_KEY_ID": "AKIASUB", "AWS_SECRET_ACCESS_KEY": "s"},
         ) as export:
@@ -448,11 +448,11 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_direct_mode_binding_exports_principal_expectation(self):
         target_env: dict[str, str] = {}
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             return_value="111111111111",
         ), mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "export_profile_credentials",
             return_value={"AWS_ACCESS_KEY_ID": "AKIADIR", "AWS_SECRET_ACCESS_KEY": "s"},
         ):
@@ -481,7 +481,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             }
         }
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "resolve_configured_profile_account_id",
             return_value="333333333333",
         ):
@@ -592,21 +592,21 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_synchronizer_asserts_selected_profile_principal(self):
         with (
             mock.patch.object(
-                aws_adapter,
+                aws_adapter.ctl_state,
                 "load_aws_credential_sources_cfg",
                 return_value=self.credential_sources,
             ),
             mock.patch.object(
-                aws_adapter,
+                aws_adapter.ctl_state,
                 "load_aws_account_registry_cfg",
                 return_value=self.account_registry,
             ),
             mock.patch.object(
-                aws_adapter,
+                aws_adapter.credentials,
                 "resolve_configured_profile_account_id",
                 return_value="111111111111",
             ),
-            mock.patch.object(aws_adapter, "assert_profile_caller") as assertion,
+            mock.patch.object(aws_adapter.ctl_state, "assert_profile_caller") as assertion,
         ):
             credential = aws_adapter.resolve_ctl_state_credential(
                 self.executions["ctl_state_dev_synchronizer"],
@@ -744,7 +744,7 @@ class AccountExpectationCheckTests(unittest.TestCase):
 
     def _check(self, caller_account, *, execution=None, registry=None, options=None):
         with mock.patch.object(
-            aws_adapter, "cached_caller_identity",
+            aws_adapter.credentials, "cached_caller_identity",
             return_value={"Account": caller_account, "Arn": "arn:aws:iam::x:user/y"},
         ):
             return aws_adapter.check_account_expectation(
@@ -788,7 +788,7 @@ class AccountExpectationCheckTests(unittest.TestCase):
     def test_caller_identity_is_cached_per_credential(self):
         aws_adapter._CALLER_IDENTITY_CACHE.clear()
         with mock.patch.object(
-            aws_adapter, "_assertion",
+            aws_adapter.credentials, "_assertion",
             return_value=mock.Mock(get_caller_identity=mock.Mock(
                 return_value={"Account": "111111111111"})),
         ) as assertion:

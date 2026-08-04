@@ -423,50 +423,90 @@ class DispatchGuardTest(unittest.TestCase):
             )
 
 
-class CompositionIdentityTest(unittest.TestCase):
-    """A member is (address, action), so opposite compositions are distinct.
+class WorkflowIsAddressedByParamsTest(unittest.TestCase):
+    """§Phase 83: a workflow instance is addressed by its DECLARED params.
 
-    Hashing addresses alone made a teardown of a target and a deploy of the same
-    target hash identically — one instance, one pointer, each overwriting the
-    other. The defect only became reachable once members carried their own action.
+    The composition sha256 this class used to test is gone. It was introduced to
+    keep a teardown of A and a deploy of A apart, but §Phase 78 answered that
+    differently and better: params ADDRESS where a hash IDENTIFIES, and the two
+    directions share one instance while publishing into different GROUP files
+    (§Phase 82). The hash then survived only in the status path, where it composed
+    a prefix no run has ever written.
+
+    What replaces those tests is the property that actually matters: the run side
+    and the status side must produce the SAME address.
     """
 
-    ADDRESS = "env/seed/baseline/instances/env.type=dev"
+    KEY = "env/workload_permissions_boundary"
+    PARAMS = ["env.type", "aws.account"]
+    CONTEXT = {
+        "execution_context.params.env.type": "dev",
+        "execution_context.params.aws.account": "dev",
+    }
 
-    def test_opposite_actions_are_different_compositions(self):
-        self.assertNotEqual(
-            common.workflow_composition_sha256([self.ADDRESS], ["provision"]),
-            common.workflow_composition_sha256([self.ADDRESS], ["destroy"]),
+    def _run_side_prefix(self):
+        segments = common.resolve_target_instance_segments(
+            self.PARAMS, self.CONTEXT, label="workflow"
         )
+        return common.compose_state_relpath("workflow", self.KEY, segments).as_posix()
 
-    def test_the_same_members_and_actions_are_one_composition(self):
-        """Two intents doing identical work ARE the same composition."""
+    def _status_side_spec(self, action="provision"):
+        return common.selection_state_spec({
+            "selection_kind": "workflow",
+            "selection_key": self.KEY,
+            "workflow_cfg": {
+                "meta": {"name": f"{action}/{self.KEY}", "action": action},
+                "workflow_instance_params": self.PARAMS,
+            },
+            "execution_context": self.CONTEXT,
+            "active_target_runs": {"tr1": {
+                "target": f"{self.KEY}/baseline",
+                "target_instance_params": self.PARAMS,
+                "action": action,
+            }},
+        })
+
+    def test_the_status_path_addresses_what_a_run_writes(self):
+        """The defect: status hydrated `instances/sha256=<digest>` while runs write
+        `instances/env.type=dev/aws.account=dev`, so a targeted remote query pulled
+        nothing and reported no state."""
+        self.assertEqual(self._run_side_prefix(), self._status_side_spec()["prefix"])
+
+    def test_the_address_is_readable_params_not_a_digest(self):
+        spec = self._status_side_spec()
+        self.assertEqual(["env.type=dev", "aws.account=dev"], spec["segments"])
+        self.assertNotIn("sha256=", spec["prefix"])
+
+    def test_opposite_actions_share_one_instance(self):
+        """Provision and destroy are two directions of ONE state, so they address
+        the same instance and differ only in the group file they publish."""
         self.assertEqual(
-            common.workflow_composition_sha256([self.ADDRESS], ["provision"]),
-            common.workflow_composition_sha256([self.ADDRESS], ["provision"]),
+            self._status_side_spec("provision")["prefix"],
+            self._status_side_spec("destroy")["prefix"],
         )
-
-    def test_order_still_distinguishes(self):
-        a, b = self.ADDRESS, "env/ops/app/instances/env.type=dev"
         self.assertNotEqual(
-            common.workflow_composition_sha256([a, b], ["destroy", "provision"]),
-            common.workflow_composition_sha256([b, a], ["provision", "destroy"]),
+            common.action_group("provision"), common.action_group("plan")
         )
 
-    def test_a_repeated_key_with_differing_actions_is_its_own_composition(self):
-        rebuild = common.workflow_composition_sha256(
-            [self.ADDRESS, self.ADDRESS], ["destroy", "provision"]
+    def test_a_members_shaped_declaration_still_resolves(self):
+        """Params may DISPATCH on context, and both sides must resolve it the same
+        way — which is why the resolution has one definition."""
+        declared = {"members": [
+            {"selectors": {"match": {"execution_context.params.env.type": "dev"}},
+             "params": ["env.type"]},
+            {"selectors": {"match": {"execution_context.params.env.type": "prod"}},
+             "params": ["env.type", "aws.account"]},
+        ]}
+        self.assertEqual(
+            ["env.type"],
+            common.resolve_declared_workflow_instance_params(
+                declared, self.CONTEXT, label="workflow"),
         )
-        deploy = common.workflow_composition_sha256([self.ADDRESS], ["provision"])
-        self.assertNotEqual(rebuild, deploy)
 
-    def test_a_mismatched_action_list_is_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "one action per address"):
-            common.workflow_composition_sha256([self.ADDRESS], ["provision", "destroy"])
-
-    def test_addresses_alone_still_hash(self):
-        """Callers that have no per-member action pass none."""
-        self.assertEqual(8, len(common.workflow_composition_sha256([self.ADDRESS])))
+    def test_the_composition_hash_is_gone(self):
+        """Guards the phase: leaving it importable invites a second addressing
+        scheme back in beside the first."""
+        self.assertFalse(hasattr(common, "workflow_composition_sha256"))
 
 
 class ActionMustBeDeclaredTest(unittest.TestCase):

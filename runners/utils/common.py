@@ -30,6 +30,50 @@ from utils.git_meta import write_git_meta_to_file
 
 REQUIRED_TOOLING_REFS = ("ctl-utils", "plt-utils")
 ADAPTER_DIR = "atlas_ctl_adapter"
+# §Phase 74: a provider adapter is TOOLING and its ref goes where refs already go
+# — DECLARED in `refs.global`, materialized by the same path as ctl-utils, never
+# discovered by looking at what sits beside the engine on disk.
+#
+# The names are DERIVED from the provider, so engine core never spells a provider
+# out; `ctl_providers.yaml` is the only place a provider is named.
+PROVIDER_ADAPTER_TOOLING_TEMPLATE = "ctl-adapter-{provider}"
+PROVIDER_ADAPTER_ENV_PREFIX_TEMPLATE = "ATLAS_CTL_ADAPTER_{PROVIDER}"
+# No repo-URL template: an adapter is the platform's PLUG-IN POINT, so where it
+# comes from is DECLARED in `ctl_providers.yaml` beside the provider it serves.
+# An engine constant here would have made every adapter an atlas-cloud-24
+# repository and left a consumer no way to point at their own.
+
+
+def provider_adapter_tooling_name(provider: str) -> str:
+    """The tooling ref name a provider's adapter is pinned under."""
+    return PROVIDER_ADAPTER_TOOLING_TEMPLATE.format(provider=provider)
+
+
+def load_ctl_providers(ctl_cfg_root) -> dict:
+    """The declared providers: what each implements, and where its adapter lives.
+
+    Read from cfg rather than carried as a constant, so adding a provider — or
+    replacing one with your own implementation — is a declaration and a
+    repository, never an edit to the engine.
+    """
+    if not ctl_cfg_root:
+        return {}
+    path = Path(ctl_cfg_root) / "ctl_providers.yaml"
+    if not path.is_file():
+        return {}
+    return (load_yaml(path) or {}).get("ctl_providers") or {}
+
+
+def provider_adapter_package(provider: str, ctl_cfg_root=None) -> str:
+    """The importable package a provider's adapter provides.
+
+    Declared, with the convention as a fallback: a consumer's adapter is THEIR
+    package, and naming it by our convention would assume they forked ours.
+    """
+    declared = (load_ctl_providers(ctl_cfg_root).get(provider) or {}).get("package")
+    return declared or f"atlas_ctl_adapter_{provider}"
+
+
 TOOLING_ENV_PREFIXES = {
     "ctl-utils": "ATLAS_CTL_UTILS",
     "plt-utils": "ATLAS_PLT_UTILS",
@@ -49,8 +93,87 @@ PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 PLT_GUARDRAILS_DIRNAME = "__guardrails__"
 CFG_SOURCE_KEYS = ("plt", "guardrails")
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
-MUTATING_ACTIONS = ("provision", "destroy")
-RUN_ACTIONS = ("provision", "plan", "destroy", "readonly", "maintenance")
+# §Phase 83 Q2: THE action registry. Actions stay engine-owned — every branch on
+# an action name asks one of the facts below, and the interesting one, that
+# provision and destroy are two DIRECTIONS of one state, is the engine's state
+# model rather than a consumer value. What was wrong was not that they are
+# hardcoded but that they were hardcoded eight times: two verbatim-duplicate name
+# tuples, a group map, a group->actions inverse, a group->representative inverse
+# and three literal argparse lists, each free to drift from the others.
+#
+# A row states only what is TRUE of that action; everything else is derived below.
+#
+#   group       which status group it publishes into
+#   mutating    whether it can change a resource. Declared, never inferred from
+#               `direction`: an action may mutate without having a reverse
+#   direction   its side of a forward/reverse pair within one group. This is what
+#               makes `provision` the representative of `mutative` and the only
+#               action whose record can go stale — a destroy record has nothing
+#               left to be stale against
+#   previews    the action it is a dry run OF, so a preview resolves the same
+#               declarations as the thing it previews rather than its own
+# Declaration order is the order the CLI offers them, so it is the established
+# one rather than the one that would group the mutating pair together.
+ACTIONS: dict[str, dict] = {
+    "provision":   {"group": "mutative",    "mutating": True, "direction": "forward"},
+    "plan":        {"group": "plan",        "previews": "provision"},
+    "destroy":     {"group": "mutative",    "mutating": True, "direction": "reverse"},
+    "readonly":    {"group": "readonly"},
+    "maintenance": {"group": "maintenance"},
+}
+
+# Every name the engine accepts. One tuple, because two of them were verbatim
+# copies consulted by different validators.
+RUN_ACTIONS = tuple(ACTIONS)
+KNOWN_ACTIONS = RUN_ACTIONS
+MUTATING_ACTIONS = tuple(
+    name for name, facts in ACTIONS.items() if facts.get("mutating")
+)
+GROUP_BY_ACTION = {name: facts["group"] for name, facts in ACTIONS.items()}
+# Groups in the order their actions are declared, so the tuple is stable.
+RESULT_GROUPS = tuple(dict.fromkeys(GROUP_BY_ACTION.values()))
+# group -> the actions publishing into it, the inverse a status filter needs.
+STATUS_GROUPS: dict[str, tuple[str, ...]] = {
+    group: tuple(name for name, g in GROUP_BY_ACTION.items() if g == group)
+    for group in RESULT_GROUPS
+}
+
+
+def action_previewed_by(action: str) -> str:
+    """The action whose declarations a preview resolves against.
+
+    `plan` previews `provision`, so a plan run reads the provision variants rather
+    than a separate plan block. An action that previews nothing answers itself.
+    """
+    return ACTIONS.get(action, {}).get("previews") or action
+
+
+def group_representative_action(group: str) -> str:
+    """The one action that speaks for a group.
+
+    A group with a forward/reverse pair is represented by its FORWARD action — the
+    state's existence is what a status answers about, and the reverse is that state
+    ending. A group with one action is represented by it.
+    """
+    members = STATUS_GROUPS[group]
+    if len(members) == 1:
+        return members[0]
+    forward = [n for n in members if ACTIONS[n].get("direction") == "forward"]
+    if len(forward) != 1:
+        raise RuntimeError(
+            f"❌ group {group!r} holds {len(members)} actions and {len(forward)} "
+            "forward direction(s); exactly one action must be the forward side"
+        )
+    return forward[0]
+
+
+def action_can_go_stale(action: str) -> bool:
+    """Whether a committed record of this action can be outdated by later change.
+
+    Only the forward side of a mutating pair: a destroy record describes an
+    instance that is gone, and nothing can make that answer stale.
+    """
+    return ACTIONS.get(action, {}).get("direction") == "forward"
 RUN_TYPES = ("workflow", "target", "procedure", "maintenance", "fan_out")
 # §Phase 30: reserved local-only ctl-state root — never synced, never a locator.
 # Locator segments must start alphanumeric, so "_local" cannot collide.
@@ -1186,10 +1309,45 @@ def validate_cadence_against_access_mode(
             )
 
 
+def activate_provider_adapters(ctl_cfg_root) -> list[str]:
+    """Put every DECLARED provider-adapter repository on the import path.
+
+    §Phase 74: an adapter is its own repository, so the engine must be told where
+    it is — and it is told by the same declaration that pins every other piece of
+    tooling. Local dev resolves `local_repos.yaml`; a strict run resolves the
+    materialized checkout. Neither scans the filesystem: globbing for
+    `atlas-ctl-adapter-*` beside the engine would make whatever happens to sit
+    there the registry, which is the thing the declaration replaces.
+
+    Returns the paths added, so a caller can report what a run actually loaded.
+    """
+    if not ctl_cfg_root:
+        return []
+    from utils.providers import set_active_ctl_cfg_root
+
+    set_active_ctl_cfg_root(Path(ctl_cfg_root))
+    try:
+        tooling = load_local_tooling_cfg(Path(ctl_cfg_root))
+    except Exception:
+        return []                       # strict runs materialize refs elsewhere
+    added = []
+    for name, entry in (tooling or {}).items():
+        if not name.startswith("ctl-adapter-"):
+            continue
+        repo_path = (entry or {}).get("repo_path")
+        if repo_path and Path(repo_path).is_dir() and repo_path not in sys.path:
+            sys.path.insert(0, repo_path)
+            added.append(repo_path)
+    return added
+
+
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
     args.execution_params = selectors_to_map(args.execution_param, label="execution param")
     args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
+    # BEFORE the first adapter call: provider options are validated by the adapter
+    # itself, so its repository has to be importable by then.
+    activate_provider_adapters(getattr(args, "ctl_cfg", None))
     validate_provider_options(
         getattr(args, "provider_options", None), getattr(args, "providers", ()) or ()
     )
@@ -3534,8 +3692,6 @@ def setup_logging() -> logging.handlers.MemoryHandler:
     return memory_handler
 
 
-KNOWN_ACTIONS = ("provision", "plan", "destroy", "readonly", "maintenance")
-
 
 def entry_actions(entry: dict, *, label: str) -> list[str]:
     """§Phase 33: the REQUIRED allowlist on a target/workflow. A missing or empty
@@ -3739,7 +3895,7 @@ def load_variants_cfg(ctl_cfg_root: Path) -> dict:
 def variant_source_action(action: str) -> str:
     """Which action's variants apply. `plan` previews `provision`, so a plan run
     resolves variants against `provision` rather than a separate `plan` block."""
-    return "provision" if action == "plan" else action
+    return action_previewed_by(action)
 
 
 def _selectors_subset(child: dict | None, parent: dict | None):
@@ -4964,8 +5120,63 @@ def state_slot_dir(instance_dir: Path, state: str, group: str) -> Path:
     return Path(instance_dir) / state / group
 
 
+STATE_SLOT_NAMES = ("in_progress", "failed")
+
+
+def run_state_group(run_dir: Path, action: str | None = None) -> str:
+    """The group THIS run's state slot belongs to.
+
+    A workflow's group is DERIVED from its members (§Phase 82) and recorded on the
+    run, so a composition that plans one member and provisions another publishes
+    its state under one group — the same one its status row reports. Everything
+    else publishes under its own action's group.
+
+    The recorded group wins because it is the more informed answer: it exists only
+    once the composition is resolved, and until then `--action` is the best a run
+    can say about itself.
+    """
+    metadata = load_run_metadata(run_dir)
+    recorded = metadata.get("group")
+    if recorded:
+        return str(recorded)
+    return action_group(str(action or metadata.get("action")))
+
+
+def move_state_slots_to_group(run_dir: Path, group: str) -> None:
+    """Re-home this run's open state slots when its group becomes known.
+
+    `mark_run_started` writes `in_progress` before a workflow's members are
+    resolved, so the slot lands under the run action's group and the derived group
+    can differ. Without the move the run finishes and looks for its slot in the new
+    group, leaves the old one behind, and the instance reports an in-progress run
+    that ended — so the slot follows the group rather than the group being
+    weakened to whatever was knowable first.
+
+    Slots are found by SEARCHING for this run's own, never by recomputing where it
+    must have put them: an instance holds slots from other runs, and the group a
+    slot was written under depends on what was known at the time.
+    """
+    instance_dir = ctl_state_dir_from_run_dir(run_dir)
+    run_path = f"runs/{Path(run_dir).name}"
+    for state in STATE_SLOT_NAMES:
+        for candidate in sorted(GROUP_BY_ACTION.values()):
+            if candidate == group:
+                continue
+            source = state_slot_dir(instance_dir, state, candidate)
+            status = source / "STATUS.yaml"
+            if not status.is_file():
+                continue
+            if (load_yaml(status) or {}).get("run_path") != run_path:
+                continue                # another run's slot in the same instance
+            destination = state_slot_dir(instance_dir, state, group)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                shutil.rmtree(destination)
+            shutil.move(str(source), str(destination))
+
+
 def remove_state_slot(run_dir: Path, state: str) -> None:
-    group = action_group(str(load_run_metadata(run_dir).get("action")))
+    group = run_state_group(run_dir)
     slot_dir = state_slot_dir(ctl_state_dir_from_run_dir(run_dir), state, group)
     if slot_dir.exists():
         shutil.rmtree(slot_dir)
@@ -5000,7 +5211,7 @@ def cleanup_run_workspace(run_dir: Path) -> None:
 
 
 def write_state_slot(run_dir: Path, state: str, payload: dict) -> None:
-    group = action_group(str(payload.get("action") or load_run_metadata(run_dir).get("action")))
+    group = run_state_group(run_dir, payload.get("action"))
     slot_dir = state_slot_dir(ctl_state_dir_from_run_dir(run_dir), state, group)
     slot_payload = dict(payload)
     slot_payload["state_slot"] = state
@@ -5140,7 +5351,7 @@ def rewrite_in_progress_slot_if_present(run_dir: Path, payload: dict) -> None:
     slot_dir = state_slot_dir(
         ctl_state_dir_from_run_dir(run_dir),
         "in_progress",
-        action_group(str(load_run_metadata(run_dir).get("action"))),
+        run_state_group(run_dir),
     )
     if slot_dir.exists():
         write_state_slot(run_dir, "in_progress", payload)
@@ -5196,6 +5407,10 @@ def record_workflow_members(
     group = workflow_group(facts)
     if group:
         facts["group"] = group
+        # The run already opened an `in_progress` slot under its own action's
+        # group, because members were not resolved yet. Move it, so the state slot
+        # and the status row agree on ONE group for this run.
+        move_state_slots_to_group(run_dir, group)
     if workflow_cfg.get("member_selectors"):
         facts["member_selectors"] = workflow_cfg["member_selectors"]
     update_run_metadata(run_dir, facts)
@@ -6237,6 +6452,16 @@ def build_execution_context(
     and `sourced` (data ctl READ from a declared `ctl_sources` entry, so a
     consumer never keeps its own copy). Keys look like
     'execution_context.params.env.type'."""
+    # §Phase 74: an adapter is its own repository, so it has to be put on the
+    # import path before it is called. Here because this is the OWNING construct:
+    # every entry point that reaches an adapter builds a context first, and it is
+    # the one place that already holds the cfg root the declaration lives in.
+    # Per-entry-point activation was tried and reverted — `validate_cfg.py` and
+    # `regenerate_guardrails.py` had each shipped without it and could not run at
+    # all, which is the duplication `Single Source Of Logic` exists to prevent.
+    # `finalize_common_args` keeps its own call: it validates provider options
+    # BEFORE any context exists, and that validation is done BY the adapter.
+    activate_provider_adapters(ctl_cfg_root)
     context: dict[str, object] = {}
 
     def put_list(namespace: str, key: str, values, *, label: str) -> None:
@@ -7782,7 +8007,13 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
                 raise RuntimeError(f"❌ duplicate {section_name} namespace {namespace_key!r}: {path} (first: {seen_sources[namespace_key]})")
             if not isinstance(entry, dict):
                 raise RuntimeError(f"❌ {section_name}.{namespace_key} must be a mapping: {path}")
-            allowed = {"provider", "backend_type", "bucket_name", "bucket_region", "execution_identity", "selectors"}
+            allowed = {
+                "provider", "backend_type", "bucket_name", "bucket_region",
+                "execution_identity", "selectors",
+                # §Phase 83 Q3: optional — how long a mutation may hold this
+                # namespace before its lock becomes breakable.
+                MUTATION_LOCK_TTL_FIELD,
+            }
             unknown = set(entry) - allowed
             if unknown:
                 raise RuntimeError(f"❌ {section_name}.{namespace_key} has unsupported keys {sorted(unknown)}: {path}")
@@ -7800,6 +8031,12 @@ def load_ctl_state_backends_cfg(ctl_cfg_root: Path) -> dict | None:
                 "bucket_name": entry["bucket_name"].strip(),
                 "bucket_region": entry["bucket_region"].strip(),
             }
+            # §Phase 83 Q3: carried and CHECKED here, because the loader builds
+            # `resolved` field by field — a key added to the allowlist but not to
+            # this block passes validation and is then silently dropped, which
+            # looks exactly like a declaration that had no effect.
+            if MUTATION_LOCK_TTL_FIELD in entry:
+                resolved[MUTATION_LOCK_TTL_FIELD] = backend_mutation_lock_ttl(entry)
             execution = entry.get("execution_identity")
             if execution is not None:
                 resolved["execution_identity"] = validate_ctl_state_backend_execution(
@@ -8177,6 +8414,9 @@ def configure_ctl_state_sync(
         action=str(metadata.get("action") or ""),
         run_id=str(metadata.get("run_id") or Path(run_dir).name),
         parent_run_id=metadata.get("parent_workflow_run_id"),
+        # §Phase 83 Q3: the namespace's own TTL, because how long a mutation can
+        # run is a property of the estate that namespace holds.
+        ttl_seconds=backend_mutation_lock_ttl(config.get("entry")),
     )
     syncer.push("run started")
     _CTL_STATE_SYNC_NOTE = syncer.summary()
@@ -8406,8 +8646,8 @@ def publish_or_queue_ctl_state_run(
 def split_target_instance_address(address: str) -> tuple[str, list[str]]:
     """Split a path-form instance address into (key, segments): trailing
     components containing `=` are instance segments; key components never contain
-    one (Q1j parse boundary). A workflow composition segment is `sha256=<digest>`,
-    so it needs no special case."""
+    one (Q1j parse boundary). Workflow and target instances are both addressed by
+    `param=value` segments (§Phase 78), so neither needs a special case."""
     if not isinstance(address, str) or not address:
         raise RuntimeError("❌ target instance address must be a non-empty string")
     parts = address.split("/")
@@ -8468,12 +8708,21 @@ def selection_state_spec(selection: dict) -> dict:
         raise RuntimeError(
             f"❌ status does not support selection kind {selection['selection_kind']!r}"
         )
-    addresses = [item["address"] for item in target_specs]
-    digest = workflow_composition_sha256(
-        addresses, [item.get("action") for item in target_specs]
-    )
     key = normalize_result_name(selection["selection_key"], label="status workflow key")
-    segments = [f"sha256={digest}"]
+    # §Phase 83: the SAME addressing a run writes — declared instance params, not a
+    # composition digest. §Phase 78 moved the run side to params and left this one
+    # on the hash, so a targeted status query hydrated `instances/sha256=<digest>`,
+    # a prefix nothing ever writes, and reported no state. Invisible under `--all`,
+    # which parses the tree instead of composing a prefix.
+    segments = resolve_target_instance_segments(
+        resolve_declared_workflow_instance_params(
+            selection["workflow_cfg"].get("workflow_instance_params"),
+            selection["execution_context"],
+            label=f"workflow {key!r}",
+        ),
+        selection["execution_context"],
+        label=f"workflow {key!r}",
+    )
     definition_canonical = json.dumps(
         selection["workflow_cfg"], separators=(",", ":"), sort_keys=True
     )
@@ -8653,8 +8902,8 @@ def compute_target_instance_status(
     # Same rule as `at` and `run_id` — one row, one run.
     if run["action"]:
         result["last_action"] = run["action"]
-    if group == "mutative" and pointer and not mutation_started:
-        if str(pointer.get("action")) != "destroy":
+    if pointer and not mutation_started:
+        if action_can_go_stale(str(pointer.get("action"))):
             freshness, freshness_reasons = _freshness(pointer, spec)
             result["freshness"] = freshness
             reasons = reasons + freshness_reasons
@@ -8842,11 +9091,10 @@ def _arm_ctl_state_operation(
     )
     if not syncer.ensure_ready(operation):
         raise RuntimeError(f"❌ ctl-state backend {namespace_key!r} is not ready")
-    enforce_mutation_lock(
-        syncer,
-        action="readonly",
-        run_id=f"{operation}-{generate_uuid7()}",
-    )
+    # §Phase 83 Q3: no mutation-lock check here. This is the READ path, and a
+    # read neither takes the lock nor may be denied by it — checking cost an
+    # object GET per query to answer a question whose only possible outcome was
+    # to refuse the caller.
     return namespace_key, namespace_root, syncer
 
 
@@ -9572,12 +9820,13 @@ def run_status_command(
                     target["prefix"] for target in spec.get("target_specs", [])
                 ]
                 syncer.hydrate_instance(spec["prefix"], child_prefixes)
-                # Lifecycle status needs sibling provision/destroy pointers.
+                # Lifecycle status needs the sibling pointers of BOTH directions,
+                # which is what the mutating actions are (§Phase 83 Q2).
                 target_specs = spec.get("target_specs") or (
                     [spec] if spec["kind"] == "target" else []
                 )
                 for target_spec in target_specs:
-                    for lifecycle_action in ("provision", "destroy"):
+                    for lifecycle_action in MUTATING_ACTIONS:
                         syncer.pull_object(
                             compose_state_relpath("target",
                                 target_spec["key"],
@@ -9640,21 +9889,12 @@ def run_status_command(
     return report
 
 
-# The action classes a status row is grouped by. `provision` and `destroy` share
-# one group because they are two directions of the SAME state — a destroy is not
-# a separate thing that happened to the instance, it is the instance ending.
 # One representative action per group, for the compute functions that still take
-# an action and derive the group from it.
+# an action and derive the group from it. Derived (§Phase 83 Q2): this was a
+# hand-written inverse of GROUP_BY_ACTION, and a hand-written inverse is a second
+# place for the same fact to be wrong.
 STATUS_GROUP_ACTION = {
-    "plan": "plan",
-    "readonly": "readonly",
-    "mutative": "provision",
-    "maintenance": "maintenance",
-}
-STATUS_GROUPS: dict[str, tuple[str, ...]] = {
-    "plan": ("plan",),
-    "readonly": ("readonly",),
-    "mutative": MUTATING_ACTIONS,
+    group: group_representative_action(group) for group in RESULT_GROUPS
 }
 
 
@@ -10445,20 +10685,24 @@ _MUTATION_LOCK_HELD: dict | None = None
 
 
 def enforce_mutation_lock(
-    syncer, *, action: str, run_id: str, parent_run_id: str | None = None
+    syncer, *, action: str, run_id: str, parent_run_id: str | None = None,
+    ttl_seconds: int | None = None,
 ) -> None:
     """§Phase 31 Q1b: the interim global mutation lock, enforced at the
     namespace bucket. Mutating runs acquire it exclusively; non-mutating runs
-    check and fail fast with the holder's run id. No syncer (sync skipped or
-    deferred) means no reachable backend — the lock is skipped with a log line
-    (the bootstrap-defer window is single-operator by definition)."""
+    proceed (§Phase 83 Q3). No syncer (sync skipped or deferred) means no
+    reachable backend — the lock is skipped with a log line (the bootstrap-defer
+    window is single-operator by definition)."""
     global _MUTATION_LOCK_HELD
     if syncer is None:
         logging.info("mutation lock skipped: no armed ctl-state syncer")
         return
+    if action not in MUTATING_ACTIONS:
+        return                          # never acquires, never blocks: no read needed
     existing = syncer.read_mutation_lock()
     outcome = evaluate_mutation_lock(
-        existing, action=action, run_id=run_id, parent_run_id=parent_run_id
+        existing, action=action, run_id=run_id, parent_run_id=parent_run_id,
+        ttl_seconds=ttl_seconds,
     )
     decision = outcome["decision"]
     if decision == "blocked":
@@ -11415,10 +11659,16 @@ def run_targets(
     mutation_marked = False
     child_revisions: list[dict] = []
     for target_run_id, target_run in active_target_runs.items():
-        log_target_run_banner(f"[{inventory_name}] [{target_run_id}]")
+        # §Phase 73: a member may declare its OWN action, and the child is spawned
+        # with it. Everything that reads back what the child did must use the same
+        # action — `inventory_name` is the RUN's, so a `plan` member inside a
+        # `provision` run publishes to committed/plan.yaml while the parent looks
+        # in committed/mutative.yaml and finds a composition that recorded nothing.
+        member_action = target_run.get("action") or inventory_name
+        log_target_run_banner(f"[{member_action}] [{target_run_id}]")
         if skip_up_to_date:
             revision = up_to_date_child_revision(
-                run_dir, target_run, execution_context, inventory_name
+                run_dir, target_run, execution_context, member_action
             )
             if revision is not None:
                 logging.info(
@@ -11456,12 +11706,12 @@ def run_targets(
             # surface on the composition row at all. Marked BEFORE the child
             # runs, on the same conservative rule as the inline path: from here
             # resources may change, and claiming possible damage beats denying it.
-            if inventory_name in MUTATING_ACTIONS and not mutation_marked:
+            if member_action in MUTATING_ACTIONS and not mutation_marked:
                 mark_mutation_started(run_dir, target_run_id)
                 mutation_marked = True
             run_and_log(argv, cwd=str(run_dir), env=child_env)
             revision = latest_child_revision(
-                run_dir, target_run, execution_context, inventory_name
+                run_dir, target_run, execution_context, member_action
             )
             if revision is not None:
                 child_revisions.append(revision)
@@ -11510,12 +11760,12 @@ def run_targets(
         )
         target_log.__enter__()
         try:
-            repo_step_ids, repo_steps = get_repo_local_steps(repo_path, inventory_name, procedure_key)
+            repo_step_ids, repo_steps = get_repo_local_steps(repo_path, member_action, procedure_key)
             run_manifest = {
                 "run_id": run_id,
                 "branch": target_run.get("branch"),
                 "commit": target_run.get("commit"),
-                "action": inventory_name,
+                "action": member_action,
                 "procedure": procedure_key,
                 "active_steps": repo_step_ids,
                 "origin_cfg": str(origin_cfg_path),
@@ -11524,14 +11774,14 @@ def run_targets(
             }
             logging.info(json.dumps(run_manifest, indent=4))
 
-            if inventory_name in MUTATING_ACTIONS and not mutation_marked:
+            if member_action in MUTATING_ACTIONS and not mutation_marked:
                 mark_mutation_started(run_dir, target_run_id)
                 mutation_marked = True
 
             for repo_step in repo_steps:
                 repo_step_id = repo_step["id"]
                 repo_step_path = repo_step["path"]
-                log_target_run_banner(f"[{inventory_name}] [{target_run_id}] [{repo_step_id}]", ch="-")
+                log_target_run_banner(f"[{member_action}] [{target_run_id}] [{repo_step_id}]", ch="-")
                 repo_step_runtime = repo_step.get("runtime", {})
                 supported = set(repo_step_runtime.get("supported_execution_runtime_modes", EXECUTION_RUNTIME_MODES))
                 if execution_runtime_mode not in supported:
@@ -11949,17 +12199,51 @@ def resolve_target_instance_segments(
 # create); non-mutating runs only check it and fail fast. Stale locks (past
 # expires_at) may be broken; the breaker records broke_lock_of.
 MUTATION_LOCK_RELPATH = "locks/mutation.yaml"
-MUTATION_LOCK_TTL_SECONDS = 3600
+
+# §Phase 83 Q3: the TTL is what makes a lock BREAKABLE, so it must exceed the
+# longest mutation a namespace can hold — at one hour a long apply outlived its
+# own lock, the next mutating run broke it, and the result was the two concurrent
+# mutators the lock exists to prevent. Six hours is past any single apply.
+#
+# Erring long is safe because expiry is not the only way out: `unlock-ctl-state`
+# releases an abandoned lock deliberately, with the operator deciding the run is
+# really gone. A TTL short enough to self-clear is a TTL short enough to break a
+# live run, and only one of those two failures is silent.
+MUTATION_LOCK_TTL_SECONDS = 21600
+
+# A namespace may declare its own: a backend holding a slow estate needs longer
+# than one holding a small one, and that is known where the namespace is declared.
+MUTATION_LOCK_TTL_FIELD = "mutation_lock_ttl_seconds"
 
 
-def build_mutation_lock_doc(run_id: str, action: str, *, broke_lock_of: str | None = None) -> dict:
+def backend_mutation_lock_ttl(entry: dict | None) -> int:
+    """The lock TTL a ctl-state backend entry declares, else the default."""
+    declared = (entry or {}).get(MUTATION_LOCK_TTL_FIELD)
+    if declared is None:
+        return MUTATION_LOCK_TTL_SECONDS
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared <= 0:
+        raise RuntimeError(
+            f"❌ {MUTATION_LOCK_TTL_FIELD} must be a positive integer of seconds, "
+            f"got {declared!r}"
+        )
+    return declared
+
+
+def build_mutation_lock_doc(
+    run_id: str, action: str, *, broke_lock_of: str | None = None,
+    ttl_seconds: int | None = None,
+) -> dict:
     now = datetime.now(timezone.utc)
+    ttl = MUTATION_LOCK_TTL_SECONDS if ttl_seconds is None else ttl_seconds
     doc = {
         "run_id": run_id,
         "run_type": "mutation",
         "action": action,
         "acquired_at": now.isoformat(),
-        "expires_at": (now + timedelta(seconds=MUTATION_LOCK_TTL_SECONDS)).isoformat(),
+        "expires_at": (now + timedelta(seconds=ttl)).isoformat(),
+        # Recorded so a later reader can tell a lock taken under a long TTL from
+        # one taken under a short one, rather than inferring it from the window.
+        "ttl_seconds": ttl,
     }
     if broke_lock_of:
         doc["broke_lock_of"] = broke_lock_of
@@ -11978,29 +12262,35 @@ def mutation_lock_is_stale(lock_doc: dict, *, now: datetime | None = None) -> bo
 
 
 def evaluate_mutation_lock(
-    existing_lock: dict | None, *, action: str, run_id: str, parent_run_id: str | None = None
+    existing_lock: dict | None, *, action: str, run_id: str, parent_run_id: str | None = None,
+    ttl_seconds: int | None = None,
 ) -> dict:
     """Pure decision logic for the interim global mutation lock (§Phase 31 Q1b).
 
     Returns {decision, lock_doc?, holder?}: mutating actions ACQUIRE (or BREAK a
-    stale lock, recording broke_lock_of); a live holder blocks them. Non-mutating
-    actions only CHECK: they proceed when free, fail fast with the holder's run
-    id while a mutation runs. The physical conditional write/read is the
-    backend adapter's job."""
+    stale lock, recording broke_lock_of); a live holder blocks them. The physical
+    conditional write/read is the backend adapter's job.
+
+    §Phase 83 Q3: a NON-MUTATING action always proceeds. It never acquires, so
+    blocking it only ever denied a read — and it denied exactly the read most
+    worth having, since `status` reports on the very run holding the lock. What
+    ctl-state holds is run HISTORY, not resource state: a reader during a
+    mutation sees a record that is being appended to, which is what "a run is in
+    progress" means and what the status row already says.
+    """
     mutating = action in MUTATING_ACTIONS
+    if not mutating:
+        return {"decision": "proceed"}
     if existing_lock is None:
-        if mutating:
-            return {"decision": "acquire", "lock_doc": build_mutation_lock_doc(run_id, action)}
-        return {"decision": "proceed"}
+        return {"decision": "acquire", "lock_doc": build_mutation_lock_doc(run_id, action, ttl_seconds=ttl_seconds)}
     if mutation_lock_is_stale(existing_lock):
-        if mutating:
-            return {
-                "decision": "break_and_acquire",
-                "lock_doc": build_mutation_lock_doc(
-                    run_id, action, broke_lock_of=str(existing_lock.get("run_id"))
-                ),
-            }
-        return {"decision": "proceed"}
+        return {
+            "decision": "break_and_acquire",
+            "lock_doc": build_mutation_lock_doc(
+                run_id, action, broke_lock_of=str(existing_lock.get("run_id")),
+                ttl_seconds=ttl_seconds,
+            ),
+        }
     holder = str(existing_lock.get("run_id"))
     # A workflow holds the namespace for the whole run and spawns its targets as
     # child processes. A child meeting its OWN parent's lock is not contention —
@@ -12043,38 +12333,6 @@ def target_instance_address(target_key: str, instance_segments: list[str]) -> st
     return instance_address(target_key, instance_segments)
 
 
-def workflow_composition_sha256(
-    target_instance_addresses: list[str], actions: list[str] | None = None
-) -> str:
-    """Workflow instance identity: SHA-256 over a whitespace-free canonical JSON
-    array of the ORDERED members, truncated to 8 hex chars.
-
-    §Phase 73: a member is `(address, action)`, not an address alone. Once members
-    carry their own action, hashing addresses only makes two compositions doing
-    OPPOSITE things to one target hash identically — a teardown of A and a deploy
-    of A would share one instance and overwrite each other's pointer.
-
-    The digest indexes a tiny per-namespace set, so 32 bits is ample; identity.yaml
-    records the full members and stays the authoritative identity source.
-    """
-    if not isinstance(target_instance_addresses, list) or not target_instance_addresses:
-        raise RuntimeError("❌ workflow composition needs a non-empty ordered address list")
-    for address in target_instance_addresses:
-        if not isinstance(address, str) or not address.strip():
-            raise RuntimeError("❌ workflow composition addresses must be non-empty strings")
-    if actions is None:
-        members: list = list(target_instance_addresses)
-    else:
-        if len(actions) != len(target_instance_addresses):
-            raise RuntimeError(
-                "❌ workflow composition needs one action per address, got "
-                f"{len(actions)} for {len(target_instance_addresses)}"
-            )
-        members = [[a, act] for a, act in zip(target_instance_addresses, actions)]
-    canonical = json.dumps(members, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8]
-
-
 def build_workflow_identity_doc(
     workflow_key: str, target_instance_addresses: list[str], resolved_params: dict[str, str]
 ) -> dict:
@@ -12095,17 +12353,10 @@ def build_workflow_identity_doc(
 # Structural names never contain `=`, so they can never be mistaken for an
 # instance segment (Q1j parse boundary).
 RESULT_KINDS = ("target", "workflow")
-# §Phase 73: state is partitioned by status GROUP. Three groups are three
-# independent facts, so they never overwrite one another; provision and destroy
-# are two directions of ONE fact and share the `deployment` file.
-GROUP_BY_ACTION = {
-    "plan": "plan",
-    "readonly": "readonly",
-    "provision": "mutative",
-    "destroy": "mutative",
-    "maintenance": "maintenance",
-}
-RESULT_GROUPS = ("plan", "readonly", "mutative", "maintenance")
+# §Phase 73: state is partitioned by status GROUP. Groups are independent facts,
+# so they never overwrite one another; provision and destroy are two directions of
+# ONE fact and share the `mutative` file. Both maps are derived from the action
+# registry (§Phase 83 Q2) — see ACTIONS.
 # §Phase 73: kinds that publish history rather than grouped state.
 GROUPLESS_KINDS = frozenset({"workflow"})
 
@@ -12476,6 +12727,35 @@ def workflow_member_instance_params(
     return union, complete
 
 
+def resolve_declared_workflow_instance_params(
+    declared, execution_context: dict[str, object] | None, *, label: str
+) -> list[str]:
+    """A workflow's declared instance params as a flat list.
+
+    Shared by the run side, which then VALIDATES the list against its members'
+    union, and by the status side, which only needs to ADDRESS an instance the
+    run already validated. One definition because the two must produce the same
+    address — they did not, and a targeted status query looked in a prefix no run
+    writes (§Phase 83).
+    """
+    if declared is None:
+        return []
+    if isinstance(declared, dict):
+        # Members-shaped, exactly as a target's own instance params may be: a
+        # member whose instance axes DISPATCH on a param (a domain, a profile)
+        # has a different union per context, so the workflow above it needs the
+        # same dispatch rather than one list that can only ever be right once.
+        resolved = resolve_list_members(
+            declared, execution_context, value_field="params", label=label
+        )
+        return list(resolved or [])
+    if isinstance(declared, list):
+        return list(declared)
+    raise RuntimeError(
+        f"❌ {label}: workflow_instance_params must be a list, or members-shaped"
+    )
+
+
 def validate_workflow_instance_params(
     declared, workflow_cfg: dict, targets: dict, *, label: str,
     execution_context: dict[str, object] | None = None,
@@ -12500,24 +12780,9 @@ def validate_workflow_instance_params(
     union, union_is_complete = workflow_member_instance_params(
         workflow_cfg, targets, label=label
     )
-    if declared is None:
-        declared_list: list[str] = []
-    elif isinstance(declared, dict):
-        # Members-shaped, exactly as a target's own instance params may be: a
-        # member whose instance axes DISPATCH on a param (a domain, a profile)
-        # has a different union per context, so the workflow above it needs the
-        # same dispatch rather than one list that can only ever be right once.
-        resolved = resolve_list_members(
-            declared, execution_context, value_field="params", label=label
-        )
-        declared_list = list(resolved or [])
-    elif isinstance(declared, list):
-        declared_list = list(declared)
-    else:
-        raise RuntimeError(
-            f"❌ {label}: workflow_instance_params must be a list, or members-shaped"
-        )
-
+    declared_list = resolve_declared_workflow_instance_params(
+        declared, execution_context, label=label
+    )
     missing = [p for p in union if p not in declared_list]
     extra = [p for p in declared_list if p not in union]
     if missing:
@@ -12551,11 +12816,11 @@ def resolve_run_instance_identity(
 ) -> dict | None:
     """Resolve a run's target-instance identity BEFORE its dirs exist (§Phase 31 6b).
 
-    target run: the target's declared target_instance_params -> Hive segments;
-    workflow run: the ordered child target-instance addresses -> the sha256
-    composition segment + the authoritative identity doc. Returns
-    {instance_segments, address, target_addresses, identity_doc?} or None for
-    run types without instance identity (fan_out/procedure/maintenance)."""
+    Both kinds resolve DECLARED instance params to Hive segments: a target's
+    `target_instance_params`, a workflow's `workflow_instance_params` (§Phase 78 —
+    a workflow publishes history, not state, so it carries no composition digest).
+    Returns {instance_segments, address, target_addresses, identity_doc?} or None
+    for run types without instance identity (fan_out/procedure/maintenance)."""
     if run_type not in ("target", "workflow"):
         return None
     execution_context = build_execution_context(

@@ -777,3 +777,100 @@ class StatusHistoryLivesOutsideTheNamespaceTest(unittest.TestCase):
             "namespace_dir.joinpath", window,
             "history under the namespace puts a never-synced dir inside a synced tree",
         )
+
+
+class WorkflowStateSlotFollowsItsGroupTest(unittest.TestCase):
+    """§Phase 83 Q1: one run must not sit in two groups.
+
+    A workflow's status row takes the group DERIVED from its members (§Phase 82),
+    while its state slot took the group of `--action`. Same run, two groups: a
+    `--action plan` workflow with a provisioning member reports `mutative` and
+    parks its `in_progress` slot under `plan`.
+
+    The slot cannot simply be written under the derived group, because
+    `mark_run_started` opens it BEFORE the members are resolved — there is nothing
+    to derive from yet. So the slot MOVES when the composition becomes known, and
+    that ordering is what these tests pin.
+    """
+
+    def _run(self, tmp: Path, action: str) -> Path:
+        run_dir = Path(tmp) / "instance" / "runs" / "w1"
+        run_dir.mkdir(parents=True)
+        common.write_yaml_file(
+            common.run_metadata_path(run_dir),
+            {"run_id": "w1", "run_type": "workflow", "action": action,
+             "target_addresses": [], "ctl_state_local_root": str(tmp)},
+        )
+        return run_dir
+
+    def _groups_holding(self, run_dir: Path, state: str) -> list[str]:
+        instance_dir = common.ctl_state_dir_from_run_dir(run_dir)
+        return sorted(
+            group for group in set(common.GROUP_BY_ACTION.values())
+            if (common.state_slot_dir(instance_dir, state, group) / "STATUS.yaml").is_file()
+        )
+
+    def test_the_open_slot_moves_to_the_derived_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), "plan")
+            common.mark_run_started(run_dir)
+            self.assertEqual(["plan"], self._groups_holding(run_dir, "in_progress"),
+                             "precondition: the slot opens under --action's group")
+
+            common.record_workflow_members(
+                run_dir,
+                {"t1": {"target": "env/core", "action": "provision"}},
+                {"default_action": "plan"},
+            )
+            self.assertEqual("mutative", common.load_run_metadata(run_dir).get("group"))
+            self.assertEqual(
+                ["mutative"], self._groups_holding(run_dir, "in_progress"),
+                "the slot must FOLLOW the group — left behind, it is an in-progress "
+                "run the instance never sees end",
+            )
+
+    def test_the_run_then_clears_its_own_slot(self):
+        """The failure the move prevents: finishing looks under the derived group,
+        so a slot left in the old one is never removed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), "plan")
+            common.mark_run_started(run_dir)
+            common.record_workflow_members(
+                run_dir,
+                {"t1": {"target": "env/core", "action": "provision"}},
+                {"default_action": "plan"},
+            )
+            common.remove_state_slot(run_dir, "in_progress")
+            self.assertEqual([], self._groups_holding(run_dir, "in_progress"))
+
+    def test_a_uniform_workflow_keeps_its_slot_where_it_opened_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), "provision")
+            common.mark_run_started(run_dir)
+            common.record_workflow_members(
+                run_dir,
+                {"t1": {"target": "env/core", "action": "provision"}},
+                {"default_action": "provision"},
+            )
+            self.assertEqual(["mutative"], self._groups_holding(run_dir, "in_progress"))
+
+    def test_another_runs_slot_in_the_same_instance_is_not_moved(self):
+        """Slots are found by whose they are, not by where this run would have put
+        them: an instance holds slots from other runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = self._run(Path(tmp), "plan")
+            instance_dir = common.ctl_state_dir_from_run_dir(run_dir)
+            intruder = common.state_slot_dir(instance_dir, "in_progress", "plan")
+            intruder.mkdir(parents=True)
+            common.write_yaml_file(intruder / "STATUS.yaml", {"run_path": "runs/someone-else"})
+
+            common.record_workflow_members(
+                run_dir,
+                {"t1": {"target": "env/core", "action": "provision"}},
+                {"default_action": "plan"},
+            )
+            self.assertEqual(
+                "runs/someone-else",
+                common.load_yaml(intruder / "STATUS.yaml").get("run_path"),
+                "another run's slot was moved out from under it",
+            )

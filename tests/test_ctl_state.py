@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from utils import common  # noqa: E402
-from utils.providers import aws as aws_adapter  # noqa: E402
+import atlas_ctl_adapter_aws as aws_adapter  # noqa: E402
 
 
 def write(path: Path, content: str) -> None:

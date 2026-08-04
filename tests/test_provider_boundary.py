@@ -8,6 +8,7 @@ cfg, and labelled documentation examples.
 """
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 from utils import common  # noqa: E402
-from utils.providers import aws as aws_adapter  # noqa: E402
+import atlas_ctl_adapter_aws as aws_adapter  # noqa: E402
 from utils.providers import get_adapter  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -100,7 +101,7 @@ class ContractWrapperTests(unittest.TestCase):
         )
         target_env: dict[str, str] = {}
         with unittest.mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "export_profile_credentials",
             return_value={"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s"},
         ) as export:
@@ -140,7 +141,7 @@ class ProfileBindingTests(unittest.TestCase):
         # The host resolves the profile (`aws configure export-credentials`);
         # the box receives plain env credentials — no file is ever written.
         with unittest.mock.patch.object(
-            aws_adapter,
+            aws_adapter.credentials,
             "_run_aws_json",
             return_value={
                 "AccessKeyId": "AKIAWANTED",
@@ -161,7 +162,7 @@ class ProfileBindingTests(unittest.TestCase):
 
     def test_incomplete_export_fails_loud(self):
         with unittest.mock.patch.object(
-            aws_adapter, "_run_aws_json", return_value={"AccessKeyId": "AKIA"}
+            aws_adapter.credentials, "_run_aws_json", return_value={"AccessKeyId": "AKIA"}
         ):
             with self.assertRaisesRegex(RuntimeError, "SecretAccessKey"):
                 aws_adapter.export_profile_credentials("wanted")
@@ -340,3 +341,167 @@ class ExecutionAccessModeTests(unittest.TestCase):
             "force_bypass",
         )
         self.assertIsNone(aws_adapter.execution_access_mode_from_options({}))
+
+
+class AdapterInternalLayeringTest(unittest.TestCase):
+    """§Phase 74: the AWS adapter is three parts and the direction is one way.
+
+        _base <- credentials <- {execution, ctl_state} <- catalog
+
+    `credentials` exists precisely so `execution` and `ctl_state` never import
+    each other. The phase expected that cycle to cost seventeen names; measuring
+    it showed ONE function on the wrong side — `resolve_target_aws_access`, which
+    resolves an identity BLOCK to a credential and is therefore credentials' job,
+    not execution's. Nothing else had to move.
+
+    Without this test the direction is a comment. One `from ..execution import`
+    inside `ctl_state` would restore the cycle and nothing else would notice.
+    """
+
+    ALLOWED = {
+        "_base": set(),
+        "credentials": {"_base"},
+        "execution": {"_base", "credentials"},
+        "ctl_state": {"_base", "credentials"},
+        # whole-catalog validation touches every part by design
+        "catalog": {"_base", "credentials", "execution", "ctl_state"},
+    }
+
+    def _package(self) -> Path:
+        import atlas_ctl_adapter_aws as pkg
+        return Path(pkg.__file__).parent
+
+    def test_the_three_parts_exist(self):
+        """Guards the suite: a flat module would make everything below vacuous."""
+        for name in self.ALLOWED:
+            self.assertTrue((self._package() / f"{name}.py").is_file(), name)
+
+    def test_no_part_imports_against_the_direction(self):
+        import ast
+
+        offenders = []
+        for part, allowed in self.ALLOWED.items():
+            tree = ast.parse((self._package() / f"{part}.py").read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module and ".aws." in node.module:
+                    dep = node.module.rsplit(".", 1)[1]
+                    if dep not in allowed:
+                        offenders.append(f"{part} -> {dep}")
+        self.assertEqual(
+            [], offenders,
+            "an edge against the direction puts the two CONTRACTS back in a cycle, "
+            "which is the thing credentials/ was extracted to prevent:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_no_part_uses_a_star_import(self):
+        """`import *` drops every underscored name, and most of this adapter's
+        internals are underscored — the first split lost `_run_aws_json` and 38
+        tests with it, silently."""
+        for part in self.ALLOWED:
+            body = (self._package() / f"{part}.py").read_text()
+            with self.subTest(part=part):
+                self.assertNotIn("import *", body)
+
+    def test_the_facade_still_exposes_the_flat_surface(self):
+        """The adapter contract is module-level callables. Splitting the file must
+        not move a name in the contract, so every engine-facing callable and every
+        internal the tests reach for stays reachable on `utils.providers.aws`."""
+        import atlas_ctl_adapter_aws as pkg
+
+        for name in ("validate_catalog", "describe", "materialize_target_binding",
+                     "resolve_ctl_state_credential", "create_state_syncer",
+                     "preflight_execution_identity", "target_assertion_argv",
+                     "_run_aws_json", "_assume_role_credentials", "subprocess"):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(pkg, name), f"{name} left the adapter surface")
+
+
+class AdapterActivationTest(unittest.TestCase):
+    """§Phase 74: building a context puts the adapter on the import path.
+
+    Once the adapter became its own repository, reaching it stopped being free —
+    something has to activate the declared checkout before the first adapter
+    call. `ctl.py` gets that through `finalize_common_args`, and the engine's
+    OTHER entry points (`validate_cfg.py`, `regenerate_guardrails.py`) never call
+    it, so both shipped unable to run at all: "adapter package is not importable"
+    on their first line of real work.
+
+    Fixed by consolidating onto the OWNING construct rather than repeating the
+    call per entry point — every adapter-reaching path builds a context first,
+    and `build_execution_context` already holds the cfg root the declaration
+    lives in. That is what makes a FUTURE entry point safe too, which a
+    per-entry-point rule could only detect after someone wrote one.
+
+    Verified in a SUBPROCESS, and it has to be: `conftest.py` puts the adapter on
+    `sys.path` for the whole suite, so an in-process check passes no matter what
+    the engine does — which is exactly why 691 tests were green while the real
+    command could not import the adapter at all.
+    """
+
+    def _dev_cfg_root(self) -> Path:
+        root = REPO_ROOT.parent.parent / "cfg/oxygen/oxygen-ctl-cfg-dev"
+        if not (root / "local_repos.yaml").is_file():
+            self.skipTest("dev cfg reflection not generated")
+        return root
+
+    # The assignment `validate_cfg` is run under; enough for a context to build.
+    PARAMS = {
+        "landing_zone": "live",
+        "env.type": "dev",
+        "aws.account": "dev",
+        "aws.region": "eu-west-2",
+        "aws.account_provisioning_mode": "direct",
+    }
+
+    def _run_clean(self, body: str) -> subprocess.CompletedProcess:
+        """A python that knows only `runners` — no conftest, no adapter path."""
+        script = (
+            f"import sys\nsys.path.insert(0, {str(REPO_ROOT / 'runners')!r})\n"
+            f"PARAMS = {self.PARAMS!r}\n"
+        ) + body
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=120,
+            # An inherited PYTHONPATH could supply the adapter and hide the point.
+            env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
+        )
+
+    def test_the_adapter_is_not_importable_without_activation(self):
+        """Guards the test below: if a bare python could already import the
+        adapter, that test would pass while proving nothing."""
+        done = self._run_clean("import atlas_ctl_adapter_aws\nprint('IMPORTED')\n")
+        self.assertNotEqual(0, done.returncode, f"unexpectedly importable: {done.stdout}")
+        self.assertIn("ModuleNotFoundError", done.stderr)
+
+    def test_building_a_context_makes_the_adapter_importable(self):
+        done = self._run_clean(
+            "from utils import common\n"
+            f"common.activate_provider_adapters({str(self._dev_cfg_root())!r})\n"
+            "import atlas_ctl_adapter_aws\n"
+            "print('IMPORTED')\n"
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertIn("IMPORTED", done.stdout)
+
+    def test_context_building_activates_before_it_reaches_an_adapter(self):
+        """The real path: `build_execution_context` must not need a caller to
+        have activated first. Run for its IMPORT behaviour only — the call is
+        expected to fail on missing params, and MUST NOT fail on the adapter."""
+        done = self._run_clean(
+            "from pathlib import Path\n"
+            "from utils import common\n"
+            "try:\n"
+            "    common.build_execution_context(\n"
+            f"        Path({str(self._dev_cfg_root())!r}), action=None,\n"
+            "        ctl_profile='local_dev', execution_params=dict(PARAMS),\n"
+            "        execution_runtime_mode='local', providers=['aws'])\n"
+            "    print('BUILT')\n"
+            "except Exception as exc:\n"
+            "    print('RAISED', type(exc).__name__, exc)\n"
+        )
+        output = done.stdout + done.stderr
+        # It must get PAST the adapter, not merely fail somewhere else first: a
+        # wrong argument type made the first version of this test die before the
+        # adapter was ever reached, so deleting the activation changed nothing.
+        self.assertIn("BUILT", output, f"never reached the adapter: {output}")

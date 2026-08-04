@@ -506,3 +506,100 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
             self._run(tmp, "provision", on_spawn=capture)
             self.assertIs(True, seen["at_spawn"])
 
+
+
+class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
+    """§Phase 83 Q1: a member carries its own action, so the parent must use it.
+
+    `run_targets` spawns each child with `target_run["action"]` but read back what
+    the child did using `inventory_name` — the RUN's action. Latent only because no
+    cfg declares per-member actions yet, and silent when it fires: a `plan` member
+    publishes into `committed/plan.yaml` while the parent looks in
+    `committed/mutative.yaml`, so a composition records nothing and reports success.
+
+    The same mismatch decides whether the run is marked as having mutated, which is
+    what these tests assert — the mark is observable in the state slot, so nothing
+    here depends on inspecting a call.
+    """
+
+    KEY = "env/seed"
+    SEGMENTS = ["sha256=x"]
+
+    def _run(self, tmp, run_action, member_action):
+        from unittest import mock
+
+        namespace = Path(tmp) / "live"
+        instance_dir = namespace / common.compose_state_relpath(
+            "workflow", self.KEY, self.SEGMENTS
+        )
+        run_dir = instance_dir / "runs" / "r1"
+        run_dir.mkdir(parents=True)
+        payload = {
+            "run_id": "r1", "run_type": "workflow", "action": run_action,
+            "status": "in_progress", "mutation_started": False,
+            "updated_at": common.utc_timestamp(),
+        }
+        common.write_yaml_file(common.run_metadata_path(run_dir), payload)
+        common.write_state_slot(run_dir, "in_progress", payload)
+
+        target_run = {"target": "env/seed/baseline"}
+        if member_action is not None:
+            target_run["action"] = member_action
+
+        cwd = Path.cwd()
+        try:
+            with mock.patch.multiple(
+                common,
+                build_tooling_env=mock.DEFAULT,
+                materialize_step_utils=mock.DEFAULT,
+                build_child_target_command=mock.DEFAULT,
+                mint_child_lock_grant=mock.DEFAULT,
+                latest_child_revision=mock.DEFAULT,
+                run_and_log=mock.DEFAULT,
+                ctl_state_push=mock.DEFAULT,
+                mark_outdated_for_run=mock.DEFAULT,
+            ) as patched:
+                patched["build_tooling_env"].return_value = {}
+                patched["materialize_step_utils"].return_value = run_dir
+                patched["build_child_target_command"].return_value = ["ctl.py"]
+                patched["mint_child_lock_grant"].return_value = "grant"
+                patched["latest_child_revision"].return_value = None
+                common.run_targets(
+                    {"tr1": target_run}, run_dir, Path(tmp), Path(tmp) / "ctx.yaml",
+                    run_action, {}, "r1", {}, False, None, {}, "aws", "local",
+                    child_command_spec={"ctl_state_local_root": str(tmp)},
+                )
+                revision_action = patched["latest_child_revision"].call_args[0][3]
+        finally:
+            os.chdir(cwd)
+        slot = common.read_instance_state_slot(
+            instance_dir, "in_progress", common.action_group(run_action)
+        )
+        return slot, revision_action
+
+    def test_a_provisioning_member_in_a_plan_run_marks_the_mutation(self):
+        """The member decides: a `plan` workflow holding a provisioning member DOES
+        mutate, and a run that does not mark it reports no damage after damage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            slot, _ = self._run(tmp, "plan", "provision")
+            self.assertIs(True, slot.get("mutation_started"))
+
+    def test_a_plan_member_in_a_provision_run_does_not_mark(self):
+        """The other direction, which a run-level check gets wrong too: planning
+        changes nothing, whatever the run as a whole is for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            slot, _ = self._run(tmp, "provision", "plan")
+            self.assertIs(False, slot.get("mutation_started"))
+
+    def test_the_revision_reader_is_given_the_members_action(self):
+        """Spawned with the member's action, so read back with the member's action
+        — otherwise the parent looks in a group the child never wrote to."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, revision_action = self._run(tmp, "provision", "plan")
+            self.assertEqual("plan", revision_action)
+
+    def test_a_member_without_its_own_action_inherits_the_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            slot, revision_action = self._run(tmp, "provision", None)
+            self.assertEqual("provision", revision_action)
+            self.assertIs(True, slot.get("mutation_started"))

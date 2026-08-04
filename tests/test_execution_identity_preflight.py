@@ -11,7 +11,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 from utils import common
-from utils.providers import aws as aws_adapter
+import atlas_ctl_adapter_aws as aws_adapter
 
 
 class PreflightRollupTests(unittest.TestCase):
@@ -644,9 +644,9 @@ class AwsPreflightTests(unittest.TestCase):
             "Arn": "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_DevDeployAccess_hash/session",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_target_aws_access", return_value=resolved
+            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
-            aws_adapter, "assert_profile_caller", return_value=caller
+            aws_adapter.execution, "assert_profile_caller", return_value=caller
         ) as assertion:
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
@@ -679,8 +679,8 @@ class AwsPreflightTests(unittest.TestCase):
             "role_name": "prod-deploy",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(aws_adapter, "assert_profile_caller") as assertion:
+            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
+        ), mock.patch.object(aws_adapter.execution, "assert_profile_caller") as assertion:
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
                 {"execution_identity_key": "prod"},
@@ -728,13 +728,13 @@ class AwsPreflightTests(unittest.TestCase):
             ({"AWS_ACCESS_KEY_ID": "two"}, {"Arn": "final"}),
         ]
         with mock.patch.object(
-            aws_adapter, "resolve_target_aws_access", return_value=resolved
+            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
-            aws_adapter, "assert_profile_caller", return_value=entry
+            aws_adapter.execution, "assert_profile_caller", return_value=entry
         ), mock.patch.object(
-            aws_adapter, "_assume_role_credentials", side_effect=assume_results
+            aws_adapter.execution, "_assume_role_credentials", side_effect=assume_results
         ) as assume, mock.patch.object(
-            aws_adapter, "_run_aws_json", return_value=final
+            aws_adapter.execution, "_run_aws_json", return_value=final
         ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
@@ -770,20 +770,20 @@ class AwsPreflightTests(unittest.TestCase):
             "Arn": "arn:aws:sts::222222222222:assumed-role/wrong-role/session",
         }
         with mock.patch.object(
-            aws_adapter, "resolve_target_aws_access", return_value=resolved
+            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "assert_profile_caller",
             return_value={
                 "Account": "111111111111",
                 "Arn": "arn:aws:sts::111111111111:assumed-role/Entry/session",
             },
         ), mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "_assume_role_credentials",
             return_value=({"AWS_ACCESS_KEY_ID": "temporary"}, {}),
         ), mock.patch.object(
-            aws_adapter, "_run_aws_json", return_value=wrong_final
+            aws_adapter.execution, "_run_aws_json", return_value=wrong_final
         ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
@@ -797,7 +797,7 @@ class AwsPreflightTests(unittest.TestCase):
 
     def test_static_error_still_fails_when_live_check_is_skipped(self):
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "resolve_target_aws_access",
             side_effect=RuntimeError("missing target_run role"),
         ):
@@ -814,7 +814,7 @@ class AwsPreflightTests(unittest.TestCase):
 
     def test_bypass_result_redacts_substitute_credential(self):
         with mock.patch.object(
-            aws_adapter,
+            aws_adapter.execution,
             "resolve_target_aws_access",
             return_value={"identity_bypass": "true"},
         ):

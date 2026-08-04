@@ -43,7 +43,33 @@ sees another provider's mode or options.
 """
 
 
+# §Phase 74: the adapter lives in its OWN repository — the engine depends on it,
+# never the other way round — so it is imported by PACKAGE NAME, not by reaching
+# into a subdirectory of this one.
+#
+# Where that package comes from is DECLARED, not discovered: `ctl-adapter-aws` is
+# a tooling ref in `refs.global`, materialized by the same path as ctl-utils and
+# plt-utils. The engine never globs the filesystem for adapters — that would make
+# whatever happens to sit beside the checkout the registry.
+# The providers with an adapter the engine can import. This is the PROVIDER LAYER,
+# not engine core — core carries no provider name at all, which
+# `test_provider_boundary` enforces on common.py.
+#
+# `ctl_providers.yaml` is the DECLARATION a cfg tree makes; this is what the
+# engine can actually load. `validate_ctl_providers` checks one against the other,
+# so a declared provider with no importable adapter is a cfg error before a run
+# rather than a RuntimeError inside one.
 REGISTERED_PROVIDERS = ("aws",)
+
+# The cfg root of the run in progress, so a provider lookup can reach the
+# declaration without every call site threading it through. Set once, by the same
+# code that puts the declared adapter repositories on the import path.
+_ACTIVE_CTL_CFG_ROOT = None
+
+
+def set_active_ctl_cfg_root(root) -> None:
+    global _ACTIVE_CTL_CFG_ROOT
+    _ACTIVE_CTL_CFG_ROOT = root
 
 
 def describe_all() -> dict[str, dict]:
@@ -55,9 +81,31 @@ def describe_all() -> dict[str, dict]:
     return {name: get_adapter(name).describe() for name in REGISTERED_PROVIDERS}
 
 
-def get_adapter(provider: str):
-    """Return the adapter module for a provider; unknown providers are a hard error."""
-    if provider == "aws":
-        from utils.providers import aws
-        return aws
-    raise RuntimeError(f"❌ no provider adapter registered for provider {provider!r}")
+def get_adapter(provider: str, ctl_cfg_root=None):
+    """Return the adapter module for a provider; unknown providers are a hard error.
+
+    The package name comes from `ctl_providers.yaml` when a cfg root is known —
+    a consumer's adapter is THEIR package — falling back to the convention only
+    when nothing declared one.
+    """
+    from utils.common import provider_adapter_package
+
+    if provider not in REGISTERED_PROVIDERS:
+        raise RuntimeError(f"❌ no provider adapter registered for provider {provider!r}")
+    package = provider_adapter_package(provider, ctl_cfg_root or _ACTIVE_CTL_CFG_ROOT)
+    import importlib
+
+    try:
+        return importlib.import_module(package)
+    except ImportError as exc:
+        # The adapter is a declared tooling ref; if its package is not importable
+        # the checkout was never materialized, and saying so beats an ImportError
+        # that looks like a missing dependency.
+        from utils.common import provider_adapter_tooling_name
+
+        tooling = provider_adapter_tooling_name(provider)
+        raise RuntimeError(
+            f"❌ provider {provider!r} is registered but its adapter package "
+            f"{package!r} is not importable: {exc}. It is declared as the tooling "
+            f"ref {tooling!r} in refs.global — check that ref materialized."
+        ) from exc
