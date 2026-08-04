@@ -16,6 +16,7 @@ from engine.catalog import targets as catalog_targets
 from engine.catalog import workflow as catalog_workflow
 from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
+from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tooling as cfg_tooling
 from engine.cfg import validate as cfg_validate
 from engine.cfg import views as cfg_views
@@ -53,8 +54,12 @@ def run_targets(
     skip_up_to_date: bool = False,
     child_command_spec: dict | None = None,
     credential_refresh_modes: dict | None = None,
+    secret_store=None,
 ) -> None:
-    """Clone and run all active target runs."""
+    """Clone and run all active target runs.
+
+    `secret_store` is passed rather than built here so the secrets registry is
+    read once for the whole run, not once per target."""
     os.chdir(run_dir)
     tooling_env = cfg_tooling.build_tooling_env(tooling_refs)
     # CTL owns the execution box. It invokes the ctl-owned runtime
@@ -129,6 +134,7 @@ def run_targets(
             target_run,
             run_dir,
             tooling_env,
+            secret_store=secret_store,
             provider_adapter=provider_adapter,
             provider_catalogs=provider_catalogs,
             execution_context=execution_context,
@@ -642,6 +648,13 @@ def run_pipeline(
     run_targets(
         active_target_runs, run_dir, plt_targets_dir_path, execution_context_path,
         action, execution_context, run_id,
+        secret_store=cfg_secrets.SecretStore(
+            ctl_cfg_root,
+            execution_context=execution_context,
+            implementation_key=provider_implementation_key,
+            execution_access_modes=execution_access_modes,
+            provider_options=provider_options,
+        ),
         child_command_spec=child_command_spec,
         tooling_refs=tooling_refs,
         use_local_tooling_cfg=use_local_tooling_cfg,

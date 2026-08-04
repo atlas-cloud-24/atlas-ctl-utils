@@ -129,13 +129,15 @@ def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str)
         ) from None
 
 
-def get_provider_adapter(provider: str):
+def get_provider_adapter(provider: str, ctl_cfg_root=None):
+    """Dispatch to a provider's adapter; an undeclared provider is a hard error.
+
+    `ctl_cfg_root` is optional because most callers run after activation has set
+    the active root; validation runs before that and passes one explicitly.
     """
 
-    dispatch to the provider adapter (utils.providers); unknown = hard error."""
-
     from engine.execution.adapters import get_adapter
-    return get_adapter(provider)
+    return get_adapter(provider, ctl_cfg_root)
 
 
 def run_providers(execution_context: dict[str, object]) -> list[str]:
@@ -397,3 +399,65 @@ def validate_target_provider_coverage(
             "❌ selected target_runs use providers not declared in --providers "
             f"{sorted(declared)}: " + ", ".join(offenders)
         )
+
+# What a declared contract OBLIGES an adapter to expose. `implements:` was
+# accepted and read by nobody, so a provider could claim a contract its package
+# did not satisfy and the mismatch surfaced mid-run as an AttributeError — which
+# reads as an engine bug rather than as a cfg error. Checking it before the run
+# is the registry's whole value.
+CONTRACT_CALLABLES: dict[str, tuple[str, ...]] = {
+    "execution": (
+        "preflight_execution_identity",
+        "materialize_target_binding",
+        "validate_active_target_access",
+        "supported_execution_access_modes",
+        "normal_execution_access_mode",
+        "resolves_execution_identity",
+        "target_consent",
+        "execution_access_mode_from_options",
+        "target_assertion_argv",
+        "load_runtime_catalogs",
+    ),
+    "ctl_state": (
+        "resolve_ctl_state_credential",
+        "create_state_syncer",
+        "validate_state_backend_entry",
+    ),
+    "secrets": (
+        "resolve_secret",
+    ),
+}
+
+
+def validate_declared_contracts(ctl_cfg_root) -> None:
+    """Every `implements:` entry is backed by the callables it promises.
+
+    A declared contract with nothing behind it is a registration accepted but not
+    honoured — the silent acceptance this registry exists to prevent.
+    """
+
+    declared = load_ctl_providers(ctl_cfg_root) or {}
+    for provider, spec in declared.items():
+        contracts = (spec or {}).get("implements")
+        if not isinstance(contracts, list) or not contracts:
+            raise RuntimeError(
+                f"❌ ctl_providers.{provider} must declare a non-empty `implements` "
+                f"list; there is no default"
+            )
+        unknown = sorted(set(contracts) - set(CONTRACT_CALLABLES))
+        if unknown:
+            raise RuntimeError(
+                f"❌ ctl_providers.{provider} declares unknown contracts {unknown}; "
+                f"known: {sorted(CONTRACT_CALLABLES)}"
+            )
+        adapter = get_provider_adapter(provider, ctl_cfg_root)
+        for contract in contracts:
+            missing = [
+                name for name in CONTRACT_CALLABLES[contract]
+                if not callable(getattr(adapter, name, None))
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"❌ ctl_providers.{provider} declares contract {contract!r} but "
+                    f"its adapter does not implement {missing}"
+                )

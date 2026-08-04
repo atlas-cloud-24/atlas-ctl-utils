@@ -18,6 +18,7 @@ import yaml
 from engine.catalog import targets as catalog_targets
 from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
+from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tooling as cfg_tooling
 from engine.cfg import validate as cfg_validate
 from engine.cfg import views as cfg_views
@@ -754,6 +755,7 @@ def run_maintenance(
         target_run,
         run_dir,
         tooling_env,
+        secret_store=cfg_secrets.SecretStore(ctl_cfg_root),
         provider_adapter=provider_adapter,
         provider_catalogs=provider_catalogs,
         execution_context=execution_context,

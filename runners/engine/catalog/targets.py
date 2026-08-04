@@ -397,7 +397,7 @@ def build_active_target_runs(
             active_target_run["repo_path"] = str(repo_path.resolve())
         else:
             active_target_run["repo_url"] = repo_value
-            active_target_run["token_type"] = source_cfg.get("token_type")
+            active_target_run["secret_key"] = source_cfg.get("secret_key")
 
         raw_modules = source_cfg.get("modules") or {}
         if raw_modules and not isinstance(raw_modules, dict):
@@ -471,7 +471,7 @@ def build_active_target_runs(
                 resolved_module["repo_path"] = str(module_repo_path.resolve())
             else:
                 resolved_module["repo_url"] = module_repo_value
-                resolved_module["token_type"] = module_meta.get("token_type")
+                resolved_module["secret_key"] = module_meta.get("secret_key")
 
             resolved_modules[module_name] = resolved_module
 

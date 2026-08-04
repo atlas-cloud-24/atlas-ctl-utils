@@ -312,7 +312,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
             "requires_plt_overlays": ["tech_jobs"],
             "execution_identities": {"aws": {"account": "dev"}},
             "repo_path": "/machine/one",
-            "token_type": "IGNORED_TOKEN",
+            "secret_key": "IGNORED_SECRET",
         }
         first = kernel_paths.canonical_sha256(
             catalog_targets.target_definition_document(target)

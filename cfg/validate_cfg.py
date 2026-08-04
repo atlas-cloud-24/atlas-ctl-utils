@@ -26,7 +26,9 @@ from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import overlays as cfg_overlays
 from engine.cfg import resources as cfg_resources
+from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tree as cfg_tree
+from engine.execution import providers as execution_providers
 from engine.execution import run_context as execution_run_context
 from engine.kernel import scalars as kernel_scalars
 from engine.run import policy as run_policy
@@ -172,6 +174,12 @@ def main() -> int:
         providers=args.providers,
     )
     execution_run_context.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+    # A registration accepted but not backed is the silent acceptance the
+    # registry exists to prevent, so both halves are checked before any render:
+    # what each provider promises, and that every secret is declared and
+    # resolvable without a cycle.
+    execution_providers.validate_declared_contracts(ctl_cfg_root)
+    cfg_secrets.validate_declared_secrets(ctl_cfg_root)
     # Every workflow's instance params, not just the one a run selects.
     # The per-run guard is exact but sees one workflow, so a misdeclaration
     # elsewhere stays silent until someone runs it. This pass is static — no

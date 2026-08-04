@@ -10,7 +10,6 @@ import shutil
 import sys
 import tempfile
 
-from enum import StrEnum
 from pathlib import Path
 from engine.kernel.git import write_git_meta_to_file
 
@@ -281,7 +280,9 @@ def run_cfg_distribution(
     return plt_targets_dir_path
 
 
-def materialize_target_modules(target_run_id: str, target_run: dict, repo_path: Path) -> None:
+def materialize_target_modules(
+    target_run_id: str, target_run: dict, repo_path: Path, secret_store=None
+) -> None:
     """
 
     populate target_run-local child modules before setup runs."""
@@ -317,7 +318,14 @@ def materialize_target_modules(target_run_id: str, target_run: dict, repo_path: 
                 branch=module_cfg["branch"],
                 commit=module_cfg["commit"],
                 dest=dest_path,
-                token=os.getenv(module_cfg["token_type"]) if module_cfg.get("token_type") else None,
+                token=(
+                    secret_store.resolve(
+                        module_cfg["secret_key"],
+                        label=f"target run {target_run_id!r} module {module_name!r}",
+                    )
+                    if secret_store is not None and module_cfg.get("secret_key")
+                    else None
+                ),
             )
 
 
@@ -405,10 +413,13 @@ def prepare_target_repo(
     provider_implementation_key: str | None = None,
     execution_access_modes: dict[str, str] | None = None,
     provider_options: dict[str, str] | None = None,
+    secret_store=None,
 ) -> tuple[Path, dict[str, str]]:
-    """
+    """Clone/copy a target_run repo, materialize child modules, prepare its env.
 
-    clone/copy a target_run repo, materialize child modules, and prepare its execution env."""
+    `secret_store` resolves the declared secret that READS each repository. It is
+    passed rather than built here so the registry is read once per run, and so a
+    local-path target run needs no store at all."""
 
     workspace = state_run_store.run_workspace_dir(run_dir)
     if workspace is None:
@@ -434,10 +445,13 @@ def prepare_target_repo(
             branch=target_run["branch"],
             commit=target_run["commit"],
             dest=repo_path,
-            token=os.getenv(target_run["token_type"]),
+            token=secret_store.resolve(
+                target_run["secret_key"],
+                label=f"target run {target_run_id!r}",
+            ),
         )
 
-    materialize_target_modules(target_run_id, target_run, repo_path)
+    materialize_target_modules(target_run_id, target_run, repo_path, secret_store)
 
     target_env = os.environ.copy()
     target_env.update(tooling_env)
