@@ -112,11 +112,18 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
 
 
 class ActionFactsTest(unittest.TestCase):
-    def test_only_the_forward_side_of_a_pair_can_go_stale(self):
-        """A destroy record describes an instance that is gone; nothing can make
-        that answer stale."""
-        self.assertTrue(run_actions.action_can_go_stale("provision"))
-        for action in ("destroy", "plan", "readonly", "maintenance"):
+    def test_a_record_that_describes_a_future_can_go_stale(self):
+        """A provision record and a PLAN both describe what holds given one cfg,
+        so a cfg change makes either wrong. A destroy record describes an
+        instance that is GONE, and nothing can make that answer stale.
+
+        Deriving this from `direction` silently excluded plan — which has no
+        direction because it mutates nothing — so it is declared per action.
+        """
+        for action in ("provision", "plan"):
+            with self.subTest(action=action):
+                self.assertTrue(run_actions.action_can_go_stale(action))
+        for action in ("destroy", "readonly", "maintenance"):
             with self.subTest(action=action):
                 self.assertFalse(run_actions.action_can_go_stale(action))
 

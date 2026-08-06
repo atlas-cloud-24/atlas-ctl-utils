@@ -17,7 +17,7 @@ import ctl_cfg_fixture
 from engine_surface import engine_source
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import materialize as cfg_materialize
-from engine.execution import providers as execution_providers
+from engine.execution import adapters as execution_adapters
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import policy as run_policy
 
@@ -225,7 +225,7 @@ class AdapterOwnsCadenceVocabularyTest(unittest.TestCase):
         ctl_cfg_fixture.cfg_root(self, "aws")
 
     def test_adapter_declares_its_cadences(self):
-        adapter = execution_providers.get_provider_adapter("aws")
+        adapter = execution_adapters.get_adapter("aws")
         self.assertEqual(
             {"per_target", "per_step"}, adapter.supported_credential_refresh_modes()
         )

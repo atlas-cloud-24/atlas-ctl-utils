@@ -18,6 +18,7 @@ import re
 
 from pathlib import Path
 
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
@@ -329,7 +330,7 @@ class CtlStateAccess:
         namespace_key, entry = CtlStateBackends.resolve_namespace(
             ctl_cfg_root, execution_context
         )
-        adapter = execution_providers.get_provider_adapter(entry["provider"])
+        adapter = execution_adapters.get_adapter(entry["provider"])
         adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
         bucket_name = str(
             execution_references.resolve_runtime_scalar(
@@ -527,7 +528,7 @@ class CtlStatePublication:
     operations then depends on: `syncer` (armed or not), `sync_config` (what to
     re-arm from), `defer_config` (whether queuing is even allowed) and `note` (what
     the run records about its own publication) are read and replaced together, and
-    every one of them was previously a module global that the same cluster mutated.
+    every one of them belongs to the run dir the cluster is re-arming.
 
     Re-arming per run dir is deliberate, not incidental: a credential is scoped to
     the exact objects one run publishes, so publishing a different run needs a
@@ -609,7 +610,7 @@ class CtlStatePublication:
 
     def _arm(self, config: dict, *, tolerate_not_ready: bool) -> bool:
         entry = config["entry"]
-        adapter = execution_providers.get_provider_adapter(entry["provider"])
+        adapter = execution_adapters.get_adapter(entry["provider"])
         run_access_mode, adapter_options = execution_providers.provider_inputs(
             entry["provider"], config["execution_access_modes"], config["provider_options"]
         )
@@ -703,7 +704,7 @@ class CtlStatePublication:
         if namespace_key is None:
             namespace_key, _ = CtlStateBackends.resolve_namespace(ctl_cfg_root, execution_context)
         entry = backends[namespace_key]
-        adapter = execution_providers.get_provider_adapter(entry["provider"])
+        adapter = execution_adapters.get_adapter(entry["provider"])
         adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
         config = self._build_config(
             ctl_cfg_root,

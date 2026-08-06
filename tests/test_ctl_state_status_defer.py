@@ -180,6 +180,9 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
 
     @staticmethod
     def add_overlay(root: Path, name: str, payload: dict) -> None:
+        """An overlay mirrors SOURCE paths, so its payload sits under the scope
+        root it patches — here `domains/env/dev`, the scope the fixture activates."""
+
         overlay_root = root / "_overlays" / name
         kernel_yaml_io.write_yaml_file(
             overlay_root / "__meta__.yaml",
@@ -191,7 +194,30 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 },
             },
         )
-        kernel_yaml_io.write_yaml_file(overlay_root / "env" / "common.yaml", payload)
+        kernel_yaml_io.write_yaml_file(
+            overlay_root / "domains" / "env" / "dev" / "common.yaml", payload
+        )
+
+    @staticmethod
+    def add_scope(root: Path, payload: dict | None = None) -> list[dict]:
+        """The one scope the overlay fixtures patch, in the shape merge_scopes
+        hands to the overlay pass."""
+
+        scope_root = root / "domains" / "env" / "dev"
+        kernel_yaml_io.write_yaml_file(
+            scope_root / "__meta__.yaml",
+            {
+                "type": "scope",
+                "target_path": "/env",
+                "selectors": {"match": {"execution_context.params.env.type": "dev"}},
+            },
+        )
+        kernel_yaml_io.write_yaml_file(scope_root / "common.yaml", payload or {"service": {"mode": "base"}})
+        return [{
+            "scope_root": scope_root,
+            "target_path": "/env",
+            "scope_path": "/domains/env/dev",
+        }]
 
 
 
@@ -222,27 +248,71 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
         self.assertEqual(active["requires_plt_overlays"], ["required"])
         self.assertTrue(active["provisions_ctl_state_backend"])
 
+    def _apply(self, root: Path, dest: Path, order: list[str], scopes: list[dict]) -> None:
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "env").mkdir(parents=True, exist_ok=True)
+        cfg_overlays.apply_selected_overlays_to_merged_cfg(
+            root,
+            dest,
+            order,
+            active_scopes=scopes,
+            execution_context=self.context,
+            merged_files={},
+            source_log_roots=(root.resolve(),),
+            dest_log_roots=(dest.resolve(),),
+            skip_filenames=set(),
+        )
+
+    def test_an_overlay_beats_the_composed_result(self):
+        """The reason the merge point moved.
+
+        Merged into the SOURCE tree, an overlay patches ONE preset level and a
+        narrower scope still overrides it — so switching an overlay on could
+        silently change nothing. Merged over the COMPOSED result it always wins,
+        which is what "switched on" has to mean.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            scopes = self.add_scope(root, {"service": {"mode": "composed"}})
+            self.add_overlay(root, "first", {"service": {"mode": "overlaid"}})
+            merged = Path(tmp) / "merged"
+            (merged / "env").mkdir(parents=True)
+            # what merge_scopes leaves behind
+            kernel_yaml_io.write_yaml_file(
+                merged / "env" / "common.yaml", {"service": {"mode": "composed"}}
+            )
+            self._apply(root, merged, ["first"], scopes)
+            self.assertEqual(
+                kernel_yaml_io.load_yaml(merged / "env" / "common.yaml")["service"]["mode"],
+                "overlaid",
+            )
+
+    def test_an_overlay_that_matches_no_active_scope_is_refused(self):
+        """Its payload mirrors scope paths, so one under a scope this run does
+        not activate would apply to nothing — silently, which is how an overlay
+        rots into a no-op."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            self.add_scope(root)
+            self.add_overlay(root, "first", {"service": {"mode": "overlaid"}})
+            # the overlay's payload sits under domains/env/dev; this run activated none
+            merged = Path(tmp) / "merged"
+            (merged / "env").mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "matched no active cfg scope"):
+                self._apply(root, merged, ["first"], [])
+
     def test_explicit_overlay_order_changes_merge_precedence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "source"
+            scopes = self.add_scope(root)
             self.add_overlay(root, "first", {"service": {"mode": "first"}})
             self.add_overlay(root, "second", {"service": {"mode": "second"}})
             left = Path(tmp) / "left"
             right = Path(tmp) / "right"
-            left.mkdir()
-            right.mkdir()
-            cfg_overlays.apply_selected_overlays_to_cfg_root(
-                root,
-                left,
-                ["first", "second"],
-                execution_context=self.context,
-            )
-            cfg_overlays.apply_selected_overlays_to_cfg_root(
-                root,
-                right,
-                ["second", "first"],
-                execution_context=self.context,
-            )
+            self._apply(root, left, ["first", "second"], scopes)
+            self._apply(root, right, ["second", "first"], scopes)
             self.assertEqual(
                 kernel_yaml_io.load_yaml(left / "env" / "common.yaml")["service"]["mode"],
                 "second",
@@ -272,7 +342,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 resolved, ["explicit", "required_a", "required_b"]
             )
 
-    def test_automatic_conflict_requires_explicit_precedence(self):
+    def test_two_overlays_may_not_set_one_leaf_differently(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.add_overlay(root, "explicit", {"service": {"mode": "one"}})
@@ -281,7 +351,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 "target": {"requires_plt_overlays": ["required"]}
             }
             with self.assertRaisesRegex(
-                RuntimeError, "complete ordered overlay list explicitly"
+                RuntimeError, "cannot set one leaf differently"
             ):
                 cfg_overlays.resolve_run_plt_overlays(
                     root,

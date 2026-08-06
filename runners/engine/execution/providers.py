@@ -12,51 +12,8 @@ from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
 from engine.cfg import tooling as cfg_tooling
+from engine.execution import adapters
 from engine.execution import references as execution_references
-from engine.kernel import yaml_io as kernel_yaml_io
-
-# A provider adapter is TOOLING and its ref goes where refs already go
-# — DECLARED in `refs.global`, materialized by the same path as ctl-utils, never
-# discovered by looking at what sits beside the engine on disk.
-# The names are DERIVED from the provider, so engine core never spells a provider
-# out; `ctl_providers.yaml` is the only place a provider is named.
-PROVIDER_ADAPTER_TOOLING_TEMPLATE = "ctl-adapter-{provider}"
-
-
-def provider_adapter_tooling_name(provider: str) -> str:
-    """
-
-    the tooling ref name a provider's adapter is pinned under."""
-
-    return PROVIDER_ADAPTER_TOOLING_TEMPLATE.format(provider=provider)
-
-
-def load_ctl_providers(ctl_cfg_root) -> dict:
-    """The declared providers: what each implements, and where its adapter lives.
-
-    Read from cfg rather than carried as a constant, so adding a provider — or
-    replacing one with your own implementation — is a declaration and a
-    repository, never an edit to the engine.
-    """
-
-    if not ctl_cfg_root:
-        return {}
-    path = Path(ctl_cfg_root) / "ctl_providers.yaml"
-    if not path.is_file():
-        return {}
-    return (kernel_yaml_io.load_yaml(path) or {}).get("ctl_providers") or {}
-
-
-def provider_adapter_package(provider: str, ctl_cfg_root=None) -> str:
-    """The importable package a provider's adapter provides.
-
-    Declared, with the convention as a fallback: a consumer's adapter is THEIR
-    package, and naming it by our convention would assume they forked ours.
-    """
-
-    declared = (load_ctl_providers(ctl_cfg_root).get(provider) or {}).get("package")
-    return declared or f"atlas_ctl_adapter_{provider}"
-
 
 def validate_target_providers(declared: object, identities: dict, *, label: str) -> list[str]:
     """A target DECLARES the providers it runs against, and the declaration must
@@ -95,9 +52,7 @@ def activate_provider_adapters(ctl_cfg_root) -> list[str]:
 
     if not ctl_cfg_root:
         return []
-    from engine.execution.adapters import set_active_ctl_cfg_root
-
-    set_active_ctl_cfg_root(Path(ctl_cfg_root))
+    adapters.set_active_ctl_cfg_root(Path(ctl_cfg_root))
     try:
         tooling = cfg_tooling.load_local_tooling_cfg(Path(ctl_cfg_root))
     except Exception:
@@ -129,17 +84,6 @@ def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str)
         ) from None
 
 
-def get_provider_adapter(provider: str, ctl_cfg_root=None):
-    """Dispatch to a provider's adapter; an undeclared provider is a hard error.
-
-    `ctl_cfg_root` is optional because most callers run after activation has set
-    the active root; validation runs before that and passes one explicitly.
-    """
-
-    from engine.execution.adapters import get_adapter
-    return get_adapter(provider, ctl_cfg_root)
-
-
 def run_providers(execution_context: dict[str, object]) -> list[str]:
     """
 
@@ -159,7 +103,7 @@ def run_providers(execution_context: dict[str, object]) -> list[str]:
 def run_provider_adapters(execution_context: dict[str, object]) -> list[tuple[str, object]]:
     """(name, adapter) for every participating provider."""
 
-    return [(name, get_provider_adapter(name)) for name in run_providers(execution_context)]
+    return [(name, adapters.get_adapter(name)) for name in run_providers(execution_context)]
 
 
 def run_provider_adapter(execution_context: dict[str, object]):
@@ -171,7 +115,7 @@ def run_provider_adapter(execution_context: dict[str, object]):
     loud here rather than silently picking the first.
     """
 
-    return get_provider_adapter(run_provider(execution_context))
+    return adapters.get_adapter(run_provider(execution_context))
 
 
 def run_provider(execution_context: dict[str, object]) -> str:
@@ -309,10 +253,8 @@ def validate_provider_options(
     that provider actually offers. The engine checks the ADDRESS; each adapter
     checks its own KEYS — the engine knows none of them."""
     validate_provider_options_addressing(options, providers)
-    from engine.execution.adapters import get_adapter
-
     for provider in providers:
-        get_adapter(provider).validate_provider_options(
+        adapters.get_adapter(provider).validate_provider_options(
             provider_options_for(options, provider)
         )
 
@@ -436,7 +378,7 @@ def validate_declared_contracts(ctl_cfg_root) -> None:
     honoured — the silent acceptance this registry exists to prevent.
     """
 
-    declared = load_ctl_providers(ctl_cfg_root) or {}
+    declared = adapters.load_ctl_providers(ctl_cfg_root) or {}
     for provider, spec in declared.items():
         contracts = (spec or {}).get("implements")
         if not isinstance(contracts, list) or not contracts:
@@ -450,7 +392,7 @@ def validate_declared_contracts(ctl_cfg_root) -> None:
                 f"❌ ctl_providers.{provider} declares unknown contracts {unknown}; "
                 f"known: {sorted(CONTRACT_CALLABLES)}"
             )
-        adapter = get_provider_adapter(provider, ctl_cfg_root)
+        adapter = adapters.get_adapter(provider, ctl_cfg_root)
         for contract in contracts:
             missing = [
                 name for name in CONTRACT_CALLABLES[contract]

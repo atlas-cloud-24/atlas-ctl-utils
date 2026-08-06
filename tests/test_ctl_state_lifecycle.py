@@ -41,20 +41,21 @@ CFG = {
     "workflow.yaml": (
         "workflows:\n"
         "  env/bootstrap:\n"
-        "    default_action: provision\n"
         "    workflow_instance_params: [account, env_type]\n"
-        "    target_keys:\n"
-        "      - env/tfstate_backend\n"
+        "    targets:\n"
+        "      default_action: provision\n"
+        "      keys:\n"
+        "      - targets.env/tfstate_backend\n"
     ),
 }
 TARGETS = (
     "targets:\n"
     "  env/tfstate_backend:\n"
     "    actions: [provision]\n"
-    "    source_key: bootstrap\n"
+    "    source_key: target_sources.bootstrap\n"
     "    ref_key: env/${execution_context.params.env.type}\n"
     "    procedure_key: tfstate_backend\n"
-    "    domains: [env]\n"
+    "    domains: [domains.env]\n"
     "    input_params: [account, env_type]\n"
     "    cfg_keys:\n"
     "      env: [ctl_state_s3_bucket_name]\n"
@@ -238,17 +239,17 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
 
     def test_a_correct_declaration_passes(self):
         self._check({"w": {"workflow_instance_params": ["account", "env_type"],
-                           "target_keys": ["wide", "narrow"]}})
+                           "targets": {"keys": ["wide", "narrow"]}}})
 
     def test_a_missing_axis_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "missing"):
             self._check({"w": {"workflow_instance_params": ["account"],
-                               "target_keys": ["wide"]}})
+                               "targets": {"keys": ["wide"]}}})
 
     def test_a_spare_axis_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "declares"):
             self._check({"w": {"workflow_instance_params": ["account", "env_type"],
-                               "target_keys": ["narrow"]}})
+                               "targets": {"keys": ["narrow"]}}})
 
     def test_a_branch_is_checked_against_the_target_branch_it_can_hold_with(self):
         """A members-shaped target contributes only the branches whose selectors
@@ -260,7 +261,7 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
                 {"params": ["domain"],
                  "selectors": {"match": {"execution_context.params.domain": "org"}}},
             ]},
-            "target_keys": ["dispatching"],
+            "targets": {"keys": ["dispatching"]},
         }})
 
     def test_an_unpinned_dispatch_axis_is_refused_rather_than_guessed(self):
@@ -271,7 +272,7 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "does not pin"):
             self._check({"w": {"workflow_instance_params": ["domain"],
-                               "target_keys": ["dispatching"]}})
+                               "targets": {"keys": ["dispatching"]}}})
 
     def test_a_target_without_selectors_applies_to_every_branch(self):
         """A plain list means 'always', so it counts under any condition."""
@@ -282,13 +283,13 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
                     {"params": ["account"],
                      "selectors": {"match": {"execution_context.params.domain": "env"}}},
                 ]},
-                "target_keys": ["wide"],
+                "targets": {"keys": ["wide"]},
             }})
 
     def test_imported_workflows_contribute_their_members(self):
         with self.assertRaisesRegex(RuntimeError, "missing"):
             self._check({
-                "base": {"target_keys": ["wide"]},
+                "base": {"targets": {"keys": ["wide"]}},
                 "w": {"workflow_instance_params": ["account"],
-                      "import_workflow_keys": ["base"], "target_keys": []},
+                      "import_workflows": ["base"], "targets": {"keys": []}},
             })

@@ -7,6 +7,7 @@ and which check owns it — belongs to `checks.py`."""
 from pathlib import Path
 
 from engine.cfg import validate as cfg_validate
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import run_context as execution_run_context
 from engine.preflight import render as preflight_render
@@ -134,7 +135,7 @@ def build_ctl_policy_preflight_report(
     def _provider_access_detail() -> dict[str, list[str]]:
         rows: dict[str, list[str]] = {}
         for provider, mode in sorted((execution_access_modes or {}).items()):
-            rows[provider] = execution_providers.get_provider_adapter(provider).authorize_run(
+            rows[provider] = execution_adapters.get_adapter(provider).authorize_run(
                 run_policy.ctl_profile_provider_policy(ctl_cfg_root, ctl_profile, provider),
                 execution_access_mode=mode,
                 provider_options=execution_providers.provider_options_for(provider_options, provider),
@@ -277,7 +278,7 @@ def build_ctl_state_backend_preflight_result(
     # The backend's own provider decides the mode and options here — it is not
     # necessarily the provider the targets run against.
     namespace_provider = str(entry["provider"])
-    namespace_adapter = execution_providers.get_provider_adapter(namespace_provider)
+    namespace_adapter = execution_adapters.get_adapter(namespace_provider)
     namespace_access_mode, namespace_adapter_options = execution_providers.provider_inputs(
         namespace_provider, execution_access_modes, provider_options
     )

@@ -18,6 +18,7 @@ from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.state import run_store as state_run_store
+from engine.cfg import resources as cfg_resources
 from engine.state import status as state_status
 from engine.state import sync as state_sync
 
@@ -63,9 +64,6 @@ def run_status_command(
                     args.ctl_ref_policy,
                     args.action,
                     child["key"] if child["kind"] == "workflow" else None,
-                    ctl_variants=(
-                        args.ctl_variants if child["kind"] == "workflow" else []
-                    ),
                     target_repo_key="repo_path",
                     require_target_ref=False,
                     execution_runtime_mode=args.execution_runtime_mode,
@@ -90,7 +88,6 @@ def run_status_command(
             args.ctl_ref_policy,
             args.action,
             args.workflow if run_type == "workflow" else None,
-            ctl_variants=getattr(args, "ctl_variants", None) or [],
             target_repo_key="repo_path",
             require_target_ref=False,
             execution_runtime_mode=args.execution_runtime_mode,
@@ -225,9 +222,15 @@ def run_status_all_command(
         execution_runtime_mode=args.execution_runtime_mode,
     )
     namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(ctl_cfg_root, execution_context)
+    # An exclusive relation names targets that are ALTERNATIVES over one
+    # deployment. ctl
+    # cannot derive that — a target names a procedure, a procedure names steps —
+    # so it is read from cfg, and an empty registry leaves every row unchanged.
+    exclusive_target_relations = cfg_resources.collect_resource(ctl_cfg_root, "exclusive_target_relations")
+    exclusive_workflow_relations = cfg_resources.collect_resource(ctl_cfg_root, "exclusive_workflow_relations")
     if args.status == "local":
         namespace_root = Path(args.ctl_state_local_root) / namespace_key
-        instances = state_status.compute_namespace_status_map(namespace_root)
+        instances = state_status.compute_namespace_status_map(namespace_root, exclusive_target_relations, exclusive_workflow_relations)
     else:
         keep = getattr(args, "hydrate_to", None)
         scratch = (
@@ -246,7 +249,7 @@ def run_status_all_command(
                 provider_options=args.provider_options,
             )
             state_run_store.hydrate_ctl_state_index(syncer)
-            instances = state_status.compute_namespace_status_map(namespace_root)
+            instances = state_status.compute_namespace_status_map(namespace_root, exclusive_target_relations, exclusive_workflow_relations)
             if keep:
                 # Provenance, not a guard: ctl refuses nothing on account of it.
                 kernel_yaml_io.write_yaml_file(

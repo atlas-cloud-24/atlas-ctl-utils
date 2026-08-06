@@ -1,8 +1,8 @@
 """Composing an ordered run out of declared targets.
 
 A workflow is an ORDERED sequence, not a graph: it has no branching and no
-concurrency, so a member that fails ends the run. Variants place extra targets
-against an anchor, and a fan-out expands one declaration into many runs."""
+concurrency, so a member that fails ends the run. A fan-out expands one
+declaration into many runs."""
 
 import hashlib
 import json
@@ -14,17 +14,118 @@ from pathlib import Path
 import yaml
 
 from engine.catalog import targets as catalog_targets
+from engine.cfg import references as cfg_references
 from engine.cfg import resources as cfg_resources
-from engine.execution import providers as execution_providers
+from engine.execution import adapters as execution_adapters
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
 from engine.kernel import paths as kernel_paths
-from engine.kernel import scalars as kernel_scalars
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
+
+def _resolve_entry_references(entries: list, *, label: str) -> list:
+    """A member list: a target reference, or a mapping carrying one.
+
+    `{key, action}` appends and `{key, after|before}` places; both address a
+    target, and an anchor names the WORKFLOW it points into as well as the target
+    it sits beside.
+    """
+
+    resolved = []
+    for value in entries or []:
+        if not isinstance(value, dict):
+            resolved.append(cfg_references.resolve(value, "targets", label=label))
+            continue
+        entry = dict(value)
+        entry["key"] = cfg_references.resolve(entry["key"], "targets", label=f"{label}.key")
+        for position in ("after", "before"):
+            anchor = entry.get(position)
+            if isinstance(anchor, dict):
+                entry[position] = {
+                    "workflow": cfg_references.resolve(
+                        anchor["workflow"], "workflows", label=f"{label}.{position}.workflow"),
+                    "key": cfg_references.resolve(
+                        anchor["key"], "targets", label=f"{label}.{position}.key"),
+                }
+        resolved.append(entry)
+    return resolved
+
+
+def _resolve_member_block(block, *, label: str):
+    if not isinstance(block, dict):
+        return block
+    if "members" in block:
+        return {**block, "members": [
+            {**member, "keys": _resolve_entry_references(
+                member.get("keys"), label=f"{label}.members")}
+            for member in block["members"]
+        ]}
+    return {**block, "keys": _resolve_entry_references(block.get("keys"), label=label)}
+
+
+def load_workflow_catalog(ctl_cfg_root: Path) -> dict:
+    """Every declared workflow, with its cross-references resolved to bare keys."""
+
+    workflows = cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+    resolved: dict = {}
+    for name, entry in workflows.items():
+        if not isinstance(entry, dict):
+            resolved[name] = entry
+            continue
+        body = dict(entry)
+        if body.get("import_workflows") is not None:
+            body["import_workflows"] = cfg_references.resolve_each(
+                body["import_workflows"], "workflows", label=f"workflow {name!r} import_workflows")
+        for field in ("targets", "insert_targets"):
+            if field in body:
+                body[field] = _resolve_member_block(
+                    body[field], label=f"workflow {name!r} {field}")
+        resolved[name] = body
+    return resolved
+
+
+def workflow_target_branches(workflow: dict, *, name: str) -> list[tuple[list, object]]:
+    """The `(keys, default_action)` pairs a workflow declares, one per branch.
+
+    `targets` is ALWAYS a mapping, and `default_action` lives INSIDE it — beside
+    the `keys` list it governs in the single-branch form, and inside each member
+    when the list branches on a selector:
+
+        targets: {default_action, keys}                    one branch
+        targets: {members: [{default_action, keys, selectors}, ...]}
+
+    `default_action` has no meaning apart from the list it governs, so it never
+    sits at workflow level, where it would stand beside `workflow_instance_params`
+    — a genuinely workflow-scoped field — and read as a property of the workflow.
+    Declared there it is REFUSED, because a branched list resolves its action from
+    the matched member and a workflow-level one could only be lost.
+    """
+
+    if "default_action" in workflow:
+        raise RuntimeError(
+            f"❌ workflow {name!r} declares `default_action` at workflow level. It "
+            "belongs inside `targets`, beside the `keys` list it governs (or inside "
+            "each member when `targets` branches)"
+        )
+    targets = workflow.get("targets")
+    if targets is None:
+        return []
+    if not isinstance(targets, dict):
+        raise RuntimeError(
+            f"❌ workflow {name!r} `targets` must be a mapping of "
+            "{default_action, keys} or {members: [...]}"
+        )
+    if "members" in targets:
+        return [
+            (member.get("keys") or [], member.get("default_action"))
+            for member in targets.get("members") or []
+            if isinstance(member, dict)
+        ]
+    return [(targets.get("keys") or [], targets.get("default_action"))]
+
 
 def validate_workflow_actions_declared(workflows: dict) -> None:
     """Every workflow entry must be able to resolve an ACTION.
@@ -38,17 +139,7 @@ def validate_workflow_actions_declared(workflows: dict) -> None:
     for name, workflow in (workflows or {}).items():
         if not isinstance(workflow, dict):
             continue
-        declaration = workflow.get("target_keys")
-        lists: list[tuple[list, object]] = []
-        if isinstance(declaration, list):
-            lists.append((declaration, workflow.get("default_action")))
-        elif isinstance(declaration, dict):
-            for member in declaration.get("members") or []:
-                if isinstance(member, dict):
-                    lists.append(
-                        (member.get("target_keys") or [], member.get("default_action"))
-                    )
-        for entries, default_action in lists:
+        for entries, default_action in workflow_target_branches(workflow, name=name):
             if default_action:
                 continue
             bare = [
@@ -65,18 +156,6 @@ def validate_workflow_actions_declared(workflows: dict) -> None:
                 )
 
 
-def parse_ctl_variants_arg(value: str) -> list[str]:
-    """
-
-    parse comma-separated ctl variant paths under variants/."""
-
-    return kernel_scalars.parse_relative_paths_arg(
-        value,
-        root_dir_name="variants",
-        item_label="Ctl variant",
-    )
-
-
 def workflow_member_actions(workflow_cfg: dict) -> set[str]:
     """Every action a workflow's member entries ask of their targets."""
     actions: set[str] = set()
@@ -86,10 +165,111 @@ def workflow_member_actions(workflow_cfg: dict) -> set[str]:
     return actions
 
 
+def resolve_insert_targets(
+    workflow: dict, execution_context: dict[str, object], *, name: str
+) -> dict:
+    """Collapse a declared `insert_targets` block to the branch this run selects.
+
+    Same shape as `targets` — `{default_action, keys}` or `{members: [...]}` —
+    because a placed entry needs the operation selector as much as an appended
+    one does. A branched block that matches nothing places nothing: an operation
+    the composition adds no member to is the normal case, not an error.
+    """
+
+    declared = workflow.get("insert_targets")
+    if declared is None:
+        return {}
+    if not isinstance(declared, dict):
+        raise RuntimeError(
+            f"❌ workflow {name!r} `insert_targets` must be a mapping of "
+            "{default_action, keys} or {members: [...]}"
+        )
+    if "members" not in declared:
+        return {
+            "keys": list(declared.get("keys") or []),
+            "default_action": run_selectors.resolve_default_action(
+                declared.get("default_action"), execution_context,
+                label=f"workflow {name!r} insert_targets",
+            ),
+        }
+    member = run_selectors.resolve_list_member(
+        declared,
+        execution_context,
+        value_field="keys",
+        label=f"workflow {name!r} insert_targets",
+        extra_fields=("default_action",),
+    )
+    if member is None:
+        return {}
+    return {
+        "keys": list(member["keys"]),
+        "default_action": run_selectors.resolve_default_action(
+            member.get("default_action"), execution_context,
+            label=f"workflow {name!r} insert_targets member",
+        ),
+    }
+
+
+def splice_insert_targets(
+    target_runs: list, wf: dict, import_spans: dict[str, tuple[int, int]], *,
+    name: str, label: str,
+) -> list:
+    """Place `insert_targets` entries INSIDE an imported sequence.
+
+    `targets` appends, so its order is the order it is written in. A composed
+    workflow that needs a member BETWEEN two imported ones cannot say that by
+    writing it, because it does not author that list — so `insert_targets` names
+    the position instead, and an anchor is legal only against an import.
+
+    This is a splice index, not a graph: the result is one linear order, exactly
+    as if the entry had been typed at that position.
+
+    Entries anchored at the same point keep their declaration order.
+    """
+
+    declared = wf.get("insert_targets") or {}
+    inserts = catalog_targets.normalize_insert_entries(
+        declared.get("keys") or [],
+        label=label,
+        default_action=declared.get("default_action") or wf.get("default_action"),
+    )
+    if not inserts:
+        return target_runs
+    placements: list[tuple[int, int, object]] = []
+    for order, (key, action, (position, anchor_workflow, anchor_key)) in enumerate(inserts):
+        if anchor_workflow not in import_spans:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} anchors in workflow {anchor_workflow!r}, "
+                f"which {name!r} does not import"
+            )
+        start, end = import_spans[anchor_workflow]
+        matches = [
+            index for index in range(start, end)
+            if run_addressing.workflow_target_run_signature(target_runs[index])[0] == anchor_key
+        ]
+        if not matches:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} anchors on {anchor_key!r}, which workflow "
+                f"{anchor_workflow!r} does not run"
+            )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} anchors on {anchor_key!r}, which workflow "
+                f"{anchor_workflow!r} runs {len(matches)} times — the position is "
+                "ambiguous, so it is refused rather than resolved by picking one"
+            )
+        at = matches[0] + (1 if position == "after" else 0)
+        placements.append((at, order, {"id": key, "target": key, "action": action}))
+    spliced = list(target_runs)
+    for offset, (at, _, run) in enumerate(sorted(placements, key=lambda p: (p[0], p[1]))):
+        spliced.insert(at + offset, run)
+    return spliced
+
+
 def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = ()) -> list:
     """
 
-    resolve import_workflow_keys in order, then append the workflow target_keys."""
+    resolve import_workflows in order, then append the workflow targets."""
 
     if name in _stack:
         raise RuntimeError(f"❌ workflow import cycle: {' -> '.join([*_stack, name])}")
@@ -98,28 +278,36 @@ def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = (
         raise RuntimeError(f"❌ workflow {name!r} not found (imported)")
     if not isinstance(wf, dict):
         raise RuntimeError(f"❌ workflow {name!r} must be a mapping")
-    import_keys = wf.get("import_workflow_keys") or []
+    import_keys = wf.get("import_workflows") or []
     if not isinstance(import_keys, list) or not all(
         isinstance(value, str) and value for value in import_keys
     ):
         raise RuntimeError(
-            f"❌ workflow {name!r} import_workflow_keys must be a list of non-empty strings"
+            f"❌ workflow {name!r} import_workflows must be a list of non-empty strings"
         )
-    # An entry is a bare key, or a key with its OWN action. A member
-    # without one inherits the invoked operation, which is what keeps every
-    # existing workflow working unchanged.
+    # An entry is a bare key, or a key with its OWN action; an entry without one
+    # takes the branch's `default_action`. `targets` is FLAT here — load_workflow
+    # has already collapsed the declared branches to the one this run selected.
     entries = catalog_targets.normalize_target_entries(
-        wf.get("target_keys") or [],
-        label=f"workflow {name!r} target_keys",
+        wf.get("targets") or [],
+        label=f"workflow {name!r} targets",
         default_action=wf.get("default_action"),
     )
     target_runs: list = []
+    # Where each import's contribution starts, so an anchor resolves inside the
+    # sequence it NAMES rather than anywhere in the merged list.
+    import_spans: dict[str, tuple[int, int]] = {}
     for workflow_key in import_keys:
+        start = len(target_runs)
         target_runs.extend(expand_workflow_imports(action_workflows, workflow_key, (*_stack, name)))
+        import_spans[workflow_key] = (start, len(target_runs))
     for key, action in entries:
         target_runs.append(
             {"id": key, "target": key, "action": action} if action else key
         )
+    target_runs = splice_insert_targets(
+        target_runs, wf, import_spans, name=name, label=f"workflow {name!r} insert_targets"
+    )
     # A key MAY repeat when the actions differ — that is a composition doing two
     # things to one instance, and order decides the final state. The same key with
     # the same action twice is still a mistake.
@@ -146,14 +334,18 @@ def load_workflow_cfg(
     """Load a content-key workflow: `workflows.<name>` (imports + selectors).
 
     workflows are declared ONCE with a required `actions:` allowlist;
-    the action gates availability. `target_keys` may be members-shaped (dispatch
+    the action gates availability. `targets` may be members-shaped (dispatch
     by `execution_context.ctl.action`) when the apply-family composition differs
-    per action. Expands `import_workflow_keys` (ordered, recursive) then the
-    workflow's own `target_keys`; applies `selectors` (intersected through
+    per action. Expands `import_workflows` (ordered, recursive) then the
+    workflow's own `targets`; applies `selectors` (intersected through
     imports). The workflow name is an opaque key (slashes are cosmetic).
+
+    Resolution COLLAPSES the declaration to the one branch this run selected, so
+    the returned workflow carries a flat `targets` list with `default_action`
+    beside it. Cfg declares branches; a resolved run has exactly one.
     """
 
-    workflows = cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
+    workflows = load_workflow_catalog(ctl_cfg_root)
     if workflow_name not in workflows:
         raise RuntimeError(f"❌ workflow {workflow_name!r} not found")
     validate_workflow_actions_declared(workflows)
@@ -164,25 +356,29 @@ def load_workflow_cfg(
         # A workflow declares no allowlist. Its member selectors decide
         # when it applies, and each member's declared action decides what runs —
         # an `operations:` list restated the selectors and could contradict them.
-        target_keys = wf.get("target_keys")
-        if isinstance(target_keys, dict):
+        # `workflow_target_branches` is the one place that reads the declared
+        # shape, so the workflow-level `default_action` refusal reaches every
+        # caller rather than only the ones that remembered to check.
+        workflow_target_branches(wf, name=name)
+        targets = wf.get("targets")
+        if isinstance(targets, dict) and "members" in targets:
             member = run_selectors.resolve_list_member(
-                target_keys,
+                targets,
                 execution_context,
-                value_field="target_keys",
-                label=f"workflow {name!r} target_keys",
+                value_field="keys",
+                label=f"workflow {name!r} targets",
                 extra_fields=("default_action",),
             )
             if member is None:
                 raise RuntimeError(
-                    f"❌ workflow {name!r} members-shaped target_keys did not "
+                    f"❌ workflow {name!r} members-shaped targets did not "
                     "resolve for this execution context"
                 )
             # The member's declared default reaches every entry it
             # carries, so a list going one direction states its verb once.
             wf = {
                 **wf,
-                "target_keys": list(member["target_keys"]),
+                "targets": list(member["keys"]),
                 "default_action": run_selectors.resolve_default_action(
                     member.get("default_action"), execution_context,
                     label=f"workflow {name!r} member",
@@ -192,11 +388,14 @@ def load_workflow_cfg(
         else:
             wf = {
                 **wf,
+                "targets": list((targets or {}).get("keys") or []),
                 "default_action": run_selectors.resolve_default_action(
-                    wf.get("default_action"), execution_context,
+                    (targets or {}).get("default_action"), execution_context,
                     label=f"workflow {name!r}",
                 ),
             }
+        wf = {**wf, "insert_targets": resolve_insert_targets(
+            wf, execution_context, name=name)}
         resolved_workflows[name] = wf
     if workflow_name not in resolved_workflows:
         raise RuntimeError(
@@ -230,179 +429,6 @@ def load_workflow_cfg(
     return cfg
 
 
-def find_workflow_anchor_index(target_runs: list, anchor: str, *, label: str) -> int | None:
-    """Locate the single entry an anchor target key names; None when absent.
-
-    Ambiguity is REFUSED rather than resolved by position. Since key
-    may appear twice with different actions, and picking the first would place a
-    variant before or after an arbitrary one of them — a silent choice about
-    ordering, which is exactly what a placement declares.
-    """
-
-    matches = [
-        index
-        for index, entry in enumerate(target_runs)
-        if run_addressing.workflow_target_run_key(entry) == anchor
-    ]
-    if not matches:
-        return None
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"❌ {label} anchor {anchor!r} matches {len(matches)} entries; a "
-            "placement cannot choose between them. Qualify the anchor or make "
-            "the key unique in this workflow"
-        )
-    return matches[0]
-
-
-def variant_source_action(action: str) -> str:
-    """
-
-    which action's variants apply. `plan` previews `provision`, so a plan run
-    resolves variants against `provision` rather than a separate `plan` block."""
-
-    return run_actions.action_previewed_by(action)
-
-
-def variant_anchor(variant: dict, *, label: str) -> tuple[str, bool]:
-    """Return `(anchor target key, insert_before)` for one placement.
-
-    The two anchor fields are one choice with two spellings, so exactly one is
-    required and both together is a contradiction rather than a precedence rule.
-    """
-    before, after = variant.get("before_target_key"), variant.get("after_target_key")
-    if before and after:
-        raise RuntimeError(
-            f"❌ {label} cannot set both 'before_target_key' and 'after_target_key'"
-        )
-    if not (before or after):
-        raise RuntimeError(
-            f"❌ {label} must define 'after_target_key' or 'before_target_key'"
-        )
-    return (before, True) if before else (after, False)
-
-
-def variant_target_run_entry(
-    variant: dict, target_name: str, workflow_cfg: dict, *, label: str
-) -> dict:
-    """Build the target_run entry a placement inserts.
-
- every entry to carry a DECLARED action, so a placement
-    resolves one the same way a member list does: its own `action:`, else the
-    workflow's resolved default. Inserting a bare key would slip past that gate,
-    because normalization has already run by the time a variant applies.
-    """
-
-    action = variant.get("action") or workflow_cfg.get("default_action")
-    if not action:
-        raise RuntimeError(
-            f"❌ {label} inserts {target_name!r} with no action: the workflow "
-            "declares no `default_action`, so the placement must declare `action:`"
-        )
-    if action not in run_actions.RUN_ACTIONS:
-        raise RuntimeError(
-            f"❌ {label} declares action {action!r}; expected one of {sorted(run_actions.RUN_ACTIONS)}"
-        )
-    return {"id": target_name, "target": target_name, "action": action}
-
-
-def apply_ctl_variants_to_workflow_cfg(
-    ctl_cfg_root: Path,
-    workflow_cfg: dict,
-    action_cfg: dict,
-    *,
-    execution_context: dict[str, object],
-    action: str,
-    workflow_name: str,
-    ctl_variants: list[str],
-) -> dict:
-    """Apply selected variant placements to a loaded workflow cfg.
-
-    A variant is `variants.<action>.<name> = {target_key, workflow_key, after_target_key|before_target_key, [selectors]}`.
-    For each selected variant whose `workflow_key` matches the running one: validate its target
-    exists and `variant.selectors ⊆ target.selectors`, gate through runtime selectors (the target
-    ceiling AND the variant subset), then insert the target name at the after/before anchor
-    (skip + log if the anchor is absent in this workflow).
-    """
-
-    if not ctl_variants:
-        return workflow_cfg
-
-    variant_action = variant_source_action(action)
-    variants = execution_run_context.load_variants_cfg(ctl_cfg_root).get(variant_action, {})
-    targets = action_cfg.get("targets", {})
-    target_runs = list(workflow_cfg.get("target_runs") or [])
-
-    for name in ctl_variants:
-        v = variants.get(name)
-        if v is None:
-            raise RuntimeError(
-                f"❌ variant {name!r} not found under action {variant_action!r} in variant config"
-            )
-        if not isinstance(v, dict):
-            raise RuntimeError(f"❌ variant {name!r} must be a mapping")
-
-        if v.get("workflow_key") != workflow_name:
-            logging.info(
-                "Variant '%s' targets workflow '%s', not the running '%s' — skipped",
-                name, v.get("workflow_key"), workflow_name,
-            )
-            continue
-
-        target_name = v.get("target_key")
-        target = targets.get(target_name)
-        if target is None:
-            raise RuntimeError(
-                f"❌ variant {name!r} references missing target {target_name!r} (action {action!r})"
-            )
-
-        ok, why = run_selectors._selectors_subset(v.get("selectors"), target.get("selectors"))
-        if not ok:
-            raise RuntimeError(f"❌ variant {name!r} selectors exceed target {target_name!r}: {why}")
-
-        if not run_selectors.selector_matches(
-            target.get("selectors"),
-            execution_context,
-            label=f"target {target_name}",
-        ):
-            logging.info("Variant '%s' target is not available for selectors %s — skipped", name, execution_context)
-            continue
-        if not run_selectors.selector_matches(
-            v.get("selectors"),
-            execution_context,
-            label=f"variant {name}",
-        ):
-            logging.info("Variant '%s' placement gated off for selectors %s — skipped", name, execution_context)
-            continue
-
-        anchor, before = variant_anchor(v, label=f"variant {name!r}")
-        index = find_workflow_anchor_index(
-            target_runs, anchor, label=f"variant {name!r}"
-        )
-        if index is None:
-            logging.info("Variant '%s' anchor '%s' absent from '%s' — skipped", name, anchor, workflow_name)
-            continue
-
-        entry = variant_target_run_entry(
-            v, target_name, workflow_cfg, label=f"variant {name!r}"
-        )
-        signature = run_addressing.workflow_target_run_signature(entry)
-        if signature in {run_addressing.workflow_target_run_signature(e) for e in target_runs}:
-            raise RuntimeError(
-                f"❌ variant {name!r} inserts duplicate target {target_name!r}"
-                + (f" (action {signature[1]})" if signature[1] else "")
-            )
-        target_runs.insert(index if before else index + 1, entry)
-        logging.info(
-            "Applied variant '%s': inserted '%s' (action %s) %s '%s'",
-            name, target_name, signature[1], "before" if before else "after", anchor,
-        )
-
-    patched = dict(workflow_cfg)
-    patched["target_runs"] = target_runs
-    return patched
-
-
 def write_target_run_flow_artifact(path: Path, workflow_meta: dict | None, active_target_runs: dict) -> None:
     """Write a compact ordered target_run-flow artifact."""
     target_run_flow = {
@@ -432,8 +458,6 @@ def write_target_flow_artifact(
     execution_context: dict[str, object],
     action: str,
     workflow_name: str | None,
-    ctl_variants: list[str],
-    plt_overlays: list[str],
     target_repo_key: str,
     require_target_ref: bool,
     require_commit_refs: bool,
@@ -456,15 +480,6 @@ def write_target_flow_artifact(
             execution_context,
         )
         target_action_cfg = catalog_targets.load_action_cfg(ctl_cfg_root, target_action, execution_context)
-        target_workflow_cfg = apply_ctl_variants_to_workflow_cfg(
-            ctl_cfg_root,
-            target_workflow_cfg,
-            target_action_cfg,
-            execution_context=execution_context,
-            action=target_action,
-            workflow_name=workflow_name,
-            ctl_variants=ctl_variants,
-        )
         catalog_targets.validate_workflow_target_selectors(target_workflow_cfg, target_action_cfg, execution_context)
         target_active_target_runs = catalog_targets.build_active_target_runs(
             target_workflow_cfg,
@@ -702,8 +717,6 @@ def build_child_target_command(
         argv += ["--provider-options", f"{key}={value}"]
     for provider, mode in (spec.get("execution_access_modes") or {}).items():
         argv += ["--execution-access-mode", f"{provider}={mode}"]
-    for overlay in (spec.get("plt_overlays") or []):
-        argv += ["--plt-overlays", overlay]
     for provider in (spec.get("force_skip_execution_identity_preflight_check") or []):
         argv += ["--force-skip-execution-identity-preflight-check", provider]
     for flag, enabled in (
@@ -746,7 +759,7 @@ def workflow_target_key_entries(
 
     name = str(workflow.get("__name__", ""))
     keys: list[str] = []
-    for imported in workflow.get("import_workflow_keys") or []:
+    for imported in workflow.get("import_workflows") or []:
         if imported in _seen or imported not in workflows:
             continue
         keys += workflow_target_key_entries(
@@ -755,12 +768,17 @@ def workflow_target_key_entries(
             label=label,
             _seen=(*_seen, name, imported),
         )
-    target_keys = workflow.get("target_keys")
-    branches = (
-        [member.get("target_keys") or [] for member in (target_keys.get("members") or [])]
-        if isinstance(target_keys, dict)
-        else [target_keys or []]
-    )
+    branches = [
+        entries for entries, _ in workflow_target_branches(workflow, name=name)
+    ]
+    # A placed member is a member: leaving it out would exempt it from the
+    # instance-param gate that every other target key passes.
+    inserts = workflow.get("insert_targets")
+    if isinstance(inserts, dict):
+        branches += (
+            [member.get("keys") or [] for member in inserts.get("members") or []]
+            if "members" in inserts else [inserts.get("keys") or []]
+        )
     for branch in branches:
         for entry in branch:
             key = entry.get("key") if isinstance(entry, dict) else entry
@@ -985,7 +1003,7 @@ def build_procedure_cfg(
         # The synthetic target gets the same execution_identity block a declared
         # target has; a single --execution-role is bound under the key that
         # provider uses for this action — the engine asks, it does not decide.
-        role_class = action_role_class or execution_providers.get_provider_adapter(
+        role_class = action_role_class or execution_adapters.get_adapter(
             execution_provider
         )._action_role_key(action, label="synthetic procedure target")
         resolved["execution_identities"] = catalog_targets.validate_target_execution_identities(
@@ -1152,7 +1170,7 @@ def expand_fan_out(
                     "params": {**params, **(extra_params or {})},
                     # One param set may serve several runs of the same
                     # workflow (each pinned by different extra_params), so the
-                    # member name alone no longer identifies a child.
+                    # member name alone does not identify a child.
                     "label": (
                         f"{key}[{'+'.join(str(v) for v in extra_params.values())}:{entry_name}]"
                         if extra_params

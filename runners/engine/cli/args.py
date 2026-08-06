@@ -18,7 +18,7 @@ import argparse
 import collections
 from pathlib import Path
 
-from engine.catalog import workflow as catalog_workflow
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.kernel import ids as kernel_ids
 from engine.kernel import scalars as kernel_scalars
@@ -156,11 +156,10 @@ def normalize_execution_access_modes(args: argparse.Namespace) -> dict[str, str]
             f"provider (no default): missing {missing}"
         )
 
-    from engine.execution.adapters import get_adapter
 
     options = getattr(args, "provider_options", None)
     for provider, mode in modes.items():
-        adapter = get_adapter(provider)
+        adapter = execution_adapters.get_adapter(provider)
         supported = adapter.supported_execution_access_modes()
         if mode not in supported:
             raise RuntimeError(
@@ -202,11 +201,10 @@ def normalize_force_skip_execution_identity_preflight_check(
             f"declared in --providers {declared}: {stray}"
         )
 
-    from engine.execution.adapters import get_adapter
 
     modes = getattr(args, "execution_access_modes", None) or {}
     for provider in requested:
-        adapter = get_adapter(provider)
+        adapter = execution_adapters.get_adapter(provider)
         if not adapter.supports_identity_preflight():
             raise RuntimeError(
                 f"❌ provider {provider!r} declares no live execution-identity check, "
@@ -385,7 +383,7 @@ def _add_maintenance_args(parser: argparse._ActionsContainer) -> None:
     parser.add_argument(
         "--cascade",
         action="store_true",
-        help="history-prune and forget: also take retained workflow runs that reference the selected records, which would otherwise be left naming a member that no longer exists",
+        help="history-prune and forget: also take retained workflow runs that reference the selected records, which would otherwise be left naming a member with nothing behind it",
     )
     parser.add_argument(
         "--apply-history-prune",
@@ -478,9 +476,6 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     override_group = parser.add_argument_group(
         "defer / skip overrides",
         "authorized escalations; each also requires ctl-profile allowance",
-    )
-    variation_group = parser.add_argument_group(
-        "cfg variation", "optional ctl variants and plt overlays"
     )
     mode_group = parser.add_argument_group(
         "checks & previews",
@@ -684,33 +679,14 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             "identity the preflight would have caught up front; requires ctl-profile "
             "authorization.",
         )
-    # 7) cfg variation
-    if run_type in {"workflow", "fan_out"}:
-        variation_group.add_argument(
-            "--ctl-variants",
-            required=False,
-            default=[],
-            dest="ctl_variants",
-            type=catalog_workflow.parse_ctl_variants_arg,
-            help="Optional comma-separated ctl variant paths under variants/",
-        )
-    variation_group.add_argument(
-        "--plt-overlays",
-        required=False,
-        default=[],
-        dest="plt_overlays",
-        type=parse_overlays_arg,
-        help="Optional comma-separated plt overlay names",
-    )
-    # 8) run modes
+    # 7) run modes
     if run_type == "fan_out":
         mode_group.add_argument(
             "--dry-run",
             action="store_true",
             help="print expanded child runner commands and exit",
         )
-    # Status is no longer a mode on the run runners — it is the
-    # standalone read-only status.py (its own slim parser). Removed here.
+    # Status is the standalone read-only status.py, with its own slim parser.
     if run_type in {"workflow", "target", "fan_out"}:
         mode_group.add_argument(
             "--execution-identity-preflight-check-only",
@@ -998,7 +974,7 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     args.execution_access_modes = {}
     if args.providers:
         execution_providers.validate_provider_options(args.provider_options, args.providers)
-        adapter = execution_providers.get_provider_adapter(read_provider)
+        adapter = execution_adapters.get_adapter(read_provider)
         adapter_options = execution_providers.provider_options_for(args.provider_options, read_provider)
         args.execution_access_modes = {
             read_provider: (
@@ -1009,7 +985,6 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     # Inert for a read (no box is built) but required by the shared context
     # builders / selection resolvers.
     args.execution_runtime_mode = "local"
-    args.ctl_variants = []
     if not args.all and args.action is None:
         raise RuntimeError(
             "❌ a targeted status (--target/--workflow/--fan-out) requires "

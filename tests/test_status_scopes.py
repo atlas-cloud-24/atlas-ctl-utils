@@ -103,10 +103,10 @@ SELECTION = {
 }
 
 
-class Phase42StatusScopeTests(unittest.TestCase):
-    def test_status_removed_from_run_parser_and_lives_in_the_slim_parser(self):
-        # status is no longer a MODE on the run runners — the
-        # standalone status.py owns it. The run parser must not carry --status.
+class StatusScopeTests(unittest.TestCase):
+    def test_status_lives_in_the_slim_parser_not_the_run_parser(self):
+        # Status is not a MODE on the run runners: the standalone status.py owns
+        # it, so the run parser must not carry --status.
         run_parser = argparse.ArgumentParser()
         cli_args.add_common_args(run_parser, run_type="target")
         self.assertFalse(

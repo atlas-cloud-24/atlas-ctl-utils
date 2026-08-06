@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
-from engine.execution import providers as execution_providers
+from engine.execution import adapters as execution_adapters
 
 RESOURCE_KEY = "ctl_secrets"
 
@@ -117,7 +117,7 @@ class SecretStore:
         return path.read_text(encoding="utf-8").rstrip("\n")
 
     def _from_provider(self, provider: str, entry: dict, *, where: str) -> str:
-        adapter = execution_providers.get_provider_adapter(provider, self.ctl_cfg_root)
+        adapter = execution_adapters.get_adapter(provider, self.ctl_cfg_root)
         resolve = getattr(adapter, "resolve_secret", None)
         if resolve is None:
             raise RuntimeError(
@@ -149,7 +149,7 @@ def validate_declared_secrets(ctl_cfg_root: Path) -> None:
     store = SecretStore(ctl_cfg_root)
     declared = store.declared
     for provider, spec in (
-        execution_providers.load_ctl_providers(ctl_cfg_root) or {}
+        execution_adapters.load_ctl_providers(ctl_cfg_root) or {}
     ).items():
         secret_key = ((spec or {}).get("source") or {}).get("secret_key")
         if secret_key is None:

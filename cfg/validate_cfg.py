@@ -141,7 +141,7 @@ def _sweep_variations(plt_cfg_root: Path, execution_context: dict) -> list[list[
 
     NOT every subset. Overlay application is a last-wins merge by file path, so
     the failures that exist are an overlay broken on its OWN — a stale path, a
-    reference the base no longer defines — and two overlays writing one path.
+    reference the base does not define — and two overlays writing one path.
     Each-alone catches the first, all-together catches the second, and a subset in
     between adds nothing while costing 2^N runs.
     """

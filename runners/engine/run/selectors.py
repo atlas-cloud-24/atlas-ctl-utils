@@ -1,7 +1,7 @@
 """Which member of a cfg block applies to this run.
 
 Selectors are the one mechanism cfg uses to vary by axis, so every collection
-that varies — scopes, overlays, targets, workflows, variants, guard
+that varies — scopes, overlays, targets, workflows, guard
 declarations — is resolved through here rather than by each consumer."""
 
 import collections
@@ -248,7 +248,7 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
         return {}
     wf = action_workflows.get(name) or {}
     effective = selector_requirements(wf.get("selectors") or {}, label=f"workflow {name} selectors")
-    for workflow_key in (wf.get("import_workflow_keys") or []):
+    for workflow_key in (wf.get("import_workflows") or []):
         imported = selector_requirements(
             workflow_effective_selectors(action_workflows, workflow_key, (*_stack, name)),
             label=f"workflow {workflow_key} effective selectors",
@@ -261,12 +261,6 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
                     f"after importing {workflow_key!r}"
                 )
     return selectors_to_in_shape(effective)
-
-
-def _selectors_subset(child: dict | None, parent: dict | None):
-    """(ok, reason) — True if child selectors are a subset of parent's, per dimension."""
-
-    return selector_subset(child, parent, child_label="variant selectors", parent_label="target selectors")
 
 
 def resolve_default_action(

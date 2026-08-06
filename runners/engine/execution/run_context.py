@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import references as execution_references
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -144,7 +145,7 @@ def load_ctl_sources(ctl_cfg_root: Path) -> dict:
         label = f"ctl_sources.{source_key}"
         if not isinstance(entry, dict):
             raise RuntimeError(f"❌ {label} must be a mapping: {ctl_cfg_root}")
-        unknown = sorted(set(entry) - {"type", "conflict_resolution", "sources"})
+        unknown = sorted(set(entry) - {"type", "conflict_resolution", "sources", "publish_under"})
         if unknown:
             raise RuntimeError(f"❌ {label} has unknown fields {unknown}: {ctl_cfg_root}")
         for field, why in (
@@ -157,6 +158,11 @@ def load_ctl_sources(ctl_cfg_root: Path) -> dict:
                 raise RuntimeError(
                     f"❌ {label}.{field} must be declared — {why}: {ctl_cfg_root}"
                 )
+        prefix = entry.get("publish_under")
+        if prefix is not None and (not isinstance(prefix, str) or not prefix.strip()):
+            raise RuntimeError(
+                f"❌ {label}.publish_under must be a non-empty dotted prefix: {ctl_cfg_root}"
+            )
         sources = entry.get("sources")
         if not isinstance(sources, list) or not sources:
             raise RuntimeError(f"❌ {label}.sources must be a non-empty list: {ctl_cfg_root}")
@@ -184,14 +190,6 @@ def resolve_ref_context(target_ref: str, context: dict[str, object]) -> str:
         context,
         label="target ref_key",
     )
-
-
-def load_variants_cfg(ctl_cfg_root: Path) -> dict:
-    """
-
-    load action-keyed variant placements discovered by content key."""
-
-    return cfg_resources.collect_resource(ctl_cfg_root, "variants", entry_depth=2)
 
 
 def resolve_input_params(
@@ -459,7 +457,7 @@ def build_execution_context(
     }
     derived_param_keys: list[str] = []
     for provider in providers or ():
-        adapter = execution_providers.get_provider_adapter(provider)
+        adapter = execution_adapters.get_adapter(provider)
         derive = getattr(adapter, "derived_params", None)
         if derive is None:
             continue
@@ -483,14 +481,21 @@ def build_execution_context(
     # and no key: it asks each participating adapter what it resolved and
     # flattens whatever comes back. Values are scalars because that is what a
     # cfg reference can carry.
+    declared_sources = load_ctl_sources(ctl_cfg_root)
     for provider in providers or ():
-        adapter = execution_providers.get_provider_adapter(provider)
+        adapter = execution_adapters.get_adapter(provider)
         resolve_sources = getattr(adapter, "resolved_sources", None)
         if resolve_sources is None:
             continue
         for source_key, payload in (resolve_sources(ctl_cfg_root, dict(context)) or {}).items():
+            # WHERE a payload lands is a cfg decision: `publish_under` names the
+            # prefix and the payload keeps its own top-level key, so an input file
+            # says what it holds and the declaration says where it belongs.
+            prefix = (declared_sources.get(source_key) or {}).get("publish_under")
             for leaf_key, leaf_value in cfg_resources._flatten_sourced_payload(
-                payload, prefix=source_key, label=f"provider {provider!r} source {source_key!r}"
+                payload,
+                prefix=str(prefix).strip() if prefix else source_key,
+                label=f"provider {provider!r} source {source_key!r}",
             ).items():
                 put("sourced", leaf_key, leaf_value, label=f"source {source_key!r}")
     return context

@@ -273,8 +273,8 @@ class PolicySet:
 
     The owner is HELD rather than passed: it decides where policy files are
     looked for, which subject kinds are legal, and whether a file may carry
-    anything besides policies — a question re-asked at the top of what used to be
-    three separate functions.
+    anything besides policies — one question answered once, rather than re-asked
+    at the top of three separate functions.
     """
 
     def __init__(self, owner: str):

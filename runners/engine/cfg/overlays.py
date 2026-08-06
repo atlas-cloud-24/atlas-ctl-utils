@@ -6,7 +6,6 @@ construction, which is why the checks here are static rather than per-run."""
 
 import collections
 import logging
-import shutil
 
 from pathlib import Path
 
@@ -97,22 +96,6 @@ def discover_overlay_candidates(
         candidates[overlay["name"]] = overlay
 
     return candidates
-
-
-def copy_cfg_root_without_overlay_catalog(plt_cfg_root: Path, dest_root: Path) -> None:
-    """Copy cfg source to a temp root, excluding git metadata and overlay catalog."""
-    cfg_root = plt_cfg_root.resolve()
-
-    def ignore(src_dir: str, names: list[str]) -> set[str]:
-        ignored: set[str] = set()
-        src_path = Path(src_dir).resolve()
-        if ".git" in names:
-            ignored.add(".git")
-        if src_path == cfg_root and "_overlays" in names:
-            ignored.add("_overlays")
-        return ignored
-
-    shutil.copytree(cfg_root, dest_root, ignore=ignore)
 
 
 def _overlay_leaf_values(overlay: dict) -> dict:
@@ -213,25 +196,41 @@ def resolve_run_plt_overlays(
                 rel_path, yaml_path = conflicts[0]
                 rendered_path = ".".join(str(part) for part in yaml_path) or "<root>"
                 raise RuntimeError(
-                    f"Automatically required plt overlay {overlay_name!r} conflicts with "
-                    f"selected overlay {previous_name!r} at {rel_path}:{rendered_path}; "
-                    "supply the complete ordered overlay list explicitly with --plt-overlays "
-                    "to acknowledge precedence"
+                    f"plt overlay {overlay_name!r} conflicts with overlay "
+                    f"{previous_name!r} at {rel_path}:{rendered_path}; two overlays a "
+                    "target requires cannot set one leaf differently, because the "
+                    "later one would win silently"
                 )
 
     return final_overlays
 
 
-def apply_selected_overlays_to_cfg_root(
+def apply_selected_overlays_to_merged_cfg(
     plt_cfg_root: Path,
-    effective_cfg_root: Path,
+    plt_merged_dir: Path,
     plt_overlays: list[str],
     *,
+    active_scopes: list[dict],
     execution_context: dict[str, object],
+    merged_files: dict,
+    source_log_roots: tuple[Path, ...],
+    dest_log_roots: tuple[Path, ...],
+    skip_filenames: set[str],
 ) -> None:
-    """
+    """Merge each selected overlay over the COMPOSED cfg, in the order given.
 
-    apply selected overlay data to a temporary cfg root before scope merge."""
+    An overlay overwrites a leaf another declaration already set, which is what
+    distinguishes it from a scope — scopes are refused when they conflict. That
+    only means "switched on = applied" if the overlay lands LAST; merged into the
+    source tree it would patch one preset level and could still lose to a
+    narrower one downstream.
+
+    An overlay mirrors SOURCE paths, so each of its files belongs to the scope
+    whose root it sits under, and lands where that scope landed. That is what
+    keeps an overlay able to carry env-specific values: `tech_jobs` pins a branch
+    for `dev` and a commit for `prod`, and only the scope this run activated
+    applies.
+    """
 
     if not plt_overlays:
         return
@@ -240,7 +239,10 @@ def apply_selected_overlays_to_cfg_root(
     if duplicates:
         raise RuntimeError(f"plt overlays must be unique; duplicates: {', '.join(sorted(duplicates))}")
 
+    cfg_root = plt_cfg_root.resolve()
     candidates = discover_overlay_candidates(plt_cfg_root, execution_context=execution_context)
+    merged_root = Path(plt_merged_dir).resolve()
+
     for overlay_name in plt_overlays:
         overlay = candidates.get(overlay_name)
         if overlay is None:
@@ -254,10 +256,34 @@ def apply_selected_overlays_to_cfg_root(
                 f"selectors={overlay['selectors']}"
             )
 
-        logging.info("Applying plt overlay %s from %s", overlay_name, overlay["root"])
-        cfg_merge.merge_config_dirs(
-            source_dirs=[str(overlay["root"])],
-            dest_dir=str(effective_cfg_root),
-            clear_dest=False,
-            skip_filenames=cfg_layout.SCOPE_META_SKIP_FILENAMES,
-        )
+        overlay_root = Path(overlay["root"]).resolve()
+        applied_any = False
+        for scope in active_scopes:
+            scope_rel = Path(scope["scope_root"]).resolve().relative_to(cfg_root)
+            overlay_scope_dir = overlay_root / scope_rel
+            if not overlay_scope_dir.is_dir():
+                continue
+            target_dest = (merged_root / scope["target_path"].lstrip("/")).resolve()
+            logging.info(
+                "Applying plt overlay %s from %s to %s",
+                overlay_name,
+                overlay_scope_dir,
+                target_dest,
+            )
+            cfg_merge.merge_config_dirs(
+                source_dirs=[str(overlay_scope_dir)],
+                dest_dir=str(target_dest),
+                clear_dest=False,
+                source_log_roots=source_log_roots,
+                dest_log_roots=dest_log_roots,
+                merged_files=merged_files,
+                skip_filenames=skip_filenames,
+            )
+            applied_any = True
+
+        if not applied_any:
+            raise RuntimeError(
+                f"plt overlay {overlay_name!r} matched no active cfg scope; its payload "
+                "mirrors scope paths, so a payload under a scope this run does not "
+                "activate would apply to nothing"
+            )

@@ -38,10 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # lands, with no edit here.
 ENGINE_SOURCE_ROOTS = (REPO_ROOT / "runners", REPO_ROOT / "cfg")
 
-# No subtree of the engine is exempt. The provider registry used to be — it held
-# an engine-side list of loadable providers — but the registry is the cfg
-# declaration now, so there is no longer anywhere in the engine that a provider
-# name is allowed to appear.
+# No subtree of the engine is exempt. The provider registry IS the cfg
+# declaration, so nowhere in the engine may a provider name appear.
 EXCLUDED_SUBTREES = ()
 
 # Directory NAMES dropped wherever in the walk they occur.
@@ -271,7 +269,7 @@ class CtlRoleChainLoaderTests(unittest.TestCase):
             (root / "providers" / "aws").mkdir(parents=True)
             (root / "providers" / "aws" / "ctl_role_chain.yaml").write_text(
                 "providers:\n  aws:\n    ctl_role_chain:\n"
-                "      entry_credential_source_key: ctl_entry\n"
+                "      entry_credential_source_key: target_sources.ctl_entry\n"
                 "      runner_role_key: ctl_runner\n"
                 "      target_role_key: ctl_target\n"
             )
@@ -392,7 +390,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
             aws_adapter.target_consent("agreed_direct"),
             {
                 "opt_in_field": "allow_agreed_direct_execution_access",
-                "execution_field": "agreed_direct_credential_source_keys",
+                "execution_field": "allowed_agreed_direct_credential_sources",
             },
         )
         self.assertIsNone(aws_adapter.target_consent("standard"))
@@ -405,7 +403,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
         workflow = {"target_runs": ["target"]}
         execution = {
             "provider": "aws",
-            "agreed_direct_credential_source_keys": ["admin"],
+            "allowed_agreed_direct_credential_sources": ["admin"],
         }
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -432,7 +430,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "allow_agreed_direct_execution_access"):
                 check({"execution_identities": {"aws": execution}})
-            with self.assertRaisesRegex(RuntimeError, "agreed_direct_credential_source_keys"):
+            with self.assertRaisesRegex(RuntimeError, "allowed_agreed_direct_credential_sources"):
                 check({
                     "allow_agreed_direct_execution_access": True,
                     "execution_identities": {"aws": {}},

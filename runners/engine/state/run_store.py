@@ -299,6 +299,10 @@ _COMMITTED_FACT_KEYS = (
     "child_revisions", "source_commit", "cfg_source_commit",
     "source_state", "ref_policy", "workflow_definition_sha256",
     "target_definition_sha256", "target_cfg_view_sha256",
+    # What this run APPLIED. A mode group's members share one deployment, so the
+    # member in effect is the one whose overlays the deployment carries — without
+    # this the others cannot know they were replaced.
+    "plt_overlays",
 )
 
 

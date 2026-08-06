@@ -28,7 +28,7 @@ def collect_resource(ctl_cfg_root: Path, key: str, *, entry_depth: int = 1) -> d
     unioned across all `*.yaml` under `ctl_cfg_root`; a duplicate entry is a load
     error (same rule as targets), order-independent. `entry_depth` is how deep the
     unique entries sit: 1 for flat catalogs (target_sources/cfg_key_sets),
-    2 for action-keyed `variants`, 3 for `workflows.<action>.<scope>.<name>` and
+    2 for action-keyed collections, 3 for `workflows.<action>.<scope>.<name>` and
     `providers.<name>.<section>.<entry>`.
     Intermediate levels merge; the entry level collides. Dir-routed trees (see
     `_IGNORED_CFG_DIRS`) are skipped — they have dedicated loaders.

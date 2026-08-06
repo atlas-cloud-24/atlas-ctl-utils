@@ -200,31 +200,41 @@ class WorkflowHistoryTest(unittest.TestCase):
         self.ns.workflow_run(WORKFLOW, run_id="w1")
         self.assertEqual(
             {"status": "passed", "at": "2026-07-30T10:00:05Z"},
-            self.ns.rows()["workflow"][WORKFLOW]["last_run"],
+            self.ns.rows()["workflow"][WORKFLOW]["mutative"],
         )
 
     def test_the_newest_run_wins(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1", at="2026-07-30T10:00:00Z")
         self.ns.workflow_run(WORKFLOW, run_id="w2", at="2026-07-30T12:00:00Z",
                              status="failed")
-        row = self.ns.rows()["workflow"][WORKFLOW]["last_run"]
+        row = self.ns.rows()["workflow"][WORKFLOW]["mutative"]
         self.assertEqual("failed", row["status"])
         self.assertEqual("2026-07-30T12:00:00Z", row["at"])
 
     def test_a_run_in_flight_reads_running(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1", status="in_progress")
         self.assertEqual(
-            "running", self.ns.rows()["workflow"][WORKFLOW]["last_run"]["status"]
+            "running", self.ns.rows()["workflow"][WORKFLOW]["mutative"]["status"]
         )
 
-    def test_the_record_carries_the_target_instances_it_ran_with(self):
+    def test_the_row_carries_the_members_it_ran_with(self):
+        """A member is ONE entry shape in the row, whether or not it declared its
+        own action — the record's `str | {instance, action}` union is a storage
+        detail a reader should not have to branch on."""
+
         targets = ["target/env/core/baseline/instances/env.type=dev",
                    {"instance": "target/env/ops/app/instances/env.type=dev",
                     "action": "destroy"}]
         self.ns.workflow_run(WORKFLOW, run_id="w1", targets=targets,
                              default_action="provision")
-        row = self.ns.rows()["workflow"][WORKFLOW]["last_run"]
-        self.assertEqual(targets, row["target_instances"])
+        row = self.ns.rows()["workflow"][WORKFLOW]["mutative"]
+        self.assertEqual(
+            ["target/env/core/baseline/instances/env.type=dev",
+             "target/env/ops/app/instances/env.type=dev"],
+            [member["address"] for member in row["members"]],
+        )
+        self.assertEqual("destroy", row["members"][1]["action"])
+        self.assertNotIn("action", row["members"][0])
         self.assertEqual("provision", row["default_action"])
 
     def test_the_record_carries_the_selectors_that_matched(self):
@@ -232,19 +242,19 @@ class WorkflowHistoryTest(unittest.TestCase):
             WORKFLOW, run_id="w1",
             selectors={"match": {"execution_context.params.intent": "rebuild"}},
         )
-        row = self.ns.rows()["workflow"][WORKFLOW]["last_run"]
+        row = self.ns.rows()["workflow"][WORKFLOW]["mutative"]
         self.assertEqual(
             {"match": {"execution_context.params.intent": "rebuild"}}, row["selectors"]
         )
 
     def test_a_member_matched_without_selectors_omits_the_field(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1")
-        self.assertNotIn("selectors", self.ns.rows()["workflow"][WORKFLOW]["last_run"])
+        self.assertNotIn("selectors", self.ns.rows()["workflow"][WORKFLOW]["mutative"])
 
     def test_a_workflow_carries_no_freshness(self):
         """It owns no state, so nothing about it can go stale."""
         self.ns.workflow_run(WORKFLOW, run_id="w1")
-        self.assertNotIn("freshness", self.ns.rows()["workflow"][WORKFLOW]["last_run"])
+        self.assertNotIn("freshness", self.ns.rows()["workflow"][WORKFLOW]["mutative"])
 
     def test_a_member_going_stale_does_not_touch_the_workflow_row(self):
         self.ns.publish("target", TARGET, TSEG, run_id="r1")
@@ -319,8 +329,9 @@ class NamespaceCountsTest(unittest.TestCase):
         self.ns.workflow_run(WORKFLOW, run_id="w1")
         counts = self.ns.counts()
         self.assertEqual(5, counts["passed"], "3 deployments + 1 plan + 1 workflow run")
-        self.assertEqual(3, counts["up_to_date"],
-                         "only completed deployments carry freshness")
+        self.assertEqual(4, counts["up_to_date"],
+                         "3 deployments + the plan: a plan describes what would "
+                         "happen given one cfg, so it goes stale when that changes")
 
 
 if __name__ == "__main__":
@@ -416,14 +427,15 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
 
     def _record(self, runs: dict, cfg: dict) -> dict:
         state_lifecycle.record_workflow_members(self.run_dir, runs, cfg)
-        return self.ns.rows()["workflow"][WORKFLOW]["last_run"]
+        return self.ns.rows()["workflow"][WORKFLOW]["mutative"]
 
     def test_a_member_taking_the_default_is_a_bare_instance(self):
         row = self._record(
             {"a": {"target": TARGET, "action": "provision"}},
             {"default_action": "provision"},
         )
-        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"], row["target_instances"])
+        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"],
+                         [m["address"] for m in row["members"]])
         self.assertEqual("provision", row["default_action"])
 
     def test_a_member_that_differs_carries_its_action(self):
@@ -434,9 +446,10 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         )
         self.assertEqual(
             [f"target/{TARGET}/instances/env.type=dev",
-             {"instance": f"target/{OTHER}/instances/env.type=dev", "action": "destroy"}],
-            row["target_instances"],
+             f"target/{OTHER}/instances/env.type=dev"],
+            [member["address"] for member in row["members"]],
         )
+        self.assertEqual("destroy", row["members"][1]["action"])
 
     def test_a_member_varying_over_fewer_axes_keeps_its_shorter_address(self):
         """The reason keys are not enough: a workflow's params are the UNION of
@@ -456,7 +469,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         self.assertEqual(
             [f"target/{TARGET}/instances/env.type=dev/aws.account=dev",
              f"target/{OTHER}/instances/aws.account=dev"],
-            row["target_instances"],
+            [member["address"] for member in row["members"]],
         )
 
     def test_a_singleton_member_records_its_bare_key(self):
@@ -470,7 +483,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
             {"a": {"target": TARGET, "action": "provision"}},
             {"default_action": "provision"},
         )
-        self.assertEqual([f"target/{TARGET}"], row["target_instances"])
+        self.assertEqual([f"target/{TARGET}"], [m["address"] for m in row["members"]])
 
     def test_the_matched_selectors_are_recorded_verbatim(self):
         selectors = {"match": {"execution_context.params.intent": "rebuild"}}
@@ -499,8 +512,8 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
             kernel_yaml_io.write_yaml_file(root / "workflows" / "w.yaml", {"workflows": {
                 "env/x": {
                     "operations": ["destroy"],
-                    "target_keys": {"members": [{
-                        "target_keys": ["env/a"],
+                    "targets": {"members": [{
+                        "keys": ["targets.env/a"],
                         "default_action": "destroy",
                         "selectors": {"match": {
                             "execution_context.ctl.operation": "destroy"}},
@@ -533,6 +546,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
                                             "provision"}}},
         )
         self.assertEqual("running", row["status"])
-        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"], row["target_instances"])
+        self.assertEqual([f"target/{TARGET}/instances/env.type=dev"],
+                         [m["address"] for m in row["members"]])
         self.assertEqual("provision", row["default_action"])
         self.assertIn("selectors", row)

@@ -6,9 +6,8 @@ review. Deliberately not derived from `fan_out_param_sets`: those declare what i
 DEPLOYED together, which is a different question from what must be GUARDED.
 
 The second test class is the drift guard in the other direction — a baseline that
-exists but is no longer declared would never be regenerated and would go stale
-without anything noticing. That is exactly how the pre-Phase-65 `iam_role_accounts`
-baselines survived.
+exists without a declaration behind it would never be regenerated and would go
+stale without anything noticing.
 """
 
 

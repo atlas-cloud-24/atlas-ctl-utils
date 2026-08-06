@@ -143,14 +143,21 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 # appears only when a run failed after a success makes the common row harder to
 # scan, and two timestamps invite misreading which is which. They remain on the
 # detailed row, where a reader is already investigating.
-AXIS_ORDER = ("status", "last_action", "freshness", "at",
+# Outcome first (`last_action` qualifies `status`, so it stays adjacent), then
+# which alternative is in effect, then whether it still matches its cfg, then
+# when. `standing`/`superseded_by` sit AHEAD of `freshness` because a superseded
+# row's freshness describes it against its OWN cfg, which reads as reassuring
+# until you know it is not the one deployed.
+AXIS_ORDER = ("status", "last_action", "standing", "superseded_by", "freshness", "at",
               "parent_workflow", "parent_workflow_run_id")
 
 
 def order_axes(axes: dict[str, str]) -> dict[str, str]:
-    """
+    """One canonical order for every emitted group.
 
-    one canonical order for every emitted group: status, freshness, at."""
+    This also FILTERS: an axis absent from `AXIS_ORDER` is dropped, so a new one
+    reaches a row only by being named here.
+    """
 
     return {k: axes[k] for k in AXIS_ORDER if k in axes}
 
@@ -162,9 +169,11 @@ def _axis_row(computed: dict) -> dict[str, str]:
     empty and its group is omitted. Freshness alone is not a fact about a run.
     """
 
+    # One field order for every row: outcome first, then which alternative is in
+    # effect, then whether it still matches its cfg, then when.
     row = {
         axis: computed[axis]
-        for axis in ("status", "last_action", "freshness")
+        for axis in ("status", "last_action", "standing", "superseded_by", "freshness")
         if computed.get(axis)
     }
     if not row.get("status"):
@@ -265,6 +274,21 @@ def qualified_address(kind: str, address: str) -> str:
     """
 
     return address if address.startswith(f"{kind}/") else f"{kind}/{address}"
+
+
+def unqualified_address(address: str) -> str:
+    """The inverse of `qualified_address` — strip a leading `<kind>/`.
+
+    A row that CARRIES a kind (a workflow's member list is targets) does not
+    repeat it per entry, while a cross-reference a reader pastes back into a
+    query does.
+    """
+
+    for kind in run_actions.RESULT_KINDS:
+        prefix = f"{kind}/"
+        if address.startswith(prefix):
+            return address[len(prefix):]
+    return address
 
 
 def instance_address(key: str, instance_segments: list[str]) -> str:

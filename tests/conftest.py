@@ -1,7 +1,6 @@
 """Test-time path setup, in ONE place.
 
- moved the AWS adapter into its own repository, so it is no longer a
-subpackage of the engine. Its location is DECLARED — `ctl-adapter-aws` is a
+The AWS adapter is its own repository, not a subpackage of the engine. Its location is DECLARED — `ctl-adapter-aws` is a
 tooling ref, and the dev cfg reflection resolves it to a local checkout in
 `local_repos.yaml` — so the tests read that declaration instead of guessing at
 the filesystem.

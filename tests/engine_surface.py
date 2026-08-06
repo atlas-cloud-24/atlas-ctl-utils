@@ -1,8 +1,8 @@
 """The engine's surface, as the tests see it — discovered, never enumerated.
 
 Every helper here walks the package. A test that names modules or files goes
-stale the moment one moves, and it goes stale SILENTLY: a list that no longer
-matches anything still passes every assertion made over it. That is what a
+stale the moment one moves, and it goes stale SILENTLY: a list that matches
+nothing still passes every assertion made over it. That is what a
 by-name list did to the provider boundary, and what a single-file source scan
 did to the checks that read engine source.
 """

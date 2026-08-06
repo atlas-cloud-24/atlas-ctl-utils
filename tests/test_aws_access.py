@@ -76,19 +76,19 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 "provider": "aws",
                 "account": "management",
                 "roles": {"readwrite": "ctl_target", "readonly": "ctl_target"},
-                "agreed_direct_credential_source_keys": ["org_admin"],
+                "allowed_agreed_direct_credential_sources": ["org_admin"],
             },
             "env_deploy": {
                 "provider": "aws",
                 "account": "${execution_context.params.env.type}",
                 "roles": {"readwrite": "ctl_target", "readonly": "ctl_target"},
-                "agreed_direct_credential_source_keys": ["non_prod_deploy"],
+                "allowed_agreed_direct_credential_sources": ["non_prod_deploy"],
             },
             "env_readonly": {
                 "provider": "aws",
                 "account": "${execution_context.params.env.type}",
                 "roles": {"readwrite": "ctl_target", "readonly": "ctl_target"},
-                "agreed_direct_credential_source_keys": ["non_prod_readonly"],
+                "allowed_agreed_direct_credential_sources": ["non_prod_readonly"],
             },
             "env_no_target_role": {
                 "provider": "aws",
@@ -176,7 +176,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_requires_direct_credential_source_key(self):
-        with self.assertRaisesRegex(RuntimeError, "no agreed_direct_credential_source_keys"):
+        with self.assertRaisesRegex(RuntimeError, "no allowed_agreed_direct_credential_sources"):
             aws_adapter.resolve_target_aws_access(
                 {"execution_identities": {"aws": self.executions["env_no_target_role"]}},
                 self.identities,

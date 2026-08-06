@@ -19,6 +19,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 
 from engine.cfg import secrets as cfg_secrets
+from engine.execution import providers as execution_providers
 
 
 def cfg_root(tmp: str, *, secrets: dict, providers: dict | None = None) -> Path:
@@ -103,7 +104,7 @@ class ProviderBackedSecretsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = cfg_root(tmp, secrets={"k": {"provider": "somecloud", "id": "x"}})
             with mock.patch.object(
-                cfg_secrets.execution_providers, "get_provider_adapter",
+                cfg_secrets.execution_adapters, "get_adapter",
                 return_value=object(),
             ):
                 with self.assertRaisesRegex(RuntimeError, "does not implement"):
@@ -125,7 +126,7 @@ class ProviderBackedSecretsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = cfg_root(tmp, secrets={"k": {"provider": "somecloud", "id": "x", "key": "p"}})
             with mock.patch.object(
-                cfg_secrets.execution_providers, "get_provider_adapter",
+                cfg_secrets.execution_adapters, "get_adapter",
                 return_value=Adapter,
             ):
                 value = cfg_secrets.SecretStore(root).resolve("k", label="a source")
@@ -206,7 +207,7 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
         dev = Path(__file__).resolve().parents[3] / "cfg/oxygen/oxygen-ctl-cfg-dev"
         if not dev.is_dir():
             self.skipTest(f"dev cfg reflection not generated: {dev}")
-        cfg_secrets.execution_providers.validate_declared_contracts(dev)
+        execution_providers.validate_declared_contracts(dev)
 
     def test_a_contract_with_no_callable_behind_it_is_refused(self):
         class Adapter:
@@ -219,11 +220,11 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
                 providers={"somecloud": {"implements": ["secrets"]}},
             )
             with mock.patch.object(
-                cfg_secrets.execution_providers, "get_provider_adapter",
+                cfg_secrets.execution_adapters, "get_adapter",
                 return_value=Adapter,
             ):
                 with self.assertRaisesRegex(RuntimeError, "resolve_secret"):
-                    cfg_secrets.execution_providers.validate_declared_contracts(root)
+                    execution_providers.validate_declared_contracts(root)
 
     def test_an_unknown_contract_name_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,7 +234,7 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
                 providers={"somecloud": {"implements": ["teleportation"]}},
             )
             with self.assertRaisesRegex(RuntimeError, "unknown contracts"):
-                cfg_secrets.execution_providers.validate_declared_contracts(root)
+                execution_providers.validate_declared_contracts(root)
 
     def test_an_empty_implements_is_refused(self):
         """There is no default: a provider that implements nothing is a typo."""
@@ -244,4 +245,4 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
                 providers={"somecloud": {"implements": []}},
             )
             with self.assertRaisesRegex(RuntimeError, "non-empty `implements`"):
-                cfg_secrets.execution_providers.validate_declared_contracts(root)
+                execution_providers.validate_declared_contracts(root)

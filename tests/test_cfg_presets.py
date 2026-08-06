@@ -300,17 +300,10 @@ class SelfContainmentTest(PresetTestCase):
     def test_reaching_into_an_undefined_name_is_an_error(self):
         """A6: a name the preset defines nothing under is not ownership.
 
- narrowed what this can catch, and the replaced assertion is
-        worth stating. It used to be that sharing a TOP-LEVEL namespace was not
-        ownership: a preset defining `shared.mine` could not reference
-        `shared.theirs`. That rule existed because every helper was wrapped in one
-        `_common` root, so a top-level name was a namespace several unrelated
-        units happened to share and owning one key under it proved nothing.
-
-        With the wrapper gone a top-level key IS a collection, and members filled
-        by different layers is the co-definition case immediately below — the same
-        shape the old rule would now reject. So the check is what it always
-        should have been: you must define SOMETHING under the name you reference.
+        The rule is exactly that — you must define SOMETHING under the name you
+        reference — and no stronger. A top-level key IS a collection, so members
+        filled by different layers is the co-definition case immediately below,
+        and requiring sole ownership of a top-level namespace would reject it.
         """
         write(self.root / "base" / "a.yaml", "mine:\n  x: 1\n")
         write(self.root / "base" / "b.yaml", "value: ${theirs.y}\n")

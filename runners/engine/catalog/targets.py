@@ -8,7 +8,9 @@ import collections
 
 from pathlib import Path
 
+from engine.cfg import references as cfg_references
 from engine.cfg import resources as cfg_resources
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
@@ -20,7 +22,7 @@ TARGET_EXECUTION_IDENTITY_FIELDS = frozenset(
     {
         "account",
         "roles",
-        "agreed_direct_credential_source_keys",
+        "allowed_agreed_direct_credential_sources",
         "allowed_accounts",
     }
 )
@@ -72,6 +74,10 @@ def validate_distinct_target_signatures(definitions: dict) -> None:
             frozen(definition.get("input_params")),
             frozen(definition.get("input_param_sets")),
             frozen(definition.get("target_instance_params")),
+            # The overlays a target requires are part of its INPUT: two targets
+            # over one procedure that render different cfg are alternatives, not
+            # a duplicate. That is exactly what a mode group declares.
+            frozen(definition.get("required_plt_overlay_keys")),
         )
 
     seen: dict[tuple, str] = {}
@@ -86,8 +92,9 @@ def validate_distinct_target_signatures(definitions: dict) -> None:
             raise RuntimeError(
                 f"❌ targets {first!r} and {key!r} declare the same input signature "
                 "(source, ref, procedure, domains, cfg keys, input params, instance "
-                "params). They would run identical work against identical resources "
-                "under two committed pointers; declare one target, or make them differ"
+                "params, required overlays). They would run identical work against "
+                "identical resources under two committed pointers; declare one "
+                "target, or make them differ"
             )
         seen[sig] = key
 
@@ -112,6 +119,61 @@ def validate_target_execution_identities(entries: object, *, label: str) -> dict
         resolved[provider] = validate_target_execution_identity(
             execution, label=f"{label} [{provider}]"
         )
+    return resolved
+
+
+# What a target's fields REFERENCE. Declared here because a target's vocabulary
+# is this module's to own: nothing more general knows that `source_key` names a
+# `target_sources` entry while `input_param_sets` names a `param_sets` one.
+# `execution_identities` is absent by design — the engine reads its shape and
+# treats every value inside as opaque, so its references are the ADAPTER's.
+TARGET_REFERENCE_FIELDS = {
+    "source_key": "target_sources",
+    "domains": "domains",
+    "input_param_sets": "param_sets",
+    "providers": "ctl_providers",
+}
+
+
+def load_target_catalog(ctl_cfg_root: Path) -> dict:
+    """Every declared target, with its cross-references resolved to bare keys.
+
+    Resolution happens at the LOAD point rather than at each read, so a qualified
+    value never reaches a reader that did not ask for one.
+    """
+
+    targets = cfg_resources.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+    resolved: dict = {}
+    for name, entry in targets.items():
+        if not isinstance(entry, dict):
+            resolved[name] = entry
+            continue
+        body = cfg_references.resolve_fields(
+            entry, TARGET_REFERENCE_FIELDS, label=f"target {name!r}"
+        )
+        identities = body.get("execution_identities")
+        if isinstance(identities, dict):
+            # Everything inside is the provider's vocabulary, so the ADAPTER
+            # resolves it — engine core never names those collections.
+            body["execution_identities"] = {
+                provider: (
+                    execution_adapters.get_adapter(
+                        provider, ctl_cfg_root
+                    ).resolve_execution_identity_references(
+                        identity, provider=provider, label=f"target {name!r} [{provider}]")
+                    if isinstance(identity, dict) else identity
+                )
+                for provider, identity in identities.items()
+            }
+        if isinstance(body.get("cfg_key_sets"), dict):
+            # The mapping KEY is a domain and stays an index; only the sets it
+            # points at are references.
+            body["cfg_key_sets"] = {
+                domain: cfg_references.resolve_each(
+                    sets, "cfg_key_sets", label=f"target {name!r} cfg_key_sets.{domain}")
+                for domain, sets in body["cfg_key_sets"].items()
+            }
+        resolved[name] = body
     return resolved
 
 
@@ -149,7 +211,7 @@ def validate_target_execution_identity(execution: object, *, label: str) -> dict
                 f"❌ {label} execution.roles.{role_class} must be a non-empty string"
             )
 
-    for field in ("agreed_direct_credential_source_keys", "allowed_accounts"):
+    for field in ("allowed_agreed_direct_credential_sources", "allowed_accounts"):
         if field not in execution:
             continue
         values = execution.get(field)
@@ -166,11 +228,9 @@ def validate_target_execution_identity(execution: object, *, label: str) -> dict
 def target_consent_opt_in_fields(ctl_cfg_root=None) -> set[str]:
     """Every per-target opt-in field any declared adapter asks for."""
 
-    from engine.execution.adapters import get_adapter, registered_providers
-
     fields: set[str] = set()
-    for provider in registered_providers(ctl_cfg_root):
-        adapter = get_adapter(provider, ctl_cfg_root)
+    for provider in execution_adapters.registered_providers(ctl_cfg_root):
+        adapter = execution_adapters.get_adapter(provider, ctl_cfg_root)
         for mode in adapter.supported_execution_access_modes():
             consent = adapter.target_consent(mode)
             if consent:
@@ -499,7 +559,7 @@ def validate_target_execution_identity_coverage(
 
     modes = execution_access_modes or {}
     if modes and not any(
-        execution_providers.get_provider_adapter(provider).resolves_execution_identity(mode)
+        execution_adapters.get_adapter(provider).resolves_execution_identity(mode)
         for provider, mode in modes.items()
     ):
         return
@@ -587,7 +647,7 @@ def load_action_cfg(
     # Targets are declared ONCE (no action level); each declares a
     # REQUIRED `actions:` allowlist (default-closed) and the action for a run
     # is the subset allowing this action.
-    all_targets = cfg_resources.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
+    all_targets = load_target_catalog(ctl_cfg_root)
     targets = {}
     # A workflow member may declare its own action, so the action
     # admits a target that allows the INVOKED action or any action a member asked
@@ -973,6 +1033,67 @@ def normalize_target_entries(
             )
         seen.add((key, action))
         entries.append((key, action))
+    return entries
+
+
+def normalize_insert_entries(
+    values: list, *, label: str, default_action: str | None = None
+) -> list[tuple[str, str, tuple[str, str, str]]]:
+    """A placed entry: a key, its action, and the ANCHOR saying where it goes.
+
+        - key: env/ops/db_artificial_populator
+          after:
+            workflow: env/baseline
+            key: env/ops/dbs
+
+    An anchor addresses a sequence this workflow did not author, so it names the
+    import it points into: with two imports a bare key would not say which one.
+    Qualified, it reads as "in `env/baseline`, after `env/ops/dbs`".
+
+    `after` and `before` are mutually exclusive — `before` exists because `after`
+    alone cannot express insertion at the head of a sequence.
+
+    Returns `(key, action, (position, anchor_workflow, anchor_key))`.
+    """
+
+    if not isinstance(values, list):
+        raise RuntimeError(f"❌ {label} must be a list")
+    entries: list[tuple[str, str, tuple[str, str, str]]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"❌ {label} entry {value!r} declares no anchor; every entry here "
+                "states `after:` or `before:`"
+            )
+        unknown = sorted(set(value) - {"key", "action", "after", "before"})
+        if unknown:
+            raise RuntimeError(
+                f"❌ {label} entry has unsupported keys {unknown}; a placed entry is "
+                "a key, an optional action, and one anchor"
+            )
+        key = run_actions.normalize_result_name(value.get("key"), label=label)
+        positions = [name for name in ("after", "before") if name in value]
+        if len(positions) != 1:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} declares {positions or 'no anchor'}; state "
+                "exactly one of `after:` or `before:`"
+            )
+        position = positions[0]
+        anchor = value[position]
+        if not isinstance(anchor, dict) or sorted(anchor) != ["key", "workflow"]:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} anchor must be "
+                "{workflow: <imported workflow>, key: <target key>}"
+            )
+        anchor_workflow = run_actions.normalize_result_name(anchor["workflow"], label=label)
+        anchor_key = run_actions.normalize_result_name(anchor["key"], label=label)
+        action = value.get("action") or default_action
+        if action is None:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} has no action, so it is not runnable. "
+                "Declare `default_action:` for the list, or `action:` beneath the key"
+            )
+        entries.append((key, action, (position, anchor_workflow, anchor_key)))
     return entries
 
 

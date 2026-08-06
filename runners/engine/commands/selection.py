@@ -55,8 +55,6 @@ def validate_target_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ target runner requires --target")
     if getattr(args, "workflow", None):
         raise RuntimeError("❌ target runner does not accept --workflow")
-    if getattr(args, "ctl_variants", None):
-        raise RuntimeError("❌ --ctl-variants is not supported for target runs")
     if any(getattr(args, field, None) for field in ("source", "ref", "domain", "procedure", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
         raise RuntimeError("❌ target runner does not accept procedure synthetic target args")
 
@@ -66,8 +64,6 @@ def validate_maintenance_args(args: argparse.Namespace) -> None:
 
     validate args for one explicit maintenance operation."""
 
-    if getattr(args, "ctl_variants", None):
-        raise RuntimeError("❌ --ctl-variants is not supported for maintenance")
     if any(
         getattr(args, field, None)
         for field in (
@@ -153,8 +149,6 @@ def validate_procedure_args(args: argparse.Namespace) -> None:
 
     if getattr(args, "workflow", None) or getattr(args, "target", None):
         raise RuntimeError("❌ procedure runner does not accept --workflow or --target")
-    if getattr(args, "ctl_variants", None):
-        raise RuntimeError("❌ --ctl-variants is not supported for procedure runs")
     missing = [f for f in ("source", "ref", "domain", "procedure") if not getattr(args, f, None)]
     if missing:
         raise RuntimeError(
@@ -404,7 +398,6 @@ def prepare_pipeline_cfg(
     action_cfg: dict,
     artifacts_dir: Path,
     ctl_profile: str,
-    plt_overlays: list[str],
     scope_params: dict[str, str] | None = None,
     execution_context: dict[str, object] | None = None,
     target_repo_key: str = "repo_url",
@@ -415,8 +408,8 @@ def prepare_pipeline_cfg(
 ) -> tuple[dict, Path, list[str]]:
     """Build active target_runs, resolve per-target overlays, and write pipeline_run_cfg.
 
-    this no longer merges anything. Each target derives its own cfg
-    (`prepare_target_cfg_view`), so there is no run-wide merged tree to build here.
+    Each target derives its own cfg (`prepare_target_cfg_view`), so there is no
+    run-wide merged tree to build here.
 
     Returns:
         tuple: (active_target_runs, pipeline_run_cfg_path, final_plt_overlays)
@@ -433,20 +426,19 @@ def prepare_pipeline_cfg(
             require_commit_refs=require_commit_refs,
         )
 
-    # Overlays are a PER-TARGET declaration, so each target_run gets
-    # exactly the overlays it asked for plus the run's explicit ones. The former
-    # run-wide union meant a target that never declared an overlay still had its cfg
-    # merged with it — `requires_plt_overlays` now means what it says.
+    # Overlays are a PER-TARGET declaration and nothing else — a run carries no
+    # explicit list, so a target's cfg is merged with exactly the overlays it
+    # asked for. The run-wide total is recorded for provenance only.
     final_plt_overlays = cfg_overlays.resolve_run_plt_overlays(
         plt_cfg_root,
-        plt_overlays,
+        [],
         active_target_runs,
         execution_context=execution_context or {},
     )
     for target_run in active_target_runs.values():
         target_run["plt_overlays"] = cfg_overlays.resolve_target_plt_overlays(
             plt_cfg_root,
-            plt_overlays,
+            [],
             target_run,
             execution_context=execution_context or {},
         )
@@ -519,7 +511,6 @@ def resolve_run_locator_segments(
     execution_runtime_mode: str,
     workflow_name: str | None = None,
     target_name: str | None = None,
-    ctl_variants: list[str] | tuple[str, ...] = (),
     providers: list[str] | tuple[str, ...] = (),
 ) -> list[str]:
     """Resolve a run's local ctl-state locator BEFORE its dirs exist.
@@ -563,7 +554,6 @@ def resolve_run_instance_identity(
     execution_runtime_mode: str,
     workflow_name: str | None = None,
     target_name: str | None = None,
-    ctl_variants: list[str] | tuple[str, ...] = (),
     providers: list[str] | tuple[str, ...] = (),
 ) -> dict | None:
     """Resolve a run's target-instance identity BEFORE its dirs exist.
@@ -616,15 +606,6 @@ def resolve_run_instance_identity(
             },
         }
     workflow_cfg = catalog_workflow.load_workflow_cfg(ctl_cfg_root, ctl_profile, action, workflow_name, execution_context)
-    workflow_cfg = catalog_workflow.apply_ctl_variants_to_workflow_cfg(
-        ctl_cfg_root,
-        workflow_cfg,
-        action_cfg,
-        execution_context=execution_context,
-        action=action,
-        workflow_name=workflow_name,
-        ctl_variants=list(ctl_variants),
-    )
     addresses: list[str] = []
     member_actions: list = []
     for entry in workflow_cfg.get("target_runs", []):
@@ -671,7 +652,6 @@ def resolve_pipeline_selection(
     action: str,
     workflow_name: str | None,
     *,
-    ctl_variants: list[str],
     target_repo_key: str,
     require_target_ref: bool,
     execution_runtime_mode: str,
@@ -763,15 +743,6 @@ def resolve_pipeline_selection(
             ctl_cfg_root, action, execution_context,
             member_actions=catalog_workflow.workflow_member_actions(workflow_cfg),
         )
-        workflow_cfg = catalog_workflow.apply_ctl_variants_to_workflow_cfg(
-            ctl_cfg_root,
-            workflow_cfg,
-            action_cfg,
-            execution_context=execution_context,
-            action=action,
-            workflow_name=workflow_name,
-            ctl_variants=ctl_variants,
-        )
         selection_kind = "workflow"
         selection_key = workflow_name
 
@@ -841,7 +812,6 @@ def resolve_and_preflight_execution_identities(
     action: str,
     workflow_name: str | None,
     *,
-    ctl_variants: list[str],
     target_repo_key: str,
     require_target_ref: bool,
     provider_implementation_key: str,
@@ -871,7 +841,6 @@ def resolve_and_preflight_execution_identities(
         ctl_ref_policy,
         action,
         workflow_name,
-        ctl_variants=ctl_variants,
         target_repo_key=target_repo_key,
         require_target_ref=require_target_ref,
         execution_runtime_mode=execution_runtime_mode,

@@ -22,10 +22,10 @@ from engine.catalog import targets as catalog_targets
 from engine.cfg import materialize as cfg_materialize
 
 BASE = {
-    "source_key": "seed",
+    "source_key": "target_sources.seed",
     "ref_key": "env/live",
     "procedure_key": "baseline",
-    "domains": ["env"],
+    "domains": ["domains.env"],
     "input_params": ["env.type"],
     "target_instance_params": ["env.type", "aws.account"],
 }
@@ -55,7 +55,7 @@ class DistinctTargetSignatureTest(unittest.TestCase):
 
     def test_an_incomplete_declaration_is_left_to_its_own_validator(self):
         catalog_targets.validate_distinct_target_signatures(
-            {"env/a": {"source_key": "seed"}, "env/b": {"source_key": "seed"}}
+            {"env/a": {"source_key": "target_sources.seed"}, "env/b": {"source_key": "target_sources.seed"}}
         )
 
     def test_the_real_ctl_cfg_has_no_duplicates(self):
@@ -80,7 +80,7 @@ class StepPathMatchesActionTest(unittest.TestCase):
         (adapter / "steps/provision/infra/src").mkdir(parents=True)
         for action in ("destroy", "provision"):
             (adapter / f"steps/{action}/infra/step.yaml").write_text(
-                "id: provision/infra\nproviders: [aws]\nruntime:\n  image: infra\n"
+                "id: provision/infra\nproviders: [ctl_providers.aws]\nruntime:\n  image: infra\n"
             )
         (adapter / "manifest.yaml").write_text(
             textwrap.dedent(f"""

@@ -93,6 +93,12 @@ class ActionFacts:
     mutating: bool = False
     direction: Direction | None = None
     previews: Action | None = None
+    # Whether a committed record of this action can be made stale by later
+    # change. Declared rather than inferred from `direction`: a PLAN mutates
+    # nothing and has no direction, yet it describes what WOULD happen given one
+    # cfg, so a cfg change makes it wrong — the most dangerous kind of stale,
+    # because a plan is read in order to be trusted.
+    outdatable: bool = False
 
 
 # THE action registry: one row per action, and the only place any of this is
@@ -101,8 +107,12 @@ class ActionFacts:
 # map, a group->actions inverse, a group->representative inverse and three
 # literal argparse lists, each free to drift from the others.
 ACTIONS: dict[Action, ActionFacts] = {
-    Action.PROVISION: ActionFacts(Group.MUTATIVE, mutating=True, direction=Direction.FORWARD),
-    Action.PLAN: ActionFacts(Group.PLAN, previews=Action.PROVISION),
+    Action.PROVISION: ActionFacts(
+        Group.MUTATIVE, mutating=True, direction=Direction.FORWARD, outdatable=True
+    ),
+    Action.PLAN: ActionFacts(Group.PLAN, previews=Action.PROVISION, outdatable=True),
+    # A destroy record describes an instance that is GONE, and nothing can make
+    # that answer stale.
     Action.DESTROY: ActionFacts(Group.MUTATIVE, mutating=True, direction=Direction.REVERSE),
     Action.READONLY: ActionFacts(Group.READONLY),
     Action.MAINTENANCE: ActionFacts(Group.MAINTENANCE),
@@ -130,9 +140,6 @@ STATUS_GROUPS: dict[Group, tuple[Action, ...]] = {
     for group in RESULT_GROUPS
 }
 
-# Kinds that publish history rather than grouped state.
-GROUPLESS_KINDS = frozenset({ResultKind.WORKFLOW})
-
 # "What is the strongest thing this workflow does". A composition that provisions
 # one target and plans another IS a mutation — the plan does not soften it — so
 # mutative wins over everything, and readonly is the weakest claim.
@@ -142,7 +149,7 @@ GROUP_PRECEDENCE = (Group.MUTATIVE, Group.MAINTENANCE, Group.PLAN, Group.READONL
 def action_previewed_by(action: str) -> str:
     """The action whose declarations a preview resolves against.
 
-    `plan` previews `provision`, so a plan run reads the provision variants rather
+    `plan` previews `provision`, so a plan run reads the provision entries rather
     than a separate plan block. An action that previews nothing answers itself.
     """
 
@@ -173,12 +180,13 @@ def group_representative_action(group: str) -> str:
 def action_can_go_stale(action: str) -> bool:
     """Whether a committed record of this action can be outdated by later change.
 
-    Only the forward side of a mutating pair: a destroy record describes an
-    instance that is gone, and nothing can make that answer stale.
+    Read from the action registry rather than derived from `direction`. Deriving
+    it silently excluded PLAN — which has no direction because it mutates
+    nothing, yet goes stale the moment the cfg it previewed changes.
     """
 
     facts = ACTIONS.get(action)
-    return bool(facts and facts.direction == Direction.FORWARD)
+    return bool(facts and facts.outdatable)
 
 
 def action_group(action: str) -> str:

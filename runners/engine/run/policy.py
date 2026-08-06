@@ -7,7 +7,7 @@ choice, a guard has become a router and stops guarding."""
 from dataclasses import dataclass
 from pathlib import Path
 
-from engine.execution import providers as execution_providers
+from engine.execution import adapters as execution_adapters
 from engine.execution import references as execution_references
 from engine.kernel import yaml_io as kernel_yaml_io
 
@@ -85,9 +85,9 @@ class Permission:
     A permission answers "is this allowed?" and never "which one is this?" — it
     is a guard, and a guard used to select something has stopped guarding.
 
-    Adding a permission is one row in `Permissions`. It used to be a bool
-    accessor, a validator, a refusal message and an argparse flag written out
-    separately, which is four places for one grant to drift: the message quoted
+    Adding a permission is one row in `Permissions`, rather than a bool accessor,
+    a validator, a refusal message and an argparse flag written out separately —
+    four places for one grant to drift: the message quoted
     the cfg key by hand, so a renamed key left the refusal naming a field that no
     longer existed.
     """
@@ -211,7 +211,6 @@ def ctl_allowed_providers(ctl_cfg_root: Path, ctl_profile: str) -> list[str]:
     vocabulary; everything inside a provider's block is not.
     """
 
-    from engine.execution.adapters import registered_providers
 
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     raw = policy.get("allowed_providers")
@@ -220,7 +219,7 @@ def ctl_allowed_providers(ctl_cfg_root: Path, ctl_profile: str) -> list[str]:
             f"❌ ctl profile {ctl_profile!r} must declare allowed_providers as a "
             "non-empty list of provider names"
         )
-    declared = registered_providers(ctl_cfg_root)
+    declared = execution_adapters.registered_providers(ctl_cfg_root)
     unknown = sorted(set(raw) - set(declared))
     if unknown:
         raise RuntimeError(
@@ -268,7 +267,7 @@ def validate_cadence_supported(provider: str, mode: str) -> None:
     provider that refreshes differently meant editing the engine.
     """
 
-    supported = execution_providers.get_provider_adapter(provider).supported_credential_refresh_modes()
+    supported = execution_adapters.get_adapter(provider).supported_credential_refresh_modes()
     if mode not in supported:
         raise RuntimeError(
             f"❌ --credential-refresh-mode {provider}={mode} is not supported by "
@@ -382,7 +381,7 @@ def validate_cadence_against_access_mode(
         access = (access_modes or {}).get(provider)
         if not access:
             continue
-        usable = execution_providers.get_provider_adapter(provider).credential_refresh_mode_access_modes(
+        usable = execution_adapters.get_adapter(provider).credential_refresh_mode_access_modes(
             mode
         )
         if usable and access not in usable:
@@ -454,7 +453,7 @@ def validate_execution_access(
             if provider not in (execution_access_modes or {}):
                 continue  # provider coverage is validated separately
             mode = execution_access_modes[str(provider)]
-            consent = execution_providers.get_provider_adapter(str(provider)).target_consent(mode)
+            consent = execution_adapters.get_adapter(str(provider)).target_consent(mode)
             if not consent:
                 continue
             opt_in_field = consent["opt_in_field"]
@@ -554,7 +553,7 @@ def validate_target_policy_constraints(
 def validate_target_policy_constraints_for_target(
     ctl_cfg_root: Path, ctl_profile: str, target_key: str
 ) -> None:
-    """Per-target variant of validate_target_policy_constraints — one target's
+    """The per-target form of validate_target_policy_constraints — one target's
     ref-policy requirement, so the ctl-policy report can attribute it per target."""
     selected_ref_policy = ctl_ref_policy(ctl_cfg_root, ctl_profile)
     for constraint in load_target_policy_constraints(ctl_cfg_root):

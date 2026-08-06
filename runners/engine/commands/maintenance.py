@@ -23,6 +23,7 @@ from engine.cfg import tooling as cfg_tooling
 from engine.cfg import validate as cfg_validate
 from engine.cfg import views as cfg_views
 from engine.commands import selection as commands_selection
+from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
@@ -61,7 +62,7 @@ def inspect_selected_graph_ctl_state_backend(
     namespace_key, entry = state_sync.CtlStateBackends.resolve_namespace(
         ctl_cfg_root, selection["execution_context"]
     )
-    adapter = execution_providers.get_provider_adapter(entry["provider"])
+    adapter = execution_adapters.get_adapter(entry["provider"])
     adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
     bucket_name = str(
         execution_references.resolve_runtime_scalar(
@@ -528,7 +529,6 @@ def run_maintenance(
     target_key: str,
     lock_id: str,
     run_id: str,
-    plt_overlays: list[str],
     target_repo_key: str,
     require_target_ref: bool,
     use_local_tooling_cfg: bool,
@@ -681,7 +681,6 @@ def run_maintenance(
         action_cfg,
         artifacts_dir,
         ctl_profile,
-        plt_overlays,
         scope_params=scope_params,
         execution_context=execution_context,
         target_repo_key=target_repo_key,

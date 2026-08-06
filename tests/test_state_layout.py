@@ -310,7 +310,7 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
     WORKFLOWS = {
         "env/baseline": {
             "default_action": "provision",
-            "target_keys": [
+            "targets": [
                 "env/core/baseline",
                 {"key": "env/ops/app", "action": "destroy"},
             ],
@@ -330,7 +330,7 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
             {
                 "env/seed": {
                     "default_action": "provision",
-                    "target_keys": [
+                    "targets": [
                         {"key": "env/seed/baseline", "action": "destroy"},
                         {"key": "env/seed/baseline", "action": "provision"},
                     ],
@@ -344,7 +344,7 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "duplicate target entry"):
             catalog_workflow.expand_workflow_imports(
                 {"w": {"default_action": "provision",
-                       "target_keys": ["a/b", {"key": "a/b"}]}},
+                       "targets": ["a/b", {"key": "a/b"}]}},
                 "w",
             )
 
@@ -410,7 +410,7 @@ class DispatchGuardTest(unittest.TestCase):
     instance path."""
 
     def _members(self, ref, value="provision"):
-        return [{"target_keys": ["a/b"], "selectors": {"match": {ref: value}}}]
+        return [{"keys": ["a/b"], "selectors": {"match": {ref: value}}}]
 
     def test_dispatching_on_the_operation_is_allowed(self):
         self.assertEqual(
@@ -548,25 +548,25 @@ class ActionMustBeDeclaredTest(unittest.TestCase):
             catalog_workflow.validate_workflow_actions_declared(workflows)
 
     def test_a_bare_list_with_no_default_is_refused(self):
-        self._refuses({"w": {"target_keys": ["a/b"]}})
+        self._refuses({"w": {"targets": {"keys": ["a/b"]}}})
 
     def test_a_member_with_no_default_is_refused(self):
-        self._refuses({"w": {"target_keys": {"members": [
-            {"target_keys": ["a/b"], "selectors": {}}]}}})
+        self._refuses({"w": {"targets": {"members": [
+            {"keys": ["a/b"], "selectors": {}}]}}})
 
     def test_a_declared_default_is_accepted(self):
         catalog_workflow.validate_workflow_actions_declared(
-            {"w": {"default_action": "provision", "target_keys": ["a/b"]}}
+            {"w": {"targets": {"default_action": "provision", "keys": ["a/b"]}}}
         )
 
     def test_per_key_actions_without_a_default_are_accepted(self):
         catalog_workflow.validate_workflow_actions_declared(
-            {"w": {"target_keys": [{"key": "a/b", "action": "destroy"}]}}
+            {"w": {"targets": {"keys": [{"key": "a/b", "action": "destroy"}]}}}
         )
 
     def test_one_bare_key_among_declared_ones_is_still_refused(self):
-        self._refuses({"w": {"target_keys": [
-            {"key": "a/b", "action": "destroy"}, "c/d"]}})
+        self._refuses({"w": {"targets": {"keys": [
+            {"key": "a/b", "action": "destroy"}, "c/d"]}}})
 
     def test_the_real_ctl_cfg_declares_an_action_everywhere(self):
         import glob

@@ -290,7 +290,8 @@ class ConstraintGateTests(unittest.TestCase):
         return root
 
     def test_when_any_ors_two_paths_in_one_rule(self):
-        # Previously this needed TWO duplicated rules, because `when` was AND-only.
+        # `when` is AND-only, so an OR across two paths needs `when_any` rather
+        # than two duplicated rules.
         body = ("  - when_any:\n"
                 "      - execution_context.params.account: [prod]\n"
                 "      - execution_context.params.env.type: [prod]\n"

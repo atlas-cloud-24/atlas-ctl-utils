@@ -8,7 +8,6 @@ import collections
 import logging
 import os
 import shutil
-import tempfile
 
 from pathlib import Path
 import yaml
@@ -262,7 +261,7 @@ def merge_plt_cfg_dirs(
     runtime_selectors = scope_params or {}
     composition_files = set(cfg_layout.SCOPE_META_SKIP_FILENAMES)
 
-    def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> None:
+    def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> list[dict]:
         active_scopes = discover_active_cfg_scopes(
             effective_cfg_root,
             scope_params=runtime_selectors,
@@ -304,27 +303,33 @@ def merge_plt_cfg_dirs(
                 skip_filenames=composition_files,
             )
             merged_target_paths.add(target_path)
+        return active_scopes
 
+    effective_source_log_roots = source_log_roots or (plt_cfg_root.resolve(),)
+    active_scopes = merge_scopes(plt_cfg_root, effective_source_log_roots)
+
+    # An overlay merges LAST, over the composed result, so "switched on" means
+    # applied. Merged into the SOURCE tree instead, its precedence would depend on
+    # which preset directory it mirrors — `_common/all` is overridden by
+    # `_common/non_prod` and then by the env — so an overlay could switch on and
+    # silently lose to a narrower declaration.
+    #
+    # Last means last BEFORE render: an overlay's values interpolate like any
+    # other cfg, and `alarms_disabled` sets `alarms_cfg: ${alarms_disabled_empty_map}`.
     if selected_overlays:
-        with tempfile.TemporaryDirectory(prefix="atlas-plt-cfg-") as tmp_dir:
-            effective_cfg_root = Path(tmp_dir) / "source"
-            cfg_overlays.copy_cfg_root_without_overlay_catalog(plt_cfg_root, effective_cfg_root)
-            if execution_context is None:
-                raise RuntimeError("❌ plt overlays require the execution context for selector gating")
-            cfg_overlays.apply_selected_overlays_to_cfg_root(
-                plt_cfg_root,
-                effective_cfg_root,
-                selected_overlays,
-                execution_context=execution_context,
-            )
-            effective_source_log_roots = source_log_roots or (
-                effective_cfg_root.resolve(),
-                plt_cfg_root.resolve(),
-            )
-            merge_scopes(effective_cfg_root, effective_source_log_roots)
-    else:
-        effective_source_log_roots = source_log_roots or (plt_cfg_root.resolve(),)
-        merge_scopes(plt_cfg_root, effective_source_log_roots)
+        if execution_context is None:
+            raise RuntimeError("❌ plt overlays require the execution context for selector gating")
+        cfg_overlays.apply_selected_overlays_to_merged_cfg(
+            plt_cfg_root,
+            plt_merged_dir,
+            selected_overlays,
+            active_scopes=active_scopes,
+            execution_context=execution_context,
+            merged_files=merged_files,
+            source_log_roots=effective_source_log_roots,
+            dest_log_roots=dest_log_roots,
+            skip_filenames=composition_files,
+        )
 
     return merged_files
 

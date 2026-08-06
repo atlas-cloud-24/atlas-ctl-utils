@@ -204,12 +204,12 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
             "targets:\n"
             "  lz/tfstate_backend:\n"
             "    actions: [provision]\n"
-            "    source_key: bootstrap\n"
+            "    source_key: target_sources.bootstrap\n"
             "    ref_key: state_backend\n"
             "    procedure_key: tfstate_backend\n"
-            "    domains: [\"${execution_context.params.domain}\"]\n"
+            "    domains: [\"domains.${execution_context.params.domain}\"]\n"
             "    cfg_key_sets:\n"
-            "      \"${execution_context.params.domain}\": [tfstate_backend_key_set]\n"
+            "      \"${execution_context.params.domain}\": [cfg_key_sets.tfstate_backend_key_set]\n"
         ))
         # loading an action validates each target's execution identity, which
         # dispatches to the adapter of a provider this root has to declare
@@ -268,10 +268,10 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "targets:\n"
                 "  t:\n"
                 "    actions: [provision]\n"
-                "    source_key: bootstrap\n"
+                "    source_key: target_sources.bootstrap\n"
                 "    ref_key: r\n"
                 "    procedure_key: s\n"
-                "    domains: [env]\n"
+                "    domains: [domains.env]\n"
                 "    cfg_keys:\n"
                 "      env: [main_tag]\n"
                 "      org: [main_tag]\n"
@@ -286,10 +286,10 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "targets:\n"
                 "  t:\n"
                 "    actions: [provision]\n"
-                "    source_key: bootstrap\n"
+                "    source_key: target_sources.bootstrap\n"
                 "    ref_key: r\n"
                 "    procedure_key: s\n"
-                "    domains: [env, org]\n"
+                "    domains: [domains.env, domains.org]\n"
                 "    cfg_keys:\n"
                 "      env: [main_tag]\n"
             ))
@@ -312,15 +312,15 @@ class TargetInputParamsTests(unittest.TestCase):
                "param_sets:\n  base:\n    input_params: [main_tag, landing_zone]\n")
         (root / "targets" / "provision").mkdir(parents=True)
         _write(root / "targets" / "provision", "t.yaml",
-               "targets:\n  t:\n    actions: [provision]\n    source_key: bootstrap\n"
-               "    ref_key: r\n    procedure_key: s\n    domains: [env]\n"
-               "    cfg_key_sets:\n      env: [k]\n" + target_body)
+               "targets:\n  t:\n    actions: [provision]\n    source_key: target_sources.bootstrap\n"
+               "    ref_key: r\n    procedure_key: s\n    domains: [domains.env]\n"
+               "    cfg_key_sets:\n      env: [cfg_key_sets.k]\n" + target_body)
         return ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
 
     def test_param_set_expands_and_instance_subset_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp,
-                "    input_param_sets: [base]\n"
+                "    input_param_sets: [param_sets.base]\n"
                 "    input_params: [env_type]\n"
                 "    target_instance_params: [env_type]\n")
             t = catalog_targets.load_action_cfg(root, "provision", {})["targets"]["t"]
@@ -330,7 +330,7 @@ class TargetInputParamsTests(unittest.TestCase):
     def test_instance_param_not_declared_as_input_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp,
-                "    input_param_sets: [base]\n"
+                "    input_param_sets: [param_sets.base]\n"
                 "    target_instance_params: [env_type]\n")
             with self.assertRaisesRegex(RuntimeError, "not\\s+declared input params"):
                 catalog_targets.load_action_cfg(root, "provision", {})
@@ -340,7 +340,7 @@ class TargetInputParamsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp,
-                "    input_param_sets: [base]\n"
+                "    input_param_sets: [param_sets.base]\n"
                 "    input_params: [env_type]\n"
                 "    target_instance_params:\n"
                 "      members:\n"
@@ -438,7 +438,7 @@ class FanOutExtraParamsTests(unittest.TestCase):
                     {"aws.account": "identity", "domain": "notifications"},
                 ],
             )
-            # The member name alone no longer identifies a child: one param set
+            # The member name alone does not identify a child: one param set
             # may back several runs of the same workflow.
             self.assertEqual(
                 [c["label"] for c in children],
@@ -495,7 +495,6 @@ class ChildTargetCommandTests(unittest.TestCase):
         "execution_params": {"landing_zone": "live", "env.type": "dev"},
         "provider_options": {"aws.credential_implementation": "profile"},
         "execution_access_modes": {"aws": "force_bypass"},
-        "plt_overlays": ["db_artificial_populator"],
         "force_skip_execution_identity_preflight_check": ["aws"],
         "agreed_defer_ctl_state_backend_sync": False,
         "force_skip_ctl_state_backend_sync": False,
@@ -536,10 +535,23 @@ class ChildTargetCommandTests(unittest.TestCase):
         argv = self._argv()
         for expected in ("landing_zone=live", "env.type=dev",
                          "aws.credential_implementation=profile", "aws=force_bypass",
-                         "db_artificial_populator", "--force-skip-full-cfg-validation-gate"):
+                         "--force-skip-full-cfg-validation-gate"):
             self.assertIn(expected, argv, f"child would run without {expected!r}")
         # a false flag must NOT appear
         self.assertNotIn("--force-skip-guardrails", argv)
+
+    def test_overlays_are_not_passed_to_the_child(self):
+        """A target declares the overlays it requires, so the parent has nothing
+        to hand down. Passing them would make the parent's invocation, rather
+        than the target's own declaration, decide what a target renders."""
+
+        argv = catalog_workflow.build_child_target_command(
+            {**self.SPEC, "plt_overlays": ["db_artificial_populator"]},
+            "env/core/baseline",
+            parent_run_dir=Path("/run"), parent_run_id="PARENT",
+        )
+        self.assertNotIn("--plt-overlays", argv)
+        self.assertNotIn("db_artificial_populator", argv)
 
 
 class RunnerProvidersWiringTests(unittest.TestCase):

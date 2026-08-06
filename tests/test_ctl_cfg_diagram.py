@@ -37,7 +37,7 @@ def make_cfg(root: Path) -> Path:
         "targets:\n"
         "  app:\n"
         "    actions: [provision]\n"
-        "    source_key: app-source\n"
+        "    source_key: target_sources.app-source\n"
         "    execution_identity_key: deploy-group\n"
     )
     write(
@@ -181,7 +181,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 "targets:\n"
                 "  app:\n"
                 "    actions: [provision]\n"
-                "    source_key: app-source\n"
+                "    source_key: target_sources.app-source\n"
                 "    execution_identity_key: runtime-${execution_context.params.account}\n"
                     )
             write(
@@ -247,7 +247,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 """targets:
   inspect-app:
     actions: [plan]
-    source_key: app-source
+    source_key: target_sources.app-source
 """,
             )
 
@@ -267,7 +267,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
             write(
                 cfg / "plan.yaml",
                 "workflows:\n  inspect:\n    actions: [plan]\n    target_keys: [inspect-app]\n"
-                "targets:\n  inspect-app:\n    actions: [plan]\n    source_key: app-source\n"
+                "targets:\n  inspect-app:\n    actions: [plan]\n    source_key: target_sources.app-source\n"
                 "    execution_identity_key: deploy-group\n",
             )
             rendered = diagram.build_diagram(
@@ -286,7 +286,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
             write(
                 cfg / "destroy.yaml",
                 "workflows:\n  remove:\n    actions: [destroy]\n    target_keys: [remove-app]\n"
-                "targets:\n  remove-app:\n    actions: [destroy]\n    source_key: app-source\n"
+                "targets:\n  remove-app:\n    actions: [destroy]\n    source_key: target_sources.app-source\n"
                 "    execution_identity_key: deploy-group\n"
                     )
 

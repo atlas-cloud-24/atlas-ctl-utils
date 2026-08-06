@@ -44,6 +44,17 @@ class Freshness(StrEnum):
 
     UP_TO_DATE = "up_to_date"
     OUTDATED = "outdated"
+    # A branch ref names a moving commit. The commit that was deployed is
+    # recorded; where the branch points NOW is a remote read, and status is a
+    # pure local computation. Reporting `up_to_date` would be a claim the engine
+    # cannot support, so it reports that it cannot know — the same refusal the
+    # project applies to a cfg-entry-ref across a state boundary.
+    UNDETERMINED = "undetermined"
+    # Another member of this instance's exclusive relation is in effect. NOT `outdated`:
+    # nothing is stale — the record still matches its own cfg, and an alternative
+    # replaced it. Helm names the same state on a release revision that was
+    # deployed and has since been superseded by a newer one.
+    SUPERSEDED = "superseded"
 
 
 def build_status_payload(
@@ -263,7 +274,13 @@ def _freshness(pointer: dict | None, spec: dict) -> tuple[str, list[str]]:
         expected = spec.get(fact_key)
         if expected is not None and pointer.get(fact_key) != expected:
             reasons.append(reason)
-    return (Freshness.OUTDATED if reasons else Freshness.UP_TO_DATE), reasons
+    if reasons:
+        return Freshness.OUTDATED, reasons
+    # A changed CONTENT axis is knowable either way, so it is reported first: a
+    # branch-pinned target whose cfg changed is outdated, not merely unknowable.
+    if pointer.get("ref_policy") not in (None, "commit_required"):
+        return Freshness.UNDETERMINED, ["source ref is a branch"]
+    return Freshness.UP_TO_DATE, reasons
 
 
 def _run_status(instance_dir: Path, group: str = "mutative") -> dict:
@@ -321,10 +338,9 @@ def _mutating_run_status(
 ) -> tuple[str | None, list[str], bool, str | None]:
     """The live run axes of a deployment instance.
 
-    provision and destroy now share one instance directory and one
-    `committed/mutative.yaml`, so there are no longer two direction prefixes to
-    merge — the slot and the pointer are read from one place, and the action comes
-    from whichever record is there.
+    provision and destroy share one instance directory and one
+    `committed/mutative.yaml`, so the slot and the pointer are read from one
+    place and the action comes from whichever record is there.
     """
     instance_dir = namespace_root / run_addressing.compose_state_relpath(kind, key, segments)
     for state, status, describe in (
@@ -390,6 +406,23 @@ def compute_target_instance_status(
     if pointer and not mutation_started:
         if run_actions.action_can_go_stale(str(pointer.get("action"))):
             freshness, freshness_reasons = _freshness(pointer, spec)
+            # A exclusive relation's members share one deployment, so a member whose
+            # record still matches its own cfg can nonetheless have been replaced.
+            # That is not staleness — nothing about it is out of date — so it
+            # REPLACES the verdict rather than being reported beside it.
+            superseded, superseded_by = resolve_supersession(
+                spec.get("relations") or {},
+                spec["address"],
+                applied_overlays_by_address(
+                    namespace_root, action, spec.get("relations") or {},
+                    spec.get("segments") or [],
+                ),
+            )
+            if superseded is not None:
+                result["standing"] = superseded
+                result["superseded_by"] = run_addressing.qualified_address(
+                    "target", superseded_by
+                )
             result["freshness"] = freshness
             reasons = reasons + freshness_reasons
 
@@ -619,7 +652,7 @@ def workflow_references(namespace_root: Path) -> dict[str, set[str]]:
     """Which retained workflow runs point at each instance address.
 
     Forgetting a record a workflow still names leaves that workflow describing a
-    member that no longer exists, so it is refused unless the caller says
+    member with nothing behind it, so it is refused unless the caller says
     `--cascade`.
     """
     references: dict[str, set[str]] = {}
@@ -636,11 +669,13 @@ def workflow_references(namespace_root: Path) -> dict[str, set[str]]:
     return references
 
 
-def _targeted_workflow_status(namespace_root: Path, spec: dict) -> dict:
-    """A workflow owns execution, so a targeted query reads its LAST RUN.
+def _targeted_workflow_status(namespace_root: Path, action: str, spec: dict) -> dict:
+    """A workflow owns execution, so its `status` comes from its LAST RUN — and
+    its `freshness` from its members, who each answer for themselves.
 
     Reading a committed pointer here returned an empty row once workflows stopped
-    publishing one — the query answered nothing rather than failing.
+    publishing one; a workflow still publishes none, so the run record is the
+    only source for what it DID. What is DEPLOYED is the members' answer.
     """
 
     result = {"kind": "workflow", "key": spec["key"], "address": spec["address"]}
@@ -648,8 +683,26 @@ def _targeted_workflow_status(namespace_root: Path, spec: dict) -> dict:
         namespace_root, spec["key"], spec.get("segments") or []
     )
     if last_run:
-        result["last_run"] = last_run
-    return result
+        result.update(
+            {k: v for k, v in last_run.items() if k not in ("target_instances",)}
+        )
+    members = [
+        target_spec["address"] for target_spec in (spec.get("target_specs") or [])
+    ] or list((last_run or {}).get("target_instances") or [])
+    freshness, member_rows, _ = workflow_member_freshness(
+        namespace_root, action, members, spec.get("relations") or {}
+    )
+    standing, superseded_by = resolve_workflow_standing(
+        namespace_root, action, spec.get("exclusive_workflow_relations") or {},
+        spec["address"], member_rows,
+    )
+    return _ordered_workflow_row(
+        result,
+        standing=standing,
+        superseded_by=superseded_by,
+        freshness=freshness,
+        members=member_rows,
+    )
 
 
 def _compute_status_results(
@@ -660,11 +713,269 @@ def _compute_status_results(
         computed = (
             compute_target_instance_status(namespace_root, action, spec)
             if spec["kind"] == "target"
-            else _targeted_workflow_status(namespace_root, spec)
+            else _targeted_workflow_status(namespace_root, action, spec)
         )
         computed["selection"] = label
         results.append(computed)
     return results
+
+
+def applied_overlays_by_address(
+    namespace_root: Path, action: str, relations: dict, segments: list[str]
+) -> dict[str, list[str]]:
+    """What each member of every exclusive relation last APPLIED, read from its pointer.
+
+    Only members are read: an exclusive relation is small, and the alternative — reading
+    every instance — would make an unrelated target's pointer decide a group it
+    is not in.
+    """
+
+    applied: dict[str, list[str]] = {}
+    group_key = run_actions.action_group(action)
+    for group in (relations or {}).values():
+        for member_key in (group or {}).get("members") or []:
+            member = run_addressing.target_instance_address(member_key, segments)
+            instance_dir = Path(namespace_root) / run_addressing.compose_state_relpath(
+                "target", member_key, segments
+            )
+            pointer = state_run_store.read_committed_pointer(instance_dir, group_key)
+            if pointer is not None:
+                applied[member] = list(pointer.get("plt_overlays") or [])
+    return applied
+
+
+def resolve_supersession(
+    relations: dict, address: str, applied_overlays_by_address: dict[str, list[str]]
+) -> tuple[str | None, str | None]:
+    """`(freshness, superseded_by)` for one instance inside an exclusive relation.
+
+    An exclusive relation names instances that are ALTERNATIVES over one deployment, so
+    exactly one is in effect. The member in effect is the one whose recorded
+    overlays match what the deployment carries; the rest are `superseded` — not
+    `outdated`, because nothing about them is stale. Their record still matches
+    their own cfg; another member simply replaced them.
+
+    Returns `(None, None)` when this address is in no group, or when no member has
+    published yet — supersession is a relationship between what RAN, and nothing
+    has.
+    """
+
+    key, segments = run_addressing.split_target_instance_address(address)
+    for group in (relations or {}).values():
+        # A group names KEYS; the verdict is per INSTANCE. `env/core/baseline`
+        # and `env/core/tech_jobs` are alternatives in dev and independently in
+        # stg, so each member is read at THIS instance's segments.
+        member_keys = list((group or {}).get("members") or [])
+        if key not in member_keys:
+            continue
+        members = [
+            run_addressing.target_instance_address(member_key, segments)
+            for member_key in member_keys
+        ]
+        applied = {
+            member: applied_overlays_by_address.get(member)
+            for member in members
+            if applied_overlays_by_address.get(member) is not None
+        }
+        if len(applied) < 2:
+            # One member (or none) has published: nothing has been replaced.
+            return None, None
+        # The member in effect is the one whose overlays the deployment carries.
+        # Every member reads the same deployment, so they agree on it.
+        in_effect = max(applied, key=lambda member: len(applied[member] or []))
+        if address == in_effect:
+            return None, None
+        return str(Freshness.SUPERSEDED), in_effect
+    return None, None
+
+
+def _ordered_workflow_row(
+    row: dict, *, standing: str | None, freshness: str | None, members: list[dict],
+    superseded_by: str | None = None,
+) -> dict:
+    """One field order for every workflow row: status, standing, freshness, at,
+    default_action, members — outcome first, then what is in effect, then when.
+
+    A dict preserves insertion order and a status map is read by humans, so the
+    order is part of the output rather than a formatting accident.
+    """
+
+    ordered: dict = {}
+    for key in ("status",):
+        if key in row:
+            ordered[key] = row[key]
+    if standing is not None:
+        ordered["standing"] = standing
+    if superseded_by is not None:
+        ordered["superseded_by"] = run_addressing.qualified_address("workflow", superseded_by)
+    if freshness is not None:
+        ordered["freshness"] = freshness
+    for key in ("at", "run_id", "selectors", "default_action"):
+        if key in row:
+            ordered[key] = row[key]
+    if members:
+        ordered["members"] = members
+    for key, value in row.items():
+        ordered.setdefault(key, value)
+    return ordered
+
+
+def resolve_workflow_standing(
+    namespace_root: Path,
+    action: str,
+    exclusive_workflow_relations: dict,
+    address: str,
+    member_rows: list[dict],
+) -> tuple[str | None, str | None]:
+    """`(standing, superseded_by)` for a workflow instance inside an exclusive relation.
+
+    A workflow publishes no state, so it cannot say which alternative is in
+    effect on its own — its MEMBERS can, and do. This maps that back up: the
+    workflow is superseded when a member is, and the sibling it names is the one
+    whose composition contains the target that replaced it.
+
+    Reported for an ACTIVE member too. Silence would be indistinguishable from
+    "not in a relation at all", and knowing which member holds is the
+    reason the group is declared.
+    """
+
+    key, segments = run_addressing.split_target_instance_address(address)
+    for group in (exclusive_workflow_relations or {}).values():
+        member_keys = list((group or {}).get("members") or [])
+        if key not in member_keys:
+            continue
+        members = [
+            run_addressing.workflow_instance_address(member_key, segments)
+            for member_key in member_keys
+        ]
+        replaced_by = {
+            run_addressing.unqualified_address(str(entry["superseded_by"]))
+            for entry in member_rows
+            if entry.get("standing") == str(Freshness.SUPERSEDED) and entry.get("superseded_by")
+        }
+        if not replaced_by:
+            return "active", None
+        for sibling in members:
+            if sibling == address:
+                continue
+            sibling_key, sibling_segments = run_addressing.split_target_instance_address(sibling)
+            for _, run_row in workflow_last_run_by_group(
+                namespace_root, sibling_key, sibling_segments
+            ).items():
+                sibling_targets = {
+                    run_addressing.unqualified_address(
+                        entry["instance"] if isinstance(entry, dict) else entry
+                    )
+                    for entry in (run_row.get("target_instances") or [])
+                }
+                if sibling_targets & replaced_by:
+                    return str(Freshness.SUPERSEDED), sibling
+        # A member was replaced by a target no sibling has run: the group says
+        # these exclude each other, and something outside it took effect.
+        return str(Freshness.SUPERSEDED), None
+    return None, None
+
+
+def workflow_member_freshness(
+    namespace_root: Path, action: str, member_addresses: list[str],
+    relations: dict | None = None,
+) -> tuple[str | None, list[dict], list[str]]:
+    """A workflow's freshness is a FUNCTION OF ITS MEMBERS.
+
+    Returns `(freshness, members, reasons)`. The child already computes whether
+    it is fresh, so the composition asks it rather than re-deriving. Comparing
+    recorded child revisions instead would compare `snapshot_sha256`, which
+    hashes the whole RUN.yaml — `run_id` and timestamps included — so a child
+    re-run with identical inputs would read as drift.
+
+    Worst-of, in a fixed order: OUTDATED is a fact, UNDETERMINED is the absence
+    of one, and a composition cannot be fresher than its least fresh member. Each
+    member carries its own verdict, because a rolled-up value is unreadable
+    without the member that caused it.
+    """
+
+    members: list[dict] = []
+    for recorded in member_addresses:
+        # A member that runs an action other than the workflow's default is
+        # recorded as `{instance, action}`; that action must survive into the
+        # row, or a destroy member reads like every other one.
+        member_action = action
+        if isinstance(recorded, dict):
+            address = str(recorded.get("instance"))
+            member_action = str(recorded.get("action") or action)
+        else:
+            address = str(recorded)
+        unqualified = run_addressing.unqualified_address(address)
+        key, segments = run_addressing.split_target_instance_address(unqualified)
+        child = compute_target_instance_status(
+            namespace_root, member_action,
+            {"kind": "target", "key": key, "segments": segments,
+             "address": unqualified, "relations": relations or {}},
+        )
+        entry = {"address": run_addressing.qualified_address("target", unqualified)}
+        if isinstance(recorded, dict) and recorded.get("action"):
+            entry["action"] = str(recorded["action"])
+        if child.get("standing") is not None:
+            entry["standing"] = str(child["standing"])
+        if child.get("superseded_by") is not None:
+            entry["superseded_by"] = str(child["superseded_by"])
+        if child.get("freshness") is not None:
+            entry["freshness"] = str(child["freshness"])
+        members.append(entry)
+
+    verdicts = {entry["freshness"] for entry in members if "freshness" in entry}
+    for value in (Freshness.OUTDATED, Freshness.UNDETERMINED, Freshness.UP_TO_DATE):
+        if str(value) not in verdicts:
+            continue
+        if value == Freshness.UP_TO_DATE:
+            return str(value), members, []
+        return str(value), members, [
+            f"{entry['address']}: {entry['freshness']}"
+            for entry in members
+            if entry.get("freshness") == str(value)
+        ]
+    return None, members, []
+
+
+def workflow_last_run_by_group(
+    namespace_root: Path, key: str, segments: list[str] | None = None
+) -> dict[str, dict]:
+    """The latest run of this workflow instance IN EACH GROUP.
+
+    A workflow instance is partitioned by group exactly as a target instance is:
+    a `plan` run and a `provision` run are separate facts about the same
+    instance, and reporting only the newest collapses them — a failed plan then
+    reads as a failed deployment, under the wrong group.
+    """
+
+    runs_dir = (
+        Path(namespace_root)
+        / run_addressing.compose_state_relpath("workflow", key, segments or [])
+        / "runs"
+    )
+    if not runs_dir.is_dir():
+        return {}
+    latest: dict[str, dict] = {}
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        metadata = state_run_store.load_run_metadata(run_dir)
+        if not metadata.get("updated_at"):
+            continue
+        # Read from the record when the run wrote one, otherwise DERIVED from the
+        # members it recorded — a run from before the field existed still answers.
+        # Falling back to the run's OWN action covers a record that names what it
+        # did without listing members; defaulting to a group instead is what put
+        # a failed plan under `mutative`.
+        group = metadata.get("group") or run_addressing.workflow_group(metadata)
+        if not group and metadata.get("action"):
+            group = run_actions.action_group(str(metadata["action"]))
+        if not group:
+            continue
+        previous = latest.get(str(group))
+        if previous is None or str(metadata.get("updated_at")) > str(previous.get("updated_at")):
+            latest[str(group)] = metadata
+    return {group: _workflow_run_row(metadata) for group, metadata in latest.items()}
 
 
 def workflow_last_run(
@@ -696,22 +1007,29 @@ def workflow_last_run(
     if not records:
         return None
     latest = max(records, key=lambda m: str(m.get("updated_at") or ""))
-    row: dict = {"status": _run_conclusion(latest), "at": latest.get("updated_at")}
+    return _workflow_run_row(latest)
+
+
+def _workflow_run_row(metadata: dict) -> dict:
+    """One run record as a row: what it did, what selected its members, and which
+    members it ran with."""
+
+    row: dict = {"status": _run_conclusion(metadata), "at": metadata.get("updated_at")}
     # The matched member's own selector block, copied verbatim: it points back at
     # the cfg that produced this run, and nothing depends on the engine knowing a
     # field called "operation". A member that matched with none omits it.
-    if latest.get("member_selectors"):
-        row["selectors"] = latest["member_selectors"]
-    if latest.get("default_action"):
-        row["default_action"] = latest["default_action"]
+    if metadata.get("member_selectors"):
+        row["selectors"] = metadata["member_selectors"]
+    if metadata.get("default_action"):
+        row["default_action"] = metadata["default_action"]
     # The group this run belonged to. Read from the record when the
     # run wrote one, otherwise DERIVED from the members it recorded — a run from
     # before the field existed still answers, rather than filtering out as though
     # it had no group at all.
-    group = latest.get("group") or run_addressing.workflow_group(latest)
+    group = metadata.get("group") or run_addressing.workflow_group(metadata)
     if group:
         row["group"] = group
-    target_instances = latest.get("target_instances")
+    target_instances = metadata.get("target_instances")
     if target_instances:
         # Qualified for the same reason the parent link is: these point at the
         # TARGET rows in this map, and an address a reader can paste back into a
@@ -738,6 +1056,8 @@ def _run_conclusion(metadata: dict) -> str:
 
 def compute_namespace_status_map(
     namespace_root: Path,
+    relations: dict | None = None,
+    exclusive_workflow_relations: dict | None = None,
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
     """Every target and workflow instance under the namespace root, one row per
     published GROUP.
@@ -796,6 +1116,7 @@ def compute_namespace_status_map(
             "key": key,
             "segments": segments,
             "address": address,
+            "relations": relations or {},
         }
         for group in run_actions.RESULT_GROUPS:
             axes = run_addressing._axis_row(
@@ -811,13 +1132,37 @@ def compute_namespace_status_map(
             run_addressing._place_instance(rows, "target", key, segments, groups)
     for key, seg in workflows:
         segments = list(seg)
-        last_run = workflow_last_run(namespace_root, key, segments)
-        if not last_run:
+        # A workflow row is keyed by GROUP like a target's, and holds EVERY group
+        # it has run — a `plan` run and a `provision` run are separate facts about
+        # one instance. Reporting only the newest collapsed them, so a failed plan
+        # read as a failed deployment under the wrong group.
+        groups: dict[str, dict] = {}
+        for group, run_row in workflow_last_run_by_group(namespace_root, key, segments).items():
+            row = {k: v for k, v in run_row.items() if k not in ("group", "target_instances")}
+            members = list(run_row.get("target_instances") or [])
+            freshness, member_rows, _ = workflow_member_freshness(
+                namespace_root, run_actions.STATUS_GROUP_ACTION[group], members, relations
+            )
+            # No `reasons`: every member carries its own verdict below, so a
+            # reason string would restate what the reader can already see.
+            address = run_addressing.workflow_instance_address(key, segments)
+            standing, superseded_by = resolve_workflow_standing(
+                namespace_root, run_actions.STATUS_GROUP_ACTION[group],
+                exclusive_workflow_relations or {}, address, member_rows,
+            )
+            groups[group] = _ordered_workflow_row(
+                row,
+                standing=standing,
+                superseded_by=superseded_by,
+                freshness=freshness,
+                members=member_rows,
+            )
+        if not groups:
             continue
         if segments:
-            run_addressing._place_instance(rows, "workflow", key, segments, {"last_run": last_run})
+            run_addressing._place_instance(rows, "workflow", key, segments, groups)
         else:
-            rows["workflow"][key] = {"last_run": last_run}
+            rows["workflow"][key] = groups
     # Kind is the OUTER key, so a reader sees where the workflows are and where
     # the targets are without parsing a prefix off every address.
     return {
@@ -950,33 +1295,14 @@ def filter_status_map(
     an empty row would read as "nothing happened here", which is a different
     claim from "you asked not to see it".
 
- `--kind workflow --group ...` outright: groups were a TARGET
-    concept and a workflow published history, which had none.
-
- a workflow's group DERIVED from its members' actions, so the
-    question now has an answer and is filtered rather than refused. A workflow row
-    carries its group as a FIELD (it still publishes history, not grouped state),
-    so it is matched on that field while a target row is matched on which group
-    partitions it holds. Two shapes, one question.
+    A workflow row is partitioned by group exactly like a target's, so one filter
+    serves both. It did not use to be: a workflow row was `{"last_run": {...}}`
+    with its group one level in, which needed a second filter that silently
+    dropped every workflow when it looked at the wrapper instead.
     """
 
     def _keep(row: dict) -> dict:
         return {g: axes for g, axes in row.items() if not groups or g in groups}
-
-    def _keep_groupless(row: dict) -> dict:
-        """A history row is kept whole or dropped, on the group it records.
-
-        The group sits on the RUN, not on the row wrapper — a workflow row is
-        `{"last_run": {...}}` — so it is read one level in. Looking at the wrapper
-        finds nothing and silently drops every workflow, which is exactly what it
-        did on the first attempt.
-        """
-
-        if not groups:
-            return row
-        run = row.get("last_run") if isinstance(row, dict) else None
-        recorded = run.get("group") if isinstance(run, dict) else None
-        return row if recorded in groups else {}
 
     selected: dict = {}
     for kind, templates in instances.items():
@@ -986,7 +1312,7 @@ def filter_status_map(
         for template, body in templates.items():
             # A template holds either an `instances` map or, for a singleton, the
             # groups directly.
-            keep = _keep_groupless if kind in run_actions.GROUPLESS_KINDS else _keep
+            keep = _keep
             if run_addressing.INSTANCES_MARKER in body:
                 kept = {
                     segs: g

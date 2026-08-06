@@ -54,6 +54,53 @@ sees another provider's mode or options.
 # The cfg root of the run in progress, so a provider lookup can reach the
 # declaration without every call site threading it through. Set once, by the same
 # code that puts the declared adapter repositories on the import path.
+from pathlib import Path
+
+from engine.kernel import yaml_io as kernel_yaml_io
+
+# A provider adapter is TOOLING and its ref goes where refs already go
+# — DECLARED in `refs.global`, materialized by the same path as ctl-utils, never
+# discovered by looking at what sits beside the engine on disk.
+# The names are DERIVED from the provider, so engine core never spells a provider
+# out; `ctl_providers.yaml` is the only place a provider is named.
+PROVIDER_ADAPTER_TOOLING_TEMPLATE = "ctl-adapter-{provider}"
+
+
+def provider_adapter_tooling_name(provider: str) -> str:
+    """
+
+    the tooling ref name a provider's adapter is pinned under."""
+
+    return PROVIDER_ADAPTER_TOOLING_TEMPLATE.format(provider=provider)
+
+
+def load_ctl_providers(ctl_cfg_root) -> dict:
+    """The declared providers: what each implements, and where its adapter lives.
+
+    Read from cfg rather than carried as a constant, so adding a provider — or
+    replacing one with your own implementation — is a declaration and a
+    repository, never an edit to the engine.
+    """
+
+    if not ctl_cfg_root:
+        return {}
+    path = Path(ctl_cfg_root) / "ctl_providers.yaml"
+    if not path.is_file():
+        return {}
+    return (kernel_yaml_io.load_yaml(path) or {}).get("ctl_providers") or {}
+
+
+def provider_adapter_package(provider: str, ctl_cfg_root=None) -> str:
+    """The importable package a provider's adapter provides.
+
+    Declared, with the convention as a fallback: a consumer's adapter is THEIR
+    package, and naming it by our convention would assume they forked ours.
+    """
+
+    declared = (load_ctl_providers(ctl_cfg_root).get(provider) or {}).get("package")
+    return declared or f"atlas_ctl_adapter_{provider}"
+
+
 _ACTIVE_CTL_CFG_ROOT = None
 
 
@@ -72,14 +119,12 @@ def registered_providers(ctl_cfg_root=None) -> tuple[str, ...]:
     adapter will not import fails at `get_adapter` with a message that says so.
     """
 
-    from engine.execution import providers
-
     root = ctl_cfg_root or _ACTIVE_CTL_CFG_ROOT
     if root is None:
         raise RuntimeError(
             "❌ no ctl cfg root is active, so the declared providers cannot be read"
         )
-    declared = providers.load_ctl_providers(root)
+    declared = load_ctl_providers(root)
     if not declared:
         raise RuntimeError(f"❌ {root} declares no providers in ctl_providers.yaml")
     return tuple(declared)
@@ -106,8 +151,6 @@ def get_adapter(provider: str, ctl_cfg_root=None):
     when nothing declared one.
     """
 
-    from engine.execution.providers import provider_adapter_package
-
     root = ctl_cfg_root or _ACTIVE_CTL_CFG_ROOT
     if provider not in registered_providers(root):
         raise RuntimeError(
@@ -123,8 +166,6 @@ def get_adapter(provider: str, ctl_cfg_root=None):
         # The adapter is a declared tooling ref; if its package is not importable
         # the checkout was never materialized, and saying so beats an ImportError
         # that looks like a missing dependency.
-        from engine.execution.providers import provider_adapter_tooling_name
-
         tooling = provider_adapter_tooling_name(provider)
         raise RuntimeError(
             f"❌ provider {provider!r} is registered but its adapter package "

@@ -22,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
+from engine.catalog import targets as catalog_targets
 from engine.cfg import resources as cfg_resources
 from engine.run import selectors as run_selectors
 
@@ -211,9 +212,9 @@ def build_diagram(
     workflows = _by_action(
         cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
     )
-    targets = _by_action(
-        cfg_resources.collect_resource(ctl_cfg_root, "targets", entry_depth=1)
-    )
+    # Through the catalog loader, so the diagram reads the same resolved keys the
+    # engine runs on rather than the qualified paths cfg declares.
+    targets = _by_action(catalog_targets.load_target_catalog(ctl_cfg_root))
     sources = cfg_resources.collect_resource(ctl_cfg_root, "target_sources")
     identities = cfg_resources.collect_resource(ctl_cfg_root, "execution_identities")
     backends = cfg_resources.collect_resource(ctl_cfg_root, "ctl_state_backends")

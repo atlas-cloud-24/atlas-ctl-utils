@@ -144,13 +144,13 @@ class AccountRegistryTests(unittest.TestCase):
                     "provider": "aws",
                     "account": "dev",
                     "roles": {"readwrite": "ctl_target"},
-                    "agreed_direct_credential_source_keys": ["dev"],
+                    "allowed_agreed_direct_credential_sources": ["dev"],
                 },
                 "management_direct": {
                     "provider": "aws",
                     "account": "management",
                     "roles": {"readwrite": "ctl_target"},
-                    "agreed_direct_credential_source_keys": ["management"],
+                    "allowed_agreed_direct_credential_sources": ["management"],
                 },
             }
             catalogs["credential_sources"] = {
@@ -383,15 +383,13 @@ class ConditionalPointerTests(unittest.TestCase):
 
 
 class ToolLockIsNotTheEngineTest(unittest.TestCase):
-    """Releasing a TOOL's state lock left the engine entirely.
+    """Releasing a TOOL's state lock is outside the engine.
 
-    It used to be a maintenance action against a target, which forced the engine
-    to read the step's SOURCE — grepping `step.sh` for `./bin/tf.sh <dir> init
-    <var>` — to discover where that tool kept its state. That was the only place
-    ctl reached inside a step instead of going through `step.yaml`, and it broke
-    silently whenever a repo renamed the script or wrapped the call.
-
-    A repo now declares an `unlock` procedure and the engine runs it by name.
+    A repo declares an `unlock` procedure and the engine runs it BY NAME. The
+    alternative — a maintenance action against a target — forces the engine to
+    read the step's SOURCE to discover where that tool keeps its state, which is
+    the one place ctl would reach inside a step instead of going through
+    `step.yaml`, and it breaks silently whenever a repo renames or wraps the call.
     """
 
     def test_the_binding_resolver_is_gone(self):

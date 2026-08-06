@@ -286,8 +286,6 @@ def run_pipeline(
     action: str,
     workflow_name: str | None,
     run_id: str,
-    plt_overlays: list[str],
-    ctl_variants: list[str],
     target_repo_key: str,
     require_target_ref: bool,
     use_local_tooling_cfg: bool,
@@ -328,7 +326,6 @@ def run_pipeline(
             ctl_ref_policy,
             action,
             workflow_name,
-            ctl_variants=ctl_variants,
             # A run DECLARES its providers; without this the selection resolves
             # with none and every provider lookup fails ("no providers declared")
             providers=providers,
@@ -462,7 +459,6 @@ def run_pipeline(
         action_cfg,
         artifacts_dir,
         ctl_profile,
-        plt_overlays,
         scope_params=scope_params,
         execution_context=execution_context,
         target_repo_key=target_repo_key,
@@ -532,8 +528,6 @@ def run_pipeline(
         execution_context=execution_context,
         action=action,
         workflow_name=workflow_name,
-        ctl_variants=ctl_variants,
-        plt_overlays=final_plt_overlays,
         target_repo_key=target_repo_key,
         require_target_ref=require_target_ref,
         require_commit_refs=require_commit_refs,
