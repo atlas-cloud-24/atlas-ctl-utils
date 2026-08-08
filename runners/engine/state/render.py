@@ -60,7 +60,7 @@ FLAT_COLUMNS = state_status.SORT_FIELDS
 # are POSITIONS there rather than cells, and members become child rows instead of
 # a count.
 NESTED_COLUMNS = (
-    "status", "last_action", "standing", "superseded_by", "freshness", "time",
+    "status", "last_action", "last_operation", "standing", "superseded_by", "freshness", "time",
     "label",
 )
 

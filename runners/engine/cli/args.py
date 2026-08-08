@@ -630,21 +630,10 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         help="Provider-namespaced options, comma-separated and/or repeatable. The "
         "engine only routes them; each provider owns its option vocabulary",
     )
-    # 4) what to do — spelled for the run type
+    # 4) what to do. Targets/procedures execute one engine action. Workflows
+    # resolve every target action from cfg; fan-outs only expand child runs.
     if run_type in ("workflow", "fan_out"):
-        # A workflow is invoked with an OPERATION: it says what was asked for,
-        # while each member target carries the ACTION it performs. The two differ
-        # only here, because a workflow is the one level that may mix directions.
-        # A fan-out shares the spelling because it expands workflows and passes the
-        # operation through unchanged — it varies the address, never the verb.
-        selector_group.add_argument(
-            "--operation",
-            dest="action",
-            required=True,
-            choices=list(run_actions.KNOWN_ACTIONS),
-            help="What to do to this thing. Each member target performs its own\n"
-            "declared action, or inherits this one when it declares none",
-        )
+        parser.set_defaults(action=None)
     else:
         selector_group.add_argument(
             "--action",

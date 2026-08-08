@@ -416,7 +416,7 @@ class DispatchGuardTest(unittest.TestCase):
         self.assertEqual(
             set(),
             run_selectors.collect_member_dispatch_axes(
-                self._members("execution_context.ctl.operation"), label="wf"
+                self._members("execution_context.params.operation"), label="wf"
             ),
         )
 
@@ -586,7 +586,7 @@ class ActionMustBeDeclaredTest(unittest.TestCase):
 class DefaultActionResolutionTest(unittest.TestCase):
     """`default_action` is a literal, or a reference to the invocation."""
 
-    CONTEXT = {"execution_context.ctl.operation": "destroy"}
+    CONTEXT = {"execution_context.params.operation": "destroy"}
 
     def test_a_literal_is_taken_as_is(self):
         self.assertEqual("provision", run_selectors.resolve_default_action(
@@ -594,12 +594,12 @@ class DefaultActionResolutionTest(unittest.TestCase):
 
     def test_a_reference_follows_the_invocation(self):
         self.assertEqual("destroy", run_selectors.resolve_default_action(
-            "${execution_context.ctl.operation}", self.CONTEXT, label="wf"))
+            "${execution_context.params.operation}", self.CONTEXT, label="wf"))
 
     def test_an_unbound_reference_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "not bound"):
             run_selectors.resolve_default_action(
-                "${execution_context.ctl.operation}", {}, label="wf")
+                "${execution_context.params.operation}", {}, label="wf")
 
     def test_none_stays_none(self):
         self.assertIsNone(run_selectors.resolve_default_action(None, self.CONTEXT, label="wf"))

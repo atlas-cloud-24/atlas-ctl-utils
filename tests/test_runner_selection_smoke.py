@@ -39,7 +39,7 @@ PARAMS = {
 def _context(action: str) -> dict:
     ctx = {
         "execution_context.ctl.action": action,
-        "execution_context.ctl.operation": action,
+        "execution_context.params.operation": action,
         "execution_context.ctl.profile": "local_dev",
         "execution_context.ctl.providers": ["aws"],
     }

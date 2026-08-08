@@ -370,11 +370,6 @@ def build_execution_context(
 
     if action is not None:
         put("ctl", "action", action, label="promoted --action")
-        # A WORKFLOW is invoked with an operation and its members carry
-        # the actions, so member selectors gate on `ctl.operation`. It is published
-        # alongside rather than instead of `ctl.action`: a target run still has one
-        # action, and credential selection keys on that.
-        put("ctl", "operation", action, label="promoted --operation")
     if ctl_profile is not None:
         put("ctl", "profile", ctl_profile, label="promoted --ctl-profile")
     # One fact per participating provider — the mode is a per-provider decision,

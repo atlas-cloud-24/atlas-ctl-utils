@@ -186,8 +186,14 @@ def main() -> int:
     # execution context, every branch — and it belongs to the SKIPPABLE gate: a
     # workflow that is not in the run cannot corrupt it, while the per-run guard
     # still fires unskippably for the one that is.
+    # load_workflow_catalog, NOT the raw collection: a member key is declared as
+    # a qualified reference (`targets.env/core/baseline`) and the loader is what
+    # resolves it to the bare key the targets collection is indexed by. Passing
+    # raw cfg here made every member look up as missing, so the union of member
+    # instance params was always empty — the `missing` half of the guard could
+    # never fire, and the `extra` half fired on any declaration at all.
     catalog_workflow.validate_all_workflow_instance_params(
-        cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1),
+        catalog_workflow.load_workflow_catalog(ctl_cfg_root),
         cfg_resources.collect_resource(ctl_cfg_root, "targets"),
     )
     # whole-tree tooling activates every declared domain (see helper)

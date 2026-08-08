@@ -151,8 +151,8 @@ def validate_workflow_actions_declared(workflows: dict) -> None:
                     f"❌ workflow {name!r}: {bare} have no action and the list "
                     "declares no default_action, so the engine cannot know how to "
                     "run them. Declare `default_action:` for the list — a literal "
-                    "action, or ${execution_context.ctl.operation} to follow the "
-                    "invocation — or `action:` beneath each key"
+                    "action, a consumer execution-param reference, or `action:` "
+                    "beneath each key"
                 )
 
 
@@ -163,6 +163,19 @@ def workflow_member_actions(workflow_cfg: dict) -> set[str]:
         if isinstance(entry, dict) and entry.get("action"):
             actions.add(str(entry["action"]))
     return actions
+
+
+def workflow_representative_action(workflow_cfg: dict) -> str:
+    """Internal action used by state APIs after a workflow composition resolves."""
+
+    actions = workflow_member_actions(workflow_cfg)
+    if workflow_cfg.get("default_action"):
+        actions.add(str(workflow_cfg["default_action"]))
+    groups = {run_actions.action_group(action) for action in actions}
+    if not groups:
+        raise RuntimeError("❌ workflow resolves no target actions")
+    group = next(group for group in run_actions.GROUP_PRECEDENCE if group in groups)
+    return str(run_actions.group_representative_action(group))
 
 
 def resolve_insert_targets(
@@ -324,10 +337,27 @@ def expand_workflow_imports(action_workflows: dict, name: str, _stack: tuple = (
     return target_runs
 
 
+def workflow_import_closure(workflows: dict, name: str, _seen: tuple = ()) -> set[str]:
+    """The selected workflow plus every workflow it imports, transitively.
+
+    What a run actually COMPOSES. `expand_workflow_imports` walks the same edges
+    to build the target sequence, so this is the set whose declarations the run
+    depends on — and therefore the only set whose branches have to resolve
+    against this run's context.
+    """
+
+    if name in _seen or name not in workflows:
+        return set(_seen)
+    closure = {name}
+    for imported in (workflows[name].get("import_workflows") or []):
+        closure |= workflow_import_closure(workflows, imported, (*_seen, name))
+    return closure
+
+
 def load_workflow_cfg(
     ctl_cfg_root: Path,
     ctl_profile: str,
-    action: str,
+    action: str | None,
     workflow_name: str,
     execution_context: dict[str, object],
 ) -> dict:
@@ -349,6 +379,22 @@ def load_workflow_cfg(
     if workflow_name not in workflows:
         raise RuntimeError(f"❌ workflow {workflow_name!r} not found")
     validate_workflow_actions_declared(workflows)
+    # WHICH workflows are resolved against this run's context, and which are only
+    # checked for shape. The two checks depend on different things:
+    #
+    #   structural            operation-INDEPENDENT — a malformed declaration is
+    #                         broken whatever runs, so every workflow is checked
+    #   branch resolution     operation-DEPENDENT — `None` means "this workflow
+    #                         does not apply to this operation", which is an
+    #                         error only for the one that was ASKED for
+    #
+    # Resolving the whole catalog conflated them: one selector value on
+    # `env/seed` failed on `env/tech_jobs`, which declares plan and provision and
+    # no destroy. That is not a defect — member selectors are exactly how a
+    # workflow says which operations it applies to — and it is not reachable by
+    # --force-skip-full-cfg-validation-gate either, because this runs before any
+    # gate exists.
+    run_closure = workflow_import_closure(workflows, workflow_name)
     resolved_workflows: dict = {}
     for name, wf in workflows.items():
         if not isinstance(wf, dict):
@@ -360,6 +406,24 @@ def load_workflow_cfg(
         # shape, so the workflow-level `default_action` refusal reaches every
         # caller rather than only the ones that remembered to check.
         workflow_target_branches(wf, name=name)
+        # Validate every operation declaration's shape even when this run does
+        # not use it. A workflow may omit operation when it has nothing useful
+        # to add to status beyond its resolved target actions.
+        if "operation" in wf:
+            run_selectors.resolve_scalar_member(
+                wf["operation"], None, label=f"workflow {name!r} operation"
+            )
+        if name not in run_closure:
+            # Shape-checked above; nothing else about it is this run's business.
+            continue
+        operation = (
+            run_selectors.resolve_scalar_member(
+                wf["operation"], execution_context,
+                label=f"workflow {name!r} operation",
+            )
+            if name == workflow_name and "operation" in wf
+            else None
+        )
         targets = wf.get("targets")
         if isinstance(targets, dict) and "members" in targets:
             member = run_selectors.resolve_list_member(
@@ -396,29 +460,33 @@ def load_workflow_cfg(
             }
         wf = {**wf, "insert_targets": resolve_insert_targets(
             wf, execution_context, name=name)}
+        if operation is not None:
+            wf["operation"] = operation
         resolved_workflows[name] = wf
     if workflow_name not in resolved_workflows:
         raise RuntimeError(
-            f"❌ workflow {workflow_name!r} does not allow action {action!r}"
+            f"❌ workflow {workflow_name!r} does not resolve for this execution context"
         )
 
     effective_selectors = run_selectors.workflow_effective_selectors(resolved_workflows, workflow_name)
     if not run_selectors.selector_matches(
         effective_selectors,
         execution_context,
-        label=f"workflow {action}/{workflow_name}",
+        label=f"workflow {workflow_name}",
     ):
         raise RuntimeError(
-            f"❌ workflow {action}/{workflow_name} is not available for "
+            f"❌ workflow {workflow_name} is not available for "
             f"runtime selectors {execution_context} (selectors {effective_selectors})"
         )
 
     target_runs = expand_workflow_imports(resolved_workflows, workflow_name)
     resolved = resolved_workflows[workflow_name]
     cfg = {
-        "meta": {"name": f"{action}/{workflow_name}", "action": action},
+        "meta": {"name": workflow_name},
         "target_runs": target_runs,
     }
+    if resolved.get("operation"):
+        cfg["operation"] = resolved["operation"]
     # The matched member's declared default and its selector block travel
     # with the resolved workflow — the run record carries them, and returning only
     # meta + target_runs silently dropped both. the instance params

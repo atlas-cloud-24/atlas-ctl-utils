@@ -201,14 +201,14 @@ class DeclaredShapeTest(unittest.TestCase):
                 {"default_action": "provision",
                  "keys": [{"key": "env/ops/populate",
                            "after": {"workflow": "base", "key": "env/ops/dbs"}}],
-                 "selectors": {"match": {"execution_context.ctl.operation": "provision"}}},
+                 "selectors": {"match": {"execution_context.params.operation": "provision"}}},
             ]
         }
     }
 
     def test_the_matching_branch_resolves(self):
         resolved = catalog_workflow.resolve_insert_targets(
-            self.DECLARED, {"execution_context.ctl.operation": "provision"}, name="w"
+            self.DECLARED, {"execution_context.params.operation": "provision"}, name="w"
         )
         self.assertEqual(["env/ops/populate"], [e["key"] for e in resolved["keys"]])
 
@@ -219,7 +219,7 @@ class DeclaredShapeTest(unittest.TestCase):
         self.assertEqual(
             {},
             catalog_workflow.resolve_insert_targets(
-                self.DECLARED, {"execution_context.ctl.operation": "destroy"}, name="w"
+                self.DECLARED, {"execution_context.params.operation": "destroy"}, name="w"
             ),
         )
 
@@ -257,7 +257,7 @@ class TheRealCompositionTest(unittest.TestCase):
 
     def _resolved(self, workflows, operation):
         from engine.run import selectors as run_selectors
-        context = {"execution_context.ctl.operation": operation,
+        context = {"execution_context.params.operation": operation,
                    "execution_context.ctl.action": operation}
         resolved = {}
         for name, wf in workflows.items():

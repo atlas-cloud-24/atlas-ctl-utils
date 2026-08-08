@@ -830,7 +830,7 @@ def _ordered_workflow_row(
         ordered["superseded_by"] = run_addressing.qualified_address("workflow", superseded_by)
     if freshness is not None:
         ordered["freshness"] = freshness
-    for key in ("time", "run_id", "selectors", "default_action"):
+    for key in ("last_operation", "time", "run_id", "selectors", "default_action"):
         if key in row:
             ordered[key] = row[key]
     if members:
@@ -1035,6 +1035,8 @@ def _workflow_run_row(metadata: dict) -> dict:
     members it ran with."""
 
     row: dict = {"status": _run_conclusion(metadata), "time": metadata.get("updated_at")}
+    if metadata.get("operation"):
+        row["last_operation"] = metadata["operation"]
     # The matched member's own selector block, copied verbatim: it points back at
     # the cfg that produced this run, and nothing depends on the engine knowing a
     # field called "operation". A member that matched with none omits it.
@@ -1213,6 +1215,7 @@ class SortField(StrEnum):
     GROUP = "group"
     STATUS = "status"
     LAST_ACTION = "last_action"
+    LAST_OPERATION = "last_operation"
     STANDING = "standing"
     SUPERSEDED_BY = "superseded_by"
     FRESHNESS = "freshness"

@@ -129,18 +129,13 @@ def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
 
     - a params axis → returned (must be declared in target_instance_params
       unless path-encoded via the namespace);
-    - `ctl.action` / `ctl.operation` → safe: both determine the instance path.
-      An operation selects the member list, and a workflow instance IS a digest
-      over its members' addresses, so a different operation is a different
-      instance. Where two operations resolve to the same members they still land
-      in different group files;
+    - `ctl.action` → safe: a target action determines the state group;
     - any OTHER ctl.* fact (e.g. ctl.profile) → hard error: it is neither
       path-encoded nor declarable, so two runs differing only in it would
       collapse onto one instance path and self-override."""
     params_prefix = f"{execution_references.EXECUTION_CONTEXT_ROOT}.params."
     safe_refs = {
         f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.action",
-        f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.operation",
     }
     axes: set[str] = set()
     for member in members or []:
@@ -156,7 +151,7 @@ def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
                 raise RuntimeError(
                     f"❌ {label}: dispatch on {ref!r} is not allowed — target "
                     "resolution may dispatch only on declarable params axes or "
-                    "the path-determining ctl.action / ctl.operation"
+                    "the path-determining ctl.action"
                 )
     return axes
 
@@ -240,6 +235,53 @@ def resolve_list_member(
     return None
 
 
+def resolve_scalar_member(
+    entry: object,
+    execution_context: dict[str, object] | None,
+    *,
+    label: str,
+) -> str | None:
+    """Resolve a scalar or `{members: [{value, selectors}, ...]}` declaration."""
+
+    if isinstance(entry, str):
+        value = entry.strip()
+        if not value or "\n" in value or "\r" in value:
+            raise RuntimeError(f"❌ {label} must be a non-empty single-line string")
+        return value
+    if not isinstance(entry, dict) or set(entry) != {"members"}:
+        raise RuntimeError(
+            f"❌ {label} must be a non-empty string or {{members: [...]}}"
+        )
+    members = entry.get("members")
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"❌ {label} members must be a non-empty list")
+    for member in members:
+        if not isinstance(member, dict) or set(member) != {"value", "selectors"}:
+            raise RuntimeError(
+                f"❌ {label}: each member must be {{value, selectors}}"
+            )
+        value = member.get("value")
+        if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            raise RuntimeError(
+                f"❌ {label}: member value must be a non-empty single-line string"
+            )
+    if execution_context is None:
+        return None
+    matches = [
+        member for member in members
+        if selector_matches(
+            member["selectors"], execution_context,
+            label=f"{label} member", structured_only=True,
+        )
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"❌ {label}: exactly one member must match the execution context, "
+            f"matched {len(matches)}"
+        )
+    return str(matches[0]["value"]).strip()
+
+
 def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tuple = ()) -> dict:
     """A workflow's selectors intersected with all imported workflows' selectors
     (an import cannot widen availability)."""
@@ -268,9 +310,8 @@ def resolve_default_action(
 ) -> str | None:
     """A member's declared default action: a literal, or a context reference.
 
-    `${execution_context.ctl.operation}` says "every member does whatever was
-    invoked" — explicitly, in cfg, rather than by an unstated fallback. A literal
-    says the list is one fixed direction whatever was asked.
+    A context reference resolves a consumer parameter explicitly. A literal says
+    the list is one fixed direction whatever selected the workflow branch.
     """
 
     if declared is None:

@@ -70,6 +70,19 @@ def record_workflow_members(
         else:
             target_instances.append(address)
     facts: dict = {"target_instances": target_instances}
+    operation = workflow_cfg.get("operation")
+    if operation is not None:
+        if not isinstance(operation, str) or not operation:
+            raise RuntimeError("❌ resolved workflow operation must be a non-empty string")
+        facts["operation"] = operation
+    operation = workflow_cfg.get("operation")
+    if not isinstance(operation, str) or not operation:
+        raise RuntimeError("❌ resolved workflow has no operation")
+    facts["operation"] = operation
+    operation = workflow_cfg.get("operation")
+    if not isinstance(operation, str) or not operation:
+        raise RuntimeError("❌ resolved workflow has no operation")
+    facts["operation"] = operation
     if default_action:
         facts["default_action"] = default_action
     # Derived here, where the composition is known, so a reader of the record

@@ -171,7 +171,7 @@ def validate_procedure_args(args: argparse.Namespace) -> None:
 
 def setup_run_dirs(
     run_id: str,
-    action: str,
+    action: str | None,
     run_type: str,
     result_name: str,
     ctl_state_local_root: Path,
@@ -247,10 +247,10 @@ def setup_run_dirs(
         run_dir,
         {
             "run_id": run_id,
-            "action": action,
             "run_type": run_type,
             "result_name": result_name,
-            "result_key": f"{action}/{run_type}/{result_name}",
+            **({"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
+               if action is not None else {}),
             "ctl_state_local_root": str(Path(ctl_state_local_root)),
             "ctl_state_locator": list(locator_segments),
             "ctl_state_dir": str(ctl_state_dir),
@@ -307,7 +307,7 @@ def setup_run_workspace(run_dir: Path) -> Path:
 
 def setup_preflight_run_dirs(
     run_id: str,
-    action: str,
+    action: str | None,
     run_type: str,
     result_name: str,
     ctl_state_local_root: Path,
@@ -364,10 +364,10 @@ def setup_preflight_run_dirs(
         run_dir,
         {
             "run_id": run_id,
-            "action": action,
             "run_type": run_type,
             "result_name": result_name,
-            "result_key": f"{action}/{run_type}/{result_name}",
+            **({"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
+               if action is not None else {}),
             "ctl_state_local_root": str(Path(ctl_state_local_root)),
             "ctl_state_locator": list(locator_segments),
             "ctl_state_dir": str(ctl_state_dir),
@@ -475,7 +475,7 @@ def require_unique_fan_out_namespace(
     ctl_cfg_root: Path,
     children: list[dict],
     *,
-    action: str,
+    action: str | None,
     ctl_profile: str,
     execution_params: dict[str, str],
     execution_runtime_mode: str,
@@ -543,7 +543,7 @@ def resolve_run_locator_segments(
     # relative tree carries no provider locator segments.
     execution_context = execution_run_context.build_execution_context(
         ctl_cfg_root,
-        action=action,
+        action=None if run_type == "workflow" else action,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
         providers=providers,
@@ -577,13 +577,23 @@ def resolve_run_instance_identity(
         return None
     execution_context = execution_run_context.build_execution_context(
         ctl_cfg_root,
-        action=action,
+        action=None if run_type == "workflow" else action,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
         providers=providers,
         execution_runtime_mode=execution_runtime_mode,
     )
-    action_cfg = catalog_targets.load_action_cfg(ctl_cfg_root, action, execution_context)
+    if run_type == "workflow":
+        workflow_cfg = catalog_workflow.load_workflow_cfg(
+            ctl_cfg_root, ctl_profile, action, workflow_name, execution_context
+        )
+        action_cfg = catalog_targets.load_action_cfg(
+            ctl_cfg_root, action, execution_context,
+            member_actions=catalog_workflow.workflow_member_actions(workflow_cfg),
+        )
+    else:
+        workflow_cfg = None
+        action_cfg = catalog_targets.load_action_cfg(ctl_cfg_root, action, execution_context)
     targets = action_cfg.get("targets", {})
 
     def target_segments(name: str) -> list[str]:
@@ -614,7 +624,7 @@ def resolve_run_instance_identity(
                 }
             },
         }
-    workflow_cfg = catalog_workflow.load_workflow_cfg(ctl_cfg_root, ctl_profile, action, workflow_name, execution_context)
+    assert workflow_cfg is not None
     addresses: list[str] = []
     member_actions: list = []
     for entry in workflow_cfg.get("target_runs", []):
@@ -693,7 +703,7 @@ def resolve_pipeline_selection(
     """
     execution_context = execution_run_context.build_execution_context(
         ctl_cfg_root,
-        action=action,
+        action=None if workflow_name and not target_name and not procedure_run else action,
         ctl_profile=ctl_profile,
         execution_params=execution_params,
         providers=providers,

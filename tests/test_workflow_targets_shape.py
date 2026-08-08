@@ -23,12 +23,12 @@ BRANCHED = {
             {
                 "default_action": "provision",
                 "keys": ["env/static/r53_public", "env/static/acm"],
-                "selectors": {"in": {"execution_context.ctl.operation": ["plan", "provision"]}},
+                "selectors": {"in": {"execution_context.params.operation": ["plan", "provision"]}},
             },
             {
                 "default_action": "destroy",
                 "keys": ["env/static/acm", "env/static/r53_public"],
-                "selectors": {"match": {"execution_context.ctl.operation": "destroy"}},
+                "selectors": {"match": {"execution_context.params.operation": "destroy"}},
             },
         ]
     }

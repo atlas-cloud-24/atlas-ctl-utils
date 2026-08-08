@@ -426,6 +426,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         })
 
     def _record(self, runs: dict, cfg: dict) -> dict:
+        cfg = {"operation": "provision", **cfg}
         state_lifecycle.record_workflow_members(self.run_dir, runs, cfg)
         return self.ns.rows()["workflow"][WORKFLOW]["mutative"]
 
@@ -511,22 +512,23 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
             (root / "workflows").mkdir()
             kernel_yaml_io.write_yaml_file(root / "workflows" / "w.yaml", {"workflows": {
                 "env/x": {
-                    "operations": ["destroy"],
+                    "operation": "destroy",
                     "targets": {"members": [{
                         "keys": ["targets.env/a"],
                         "default_action": "destroy",
                         "selectors": {"match": {
-                            "execution_context.ctl.operation": "destroy"}},
+                            "execution_context.params.operation": "destroy"}},
                     }]},
                 }
             }})
             cfg = catalog_workflow.load_workflow_cfg(
-                root, "p", "destroy", "env/x",
-                {"execution_context.ctl.operation": "destroy"},
+                root, "p", None, "env/x",
+                {"execution_context.params.operation": "destroy"},
             )
             self.assertEqual("destroy", cfg["default_action"])
+            self.assertEqual("destroy", cfg["operation"])
             self.assertEqual(
-                {"match": {"execution_context.ctl.operation": "destroy"}},
+                {"match": {"execution_context.params.operation": "destroy"}},
                 cfg["member_selectors"],
             )
 
@@ -542,7 +544,7 @@ class WorkflowRecordsItsCompositionTest(unittest.TestCase):
         row = self._record(
             {"a": {"target": TARGET, "action": "provision"}},
             {"default_action": "provision",
-             "member_selectors": {"match": {"execution_context.ctl.operation":
+             "member_selectors": {"match": {"execution_context.params.operation":
                                             "provision"}}},
         )
         self.assertEqual("running", row["status"])
