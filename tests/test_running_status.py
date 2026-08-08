@@ -251,7 +251,11 @@ class StatusGroupTest(unittest.TestCase):
 
 
 class StatusFilterTest(unittest.TestCase):
-    """`--kind` and `--group` narrow what --all PRINTS; they select nothing."""
+    """`--filter` narrows what --all PRINTS; it selects nothing.
+
+    A breadth argument names ONE instance; a filter drops rows from the map a
+    whole-namespace read already computed.
+    """
 
     MAP = {
         "target": {
@@ -271,12 +275,12 @@ class StatusFilterTest(unittest.TestCase):
     }
 
     def test_kind_keeps_only_matching_rows(self):
-        got = state_status.filter_status_map(self.MAP, ["workflow"], None)
+        got = state_status.filter_status_map(self.MAP, {"kind": ["workflow"]})
         self.assertEqual({"workflow"}, set(got))
         self.assertEqual({"env/baseline"}, set(got["workflow"]))
 
     def test_group_keeps_only_matching_groups(self):
-        got = state_status.filter_status_map(self.MAP, None, ["mutative"])
+        got = state_status.filter_status_map(self.MAP, {"group": ["mutative"]})
         self.assertEqual({"mutative"}, set(got["target"]["env/core"]["instances"]["account=dev"]))
 
     def test_a_row_left_with_no_group_is_dropped(self):
@@ -285,16 +289,16 @@ class StatusFilterTest(unittest.TestCase):
         not shown empty: an empty row reads as "nothing happened here", a
         different claim from "you asked not to see it"."""
 
-        got = state_status.filter_status_map(self.MAP, None, ["mutative"])
+        got = state_status.filter_status_map(self.MAP, {"group": ["mutative"]})
         self.assertNotIn("env/acm", got["target"])
 
     def test_both_filters_compose(self):
-        got = state_status.filter_status_map(self.MAP, ["target"], ["plan"])
+        got = state_status.filter_status_map(self.MAP, {"kind": ["target"], "group": ["plan"]})
         self.assertEqual({"target"}, set(got))
         self.assertEqual({"env/core", "env/acm"}, set(got["target"]))
 
     def test_no_filter_is_the_whole_map(self):
-        self.assertEqual(self.MAP, state_status.filter_status_map(self.MAP, None, None))
+        self.assertEqual(self.MAP, state_status.filter_status_map(self.MAP, {}))
 
 
 class TemplateNestingTest(unittest.TestCase):
@@ -319,7 +323,7 @@ class TemplateNestingTest(unittest.TestCase):
 
     def test_filtering_a_singleton_template_drops_it_whole(self):
         singleton = {"target": {"env/core": {"plan": {"status": "passed"}}}}
-        self.assertEqual({}, state_status.filter_status_map(singleton, None, ["mutative"]))
+        self.assertEqual({}, state_status.filter_status_map(singleton, {"group": ["mutative"]}))
 
 
 class StructureAndSortTest(unittest.TestCase):
@@ -332,10 +336,10 @@ class StructureAndSortTest(unittest.TestCase):
 
     MAP = {
         "target": {
-            "A": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-01T00:00:00Z"}},
-                                "i2": {"mutative": {"status": "passed", "at": "2026-01-03T00:00:00Z"}}}},
-            "B": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-02T00:00:00Z"}},
-                                "i2": {"mutative": {"status": "passed", "at": "2026-01-04T00:00:00Z"}}}},
+            "A": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-01T00:00:00Z"}},
+                                "i2": {"mutative": {"status": "passed", "time": "2026-01-03T00:00:00Z"}}}},
+            "B": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-02T00:00:00Z"}},
+                                "i2": {"mutative": {"status": "passed", "time": "2026-01-04T00:00:00Z"}}}},
         }
     }
 
@@ -371,7 +375,7 @@ class StructureAndSortTest(unittest.TestCase):
         mixed = {
             **self.MAP,
             "workflow": {
-                "W": {"instances": {"i1": {"mutative": {"status": "passed", "at": "2026-01-05T00:00:00Z"}}}}
+                "W": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-05T00:00:00Z"}}}}
             },
         }
         got = state_status.structure_status_map(mixed, "flat", "time:desc")

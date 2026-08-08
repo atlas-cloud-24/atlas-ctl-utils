@@ -172,8 +172,8 @@ class RowShapeTest(unittest.TestCase):
 
     def test_the_canonical_order_is_status_freshness_at(self):
         self.assertEqual(
-            ["status", "freshness", "at"],
-            list(run_addressing.order_axes({"at": "t", "freshness": "outdated", "status": "passed"})),
+            ["status", "freshness", "time"],
+            list(run_addressing.order_axes({"time": "t", "freshness": "outdated", "status": "passed"})),
         )
 
     def test_a_live_slot_reads_running(self):

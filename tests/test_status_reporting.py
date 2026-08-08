@@ -106,7 +106,7 @@ class TimelineTest(unittest.TestCase):
             ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("passed", row["status"])
             self.assertEqual("up_to_date", row["freshness"])
-            self.assertEqual("2026-07-30T15:05:34Z", row["at"])
+            self.assertEqual("2026-07-30T15:05:34Z", row["time"])
 
     def test_a_target_and_its_workflow_both_appear(self):
         """
@@ -179,12 +179,12 @@ class ShapingTest(unittest.TestCase):
 
     def test_kind_filter_keeps_only_that_kind(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), ["workflow"], None)
+            rows = state_status.filter_status_map(self._map(Path(tmp)), {"kind": ["workflow"]})
             self.assertEqual(["workflow"], list(rows))
 
     def test_group_filter_keeps_only_that_group(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), None, ["plan"])
+            rows = state_status.filter_status_map(self._map(Path(tmp)), {"group": ["plan"]})
             instance = rows["target"][TARGET_KEY]["instances"][
                 "/".join(TARGET_SEGMENTS)
             ]
@@ -192,13 +192,13 @@ class ShapingTest(unittest.TestCase):
 
     def test_a_row_left_with_no_group_is_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), None, ["readonly"])
+            rows = state_status.filter_status_map(self._map(Path(tmp)), {"group": ["readonly"]})
             self.assertEqual({}, rows)
 
     def test_flat_structure_sorts_chronologically(self):
         with tempfile.TemporaryDirectory() as tmp:
             flat = state_status.structure_status_map(self._map(Path(tmp)), "flat", "time:asc")
-            times = [row["at"] for row in flat["instances"]]
+            times = [row["time"] for row in flat["instances"]]
             self.assertEqual(sorted(times), times)
 
     def test_an_unknown_sort_is_refused(self):
@@ -249,9 +249,7 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._tree(ns)
-            rows = state_status.filter_status_map(
-                state_status.compute_namespace_status_map(ns), ["workflow"], None
-            )
+            rows = state_status.filter_status_map(state_status.compute_namespace_status_map(ns), {"kind": ["workflow"]})
             self.assertEqual(["workflow"], list(rows))
 
     def test_naming_a_group_keeps_workflows_in_that_group(self):
@@ -261,9 +259,7 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._tree(ns)
-            rows = state_status.filter_status_map(
-                state_status.compute_namespace_status_map(ns), None, ["mutative"]
-            )
+            rows = state_status.filter_status_map(state_status.compute_namespace_status_map(ns), {"group": ["mutative"]})
             self.assertEqual(["target", "workflow"], sorted(rows))
 
     def test_flat_structure_carries_both_kinds(self):
@@ -292,7 +288,7 @@ class StatusArgumentsTest(unittest.TestCase):
                 "env/readonly": {"readonly": {"status": "succeeded"}},
             }
         }
-        kept = state_status.filter_status_map(instances, ["workflow"], ["mutative"])
+        kept = state_status.filter_status_map(instances, {"kind": ["workflow"], "group": ["mutative"]})
         self.assertEqual(["env/baseline"], list(kept["workflow"]))
 
     def test_a_workflow_row_is_narrowed_by_group_like_a_target(self):
@@ -300,18 +296,18 @@ class StatusArgumentsTest(unittest.TestCase):
         is dropped when none remain."""
 
         instances = {"workflow": {"env/baseline": {"mutative": {"status": "succeeded"}}}}
-        kept = state_status.filter_status_map(instances, ["workflow"], ["mutative"])
+        kept = state_status.filter_status_map(instances, {"kind": ["workflow"], "group": ["mutative"]})
         self.assertEqual({"mutative": {"status": "succeeded"}},
                          kept["workflow"]["env/baseline"])
-        self.assertEqual({}, state_status.filter_status_map(instances, ["workflow"], ["plan"]))
+        self.assertEqual({}, state_status.filter_status_map(instances, {"kind": ["workflow"], "group": ["plan"]}))
 
     def test_workflows_alone_are_fine(self):
-        state_status.filter_status_map({}, ["workflow"], None)
+        state_status.filter_status_map({}, {"kind": ["workflow"]})
 
     def test_a_group_with_targets_included_is_fine(self):
         """The group narrows the target rows; the workflow rows are unaffected."""
-        state_status.filter_status_map({}, ["target", "workflow"], ["mutative"])
-        state_status.filter_status_map({}, None, ["mutative"])
+        state_status.filter_status_map({}, {"kind": ["target", "workflow"], "group": ["mutative"]})
+        state_status.filter_status_map({}, {"group": ["mutative"]})
 
 
 class RunIdentityTest(unittest.TestCase):
@@ -342,7 +338,7 @@ class RunIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             row = self._instance_with_failure_after_success(Path(tmp))
             self.assertEqual("failed", row["status"])
-            self.assertEqual("2026-08-03T11:22:26Z", row["at"])
+            self.assertEqual("2026-08-03T11:22:26Z", row["time"])
 
     def test_run_id_is_the_failed_run(self):
         """
@@ -369,7 +365,7 @@ class RunIdentityTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             row = self._instance_with_failure_after_success(Path(tmp))
-            self.assertEqual(["status", "last_action", "at"], list(row))
+            self.assertEqual(["status", "last_action", "time"], list(row))
 
     def test_a_clean_row_does_not_repeat_itself(self):
         """
@@ -457,7 +453,7 @@ class LastActionTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             row = self._row(Path(tmp), "provision")
-            self.assertEqual(["status", "last_action", "freshness", "at"], list(row))
+            self.assertEqual(["status", "last_action", "freshness", "time"], list(row))
 
 
 class WorkflowGroupPartitionTest(unittest.TestCase):
@@ -499,7 +495,7 @@ class WorkflowGroupPartitionTest(unittest.TestCase):
             self._run(ns, "w2", "provision", "ok", "2026-08-05T12:00:00Z")
             row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
             self.assertEqual("passed", row["mutative"]["status"])
-            self.assertEqual("2026-08-05T12:00:00Z", row["mutative"]["at"])
+            self.assertEqual("2026-08-05T12:00:00Z", row["mutative"]["time"])
 
     def test_a_group_never_run_is_absent(self):
         """An omitted group means no run of that class ever touched the
@@ -562,7 +558,7 @@ class WorkflowInstanceTest(unittest.TestCase):
             dev = state_status.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY][
                 "instances"]["env.type=dev"]["mutative"]
             self.assertEqual("passed", dev["status"])
-            self.assertEqual("2026-08-03T10:00:00Z", dev["at"])
+            self.assertEqual("2026-08-03T10:00:00Z", dev["time"])
 
     def test_a_workflow_varying_by_nothing_stays_unnested(self):
         """A singleton keeps the flat shape — no empty instances/ layer."""
@@ -806,8 +802,8 @@ class WorkflowGroupIsDerivedTest(unittest.TestCase):
 class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
     """Filter the map `compute_namespace_status_map` ACTUALLY produces.
 
-    This exists because of a bug I shipped and the user found: `--kind workflow
-    --group mutative` silently returned nothing. The group is recorded on the RUN,
+    This exists because of a bug I shipped and the user found: filtering to
+    mutative workflows silently returned nothing. The group is recorded on the RUN,
     and a workflow row wraps it as `{"last_run": {...}}`, so a filter reading
     `row["group"]` finds nothing and drops every workflow — which reads as "no
     workflows ran", not as "your filter was wrong".
@@ -838,11 +834,11 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
             rows = state_status.compute_namespace_status_map(ns)
             self.assertIn("env/baseline", rows["workflow"], "precondition: the row exists unfiltered")
 
-            kept = state_status.filter_status_map(rows, ["workflow"], ["mutative"])
+            kept = state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]})
             self.assertIn(
                 "workflow", kept,
                 "a provisioning workflow IS mutative — dropping it here is the bug "
-                "that made `--kind workflow --group mutative` return nothing",
+                "that made filtering to mutative workflows return nothing",
             )
             self.assertIn("env/baseline", kept["workflow"])
 
@@ -855,8 +851,8 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = self._namespace(Path(tmp), default_action="plan")
             rows = state_status.compute_namespace_status_map(ns)
-            self.assertEqual({}, state_status.filter_status_map(rows, ["workflow"], ["mutative"]))
-            self.assertIn("workflow", state_status.filter_status_map(rows, ["workflow"], ["plan"]))
+            self.assertEqual({}, state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}))
+            self.assertIn("workflow", state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["plan"]}))
 
     def test_a_run_recorded_before_the_group_existed_still_answers(self):
         """
@@ -877,7 +873,7 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
             )
             rows = state_status.compute_namespace_status_map(ns)
             self.assertIn("mutative", rows["workflow"]["env/legacy"])
-            self.assertIn("workflow", state_status.filter_status_map(rows, ["workflow"], ["mutative"]))
+            self.assertIn("workflow", state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}))
 
 
 class StatusHistoryLivesOutsideTheNamespaceTest(unittest.TestCase):

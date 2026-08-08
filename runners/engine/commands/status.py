@@ -19,6 +19,7 @@ from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.state import run_store as state_run_store
 from engine.cfg import resources as cfg_resources
+from engine.state import render as state_render
 from engine.state import status as state_status
 from engine.state import sync as state_sync
 
@@ -52,7 +53,9 @@ def run_status_command(
             execution_runtime_mode=args.execution_runtime_mode,
         )
         selections = []
-        labels = []
+        # The fan-out child's display name, not a run label — see
+        # _compute_status_results.
+        selection_labels = []
         for child in plan["children"]:
             params = dict(args.execution_params)
             params.update(child["params"])
@@ -78,7 +81,7 @@ def run_status_command(
                     load_provider_catalogs=False,
                 )
             )
-            labels.append(child["label"])
+            selection_labels.append(child["label"])
         specs = catalog_workflow.validate_unique_fan_out_materializations(selections)
     else:
         selection = commands_selection.resolve_pipeline_selection(
@@ -101,7 +104,7 @@ def run_status_command(
         )
         selections = [selection]
         specs = [catalog_workflow.selection_state_spec(selection)]
-        labels = [selection["selection_key"]]
+        selection_labels = [selection["selection_key"]]
 
     # A query must NEVER mutate local ctl-state. `remote` hydrates
     # into an auto-generated throwaway root (an implementation detail — never a
@@ -113,7 +116,7 @@ def run_status_command(
             selections[0]["execution_context"],
             args.ctl_state_local_root,
         )
-        results = state_status._compute_status_results(namespace_root, args.action, labels, specs)
+        results = state_status._compute_status_results(namespace_root, args.action, selection_labels, specs)
     else:
         with tempfile.TemporaryDirectory(
             prefix="atlas-ctl-state-remote-"
@@ -146,7 +149,7 @@ def run_status_command(
                             + "/committed.yaml"
                         )
             results = state_status._compute_status_results(
-                namespace_root, args.action, labels, specs
+                namespace_root, args.action, selection_labels, specs
             )
     report = {
         "selection": {
@@ -260,9 +263,8 @@ def run_status_all_command(
                         "source": "remote ctl-state backend",
                     },
                 )
-    kinds = getattr(args, "kinds", None)
-    groups = getattr(args, "groups", None)
-    instances = state_status.filter_status_map(instances, kinds, groups)
+    filters = getattr(args, "filters", None) or {}
+    instances = state_status.filter_status_map(instances, filters)
     instances = state_status.structure_status_map(instances, args.structure, args.sort)
     # Kinds sit at the TOP level, not under an `instances:` wrapper: the wrapper
     # said nothing the kind keys do not, and cost a level of nesting on every read.
@@ -272,14 +274,16 @@ def run_status_all_command(
         "computed_at": kernel_ids.utc_timestamp(),
         "structure": args.structure,
         "sort": args.sort,
-        **({"kinds": kinds} if kinds else {}),
-        **({"groups": groups} if groups else {}),
+        # Only when one was applied: an absent filter is not a fact about the
+        # namespace, and a cached map that states its filters cannot be mistaken
+        # for a whole-namespace one.
+        **({"filters": filters} if filters else {}),
         **instances,
     }
     if getattr(args, "write_cache", False):
-        # `report` already carries `kinds`/`groups` when a filter was applied, so
-        # A filtered cache states which view produced it and cannot be mistaken
-        # for a whole-namespace map.
+        # `report` already carries `filters` when one was applied, so a filtered
+        # cache states which view produced it and cannot be mistaken for a
+        # whole-namespace map.
         queried_at = kernel_ids.utc_timestamp()
         cache = {"advisory": True, "source": "status runner", "queried_at": queried_at, **report}
         namespace_dir = Path(args.ctl_state_local_root) / namespace_key
@@ -309,7 +313,14 @@ def run_status_all_command(
         report = {**report,
                   "cache_written": cache_path.as_posix(),
                   "history_written": history_path.as_posix()}
-    print(yaml.safe_dump(report, sort_keys=False).rstrip())
+    # ONE report, rendered two ways. `--format` is deliberately absent from the
+    # report itself: how it was printed is not a fact about the namespace, and a
+    # cached map claiming a format would be a claim about a file nobody kept.
+    print(
+        state_render.render_status_map(report)
+        if getattr(args, "output_format", None) == state_render.StatusFormat.TABLE
+        else yaml.safe_dump(report, sort_keys=False).rstrip()
+    )
     return report
 
 

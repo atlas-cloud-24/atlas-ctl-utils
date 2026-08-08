@@ -149,7 +149,7 @@ class OutdateLifecycleTest(unittest.TestCase):
         row = self.ns.row("target", TARGET, TSEG)
         self.assertEqual({"status": "passed", "last_action": "provision",
                           "freshness": "up_to_date",
-                          "at": "2026-07-30T10:00:00Z"}, row)
+                          "time": "2026-07-30T10:00:00Z"}, row)
 
     def test_outdating_moves_only_that_axis(self):
         """`status` describes the RUN and must not change when inputs move."""
@@ -167,7 +167,7 @@ class OutdateLifecycleTest(unittest.TestCase):
                         at="2026-07-30T12:00:00Z")
         row = self.ns.row("target", TARGET, TSEG)
         self.assertEqual("up_to_date", row["freshness"])
-        self.assertEqual("2026-07-30T12:00:00Z", row["at"])
+        self.assertEqual("2026-07-30T12:00:00Z", row["time"])
 
     def test_outdating_one_instance_leaves_its_siblings_alone(self):
         self.ns.publish("target", TARGET, TSEG, run_id="r1")
@@ -199,7 +199,7 @@ class WorkflowHistoryTest(unittest.TestCase):
     def test_a_workflow_row_is_its_last_run(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1")
         self.assertEqual(
-            {"status": "passed", "at": "2026-07-30T10:00:05Z"},
+            {"status": "passed", "time": "2026-07-30T10:00:05Z"},
             self.ns.rows()["workflow"][WORKFLOW]["mutative"],
         )
 
@@ -209,7 +209,7 @@ class WorkflowHistoryTest(unittest.TestCase):
                              status="failed")
         row = self.ns.rows()["workflow"][WORKFLOW]["mutative"]
         self.assertEqual("failed", row["status"])
-        self.assertEqual("2026-07-30T12:00:00Z", row["at"])
+        self.assertEqual("2026-07-30T12:00:00Z", row["time"])
 
     def test_a_run_in_flight_reads_running(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1", status="in_progress")

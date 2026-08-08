@@ -70,8 +70,8 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
     def test_the_group_inverse_is_derived_not_written(self):
         """`STATUS_GROUPS` was a hand-written inverse of `GROUP_BY_ACTION`, which
         is a second place for one fact to be wrong — and it WAS wrong: it omitted
-        `maintenance`, so `--group maintenance` was refused for rows the status
-        computation produces."""
+        `maintenance`, so `--filter group=maintenance` was refused for rows the
+        status computation produces."""
 
         rebuilt = {}
         for action, group in run_actions.GROUP_BY_ACTION.items():

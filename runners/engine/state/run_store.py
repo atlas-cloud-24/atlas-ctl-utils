@@ -303,6 +303,15 @@ _COMMITTED_FACT_KEYS = (
     # member in effect is the one whose overlays the deployment carries — without
     # this the others cannot know they were replaced.
     "plt_overlays",
+    # Which INVOCATION published this revision. Targets come from different
+    # source repositories, so no commit says which of them were one deployment;
+    # this does, and it is denormalized here for the same reason the rest are —
+    # a status read opens the pointer and nothing else.
+    # METADATA, NEVER IDENTITY: it is deliberately absent from the `expected`
+    # comparison in up_to_date_child_revision, so re-running the same deployment
+    # under a different label still reuses the committed result rather than
+    # materializing a new instance and resetting staleness.
+    "label",
 )
 
 

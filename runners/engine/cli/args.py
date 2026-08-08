@@ -25,6 +25,7 @@ from engine.kernel import scalars as kernel_scalars
 from engine.run import actions as run_actions
 from engine.run import policy as run_policy
 from engine.run import selectors as run_selectors
+from engine.state import render as state_render
 from engine.state import status as state_status
 
 
@@ -85,10 +86,53 @@ def normalize_ctl_state_local_root(value: str) -> Path:
     return root
 
 
+# A run label is written into run records and printed in a status column, so it
+# has to stay one readable line. It is never a path segment and never an
+# identity, so it needs no stricter charset than that.
+RUN_LABEL_MAX_LENGTH = 64
+
+
+def normalize_run_label(value: str | None) -> str | None:
+    """Normalize the operator-supplied run label.
+
+    Absent stays absent — a run without a label is the ordinary case, and an
+    empty string would be a label every unlabelled run shares.
+    """
+
+    if value is None:
+        return None
+    label = value.strip()
+    if not label:
+        raise RuntimeError("❌ --label must be a non-empty name when given")
+    if len(label) > RUN_LABEL_MAX_LENGTH:
+        raise RuntimeError(
+            f"❌ --label must be at most {RUN_LABEL_MAX_LENGTH} characters, "
+            f"got {len(label)}"
+        )
+    if not label.isprintable():
+        raise RuntimeError("❌ --label must be one printable line")
+    # A label is PASSED ON: a workflow spawns its children with
+    # `["--label", <value>]`, so a value argparse would read as a flag breaks the
+    # child rather than this run. `--label=-x` parses here and dies there, after
+    # the parent has taken the lock and written a run directory — which is why it
+    # is refused up front instead of at the first child.
+    if label.startswith("-"):
+        raise RuntimeError(
+            f"❌ --label must not start with '-' (it is passed on to child runs, "
+            f"which would read it as a flag): {label!r}"
+        )
+    return label
+
+
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
     args.execution_params = run_selectors.selectors_to_map(args.execution_param, label="execution param")
     args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
+    # hasattr, because a maintenance run declares no label at all (see
+    # add_common_args) — normalizing one in would invent an attribute its parser
+    # never offered.
+    if hasattr(args, "label"):
+        args.label = normalize_run_label(args.label)
     # BEFORE the first adapter call: provider options are validated by the adapter
     # itself, so its repository has to be importable by then.
     execution_providers.activate_provider_adapters(getattr(args, "ctl_cfg", None))
@@ -461,7 +505,8 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
     ctl_group = parser.add_argument_group(
         "ctl",
         "control-plane authority & context: cfg/policy source, governing "
-        "profile, state root — the profile declares what this run is allowed to do",
+        "profile, state root, run label — the profile declares what this run "
+        "is allowed to do",
     )
     execution_group = parser.add_argument_group(
         "execution",
@@ -498,6 +543,22 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
         required=True,
         help="Local ctl-state root (run results tree); runner appends <action>/<run_type>/<name>",
     )
+    # A label names ONE invocation and groups every run it produces. A
+    # maintenance run is out-of-band ctl-state work that publishes no revision,
+    # so it has nothing to group and is not offered one.
+    if run_type in {"workflow", "target", "fan_out", "procedure"}:
+        ctl_group.add_argument(
+            "--label",
+            default=None,
+            metavar="NAME",
+            help="Optional name for THIS invocation, carried by every run it "
+            "produces (a fan-out labels its workflows, a workflow its targets) "
+            "and recorded beside the revision each one commits. Targets come "
+            "from different source repositories, so no commit says which "
+            "revisions were one deployment — this does. Metadata only: it never "
+            "enters an instance address, a composition digest, or a reuse "
+            "comparison, so relabelling changes nothing about what is deployed",
+        )
     # 2) execution access mode, then runtime.
     # Execution access is a PER-PROVIDER decision: a run that spans
     # providers may need normal access to one and escalated access to another,
@@ -694,46 +755,55 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             help="Resolve and live-check every selected execution identity, write the "
             "preflight artifacts, and exit without state, guardrails, or target_runs",
         )
-    # internal, engine-set (hidden from --help) — last
-    parser.add_argument(
-        "--parent-graph-provisions-ctl-state-backend",
-        action="store_true",
-        dest="parent_graph_provisions_ctl_state_backend",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--parent-ctl-state-backend-absence-confirmed",
-        action="store_true",
-        dest="parent_ctl_state_backend_absence_confirmed",
-        help=argparse.SUPPRESS,
-    )
-    # Set by the fan-out runner on its child runs: the fan-out run id recorded
-    # in child run metadata as the batch audit record (— the fan-out
-    # itself is stateless and owns no run history).
-    parser.add_argument(
-        "--parent-fan-out-run-id",
-        dest="parent_fan_out_run_id",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    # A workflow-spawned child target run executes under the lock its
-    # parent already holds. Internal wiring, not an operator flag.
-    parser.add_argument(
-        "--parent-workflow-run-id",
-        dest="parent_workflow_run_id",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    # The parent's INSTANCE address, not just its run id. A spawned
-    # child cannot derive it — it knows neither the workflow key nor the axes the
-    # workflow partitions by — so the parent hands it over like every other fact
-    # the child cannot compute. The in-process path already recorded it.
-    parser.add_argument(
-        "--parent-workflow-instance-address",
-        dest="parent_workflow_instance_address",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
+    # internal, engine-set (hidden from --help) — last.
+    #
+    # Scoped by run type, because only some runs can BE a child. Exactly two
+    # places build a child argv: build_child_target_command, which always spawns
+    # a `target`, and the fan-out, whose children are a `workflow` or a `target`.
+    # A procedure, a maintenance run and a fan-out are always top-level, so
+    # declaring these on them accepted flags nothing could ever send and that the
+    # runner would then ignore.
+    if run_type in {"workflow", "target"}:
+        parser.add_argument(
+            "--parent-graph-provisions-ctl-state-backend",
+            action="store_true",
+            dest="parent_graph_provisions_ctl_state_backend",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--parent-ctl-state-backend-absence-confirmed",
+            action="store_true",
+            dest="parent_ctl_state_backend_absence_confirmed",
+            help=argparse.SUPPRESS,
+        )
+        # Set by the fan-out runner on its child runs: the fan-out run id recorded
+        # in child run metadata as the batch audit record (— the fan-out
+        # itself is stateless and owns no run history).
+        parser.add_argument(
+            "--parent-fan-out-run-id",
+            dest="parent_fan_out_run_id",
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+    # A workflow spawns TARGETS and nothing else, so only a target can run under
+    # a parent workflow's lock.
+    if run_type == "target":
+        parser.add_argument(
+            "--parent-workflow-run-id",
+            dest="parent_workflow_run_id",
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+        # The parent's INSTANCE address, not just its run id. A spawned
+        # child cannot derive it — it knows neither the workflow key nor the axes the
+        # workflow partitions by — so the parent hands it over like every other fact
+        # the child cannot compute. The in-process path already recorded it.
+        parser.add_argument(
+            "--parent-workflow-instance-address",
+            dest="parent_workflow_instance_address",
+            default=None,
+            help=argparse.SUPPRESS,
+        )
 
 
 def add_status_args(parser: argparse.ArgumentParser) -> None:
@@ -751,7 +821,8 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
     query_group = parser.add_argument_group(
         "query",
         "what to read: the namespace/instance selectors, the breadth (whole "
-        "namespace or one owner), and the optional lifecycle view",
+        "namespace or one owner), and how a whole-namespace read is shaped, "
+        "narrowed and ordered",
     )
     scope_group = parser.add_argument_group(
         "scope",
@@ -802,17 +873,22 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         help="which status GROUP a targeted target query reports (an action names "
         "its group: provision/destroy -> deployment); ignored by --all",
     )
-    # Filters, not selectors: they narrow what --all PRINTS. A breadth argument
+    # A filter, not a selector: it narrows what --all PRINTS. A breadth argument
     # names ONE instance, so a filter needs its own word rather than a valueless
     # --target/--workflow.
     query_group.add_argument(
-        "--kind",
-        dest="kinds",
-        default=None,
-        type=kernel_scalars.parse_comma_list,
-        metavar="KIND[,KIND...]",
-        help="--all only: show these row kinds (target, workflow); default both. "
-        "Same vocabulary as the row prefix and as --prune-kind",
+        "--filter",
+        dest="filters",
+        action=ExecutionParamsAction,
+        default=[],
+        metavar="FIELD=VALUE[,FIELD=VALUE...]",
+        help="--all only: show the rows matching every filter, comma-separated "
+        "and/or repeatable. Any field a row carries — kind, address, group, "
+        "status, last_action, standing, superseded_by, freshness, time, members, "
+        "label. Repeating a field is OR (`group=plan,group=mutative` is either); "
+        "different fields all have to hold, so adding one always narrows. Matched "
+        "against the row as the FLAT shape presents it, so what you filter on is "
+        "what you can see",
     )
     query_group.add_argument(
         "--structure",
@@ -824,21 +900,26 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         "is a choice, not a default to inherit",
     )
     query_group.add_argument(
-        "--sort",
-        default="address",
-        metavar="FIELD[:asc|desc]",
-        help="--all only: order by `time` or `address`; direction defaults to asc. "
-        "Nested sorts on two levels — templates by their newest instance, "
-        "instances by their newest group",
+        "--format",
+        dest="output_format",
+        default=None,
+        choices=list(state_render.STATUS_FORMATS),
+        help="--all only: `yaml` (the default) is the report as one machine-"
+        "readable object; `table` renders the SAME report for reading. "
+        "ORTHOGONAL to --structure — each shape has a table, and neither "
+        "argument narrows the other. A table never becomes a parse target and "
+        "never carries a fact the YAML lacks",
     )
     query_group.add_argument(
-        "--group",
-        dest="groups",
-        default=None,
-        type=kernel_scalars.parse_comma_list,
-        metavar="GROUP[,GROUP...]",
-        help="--all only: show these status groups (plan, readonly, deployment); "
-        "default all. A row whose every group is filtered out is dropped",
+        "--sort",
+        default="address",
+        metavar="FIELD[:asc|desc][,FIELD[:asc|desc]...]",
+        help="--all only: order by one field per key, the first deciding and each "
+        "later one breaking the ties before it — `--sort members:desc,time` is the "
+        "biggest compositions, oldest first. Every field a flat row carries is "
+        "sortable (the same set --filter takes, minus kind), each with its own "
+        "direction, asc by default. `--structure nested` orders SETS of rows, so "
+        "it takes only `address` or `time`",
     )
     # 3) scope — where to read, and the local dir / dev substitute
     scope_group.add_argument(
@@ -909,22 +990,23 @@ def finalize_status_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ --all requires --structure nested|flat")
     if getattr(args, "structure", None) and not args.all:
         raise RuntimeError("❌ --structure shapes --all; a targeted query names one instance")
+    # Unlike --structure, --format is OPTIONAL with --all: yaml is the default,
+    # so the shape a reader gets without asking is the machine-readable one.
+    if getattr(args, "output_format", None) and not args.all:
+        raise RuntimeError(
+            "❌ --format renders --all; a targeted query names one instance, "
+            "which is what the YAML report is already right for"
+        )
     if args.all:
-        state_status.parse_sort(args.sort)
-    for flag, dest, allowed in (
-        ("--kind", "kinds", run_actions.RESULT_KINDS),
-        ("--group", "groups", tuple(run_actions.STATUS_GROUPS)),
-    ):
-        selected = getattr(args, dest, None)
-        if selected is None:
-            continue
-        if not args.all:
-            raise RuntimeError(f"❌ {flag} filters --all; a targeted query names one instance")
-        unknown = sorted(set(selected) - set(allowed))
-        if unknown:
-            raise RuntimeError(
-                f"❌ {flag} got unknown {', '.join(unknown)}; expected one of {', '.join(allowed)}"
-            )
+        # WITH the structure: a nested map orders sets of rows, so it accepts a
+        # narrower field set, and the refusal belongs where the shape is known.
+        state_status.parse_sort(args.sort, structure=args.structure)
+    raw_filters = getattr(args, "filters", None) or []
+    if raw_filters and not args.all:
+        raise RuntimeError("❌ --filter narrows --all; a targeted query names one instance")
+    args.filters = state_status.parse_filters(
+        [f"{field}={value}" for field, value in raw_filters]
+    )
     if args.scope == "local":
         if not args.ctl_state_local_root:
             raise RuntimeError("❌ --scope local requires --ctl-state-local-root")

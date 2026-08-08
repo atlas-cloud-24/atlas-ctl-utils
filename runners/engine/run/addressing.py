@@ -137,8 +137,8 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 
 
 # One shape for every kind. `status` first because it is the fact a
-# reader acts on, `freshness` second because it qualifies a published result, `at`
-# Last because it dates the record rather than describing it.
+# reader acts on, `freshness` second because it qualifies a published result,
+# `time` after them because it dates the record rather than describing it.
 # `committed_at`/`committed_run_id` stay OUT of the flat row: a field that
 # appears only when a run failed after a success makes the common row harder to
 # scan, and two timestamps invite misreading which is which. They remain on the
@@ -148,8 +148,11 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 # when. `standing`/`superseded_by` sit AHEAD of `freshness` because a superseded
 # row's freshness describes it against its OWN cfg, which reads as reassuring
 # until you know it is not the one deployed.
-AXIS_ORDER = ("status", "last_action", "standing", "superseded_by", "freshness", "at",
-              "parent_workflow", "parent_workflow_run_id")
+# `label` is LAST: it names the invocation a row belonged to rather than saying
+# anything about the row's own outcome, so it is the fact a reader reaches for
+# after the ones they act on.
+AXIS_ORDER = ("status", "last_action", "standing", "superseded_by", "freshness", "time",
+              "parent_workflow", "parent_workflow_run_id", "label")
 
 
 def order_axes(axes: dict[str, str]) -> dict[str, str]:
@@ -178,7 +181,7 @@ def _axis_row(computed: dict) -> dict[str, str]:
     }
     if not row.get("status"):
         return {}
-    for field in ("at", "parent_workflow", "parent_workflow_run_id"):
+    for field in ("time", "parent_workflow", "parent_workflow_run_id", "label"):
         if computed.get(field):
             row[field] = computed[field]
     return order_axes(row)

@@ -178,6 +178,7 @@ def setup_run_dirs(
     memory_handler: logging.handlers.MemoryHandler,
     *,
     locator_segments: list[str],
+    label: str | None = None,
     parent_fan_out_run_id: str | None = None,
     parent_workflow_run_id: str | None = None,
     parent_workflow_instance_address: str | None = None,
@@ -268,6 +269,11 @@ def setup_run_dirs(
             **({"instance": list(instance_segments)} if instance_segments else {}),
             **({"instance_address": instance_address} if instance_address else {}),
             **({"target_addresses": list(target_addresses)} if target_addresses else {}),
+            # The operator's name for the invocation this run belongs to,
+            # inherited from the parent rather than minted here. Metadata: it is
+            # denormalized onto the committed pointer for reading, and absent
+            # from every identity and reuse comparison — see _COMMITTED_FACT_KEYS.
+            **({"label": label} if label else {}),
             # 8: the stateless fan-out's batch audit record —
             # "these runs were one invocation" lives only in child metadata.
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
@@ -309,6 +315,7 @@ def setup_preflight_run_dirs(
     *,
     locator_segments: list[str],
     check_only: bool = True,
+    label: str | None = None,
     instance_segments: list[str] | None = None,
     instance_address: str | None = None,
     target_addresses: list[str] | None = None,
@@ -378,6 +385,8 @@ def setup_preflight_run_dirs(
             **({"instance": list(instance_segments)} if instance_segments else {}),
             **({"instance_address": instance_address} if instance_address else {}),
             **({"target_addresses": list(target_addresses)} if target_addresses else {}),
+            # The invocation this run belongs to (see setup_run_dirs).
+            **({"label": label} if label else {}),
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
             # A child spawned by a workflow records its parent, so the
             # namespace mutation lock can tell "my parent holds it" from contention.

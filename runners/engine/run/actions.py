@@ -203,7 +203,8 @@ def action_group(action: str) -> str:
 # One representative action per group, for the compute functions that still take
 # an action and derive the group from it. Derived, because a hand-written inverse
 # is a second place for the same fact to be wrong — and it WAS wrong: it omitted
-# `maintenance`, so `--group maintenance` was refused for rows status produces.
+# `maintenance`, so `--filter group=maintenance` was refused for rows status
+# produces.
 STATUS_GROUP_ACTION = {
     group: group_representative_action(group) for group in RESULT_GROUPS
 }

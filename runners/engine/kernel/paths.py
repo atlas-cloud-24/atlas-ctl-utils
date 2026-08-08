@@ -122,9 +122,9 @@ def _sha256_file(path: Path) -> str:
 def _newest(groups: dict) -> str:
     """
 
-    the latest `at` across a row's groups; '' when none carries one."""
+    the latest `time` across a row's groups; '' when none carries one."""
 
-    return max((g.get("at") or "" for g in groups.values()), default="")
+    return max((g.get("time") or "" for g in groups.values()), default="")
 
 
 def _remove_path(path: Path) -> None:

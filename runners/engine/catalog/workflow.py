@@ -697,11 +697,19 @@ def build_child_target_command(
         "--parent-workflow-run-id", parent_run_id,
     ]
     # Read from the parent's own record rather than the frozen spec: the spec is
-    # about how to INVOKE a child, the instance address is a fact about the parent,
-    # and taking it from the record it is written in leaves nothing to drift.
-    parent_instance_address = state_run_store.load_run_metadata(parent_run_dir).get("instance_address")
+    # about how to INVOKE a child, while the instance address and the label are
+    # facts ABOUT the parent, and taking them from the record they are written in
+    # leaves nothing to drift.
+    parent_metadata = state_run_store.load_run_metadata(parent_run_dir)
+    parent_instance_address = parent_metadata.get("instance_address")
     if parent_instance_address:
         argv += ["--parent-workflow-instance-address", str(parent_instance_address)]
+    # One invocation, one label: a child carries its parent's rather than being
+    # given one of its own, which is what makes a label group a deployment
+    # instead of restating the run it sits on.
+    parent_label = parent_metadata.get("label")
+    if parent_label:
+        argv += ["--label", str(parent_label)]
     if spec.get("providers"):
         argv += ["--providers", ",".join(spec["providers"])]
     # The cadence has no default, so a child cannot inherit one: the parent's

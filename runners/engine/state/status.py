@@ -308,8 +308,9 @@ def _run_status(instance_dir: Path, group: str = "mutative") -> dict:
                 "reasons": [reason(slot)],
                 "mutation_started": slot.get("mutation_started") is True,
                 "run_id": slot.get("run_id"),
-                "at": slot.get("updated_at"),
+                "time": slot.get("updated_at"),
                 "action": slot.get("action"),
+                "label": slot.get("label"),
                 "parent_workflow_instance": slot.get("parent_workflow_instance_address"),
                 "parent_workflow_run_id": slot.get("parent_workflow_run_id"),
             }
@@ -319,15 +320,16 @@ def _run_status(instance_dir: Path, group: str = "mutative") -> dict:
     pointer = state_run_store.read_committed_pointer(instance_dir, group)
     if pointer is None:
         return {"status": None, "reasons": [], "mutation_started": False,
-                "run_id": None, "at": None, "action": None,
+                "run_id": None, "time": None, "action": None, "label": None,
                 "parent_workflow_instance": None, "parent_workflow_run_id": None}
     return {
         "status": Verdict.PASSED,
         "reasons": [],
         "mutation_started": False,
         "run_id": pointer.get("run_id"),
-        "at": pointer.get("committed_at"),
+        "time": pointer.get("committed_at"),
         "action": pointer.get("action"),
+        "label": pointer.get("label"),
         "parent_workflow_instance": pointer.get("parent_workflow_instance_address"),
         "parent_workflow_run_id": pointer.get("parent_workflow_run_id"),
     }
@@ -442,8 +444,14 @@ def compute_target_instance_status(
     # committed pointer when the two are different runs.
     if run["run_id"]:
         result["run_id"] = run["run_id"]
-    if run["at"]:
-        result["at"] = run["at"]
+    if run["time"]:
+        result["time"] = run["time"]
+    # The INVOCATION that run belonged to, which is what makes targets from
+    # unrelated source repositories readable as one deployment. Same rule as `at`
+    # and `run_id` — it comes from the run that produced `status`, never from a
+    # pointer a different run wrote.
+    if run["label"]:
+        result["label"] = run["label"]
     # The last PUBLISHED result is a separate fact, and only worth stating when
     # it is not the run above — otherwise it would repeat `at` on every row.
     if pointer and pointer.get("run_id") != run["run_id"]:
@@ -542,8 +550,12 @@ def compute_workflow_instance_status(
 
     if run["run_id"]:
         result["run_id"] = run["run_id"]
-    if run["at"]:
-        result["at"] = run["at"]
+    if run["time"]:
+        result["time"] = run["time"]
+    # The invocation this composition belonged to (see
+    # compute_target_instance_status).
+    if run["label"]:
+        result["label"] = run["label"]
     if pointer and pointer.get("run_id") != run["run_id"]:
         result["committed_at"] = pointer.get("committed_at")
         result["committed_run_id"] = pointer.get("run_id")
@@ -706,16 +718,24 @@ def _targeted_workflow_status(namespace_root: Path, action: str, spec: dict) -> 
 
 
 def _compute_status_results(
-    namespace_root: Path, action: str, labels: list[str], specs: list[dict]
+    namespace_root: Path, action: str, selection_labels: list[str], specs: list[dict]
 ) -> list[dict]:
+    """One result per selected spec, each naming WHAT WAS ASKED FOR beside it.
+
+    `selection_labels` names the query — a fan-out child's display name, or the
+    selection key of a targeted read. It is spelled in full because a row also
+    carries `label`, which is the operator's name for the INVOCATION that
+    produced the record; the two are unrelated facts and must not share a word.
+    """
+
     results = []
-    for label, spec in zip(labels, specs):
+    for selection_label, spec in zip(selection_labels, specs):
         computed = (
             compute_target_instance_status(namespace_root, action, spec)
             if spec["kind"] == "target"
             else _targeted_workflow_status(namespace_root, action, spec)
         )
-        computed["selection"] = label
+        computed["selection"] = selection_label
         results.append(computed)
     return results
 
@@ -810,7 +830,7 @@ def _ordered_workflow_row(
         ordered["superseded_by"] = run_addressing.qualified_address("workflow", superseded_by)
     if freshness is not None:
         ordered["freshness"] = freshness
-    for key in ("at", "run_id", "selectors", "default_action"):
+    for key in ("time", "run_id", "selectors", "default_action"):
         if key in row:
             ordered[key] = row[key]
     if members:
@@ -1014,7 +1034,7 @@ def _workflow_run_row(metadata: dict) -> dict:
     """One run record as a row: what it did, what selected its members, and which
     members it ran with."""
 
-    row: dict = {"status": _run_conclusion(metadata), "at": metadata.get("updated_at")}
+    row: dict = {"status": _run_conclusion(metadata), "time": metadata.get("updated_at")}
     # The matched member's own selector block, copied verbatim: it points back at
     # the cfg that produced this run, and nothing depends on the engine knowing a
     # field called "operation". A member that matched with none omits it.
@@ -1022,6 +1042,10 @@ def _workflow_run_row(metadata: dict) -> dict:
         row["selectors"] = metadata["member_selectors"]
     if metadata.get("default_action"):
         row["default_action"] = metadata["default_action"]
+    # A workflow publishes no pointer, so its run record is the only place the
+    # invocation label can be read from.
+    if metadata.get("label"):
+        row["label"] = metadata["label"]
     # The group this run belonged to. Read from the record when the
     # run wrote one, otherwise DERIVED from the members it recorded — a run from
     # before the field existed still answers, rather than filtering out as though
@@ -1173,14 +1197,28 @@ def compute_namespace_status_map(
 
 
 class SortField(StrEnum):
-    """What `--sort` may order a status map by.
+    """What `--sort` may order a status map by: every scalar fact a row carries.
 
-    Two, because a row has exactly two things every kind of row carries: WHEN it
-    happened and WHAT it is about.
+    One vocabulary, in one order, because a sortable field and a table column are
+    the same thing — the question "which of these ran last / failed / is
+    unlabelled" is asked by ordering the column you are already reading. The
+    table's `FLAT_COLUMNS` IS this tuple; declaring them separately would let a
+    column appear that could not be sorted by, with nothing to say why.
+
+    `time`, not `at`: a field name has to work as both a column heading and a
+    `--sort` value, and `--sort at` reads as an unfinished sentence.
     """
 
-    TIME = "time"
     ADDRESS = "address"
+    GROUP = "group"
+    STATUS = "status"
+    LAST_ACTION = "last_action"
+    STANDING = "standing"
+    SUPERSEDED_BY = "superseded_by"
+    FRESHNESS = "freshness"
+    TIME = "time"
+    MEMBERS = "members"
+    LABEL = "label"
 
 
 class SortDirection(StrEnum):
@@ -1204,17 +1242,172 @@ class StatusStructure(StrEnum):
 SORT_FIELDS = tuple(SortField)
 STATUS_STRUCTURES = tuple(StatusStructure)
 
+# What a NESTED map can be ordered by. A flat row has one value per field, so
+# every field orders it. A nested one orders SETS — a template holds many
+# instances, an instance many groups — and only these two aggregate over a set
+# without inventing a meaning: a template's name is its own, and its newest row
+# is the one a reader is looking for. "The worst status in this template" or "the
+# largest label under it" are not questions, and answering them deterministically
+# would be worse than refusing, because the order would look considered.
+NESTED_SORT_FIELDS = (SortField.ADDRESS, SortField.TIME)
 
-def parse_sort(raw: str) -> tuple[str, bool]:
-    """`<field>[:asc|desc]` -> (field, descending). Direction defaults to asc."""
-    field, _, direction = raw.partition(":")
-    if field not in SORT_FIELDS:
-        raise RuntimeError(
-            f"❌ --sort field {field!r} unknown; expected one of {', '.join(SORT_FIELDS)}"
-        )
-    if direction not in ("", SortDirection.ASC, SortDirection.DESC):
-        raise RuntimeError(f"❌ --sort direction {direction!r} must be asc or desc")
-    return field, direction == SortDirection.DESC
+# What `--filter` may narrow by: every sortable field, plus `kind`.
+#
+# `kind` is filterable without being a column. The flat shape carries it as the
+# first segment of `address` and the nested shape as its outer key, so printing
+# it again would repeat what a reader can already see — but "only the workflows"
+# is a question worth asking, and it has to be askable through the one mechanism.
+FILTER_FIELDS = ("kind", *SORT_FIELDS)
+
+
+def parse_filters(items: list[str] | None) -> dict[str, list[str]]:
+    """`FIELD=VALUE` pairs -> `{field: [values]}`, order preserved.
+
+    Repeating a field collects ALTERNATIVES rather than overwriting: `group=plan,
+    group=mutative` is either of them, and different fields all have to hold. That
+    is the only reading under which adding a filter narrows a result — a second
+    `group=` that replaced the first would silently widen it back.
+    """
+
+    filters: dict[str, list[str]] = {}
+    for item in items or []:
+        field, separator, value = item.partition("=")
+        field, value = field.strip(), value.strip()
+        if not separator or not field or not value:
+            raise RuntimeError(
+                f"❌ --filter must use FIELD=VALUE, got: {item!r}"
+            )
+        if field not in FILTER_FIELDS:
+            raise RuntimeError(
+                f"❌ --filter field {field!r} unknown; expected one of "
+                f"{', '.join(FILTER_FIELDS)}"
+            )
+        values = filters.setdefault(field, [])
+        if value not in values:
+            values.append(value)
+    return filters
+
+
+def parse_sort(raw: str, *, structure: str | None = None) -> list[tuple[str, bool]]:
+    """`<field>[:asc|desc][,<field>[:asc|desc]...]` -> ordered `(field, descending)`.
+
+    A LIST, because one field rarely decides an order on its own: sorting by
+    `members` puts every one-member workflow together and says nothing about
+    which of them ran last, and sorting by `status` groups the failures without
+    ordering them. Keys apply left to right — the first decides, each later one
+    breaks the ties the earlier ones left — and each carries its OWN direction,
+    so `members:desc,time` is the biggest compositions, oldest first.
+
+    `structure` narrows the field set when it is known; omitting it validates the
+    fields alone, which is what a caller ordering an already-shaped map needs.
+    """
+
+    keys: list[tuple[str, bool]] = []
+    # Split here rather than through parse_comma_list, which DEDUPES: it exists
+    # for name lists where a repeat is harmless, and silently collapsing
+    # `time,time` would make the duplicate guard below unreachable for exactly
+    # the spelling most likely to be a mistake.
+    for item in (part.strip() for part in str(raw).split(",")):
+        if not item:
+            continue
+        field, _, direction = item.partition(":")
+        if field not in SORT_FIELDS:
+            raise RuntimeError(
+                f"❌ --sort field {field!r} unknown; expected one of {', '.join(SORT_FIELDS)}"
+            )
+        if structure == StatusStructure.NESTED and field not in NESTED_SORT_FIELDS:
+            raise RuntimeError(
+                f"❌ --sort {field!r} shapes --structure flat, where a row has one "
+                f"value for it; a nested map orders sets of rows, which only "
+                f"{', '.join(NESTED_SORT_FIELDS)} do without inventing a meaning"
+            )
+        if direction not in ("", SortDirection.ASC, SortDirection.DESC):
+            raise RuntimeError(f"❌ --sort direction {direction!r} must be asc or desc")
+        if any(field == existing for existing, _ in keys):
+            raise RuntimeError(
+                f"❌ --sort names {field!r} twice; a field that already decided "
+                "the order cannot break its own ties"
+            )
+        keys.append((field, direction == SortDirection.DESC))
+    if not keys:
+        raise RuntimeError("❌ --sort must name at least one field")
+    return keys
+
+
+def sort_rows(rows: list[dict], keys: list[tuple[str, bool]]) -> list[dict]:
+    """Order rows by every key, the first deciding and the rest breaking ties.
+
+    Applied from the LAST key backwards over a stable sort, which is the standard
+    way to get lexicographic ordering with a per-key direction — building one
+    composite key cannot, because reversing it would reverse every field at once.
+
+    Address and group are the final tie-break, always ascending: two runs can
+    agree on every declared key, and an order that then varies between two reads
+    of the same namespace is unusable for comparing them.
+    """
+
+    ordered = sorted(rows, key=lambda row: (row.get("address") or "", row.get("group") or ""))
+    for field, descending in reversed(keys):
+        ordered.sort(key=lambda row: sort_value(row, field), reverse=descending)
+    return ordered
+
+
+def sort_value(row: dict, field: str):
+    """One row's ordering value for one field.
+
+    `members` orders by HOW MANY, not by the text of a list: the flat shape
+    already renders it as a count, because a row carrying its own address has
+    nowhere to nest the objects. Every other field orders as text, and an absent
+    value sorts as empty — which puts the rows that never had one together at one
+    end rather than scattering them.
+    """
+
+    if field == SortField.MEMBERS:
+        members = row.get("members")
+        return len(members) if isinstance(members, list) else 0
+    return str(row.get(field) or "")
+
+
+def walk_status_map(instances: dict):
+    """Every row in a nested map, as `(kind, template, segments, group, row)`.
+
+    ONE walk, used by both the filter and the flat shape, because they have to
+    agree on what a row IS. They did not have to before — the filter matched on
+    the tree's own keys while only the flat shape ever composed an address — and
+    a general filter that matches on `address` makes the two answer the same
+    question, which is exactly where a second walk would drift.
+
+    `segments` is the instance path exactly as the state layout writes it —
+    `param=value` joined by `/` — and empty for a singleton, which has none.
+    """
+
+    for kind, templates in instances.items():
+        for template, body in templates.items():
+            bodies = (
+                list(body[run_addressing.INSTANCES_MARKER].items())
+                if run_addressing.INSTANCES_MARKER in body
+                else [("", body)]
+            )
+            for segments, groups in bodies:
+                for group, row in groups.items():
+                    yield kind, template, segments or "", group, row
+
+
+def flat_row(kind: str, template: str, segments: str, group: str, row: dict) -> dict:
+    """One row of the flat shape: its own address, its group, then its axes.
+
+    The kind is a path SEGMENT of the address rather than a field of its own —
+    splitting the flat list by kind would break a globally chronological order for
+    the same reason template nesting does.
+    """
+
+    address = "/".join([
+        kind,
+        run_addressing.instance_address(
+            template, segments.split("/") if segments else []
+        ),
+    ])
+    return {"address": address, "group": group, **row}
 
 
 def structure_status_map(instances: dict, structure: str, sort: str) -> dict:
@@ -1224,58 +1417,54 @@ def structure_status_map(instances: dict, structure: str, sort: str) -> dict:
     templates by their newest instance, instances by their newest group. A tree
     cannot express a globally chronological order — grouping and global ordering
     are in conflict — so `flat` exists for that: a LIST of one row per group,
-    each carrying its own address, which can be ordered strictly by time.
+    each carrying its own address, which can be ordered by every field a row has.
     """
-    field, descending = parse_sort(sort)
+
+    keys = parse_sort(sort, structure=structure)
 
     if structure == StatusStructure.FLAT:
-        # ONE list. Splitting by kind would break global chronological order for
-        # the same reason template nesting does, and the kind is already a path
-        # segment of the address, so it needs no field of its own.
-        rows = []
-        for kind, templates in instances.items():
-            for template, body in templates.items():
-                bodies = (
-                    list(body[run_addressing.INSTANCES_MARKER].items())
-                    if run_addressing.INSTANCES_MARKER in body
-                    else [(None, body)]
-                )
-                for segs, row in bodies:
-                    address = "/".join(
-                        [kind, run_addressing.instance_address(template, segs.split("/") if segs else [])]
-                    )
-                    for group, axes in row.items():
-                        rows.append({"address": address, "group": group, **axes})
-        key = (
-            (lambda r: (r.get("at") or ""))
-            if field == SortField.TIME
-            else (lambda r: (r["address"], r["group"]))
-        )
-        return {"instances": sorted(rows, key=key, reverse=descending)}
+        return {
+            "instances": sort_rows(
+                [flat_row(*entry) for entry in walk_status_map(instances)], keys
+            )
+        }
 
+    # A nested map orders SETS, so it uses only the fields that aggregate over
+    # one (parse_sort has already refused the others). Applied from the last key
+    # backwards over a stable sort, exactly as sort_rows does for a flat row.
+    def _by(keys, value_of):
+        def order(items):
+            ordered = list(items)
+            for field, descending in reversed(keys):
+                ordered.sort(key=lambda item: value_of(item, field), reverse=descending)
+            return ordered
+        return order
+
+    def _template_value(item, field):
+        template, body = item
+        if field == SortField.ADDRESS:
+            return template
+        rows = (
+            body[run_addressing.INSTANCES_MARKER].values()
+            if run_addressing.INSTANCES_MARKER in body
+            else [body]
+        )
+        return max((kernel_paths._newest(row) for row in rows), default="")
+
+    def _instance_value(item, field):
+        segments, groups = item
+        return segments if field == SortField.ADDRESS else kernel_paths._newest(groups)
+
+    order_templates = _by(keys, _template_value)
+    order_instances = _by(keys, _instance_value)
     ordered: dict = {}
     for kind, templates in instances.items():
-        def template_key(item):
-            template, body = item
-            if field == SortField.ADDRESS:
-                return template
-            rows = (
-                body[run_addressing.INSTANCES_MARKER].values()
-                if run_addressing.INSTANCES_MARKER in body
-                else [body]
-            )
-            return max((kernel_paths._newest(r) for r in rows), default="")
-
         kind_out: dict = {}
-        for template, body in sorted(templates.items(), key=template_key, reverse=descending):
+        for template, body in order_templates(templates.items()):
             if run_addressing.INSTANCES_MARKER in body:
-                rows = body[run_addressing.INSTANCES_MARKER]
-                instance_key = (
-                    (lambda kv: kernel_paths._newest(kv[1])) if field == SortField.TIME else (lambda kv: kv[0])
-                )
                 kind_out[template] = {
                     run_addressing.INSTANCES_MARKER: dict(
-                        sorted(rows.items(), key=instance_key, reverse=descending)
+                        order_instances(body[run_addressing.INSTANCES_MARKER].items())
                     )
                 }
             else:
@@ -1284,49 +1473,43 @@ def structure_status_map(instances: dict, structure: str, sort: str) -> dict:
     return ordered
 
 
-def filter_status_map(
-    instances: dict,
-    kinds: list[str] | None,
-    groups: list[str] | None,
-) -> dict:
-    """Narrow a namespace map by row kind and status group.
+def filter_status_map(instances: dict, filters: dict[str, list[str]] | None) -> dict:
+    """Narrow a namespace map to the rows matching every filter.
 
-    A row whose every group is filtered out is DROPPED rather than shown empty —
-    an empty row would read as "nothing happened here", which is a different
-    claim from "you asked not to see it".
+    Values of ONE field are alternatives (`group=plan,group=mutative` is either),
+    and different fields all have to hold — which is the only reading that lets a
+    filter be added to narrow a result rather than to widen it by accident.
 
-    A workflow row is partitioned by group exactly like a target's, so one filter
-    serves both. It did not use to be: a workflow row was `{"last_run": {...}}`
-    with its group one level in, which needed a second filter that silently
-    dropped every workflow when it looked at the wrapper instead.
+    A template or instance whose every row is filtered out is DROPPED rather than
+    shown empty: an empty one would read as "nothing happened here", which is a
+    different claim from "you asked not to see it".
+
+    Matching is on the row as the FLAT shape presents it, so what a filter tests
+    is what a reader can see — including `address`, which the nested tree spells
+    across three levels and never as one string.
     """
 
-    def _keep(row: dict) -> dict:
-        return {g: axes for g, axes in row.items() if not groups or g in groups}
+    if not filters:
+        return instances
+
+    def matches(kind, template, segments, group, row) -> bool:
+        candidate = {"kind": kind, **flat_row(kind, template, segments, group, row)}
+        return all(
+            any(str(sort_value(candidate, field)) == value for value in values)
+            for field, values in filters.items()
+        )
 
     selected: dict = {}
-    for kind, templates in instances.items():
-        if kinds and kind not in kinds:
+    for kind, template, segments, group, row in walk_status_map(instances):
+        if not matches(kind, template, segments, group, row):
             continue
-        kept_templates: dict = {}
-        for template, body in templates.items():
-            # A template holds either an `instances` map or, for a singleton, the
-            # groups directly.
-            keep = _keep
-            if run_addressing.INSTANCES_MARKER in body:
-                kept = {
-                    segs: g
-                    for segs, row in body[run_addressing.INSTANCES_MARKER].items()
-                    if (g := keep(row))
-                }
-                if kept:
-                    kept_templates[template] = {run_addressing.INSTANCES_MARKER: kept}
-            else:
-                kept = keep(body)
-                if kept:
-                    kept_templates[template] = kept
-        if kept_templates:
-            selected[kind] = kept_templates
+        templates = selected.setdefault(kind, {})
+        if segments:
+            templates.setdefault(template, {run_addressing.INSTANCES_MARKER: {}})[
+                run_addressing.INSTANCES_MARKER
+            ].setdefault(segments, {})[group] = row
+        else:
+            templates.setdefault(template, {})[group] = row
     return selected
 
 
