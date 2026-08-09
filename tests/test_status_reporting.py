@@ -456,12 +456,12 @@ class LastActionTest(unittest.TestCase):
             self.assertEqual(["status", "last_action", "freshness", "time"], list(row))
 
 
-class WorkflowGroupPartitionTest(unittest.TestCase):
-    """A workflow instance holds EVERY group it has run, like a target instance.
+class WorkflowEffectPartitionTest(unittest.TestCase):
+    """A workflow instance reports public mutability effects.
 
-    Reporting only the newest run collapsed them: a failed `plan` after a
-    successful `provision` replaced the deployment row and appeared under
-    `mutative`, so the row said the deployment failed when the plan did.
+    Internal plan and readonly channels stay independent on disk, but both are
+    one public non-mutative claim. A failed plan after a successful provision
+    must not replace the mutative row.
     """
 
     KEY = "env/baseline"
@@ -484,9 +484,9 @@ class WorkflowGroupPartitionTest(unittest.TestCase):
             self._run(ns, "w1", "provision", "ok", "2026-08-05T10:00:00Z")
             self._run(ns, "w2", "plan", "failed", "2026-08-05T18:00:00Z")
             row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
-            self.assertEqual({"mutative", "plan"}, set(row))
+            self.assertEqual({"mutative", "non_mutative"}, set(row))
             self.assertEqual("passed", row["mutative"]["status"])
-            self.assertEqual("failed", row["plan"]["status"])
+            self.assertEqual("failed", row["non_mutative"]["status"])
 
     def test_each_group_keeps_its_own_latest_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -505,7 +505,17 @@ class WorkflowGroupPartitionTest(unittest.TestCase):
             ns = Path(tmp)
             self._run(ns, "w1", "plan", "ok", "2026-08-05T10:00:00Z")
             row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
-            self.assertEqual(["plan"], list(row))
+            self.assertEqual(["non_mutative"], list(row))
+
+    def test_latest_plan_or_readonly_run_represents_non_mutative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = Path(tmp)
+            self._run(ns, "w1", "plan", "failed", "2026-08-05T10:00:00Z")
+            self._run(ns, "w2", "readonly", "ok", "2026-08-05T12:00:00Z")
+            row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
+            self.assertEqual(["non_mutative"], list(row))
+            self.assertEqual("passed", row["non_mutative"]["status"])
+            self.assertEqual(["readonly"], row["non_mutative"]["actions"])
 
 
 class WorkflowInstanceTest(unittest.TestCase):
@@ -730,8 +740,8 @@ class StatusQueryHistoryTest(unittest.TestCase):
                 self.assertIn("namespace_dir", line)
 
 
-class WorkflowGroupIsDerivedTest(unittest.TestCase):
-    """A workflow's group comes from what its members DO.
+class WorkflowClassificationIsDerivedTest(unittest.TestCase):
+    """A workflow's internal group, public effect, and actions come from members.
 
     Derived, never declared: a declared flag can disagree with the composition and
     nothing would catch it, while the members are already recorded on the run.
@@ -746,6 +756,8 @@ class WorkflowGroupIsDerivedTest(unittest.TestCase):
             "target_instances": ["env/static/acm", {"instance": "env/core", "action": "provision"}],
         }
         self.assertEqual("mutative", run_addressing.workflow_group(facts))
+        self.assertEqual("mutative", run_addressing.workflow_effect(facts))
+        self.assertEqual(["plan", "provision"], run_addressing.workflow_actions(facts))
 
     def test_destroy_is_mutative_too(self):
         """The group is `mutative`, which covers destroy — not a deployment."""
@@ -756,6 +768,24 @@ class WorkflowGroupIsDerivedTest(unittest.TestCase):
     def test_a_uniform_composition_takes_its_own_group(self):
         facts = {"default_action": "plan", "target_instances": ["env/core", "env/seed"]}
         self.assertEqual("plan", run_addressing.workflow_group(facts))
+        self.assertEqual("non_mutative", run_addressing.workflow_effect(facts))
+
+    def test_plan_and_readonly_are_one_public_non_mutative_effect(self):
+        facts = {
+            "default_action": "readonly",
+            "target_instances": [
+                "env/a",
+                {"instance": "env/b", "action": "plan"},
+            ],
+        }
+        self.assertEqual("plan", run_addressing.workflow_group(facts))
+        self.assertEqual("non_mutative", run_addressing.workflow_effect(facts))
+        self.assertEqual(["readonly", "plan"], run_addressing.workflow_actions(facts))
+
+    def test_maintenance_is_not_a_workflow_action(self):
+        facts = {"default_action": "maintenance", "target_instances": ["env/core"]}
+        with self.assertRaisesRegex(RuntimeError, "maintenance.*runner"):
+            run_addressing.workflow_effect(facts)
 
     def test_members_inherit_the_default_action(self):
         """A bare address took the workflow's default_action."""
@@ -796,7 +826,10 @@ class WorkflowGroupIsDerivedTest(unittest.TestCase):
                 {"t1": {"target": "env/core", "action": "provision"}},
                 {"default_action": "provision"},
             )
-            self.assertEqual("mutative", state_run_store.load_run_metadata(run_dir).get("group"))
+            metadata = state_run_store.load_run_metadata(run_dir)
+            self.assertEqual("mutative", metadata.get("group"))
+            self.assertEqual("mutative", metadata.get("effect"))
+            self.assertEqual(["provision"], metadata.get("actions"))
 
 
 class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
@@ -852,18 +885,21 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
             ns = self._namespace(Path(tmp), default_action="plan")
             rows = state_status.compute_namespace_status_map(ns)
             self.assertEqual({}, state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}))
-            self.assertIn("workflow", state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["plan"]}))
+            self.assertIn("workflow", state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["non_mutative"]}))
 
-    def test_a_run_recorded_before_the_group_existed_still_answers(self):
-        """
-
-        runs written before have no `group` field. Deriving it from
-        the members they DID record is what stops them filtering out as though
-        they had no group at all."""
+    def test_a_minimal_workflow_record_uses_its_action_as_group_evidence(self):
+        """A record without `group` still reports from its available action."""
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp) / "live"
-            run_dir = ns / run_addressing.compose_state_relpath("workflow", "env/legacy", []) / "runs" / "r1"
+            run_dir = (
+                ns
+                / run_addressing.compose_state_relpath(
+                    "workflow", "env/minimal_record", []
+                )
+                / "runs"
+                / "r1"
+            )
             run_dir.mkdir(parents=True)
             kernel_yaml_io.write_yaml_file(
                 state_run_store.run_metadata_path(run_dir),
@@ -872,7 +908,7 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
                  "default_action": "provision", "target_instances": ["env/core"]},
             )
             rows = state_status.compute_namespace_status_map(ns)
-            self.assertIn("mutative", rows["workflow"]["env/legacy"])
+            self.assertIn("mutative", rows["workflow"]["env/minimal_record"])
             self.assertIn("workflow", state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}))
 
 

@@ -67,11 +67,26 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
         self.assertIs(run_actions.RUN_ACTIONS, run_actions.KNOWN_ACTIONS)
         self.assertEqual(tuple(run_actions.ACTIONS), run_actions.RUN_ACTIONS)
 
+    def test_maintenance_is_not_a_workflow_action(self):
+        self.assertEqual(
+            {"provision", "plan", "destroy", "readonly"},
+            set(run_actions.WORKFLOW_ACTIONS),
+        )
+
+    def test_maintenance_has_state_ownership_but_not_ordinary_status_ownership(self):
+        self.assertEqual(
+            {"target", "workflow", "maintenance"}, set(run_actions.RESULT_KINDS)
+        )
+        self.assertEqual(
+            {"target", "workflow"}, set(run_actions.STATUS_RESULT_KINDS)
+        )
+        self.assertNotIn("maintenance", run_actions.STATUS_RESULT_GROUPS)
+
     def test_the_group_inverse_is_derived_not_written(self):
         """`STATUS_GROUPS` was a hand-written inverse of `GROUP_BY_ACTION`, which
         is a second place for one fact to be wrong — and it WAS wrong: it omitted
-        `maintenance`, so `--filter group=maintenance` was refused for rows the
-        status computation produces."""
+        `maintenance`. The full inverse remains complete even though ordinary
+        target/workflow status deliberately excludes the maintenance group."""
 
         rebuilt = {}
         for action, group in run_actions.GROUP_BY_ACTION.items():

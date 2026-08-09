@@ -44,6 +44,19 @@ class Group(StrEnum):
     MAINTENANCE = "maintenance"
 
 
+class WorkflowEffect(StrEnum):
+    """The public status classification of one resolved workflow run.
+
+    A workflow may contain several exact target actions. Its status therefore
+    reports whether any member mutates, while the action list preserves what the
+    composition actually did. Maintenance is not a workflow effect; it has its
+    own result owner and report.
+    """
+
+    MUTATIVE = "mutative"
+    NON_MUTATIVE = "non_mutative"
+
+
 class Direction(StrEnum):
     """An action's side of a forward/reverse pair within one group."""
 
@@ -70,10 +83,17 @@ class ResultKind(StrEnum):
 
     TARGET = "target"
     WORKFLOW = "workflow"
+    MAINTENANCE = "maintenance"
 
 
 class MaintenanceAction(StrEnum):
-    """Out-of-band operations, which are not runs and hold no run state."""
+    """Operator maintenance operations.
+
+    Maintenance-runner operations use the maintenance result owner and normal
+    lifecycle. A direct target run with ``action=maintenance`` remains owned by
+    that target. Ctl-state-only operations own their command report or audit
+    manifest.
+    """
 
     UNLOCK_CTL_STATE = "unlock-ctl-state"
     STATUS_SWEEP = "status-sweep"
@@ -121,11 +141,13 @@ ACTIONS: dict[Action, ActionFacts] = {
 MAINTENANCE_ACTIONS = tuple(MaintenanceAction)
 RUN_TYPES = tuple(RunType)
 RESULT_KINDS = tuple(ResultKind)
+STATUS_RESULT_KINDS = (ResultKind.TARGET, ResultKind.WORKFLOW)
 
 # Every action name the engine accepts. One tuple, because two of them were
 # verbatim copies consulted by different validators.
 RUN_ACTIONS = tuple(ACTIONS)
 KNOWN_ACTIONS = RUN_ACTIONS
+WORKFLOW_ACTIONS = tuple(action for action in RUN_ACTIONS if action != Action.MAINTENANCE)
 
 MUTATING_ACTIONS = tuple(name for name, facts in ACTIONS.items() if facts.mutating)
 
@@ -133,6 +155,7 @@ GROUP_BY_ACTION = {name: facts.group for name, facts in ACTIONS.items()}
 
 # Groups in the order their actions are declared, so the tuple is stable.
 RESULT_GROUPS = tuple(dict.fromkeys(GROUP_BY_ACTION.values()))
+STATUS_RESULT_GROUPS = tuple(group for group in RESULT_GROUPS if group != Group.MAINTENANCE)
 
 # Group -> the actions publishing into it, the inverse a status filter needs.
 STATUS_GROUPS: dict[Group, tuple[Action, ...]] = {
@@ -140,10 +163,11 @@ STATUS_GROUPS: dict[Group, tuple[Action, ...]] = {
     for group in RESULT_GROUPS
 }
 
-# "What is the strongest thing this workflow does". A composition that provisions
-# one target and plans another IS a mutation — the plan does not soften it — so
-# mutative wins over everything, and readonly is the weakest claim.
-GROUP_PRECEDENCE = (Group.MUTATIVE, Group.MAINTENANCE, Group.PLAN, Group.READONLY)
+# Internal state-slot selection only. Public workflow status does not choose a
+# winning action group: it reports mutative/non_mutative plus the exact actions.
+# A mixed non-mutative run still needs one internal slot, and PLAN is the
+# outdatable result channel while READONLY is not.
+WORKFLOW_STATE_GROUP_PRECEDENCE = (Group.MUTATIVE, Group.PLAN, Group.READONLY)
 
 
 def action_previewed_by(action: str) -> str:
@@ -205,9 +229,7 @@ def action_group(action: str) -> str:
 # is a second place for the same fact to be wrong — and it WAS wrong: it omitted
 # `maintenance`, so `--filter group=maintenance` was refused for rows status
 # produces.
-STATUS_GROUP_ACTION = {
-    group: group_representative_action(group) for group in RESULT_GROUPS
-}
+STATUS_GROUP_ACTION = {group: group_representative_action(group) for group in RESULT_GROUPS}
 
 
 def normalize_result_name(value: str, *, label: str) -> str:

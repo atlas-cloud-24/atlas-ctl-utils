@@ -6,7 +6,6 @@ would report dependents as stale on a run that turns out to be a no-op."""
 
 import logging
 import sys
-
 from pathlib import Path
 
 from engine.kernel import ids as kernel_ids
@@ -16,6 +15,7 @@ from engine.run import addressing as run_addressing
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+
 
 def log_target_run_banner(target_run_id: str, *, ch: str = "#", min_width: int = 70) -> None:
     title = f" {target_run_id} "
@@ -31,6 +31,30 @@ def mark_run_started(run_dir: Path) -> None:
     payload = state_status.build_status_payload(run_dir, state_run_store.RunStatus.IN_PROGRESS)
     state_run_store.write_current_status(run_dir, payload)
     state_run_store.write_state_slot(run_dir, state_run_store.StateSlot.IN_PROGRESS, payload)
+
+
+def record_maintenance_request(
+    run_dir: Path,
+    *,
+    operation: str,
+    subject: str | None = None,
+    scope: str | None = None,
+) -> None:
+    """Persist the operator request before maintenance enters its lifecycle.
+
+    The result path already encodes operation and subject; recording them as
+    fields keeps the audit row self-describing and makes the requested scope
+    visible while the run is still in progress.
+    """
+
+    state_run_store.update_run_metadata(
+        run_dir,
+        {
+            "maintenance_operation": operation,
+            **({"maintenance_subject": subject} if subject else {}),
+            **({"maintenance_scope": scope} if scope else {}),
+        },
+    )
 
 
 def record_workflow_members(
@@ -75,18 +99,17 @@ def record_workflow_members(
         if not isinstance(operation, str) or not operation:
             raise RuntimeError("❌ resolved workflow operation must be a non-empty string")
         facts["operation"] = operation
-    operation = workflow_cfg.get("operation")
-    if not isinstance(operation, str) or not operation:
-        raise RuntimeError("❌ resolved workflow has no operation")
-    facts["operation"] = operation
-    operation = workflow_cfg.get("operation")
-    if not isinstance(operation, str) or not operation:
-        raise RuntimeError("❌ resolved workflow has no operation")
-    facts["operation"] = operation
     if default_action:
         facts["default_action"] = default_action
+    actions = run_addressing.workflow_actions(facts)
+    if actions:
+        facts["actions"] = actions
+    effect = run_addressing.workflow_effect(facts)
+    if effect:
+        facts["effect"] = effect
     # Derived here, where the composition is known, so a reader of the record
-    # never has to re-derive it and cannot derive it differently
+    # never has to re-derive it and cannot derive it differently. `group` is the
+    # internal state channel; public status reads `effect` + `actions`.
     group = run_addressing.workflow_group(facts)
     if group:
         facts["group"] = group

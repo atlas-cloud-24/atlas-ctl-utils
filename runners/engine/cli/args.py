@@ -667,9 +667,10 @@ def add_common_args(parser: argparse.ArgumentParser, *, run_type: str) -> None:
             metavar="{true,false}",
             help="Explicit true/false (no default; required for a normal run, "
             "omit only with --status or --execution-identity-preflight-check-only): "
-            "when true, reuse a workflow child's committed result (skip re-running "
-            "it) only when its committed target instance is current, commit-pinned, "
-            "clean, and matches the current source/cfg commits and effective target definition/cfg view; when false, always re-run",
+            "when true, request reuse for each workflow child whose target enables "
+            "committed_result_reuse for its action and whose committed result is "
+            "current, commit-pinned, clean, and matches the current source/cfg "
+            "commits and effective target definition/cfg view; when false, always re-run",
         )
     # 6) --agreed-* / --force-* overrides
     override_group.add_argument(
@@ -845,6 +846,11 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="whole-namespace: every target and workflow instance",
     )
+    breadth.add_argument(
+        "--maintenance",
+        action="store_true",
+        help="whole-namespace maintenance audit, separate from target/workflow status",
+    )
     breadth.add_argument("--target", metavar="NAME", help="one declared target instance")
     breadth.add_argument(
         "--workflow", metavar="NAME", help="one declared workflow instance"
@@ -860,7 +866,8 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         choices=list(run_actions.KNOWN_ACTIONS),
         help="which status GROUP a targeted target query reports (an action names "
-        "its group: provision/destroy -> deployment); ignored by --all",
+        "its group: provision/destroy -> mutative); ignored by --all and "
+        "--maintenance",
     )
     # A filter, not a selector: it narrows what --all PRINTS. A breadth argument
     # names ONE instance, so a filter needs its own word rather than a valueless
@@ -872,12 +879,14 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="FIELD=VALUE[,FIELD=VALUE...]",
         help="--all only: show the rows matching every filter, comma-separated "
-        "and/or repeatable. Any field a row carries — kind, address, group, "
-        "status, last_action, standing, superseded_by, freshness, time, members, "
-        "label. Repeating a field is OR (`group=plan,group=mutative` is either); "
-        "different fields all have to hold, so adding one always narrows. Matched "
-        "against the row as the FLAT shape presents it, so what you filter on is "
-        "what you can see",
+        "and/or repeatable. Any displayed scalar field — kind, address, group, "
+        "status, last_action, last_operation, actions, standing, freshness, time, "
+        "members, label. Repeating a field is OR "
+        "(`group=non_mutative,group=mutative` is either); "
+        "different fields all have to hold, so adding one always narrows. A single "
+        "trailing * matches a prefix (`address=workflow/env/*`); quote wildcard "
+        "values in the shell. Matched against the row as the FLAT shape presents "
+        "it, so what you filter on is what you can see",
     )
     query_group.add_argument(
         "--structure",
@@ -893,11 +902,17 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         dest="output_format",
         default=None,
         choices=list(state_render.STATUS_FORMATS),
-        help="--all only: `yaml` (the default) is the report as one machine-"
-        "readable object; `table` renders the SAME report for reading. "
+        help="--all/--maintenance: `yaml` (the default) is the report as one "
+        "machine-readable object; `table` renders the SAME report for reading. "
         "ORTHOGONAL to --structure — each shape has a table, and neither "
         "argument narrows the other. A table never becomes a parse target and "
         "never carries a fact the YAML lacks",
+    )
+    query_group.add_argument(
+        "--hide-members",
+        action="store_true",
+        help="nested table only: omit workflow member target rows from the "
+        "presentation. The computed report and YAML remain complete",
     )
     query_group.add_argument(
         "--sort",
@@ -979,13 +994,24 @@ def finalize_status_args(args: argparse.Namespace) -> None:
         raise RuntimeError("❌ --all requires --structure nested|flat")
     if getattr(args, "structure", None) and not args.all:
         raise RuntimeError("❌ --structure shapes --all; a targeted query names one instance")
-    # Unlike --structure, --format is OPTIONAL with --all: yaml is the default,
-    # so the shape a reader gets without asking is the machine-readable one.
-    if getattr(args, "output_format", None) and not args.all:
+    # Unlike --structure, --format is optional for either whole-namespace view:
+    # yaml is the machine-readable default.
+    if (
+        getattr(args, "output_format", None)
+        and not args.all
+        and not getattr(args, "maintenance", False)
+    ):
         raise RuntimeError(
-            "❌ --format renders --all; a targeted query names one instance, "
-            "which is what the YAML report is already right for"
+            "❌ --format renders --all or --maintenance; a targeted query names "
+            "one instance, which is what the YAML report is already right for"
         )
+    if getattr(args, "hide_members", False):
+        if not args.all:
+            raise RuntimeError("❌ --hide-members renders --all")
+        if args.structure != state_status.StatusStructure.NESTED:
+            raise RuntimeError("❌ --hide-members requires --structure nested")
+        if getattr(args, "output_format", None) != state_render.StatusFormat.TABLE:
+            raise RuntimeError("❌ --hide-members requires --format table")
     if args.all:
         # WITH the structure: a nested map orders sets of rows, so it accepts a
         # narrower field set, and the refusal belongs where the shape is known.
@@ -1056,7 +1082,11 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     # Inert for a read (no box is built) but required by the shared context
     # builders / selection resolvers.
     args.execution_runtime_mode = "local"
-    if not args.all and args.action is None:
+    if (
+        not args.all
+        and not getattr(args, "maintenance", False)
+        and args.action is None
+    ):
         raise RuntimeError(
             "❌ a targeted status (--target/--workflow/--fan-out) requires "
             "--action provision|destroy"

@@ -5,7 +5,6 @@ target that cannot say who runs it is not runnable, and finding that out at
 execution time is finding it out too late."""
 
 import collections
-
 from pathlib import Path
 
 from engine.cfg import references as cfg_references
@@ -390,6 +389,32 @@ def build_active_target_runs(
         if target_cfg_keys is not None and not isinstance(target_cfg_keys, dict):
             raise RuntimeError(f"Target run target {target_key!r} cfg_keys must be a map")
 
+        # A member entry may declare the ACTION this target performs.
+        # Carried onto the run record so the spawn hands the child its own verb
+        # rather than the parent's, and validated against the target's own
+        # allowlist — the workflow may choose, never widen.
+        member_action = target_override.get("action")
+        allowed = target_cfg.get("allowed_actions") or []
+        if member_action is not None and member_action not in allowed:
+            raise RuntimeError(
+                f"❌ workflow member {target_key!r} declares action "
+                f"{member_action!r}, which that target does not allow "
+                f"(allowed: {', '.join(sorted(allowed)) or 'none'})"
+            )
+        effective_action = member_action or (workflow_cfg.get("meta") or {}).get("action")
+        reuse_policy = target_cfg.get("committed_result_reuse")
+        if not isinstance(reuse_policy, dict) or effective_action not in reuse_policy:
+            raise RuntimeError(
+                f"❌ target run {target_run_id!r} cannot resolve committed-result reuse "
+                f"for action {effective_action!r}"
+            )
+        reuse_committed_result = reuse_policy[effective_action]
+        if not isinstance(reuse_committed_result, bool):
+            raise RuntimeError(
+                f"❌ target run {target_run_id!r} committed-result reuse for action "
+                f"{effective_action!r} must be boolean"
+            )
+
         active_target_run = {
             "target": target_key,
             "source": target_source,
@@ -399,20 +424,9 @@ def build_active_target_runs(
             "procedure": child_procedure,
             "domains": target_domains,
             "cfg_keys": target_cfg_keys,
+            "reuse_committed_result": reuse_committed_result,
         }
-        # A member entry may declare the ACTION this target performs.
-        # Carried onto the run record so the spawn hands the child its own verb
-        # rather than the parent's, and validated against the target's own
-        # allowlist — the workflow may choose, never widen.
-        member_action = target_override.get("action")
         if member_action is not None:
-            allowed = target_cfg.get("allowed_actions") or []
-            if member_action not in allowed:
-                raise RuntimeError(
-                    f"❌ workflow member {target_key!r} declares action "
-                    f"{member_action!r}, which that target does not allow "
-                    f"(allowed: {', '.join(sorted(allowed)) or 'none'})"
-                )
             active_target_run["action"] = member_action
         required_overlays = target_cfg.get("requires_plt_overlays")
         if required_overlays:
@@ -576,37 +590,72 @@ def validate_target_execution_identity_coverage(
         )
 
 
-def entry_actions(entry: dict, *, label: str) -> list[str]:
-    """The REQUIRED allowlist on a target/workflow. A missing or empty
-    list is a hard error — availability is default-CLOSED and must be explicit,
-    never inferred from an optional selector.
+class TargetActionPolicy:
+    """Validate one target declaration's action-related policy.
 
-    a WORKFLOW spells it `operations:`, because a workflow is invoked
-    with an operation and its members carry the actions. A target keeps `actions:`.
-    Exactly one spelling per entry — declaring both is a contradiction about which
-    the caller supplies.
+    The declaration and its label are shared by both checks, so the responsibility
+    is one object rather than separate validators that repeat the same inputs.
     """
 
-    actions = entry.get("actions")
-    operations = entry.get("operations")
-    if actions is not None and operations is not None:
-        raise RuntimeError(
-            f"❌ {label} declares both 'actions' and 'operations'; a workflow "
-            "declares operations, a target declares actions"
+    def __init__(self, entry: dict, *, label: str):
+        self.entry = entry
+        self.label = label
+
+    def actions(self) -> list[str]:
+        """Return the required target-action allowlist."""
+
+        actions = self.entry.get("actions")
+        if "operations" in self.entry:
+            raise RuntimeError(
+                f"❌ {self.label} target action policy does not accept 'operations'"
+            )
+        if (
+            not isinstance(actions, list)
+            or not actions
+            or not all(
+                isinstance(action, str) and action in run_actions.KNOWN_ACTIONS
+                for action in actions
+            )
+            or len(set(actions)) != len(actions)
+        ):
+            raise RuntimeError(
+                f"❌ {self.label} must declare 'actions': a non-empty, duplicate-free "
+                f"subset of {list(run_actions.KNOWN_ACTIONS)} "
+                "(availability is default-closed)"
+            )
+        return actions
+
+    def committed_result_reuse(self) -> dict[str, bool]:
+        """Return the target's action-exact committed-result reuse policy."""
+
+        actions = self.actions()
+        policy = self.entry.get("committed_result_reuse")
+        if not isinstance(policy, dict):
+            raise RuntimeError(
+                f"❌ {self.label} must declare 'committed_result_reuse': a mapping with "
+                "one boolean for every declared action"
+            )
+        missing = sorted(set(actions) - set(policy))
+        extra = sorted(set(policy) - set(actions))
+        if missing or extra:
+            details = []
+            if missing:
+                details.append(f"missing actions: {missing}")
+            if extra:
+                details.append(f"undeclared actions: {extra}")
+            raise RuntimeError(
+                f"❌ {self.label} committed_result_reuse must match its actions exactly "
+                f"({'; '.join(details)})"
+            )
+        non_boolean = sorted(
+            action for action, value in policy.items() if not isinstance(value, bool)
         )
-    if actions is None:
-        actions = operations
-    if (
-        not isinstance(actions, list)
-        or not actions
-        or not all(isinstance(a, str) and a in run_actions.KNOWN_ACTIONS for a in actions)
-        or len(set(actions)) != len(actions)
-    ):
-        raise RuntimeError(
-            f"❌ {label} must declare 'actions': a non-empty, duplicate-free "
-            f"subset of {list(run_actions.KNOWN_ACTIONS)} (availability is default-closed)"
-        )
-    return actions
+        if non_boolean:
+            raise RuntimeError(
+                f"❌ {self.label} committed_result_reuse values must be booleans "
+                f"(invalid actions: {non_boolean})"
+            )
+        return policy
 
 
 def load_action_cfg(
@@ -615,16 +664,15 @@ def load_action_cfg(
     execution_context: dict[str, object] | None = None,
     member_actions: set[str] | None = None,
 ) -> dict:
-    """Compose action cfg from target_sources + cfg_key_sets + targets/<action>/*.yaml.
+    """Compose action cfg from target_sources, cfg key sets, and targets/*.yaml.
 
     `action` is the action (provision/plan/destroy/readonly). Layout:
       - target_sources.yaml  source repos: source key -> meta
       - cfg_key_sets.yaml        named CONTENT-KEY bundles: set key -> [key selectors]
-      - targets/<action>/*.yaml  fat targets (the directory IS the action). Each
-            file is a flat `targets:` map; all files for an action merge (duplicate
-            names rejected). A target is self-contained:
-              {source_key, ref_key, procedure_key, domains, cfg_keys,
-               [execution], [selectors],
+      - targets/*.yaml  fat targets. Each file is a flat `targets:` map; all
+            files merge (duplicate names rejected). A target is self-contained:
+              {actions, committed_result_reuse, source_key, ref_key,
+               procedure_key, domains, cfg_keys, [execution], [selectors],
                [required_plt_overlay_keys]}.
 
     Returns the flat shape build_active_target_runs consumes ({target_sources,
@@ -649,6 +697,8 @@ def load_action_cfg(
     # is the subset allowing this action.
     all_targets = load_target_catalog(ctl_cfg_root)
     targets = {}
+    target_actions: dict[str, list[str]] = {}
+    target_reuse_policies: dict[str, dict[str, bool]] = {}
     # A workflow member may declare its own action, so the action
     # admits a target that allows the INVOKED action or any action a member asked
     # of it. Without this a member naming `destroy` on a destroy-only target could
@@ -658,7 +708,13 @@ def load_action_cfg(
     for target_name, target_def in all_targets.items():
         if not isinstance(target_def, dict):
             raise RuntimeError(f"❌ target {target_name!r} must be a mapping")
-        if admitted & set(entry_actions(target_def, label=f"target {target_name!r}")):
+        label = f"target {target_name!r}"
+        action_policy = TargetActionPolicy(target_def, label=label)
+        allowed_actions = action_policy.actions()
+        reuse_policy = action_policy.committed_result_reuse()
+        target_actions[target_name] = allowed_actions
+        target_reuse_policies[target_name] = reuse_policy
+        if admitted & set(allowed_actions):
             targets[target_name] = target_def
     if not targets:
         raise RuntimeError(f"❌ no targets allow action {action!r}")
@@ -839,7 +895,8 @@ def load_action_cfg(
             # consumed by the filter that built it. A workflow member may name an
             # action, and the check that it is permitted needs the list at the
             # point the member is resolved.
-            "allowed_actions": entry_actions(target_def, label=f"target {target_name!r}"),
+            "allowed_actions": target_actions[target_name],
+            "committed_result_reuse": target_reuse_policies[target_name],
         }
         if domains is None:
             # Domain-generic target whose domain axis is not bound in this run.
@@ -1008,11 +1065,13 @@ def normalize_target_entries(
             key = run_actions.normalize_result_name(value.get("key"), label=label)
             action = value.get("action")
             if action is not None and (
-                not isinstance(action, str) or action not in run_actions.RUN_ACTIONS
+                not isinstance(action, str)
+                or action not in run_actions.WORKFLOW_ACTIONS
             ):
                 raise RuntimeError(
                     f"❌ {label} entry {key!r} declares action {action!r}; expected "
-                    f"one of {sorted(run_actions.RUN_ACTIONS)}"
+                    f"one of {sorted(run_actions.WORKFLOW_ACTIONS)}; maintenance "
+                    "uses the maintenance runner"
                 )
         else:
             key, action = run_actions.normalize_result_name(value, label=label), None
@@ -1025,6 +1084,12 @@ def normalize_target_entries(
             raise RuntimeError(
                 f"❌ {label} entry {key!r} has no action, so it is not runnable. "
                 "Declare `default_action:` for the list, or `action:` beneath the key"
+            )
+        if action not in run_actions.WORKFLOW_ACTIONS:
+            raise RuntimeError(
+                f"❌ {label} entry {key!r} resolves action {action!r}; expected one "
+                f"of {sorted(run_actions.WORKFLOW_ACTIONS)}; maintenance uses the "
+                "maintenance runner"
             )
         if (key, action) in seen:
             raise RuntimeError(
@@ -1122,6 +1187,7 @@ def target_definition_document(target_run: dict) -> dict:
         "procedure",
         "domains",
         "cfg_keys",
+        "reuse_committed_result",
         "target_instance_params",
         "requires_plt_overlays",
         "execution_identities",

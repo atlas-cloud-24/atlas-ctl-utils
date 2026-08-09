@@ -51,17 +51,17 @@ FOOTER_FIELDS = ("cache_written", "history_written")
 
 # The columns a flat table carries, in order — the SORT VOCABULARY itself, not a
 # second list beside it. A column and a sortable field are the same thing: the
-# scalar facts a row carries, which is also what `--filter` matches on. Declaring
-# them apart would let a column exist that could not be sorted by, or a sort field
-# with no column to read the result in, with nothing to say which was intended.
+# displayed scalar facts, which is also what `--filter` matches on. Declaring them
+# apart would let a column exist that could not be sorted by, or a sort field with
+# no column to read the result in, with nothing to say which was intended.
 FLAT_COLUMNS = state_status.SORT_FIELDS
 
 # The nested table spends its first column on the tree, so `address` and `group`
 # are POSITIONS there rather than cells, and members become child rows instead of
 # a count.
 NESTED_COLUMNS = (
-    "status", "last_action", "last_operation", "standing", "superseded_by", "freshness", "time",
-    "label",
+    "status", "last_action", "last_operation", "actions", "standing",
+    "freshness", "time", "label",
 )
 
 # The columns EVERY row could carry, whatever kind it is and whatever the cfg
@@ -70,26 +70,32 @@ NESTED_COLUMNS = (
 # namespace where nothing was labelled has to be readable as exactly that, not as
 # one where labelling does not exist.
 #
-# Every other column is CONDITIONAL, and is dropped when nothing in view has one:
+# Every other table column is CONDITIONAL and is dropped when nothing in view has
+# one:
 #
 #   last_action              a workflow row cannot have one; a workflow declares
 #                            a default_action and its members carry the actions
-#   standing, superseded_by  only exist inside an exclusive relation
+#   last_operation           only a workflow whose execution context declares one
+#                            can have one
 #   freshness                only a record that can go stale has one — a destroy
 #                            record describes an instance that is GONE
 #   members                  only a workflow composes any
 #
+# `superseded_by` is status-report detail kept in YAML, not a table column.
+#
 # The split decides only whether a column APPEARS when nothing in view fills it.
-# A whole column of dashes would answer a question the vocabulary never posed —
-# "did any of these have a standing?" is not a question in a namespace with no
-# exclusive relations, while "was any of these labelled?" always is.
+# Standing stays visible because operators use the stable column to distinguish
+# an active alternative from a superseded one; `-` means the row has no standing
+# evidence. Detailed replacement addresses remain in YAML.
 #
 # Once a column IS shown, every reporting line takes the marker where it has no
 # value, including a kind that could not have filled it (a workflow line under a
 # LAST_ACTION column that a target line kept alive). Reading that per kind would
 # need a second cell vocabulary inside one grid, and the grid is what makes the
 # table scannable.
-UNCONDITIONAL_COLUMNS = ("address", "group", "status", "time", "label")
+UNCONDITIONAL_COLUMNS = (
+    "address", "group", "status", "standing", "time", "label",
+)
 
 # What an unconditional column shows when the row has no value.
 #
@@ -113,18 +119,25 @@ INDENT = "  "
 # under it, which reads as truncated output rather than as an answer.
 EMPTY_MAP_LINE = "(no instances)"
 
+MAINTENANCE_COLUMNS = (
+    "operation", "status", "subject", "scope", "time", "id", "source",
+)
+
 
 def _value(row: dict, column: str) -> str:
     """One row's value for one column, as text, or `""` when it has none.
 
-    `members` is the only COMPUTED value: a flat row has nowhere to nest a list
-    of member objects, so it carries how many there were. Everything else is the
+    `members` and `actions` are the only COMPUTED display values: a flat row has
+    nowhere to nest member objects, so it carries their count, while exact
+    workflow actions are a compact plus-separated cell. Everything else is the
     report's own value, printed.
     """
 
     if column == "members":
         members = row.get("members")
         return str(len(members)) if isinstance(members, list) else ""
+    if column == "actions":
+        return state_status.actions_text(row.get("actions"))
     value = row.get(column)
     return "" if value is None else str(value)
 
@@ -133,11 +146,10 @@ def _cell(row: dict | None, column: str, *, reports_a_run: bool) -> str:
     """What a printed cell shows.
 
     `reports_a_run` is what decides an absent value. A line that REPORTS one — a
-    flat row, a nested group — shows the absence marker, because that run could
-    have carried the fact and did not. A line that NAMES something instead shows
-    blank: a kind/template or instance line has no run of its own, and a member
-    line is a reference to a target row that appears elsewhere in this same map,
-    so a dash on either would answer a question they were never asked.
+    flat row, a nested group, or a joined workflow member shows the
+    absence marker, because that run could have carried the fact and did not.
+    A line that only names something instead shows blank: a kind, template, or
+    instance line has no run of its own.
     """
 
     if row is None:
@@ -184,7 +196,7 @@ def _grid_lines(
         widths[0] = first_column_width
     return [
         COLUMN_GAP.join(
-            cell.ljust(width) for cell, width in zip(row, widths)
+            cell.ljust(width) for cell, width in zip(row, widths, strict=True)
         ).rstrip()
         for row in grid
     ]
@@ -244,72 +256,141 @@ def _flat_lines(rows: list[dict]) -> list[str]:
     )
 
 
-def _group_entries(groups: dict, *, depth: int) -> list[tuple[str, dict | None, bool]]:
-    """One entry per status group, followed by the members that group ran with."""
+def _member_tree_cell(address: str, parent_segments: str) -> str:
+    """A member target's unqualified address, shortened only by its parent axes.
 
-    entries: list[tuple[str, dict | None, bool]] = []
-    for group, row in groups.items():
-        entries.append((INDENT * depth + str(group), row, False))
-        for member in row.get("members") or []:
-            # A member row reports what THAT member did under the group above it,
-            # so its `action` fills the same column a group's `last_action` does.
-            # One column grid for the whole table is what makes it scannable; a
-            # second name for one fact would break that for no gain.
+    Workflow members are targets by contract, so repeating `target` on every leaf
+    adds no information. A differing instance keeps its segments: hiding those
+    axes would make two distinct target instances look like one.
+    """
+
+    unqualified = run_addressing.unqualified_address(address)
+    key, segments = run_addressing.split_target_instance_address(unqualified)
+    return key if "/".join(segments) == parent_segments else unqualified
+
+
+def _tree_branch(ancestors_are_last: tuple[bool, ...], *, is_last: bool) -> str:
+    """The edge to one child, retaining lines for ancestors with later siblings."""
+
+    return (
+        INDENT
+        + "".join(
+            INDENT if ancestor_is_last else "\u2502 "
+            for ancestor_is_last in ancestors_are_last
+        )
+        + ("\u2514" if is_last else "\u251c")
+        + " "
+    )
+
+
+def _group_entries(
+    groups: dict,
+    *,
+    ancestors_are_last: tuple[bool, ...],
+    parent_segments: str,
+    hide_members: bool,
+) -> list[tuple[str, dict | None]]:
+    """One connected group branch, optionally followed by target-row children."""
+
+    entries: list[tuple[str, dict | None]] = []
+    group_items = list(groups.items())
+    for group_index, (group, row) in enumerate(group_items):
+        group_is_last = group_index == len(group_items) - 1
+        entries.append(
+            (
+                _tree_branch(ancestors_are_last, is_last=group_is_last) + str(group),
+                row,
+            )
+        )
+        members = [] if hide_members else (row.get("members") or [])
+        member_ancestors = (*ancestors_are_last, group_is_last)
+        for member_index, member in enumerate(members):
             entries.append(
                 (
-                    INDENT * (depth + 1) + "└ " + str(member.get("address", "")),
-                    {**member, "last_action": member.get("action")},
-                    True,
+                    _tree_branch(
+                        member_ancestors,
+                        is_last=member_index == len(members) - 1,
+                    )
+                    + _member_tree_cell(
+                        str(member.get("address", "")), parent_segments,
+                    ),
+                    member,
                 )
             )
     return entries
 
 
-def _nested_entries(kinds: dict) -> list[tuple[str, dict | None, bool]]:
-    """The nested map flattened to `(tree cell, row, is_member)` triples.
+def _nested_entries(
+    kinds: dict, *, hide_members: bool,
+) -> list[tuple[str, dict | None]]:
+    """Flatten the nested map to connected tree cells and optional status rows.
 
-    Indentation carries the structure the YAML carries as nesting. A kind/template
-    line and an instance line carry `None` rather than an empty row: they NAME
-    what the rows below them belong to, so their cells stay blank — a dash there
-    would claim a template has no status, when a template has no status to have.
-
-    `is_member` marks the leaf annotations. A member is not a level of the tree —
-    the state layout has no member directory, and a member's address names a
-    target that lives elsewhere in this same map — so it is excluded from the
-    tree column's width below.
+    Kind, template, instance, and group are separate tree levels. Naming levels
+    carry `None` rather than an empty row, so their fact columns stay blank.
+    Workflow members are joined target rows and can be omitted as a presentation
+    choice without changing the report.
     """
 
-    entries: list[tuple[str, dict | None, bool]] = []
+    entries: list[tuple[str, dict | None]] = []
     for kind, templates in kinds.items():
-        for template, body in templates.items():
-            entries.append((f"{kind}{COLUMN_GAP}{template}", None, False))
+        entries.append((str(kind), None))
+        template_items = list(templates.items())
+        for template_index, (template, body) in enumerate(template_items):
+            template_is_last = template_index == len(template_items) - 1
+            entries.append(
+                (_tree_branch((), is_last=template_is_last) + str(template), None)
+            )
+            template_ancestors = (template_is_last,)
             if run_addressing.INSTANCES_MARKER in body:
-                for segments, groups in body[run_addressing.INSTANCES_MARKER].items():
-                    entries.append((INDENT + str(segments), None, False))
-                    entries.extend(_group_entries(groups, depth=2))
+                instance_items = list(body[run_addressing.INSTANCES_MARKER].items())
+                for instance_index, (segments, groups) in enumerate(instance_items):
+                    instance_is_last = instance_index == len(instance_items) - 1
+                    entries.append(
+                        (
+                            _tree_branch(
+                                template_ancestors, is_last=instance_is_last,
+                            )
+                            + str(segments),
+                            None,
+                        )
+                    )
+                    entries.extend(
+                        _group_entries(
+                            groups,
+                            ancestors_are_last=(template_is_last, instance_is_last),
+                            parent_segments=str(segments),
+                            hide_members=hide_members,
+                        )
+                    )
             else:
                 # A singleton has no segments and therefore no instance line,
                 # exactly as the state layout omits the `instances/` level.
-                entries.extend(_group_entries(body, depth=1))
+                entries.extend(
+                    _group_entries(
+                        body,
+                        ancestors_are_last=template_ancestors,
+                        parent_segments="",
+                        hide_members=hide_members,
+                    )
+                )
     return entries
 
 
-def _nested_lines(kinds: dict) -> list[str]:
-    """The kind/template/instance tree in the first column, groups as its rows."""
+def _nested_lines(kinds: dict, *, hide_members: bool) -> list[str]:
+    """The connected kind/template/instance tree, with groups as fact rows."""
 
-    entries = _nested_entries(kinds)
+    entries = _nested_entries(kinds, hide_members=hide_members)
     if not entries:
         return []
     columns = _present_columns(
-        [row for _, row, _ in entries if row is not None], NESTED_COLUMNS
+        [row for _, row in entries if row is not None], NESTED_COLUMNS
     )
-    # The tree column is sized by the TREE, not by the member addresses hanging
-    # off it: a member sits at the deepest indent and carries the longest text, so
-    # letting it set the width pushed every group's axes off to the right and made
-    # the column a reader scans down unreadable. Members overflow instead.
-    tree_width = max(len(tree) for tree, _, is_member in entries if not is_member)
-    # The tree column gets no heading: it holds four different kinds of thing —
-    # a template, an instance, a group, a member — and no one word is true of all
+    # Matching member instance axes are shortened above, so members participate
+    # in the common grid without pushing their values away from their identity.
+    # A genuinely different instance keeps its full address and widens the tree.
+    tree_width = max(len(tree) for tree, _ in entries)
+    # The tree column gets no heading: it holds five different kinds of thing —
+    # a kind, template, instance, group, or member — and no one word is true of all
     # of them. The axis headings are what a reader needs to tell the columns apart.
     return _grid_lines(
         ["", *[column.upper() for column in columns]],
@@ -317,30 +398,36 @@ def _nested_lines(kinds: dict) -> list[str]:
             [
                 tree,
                 *[
-                    _cell(row, column, reports_a_run=not is_member)
+                    _cell(row, column, reports_a_run=row is not None)
                     for column in columns
                 ],
             ]
-            for tree, row, is_member in entries
+            for tree, row in entries
         ],
         first_column_width=tree_width,
     )
 
 
-def render_status_map(report: dict) -> str:
+def render_status_map(report: dict, *, hide_members: bool = False) -> str:
     """A whole-namespace status report as text.
 
-    Dispatches on the report's OWN `structure`, so `--format` and `--structure`
-    stay orthogonal — each shape has a rendering, and neither argument narrows
-    the other.
+    Dispatches on the report's OWN `structure`. Hiding workflow-member rows is a
+    nested-table projection; it never edits or recomputes the report.
     """
 
     structure = str(report.get("structure") or "")
+    if hide_members and structure != state_status.StatusStructure.NESTED:
+        raise RuntimeError("❌ hiding workflow members requires --structure nested")
     if structure == state_status.StatusStructure.FLAT:
         body = _flat_lines(list(report.get("instances") or []))
     elif structure == state_status.StatusStructure.NESTED:
         body = _nested_lines(
-            {kind: report[kind] for kind in run_actions.RESULT_KINDS if kind in report}
+            {
+                kind: report[kind]
+                for kind in run_actions.STATUS_RESULT_KINDS
+                if kind in report
+            },
+            hide_members=hide_members,
         )
     else:
         raise RuntimeError(
@@ -351,5 +438,32 @@ def render_status_map(report: dict) -> str:
         _field_lines(report, HEADER_FIELDS),
         body or [EMPTY_MAP_LINE],
         _field_lines(report, FOOTER_FIELDS),
+    ]
+    return "\n\n".join("\n".join(section) for section in sections if section)
+
+
+def render_maintenance_status(report: dict) -> str:
+    """A dedicated maintenance audit table over the maintenance report object."""
+
+    rows = list(report.get("maintenance") or [])
+    if rows:
+        columns = [
+            column
+            for column in MAINTENANCE_COLUMNS
+            if column in ("operation", "status", "time", "id")
+            or any(_value(row, column) for row in rows)
+        ]
+        body = _grid_lines(
+            [column.upper() for column in columns],
+            [
+                [_cell(row, column, reports_a_run=True) for column in columns]
+                for row in rows
+            ],
+        )
+    else:
+        body = ["(no maintenance records)"]
+    sections = [
+        _field_lines(report, ("namespace", "scope", "computed_at")),
+        body,
     ]
     return "\n\n".join("\n".join(section) for section in sections if section)

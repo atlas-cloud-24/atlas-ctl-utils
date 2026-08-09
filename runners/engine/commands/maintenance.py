@@ -1,8 +1,10 @@
-"""Out-of-band operations on ctl state.
+"""Operator maintenance operations.
 
-Maintenance is not a run: it does not provision, has no workflow, and holds no
-mutation lock in the ordinary way. It is here rather than in `state/` because
-these are operator entry points with their own arguments and reports."""
+Target-backed maintenance uses the dedicated maintenance result owner and the
+normal lifecycle. Ctl-state-only maintenance has no target or workflow and owns
+its command report or audit manifest. These are command entry points rather than
+state primitives, so they live here instead of in ``state/``.
+"""
 
 import argparse
 import logging
@@ -10,13 +12,12 @@ import os
 import re
 import shutil
 import tempfile
-
 from datetime import UTC, datetime
 from pathlib import Path
+
 import yaml
 
 from engine.catalog import targets as catalog_targets
-from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tooling as cfg_tooling
@@ -27,6 +28,7 @@ from engine.execution import adapters as execution_adapters
 from engine.execution import providers as execution_providers
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
+from engine.guardrails import verify as guardrails_verify
 from engine.kernel import ids as kernel_ids
 from engine.kernel import process as kernel_process
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -37,6 +39,7 @@ from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+
 
 def inspect_selected_graph_ctl_state_backend(
     selections: list[dict],

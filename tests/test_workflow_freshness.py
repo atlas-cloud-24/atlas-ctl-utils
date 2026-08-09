@@ -8,10 +8,9 @@ re-run with identical inputs would read as drift, which is the confusion this
 avoids.
 
 Worst-of, in a fixed order: OUTDATED is a fact, UNDETERMINED is the absence of
-one, and a composition cannot be fresher than its least fresh member.
-
-Before this, a workflow row carried no freshness at all — it was its last run and
-nothing else — so `--skip-up-to-date` had nothing to consult at workflow level.
+one, and a composition cannot be fresher than its least fresh member. Each member
+retains the target status row that supplied its freshness, so every presentation
+reads facts from the report rather than reconstructing them.
 """
 import sys
 import tempfile
@@ -84,6 +83,24 @@ class WorkflowFreshnessTest(unittest.TestCase):
              ("target/env/ops/dbs/instances/env.type=dev", "outdated")],
             [(m["address"], m["freshness"]) for m in members],
         )
+
+    def test_a_member_retains_the_target_status_row(self):
+        """The report owns facts; a renderer must never read state to fill them."""
+
+        answer = {
+            "status": "passed",
+            "last_action": "provision",
+            "freshness": "up_to_date",
+            "time": "2026-08-09T01:00:00Z",
+            "label": "release",
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            state_status, "compute_target_instance_status", return_value=answer,
+        ):
+            _, members, _ = state_status.workflow_member_freshness(
+                Path(tmp), "provision", [MEMBERS[0]],
+            )
+        self.assertEqual({**answer, "address": MEMBERS[0]}, members[0])
 
     def test_a_workflow_with_no_members_has_no_freshness(self):
         """Not `up_to_date`: there is nothing to be fresh about, and claiming

@@ -20,9 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import ctl_cfg_fixture
+from engine.cli import args as cli_args
 from engine.commands import status as commands_status
 from engine.kernel import yaml_io as kernel_yaml_io
-from engine.cli import args as cli_args
 
 ADDRESS = "env/seed/baseline/instances/env_type=dev/account=dev"
 TEMPLATE = "env/seed/baseline"
@@ -58,8 +58,6 @@ def _seed_workflow_pointer(root: Path, action: str, key: str, seg: str, *, when:
 
 
 from engine.execution import run_context as execution_run_context
-
-
 from engine.state import sync as state_sync
 
 
@@ -78,10 +76,11 @@ class FinalizeStatusArgsTests(unittest.TestCase):
     def _ns(self, **kw):
         base = dict(
             execution_param=[("provider", "aws"), ("landing_zone", "live")],
-            all=False, target=None, workflow=None, fan_out=None,
+            all=False, maintenance=False, target=None, workflow=None, fan_out=None,
             action=None, scope="local", ctl_state_local_root="/tmp/x",
             provider_options={}, write_cache=False,
-            structure="nested", sort="address", kinds=None, groups=None,
+            structure="nested", output_format=None, hide_members=False,
+            sort="address", kinds=None, groups=None,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -139,6 +138,45 @@ class FinalizeStatusArgsTests(unittest.TestCase):
         self.assertEqual(args.execution_params, {"provider": "aws", "landing_zone": "live"})
         self.assertEqual(args.status, "local")
 
+    def test_maintenance_does_not_require_action_or_structure(self):
+        args = self._ns(maintenance=True, structure=None)
+        cli_args.finalize_status_args(args)
+        self.assertTrue(args.maintenance)
+
+    def test_maintenance_rejects_all_only_shaping(self):
+        with self.assertRaisesRegex(RuntimeError, "--structure shapes --all"):
+            cli_args.finalize_status_args(
+                self._ns(maintenance=True, structure="nested")
+            )
+
+    def test_hide_members_accepts_only_a_nested_table(self):
+        args = self._ns(
+            all=True, structure="nested", output_format="table", hide_members=True,
+        )
+        cli_args.finalize_status_args(args)
+        self.assertTrue(args.hide_members)
+
+    def test_hide_members_rejects_flat_structure(self):
+        with self.assertRaisesRegex(RuntimeError, "--structure nested"):
+            cli_args.finalize_status_args(
+                self._ns(
+                    all=True, structure="flat", output_format="table",
+                    hide_members=True,
+                )
+            )
+
+    def test_hide_members_rejects_machine_readable_output(self):
+        for output_format in (None, "yaml"):
+            with self.subTest(output_format=output_format), self.assertRaisesRegex(
+                RuntimeError, "--format table"
+            ):
+                cli_args.finalize_status_args(
+                        self._ns(
+                            all=True, structure="nested",
+                            output_format=output_format, hide_members=True,
+                        )
+                    )
+
     def test_write_cache_requires_all(self):
         with self.assertRaises(RuntimeError):
             cli_args.finalize_status_args(
@@ -195,4 +233,3 @@ class DestroyedIsNotIndistinguishableTest(unittest.TestCase):
     `status: passed` with no `state`, so `--all` could not tell "torn down" from
     "never deployed".
     """
-

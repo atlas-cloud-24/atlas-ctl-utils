@@ -289,9 +289,9 @@ class TheRealCompositionTest(unittest.TestCase):
                 baseline = _expand(resolved, "env/baseline")
                 composed = _expand(resolved, "env/baseline_with_artificial_data")
                 if operation == "provision":
-                    index = baseline.index("env/ops/dbs") + 1
+                    index = baseline.index("env/database_setup") + 1
                     self.assertEqual(
-                        baseline[:index] + ["env/ops/db_artificial_populator"] + baseline[index:],
+                        baseline[:index] + ["env/artificial_data"] + baseline[index:],
                         composed,
                     )
                 else:

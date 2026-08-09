@@ -87,6 +87,30 @@ class TheRefusalsReachEveryCallerTest(unittest.TestCase):
                 {"w": {"default_action": "provision", "targets": {"keys": ["a/b"]}}}
             )
 
+    def test_action_validation_refuses_maintenance_in_every_branch(self):
+        for targets in (
+            {"default_action": "maintenance", "keys": ["a/b"]},
+            {"default_action": "provision", "keys": [
+                {"key": "a/b", "action": "maintenance"}
+            ]},
+        ):
+            with self.subTest(targets=targets), self.assertRaisesRegex(
+                RuntimeError, "maintenance runner"
+            ):
+                catalog_workflow.validate_workflow_actions_declared(
+                    {"w": {"targets": targets}}
+                )
+
+    def test_action_validation_allows_a_default_action_reference(self):
+        catalog_workflow.validate_workflow_actions_declared({
+            "w": {
+                "targets": {
+                    "default_action": "${execution_context.params.operation}",
+                    "keys": ["a/b"],
+                }
+            }
+        })
+
     def test_the_static_key_walk_reads_both_forms(self):
         self.assertEqual(
             ["env/core/baseline"],

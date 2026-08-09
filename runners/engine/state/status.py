@@ -7,7 +7,6 @@ describes an instance that is gone, and nothing can make that answer stale."""
 import hashlib
 import json
 import logging
-
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -50,10 +49,12 @@ class Freshness(StrEnum):
     # cannot support, so it reports that it cannot know — the same refusal the
     # project applies to a cfg-entry-ref across a state boundary.
     UNDETERMINED = "undetermined"
-    # Another member of this instance's exclusive relation is in effect. NOT `outdated`:
-    # nothing is stale — the record still matches its own cfg, and an alternative
-    # replaced it. Helm names the same state on a release revision that was
-    # deployed and has since been superseded by a newer one.
+
+
+class Standing(StrEnum):
+    """The `standing` axis inside an exclusive relation."""
+
+    ACTIVE = "active"
     SUPERSEDED = "superseded"
 
 
@@ -405,28 +406,26 @@ def compute_target_instance_status(
     # Same rule as `at` and `run_id` — one row, one run.
     if run["action"]:
         result["last_action"] = run["action"]
-    if pointer and not mutation_started:
-        if run_actions.action_can_go_stale(str(pointer.get("action"))):
-            freshness, freshness_reasons = _freshness(pointer, spec)
-            # A exclusive relation's members share one deployment, so a member whose
-            # record still matches its own cfg can nonetheless have been replaced.
-            # That is not staleness — nothing about it is out of date — so it
-            # REPLACES the verdict rather than being reported beside it.
-            superseded, superseded_by = resolve_supersession(
-                spec.get("relations") or {},
-                spec["address"],
-                applied_overlays_by_address(
-                    namespace_root, action, spec.get("relations") or {},
-                    spec.get("segments") or [],
-                ),
-            )
-            if superseded is not None:
-                result["standing"] = superseded
-                result["superseded_by"] = run_addressing.qualified_address(
-                    "target", superseded_by
-                )
-            result["freshness"] = freshness
-            reasons = reasons + freshness_reasons
+    if (
+        pointer
+        and not mutation_started
+        and run_actions.action_can_go_stale(str(pointer.get("action")))
+    ):
+        freshness, freshness_reasons = _freshness(pointer, spec)
+        result["freshness"] = freshness
+        reasons = reasons + freshness_reasons
+
+    standing, superseded_by = StandingResolver(namespace_root).target(
+        spec.get("relations") or {},
+        spec["address"],
+        spec.get("segments") or [],
+    )
+    if standing is not None:
+        result["standing"] = standing
+    if superseded_by is not None:
+        result["superseded_by"] = run_addressing.qualified_address(
+            "target", superseded_by
+        )
 
     # The workflow INSTANCE this run belonged to, closing the loop the workflow
     # row opens: a workflow instance names the target instances it drove, and a
@@ -704,9 +703,10 @@ def _targeted_workflow_status(namespace_root: Path, action: str, spec: dict) -> 
     freshness, member_rows, _ = workflow_member_freshness(
         namespace_root, action, members, spec.get("relations") or {}
     )
-    standing, superseded_by = resolve_workflow_standing(
-        namespace_root, action, spec.get("exclusive_workflow_relations") or {},
-        spec["address"], member_rows,
+    standing, superseded_by = StandingResolver(namespace_root).workflow(
+        spec.get("exclusive_workflow_relations") or {},
+        spec["address"],
+        member_rows,
     )
     return _ordered_workflow_row(
         result,
@@ -729,7 +729,7 @@ def _compute_status_results(
     """
 
     results = []
-    for selection_label, spec in zip(selection_labels, specs):
+    for selection_label, spec in zip(selection_labels, specs, strict=True):
         computed = (
             compute_target_instance_status(namespace_root, action, spec)
             if spec["kind"] == "target"
@@ -740,77 +740,169 @@ def _compute_status_results(
     return results
 
 
-def applied_overlays_by_address(
-    namespace_root: Path, action: str, relations: dict, segments: list[str]
-) -> dict[str, list[str]]:
-    """What each member of every exclusive relation last APPLIED, read from its pointer.
+class StandingResolver:
+    """Standing inside declared exclusive target and workflow relations.
 
-    Only members are read: an exclusive relation is small, and the alternative — reading
-    every instance — would make an unrelated target's pointer decide a group it
-    is not in.
+    Standing is computed from committed mutative target evidence and never
+    persisted. One resolver owns the namespace read for both target rows and
+    the workflow rows derived from them.
     """
 
-    applied: dict[str, list[str]] = {}
-    group_key = run_actions.action_group(action)
-    for group in (relations or {}).values():
-        for member_key in (group or {}).get("members") or []:
-            member = run_addressing.target_instance_address(member_key, segments)
-            instance_dir = Path(namespace_root) / run_addressing.compose_state_relpath(
-                "target", member_key, segments
+    def __init__(self, namespace_root: Path):
+        self._namespace_root = Path(namespace_root)
+
+    def target(
+        self, relations: dict, address: str, segments: list[str]
+    ) -> tuple[Standing | None, str | None]:
+        return self.target_from_evidence(
+            relations,
+            address,
+            self._target_evidence(relations, segments),
+        )
+
+    def workflow(
+        self,
+        exclusive_workflow_relations: dict,
+        address: str,
+        member_rows: list[dict],
+    ) -> tuple[Standing | None, str | None]:
+        """Map target standing back onto an exclusive workflow relation."""
+
+        key, segments = run_addressing.split_target_instance_address(address)
+        for group in (exclusive_workflow_relations or {}).values():
+            member_keys = list((group or {}).get("members") or [])
+            if key not in member_keys:
+                continue
+            members = [
+                run_addressing.workflow_instance_address(member_key, segments)
+                for member_key in member_keys
+            ]
+            if not any(entry.get("standing") for entry in member_rows):
+                return None, None
+            replaced_by = {
+                run_addressing.unqualified_address(str(entry["superseded_by"]))
+                for entry in member_rows
+                if entry.get("standing") == Standing.SUPERSEDED
+                and entry.get("superseded_by")
+            }
+            if not replaced_by:
+                return Standing.ACTIVE, None
+            for sibling in members:
+                if sibling == address:
+                    continue
+                sibling_key, sibling_segments = (
+                    run_addressing.split_target_instance_address(sibling)
+                )
+                for _, run_row in workflow_last_run_by_group(
+                    self._namespace_root, sibling_key, sibling_segments
+                ).items():
+                    sibling_targets = {
+                        run_addressing.unqualified_address(
+                            entry["instance"] if isinstance(entry, dict) else entry
+                        )
+                        for entry in (run_row.get("target_instances") or [])
+                    }
+                    if sibling_targets & replaced_by:
+                        return Standing.SUPERSEDED, sibling
+            # A member was replaced by a target no sibling has run: the group
+            # says these exclude each other, and something outside it took effect.
+            return Standing.SUPERSEDED, None
+        return None, None
+
+    def _target_evidence(
+        self, relations: dict, segments: list[str]
+    ) -> dict[str, dict]:
+        """Latest committed mutative event for each target relation member."""
+
+        evidence: dict[str, dict] = {}
+        for group in (relations or {}).values():
+            for member_key in (group or {}).get("members") or []:
+                member = run_addressing.target_instance_address(member_key, segments)
+                instance_dir = self._namespace_root / run_addressing.compose_state_relpath(
+                    "target", member_key, segments
+                )
+                pointer = state_run_store.read_committed_pointer(
+                    instance_dir, run_actions.Group.MUTATIVE
+                )
+                if pointer is not None:
+                    evidence[member] = pointer
+        return evidence
+
+    @staticmethod
+    def target_from_evidence(
+        relations: dict, address: str, evidence_by_address: dict[str, dict]
+    ) -> tuple[Standing | None, str | None]:
+        """Resolve target standing from committed mutative relation events.
+
+        An exclusive relation names alternatives over one deployment. Its newest
+        committed event decides the current standing: provision makes that member
+        active, while destroy leaves the relation with no active member. Run ids
+        break equal-timestamp ties because ctl run ids are time-sortable UUIDv7s.
+        """
+
+        key, segments = run_addressing.split_target_instance_address(address)
+        for group in (relations or {}).values():
+            member_keys = list((group or {}).get("members") or [])
+            if key not in member_keys:
+                continue
+            members = [
+                run_addressing.target_instance_address(member_key, segments)
+                for member_key in member_keys
+            ]
+            evidence = {
+                member: evidence_by_address[member]
+                for member in members
+                if member in evidence_by_address
+            }
+            if address not in evidence:
+                return None, None
+            for member, event in evidence.items():
+                if not isinstance(event, dict):
+                    raise RuntimeError(
+                        f"❌ target standing evidence for {member!r} must be a mapping"
+                    )
+                if event.get("action") not in run_actions.MUTATING_ACTIONS:
+                    raise RuntimeError(
+                        f"❌ target standing evidence for {member!r} must record "
+                        "a mutating action"
+                    )
+                if (
+                    not isinstance(event.get("committed_at"), str)
+                    or not event["committed_at"]
+                ):
+                    raise RuntimeError(
+                        f"❌ target standing evidence for {member!r} must record "
+                        "committed_at"
+                    )
+                if not isinstance(event.get("run_id"), str) or not event["run_id"]:
+                    raise RuntimeError(
+                        f"❌ target standing evidence for {member!r} must record run_id"
+                    )
+            coordinates = [
+                (event["committed_at"], event["run_id"])
+                for event in evidence.values()
+            ]
+            if len(coordinates) != len(set(coordinates)):
+                raise RuntimeError(
+                    f"❌ target standing evidence for relation members {members} "
+                    "must have distinct commit coordinates"
+                )
+            in_effect = max(
+                evidence,
+                key=lambda member: (
+                    evidence[member]["committed_at"], evidence[member]["run_id"]
+                ),
             )
-            pointer = state_run_store.read_committed_pointer(instance_dir, group_key)
-            if pointer is not None:
-                applied[member] = list(pointer.get("plt_overlays") or [])
-    return applied
-
-
-def resolve_supersession(
-    relations: dict, address: str, applied_overlays_by_address: dict[str, list[str]]
-) -> tuple[str | None, str | None]:
-    """`(freshness, superseded_by)` for one instance inside an exclusive relation.
-
-    An exclusive relation names instances that are ALTERNATIVES over one deployment, so
-    exactly one is in effect. The member in effect is the one whose recorded
-    overlays match what the deployment carries; the rest are `superseded` — not
-    `outdated`, because nothing about them is stale. Their record still matches
-    their own cfg; another member simply replaced them.
-
-    Returns `(None, None)` when this address is in no group, or when no member has
-    published yet — supersession is a relationship between what RAN, and nothing
-    has.
-    """
-
-    key, segments = run_addressing.split_target_instance_address(address)
-    for group in (relations or {}).values():
-        # A group names KEYS; the verdict is per INSTANCE. `env/core/baseline`
-        # and `env/core/tech_jobs` are alternatives in dev and independently in
-        # stg, so each member is read at THIS instance's segments.
-        member_keys = list((group or {}).get("members") or [])
-        if key not in member_keys:
-            continue
-        members = [
-            run_addressing.target_instance_address(member_key, segments)
-            for member_key in member_keys
-        ]
-        applied = {
-            member: applied_overlays_by_address.get(member)
-            for member in members
-            if applied_overlays_by_address.get(member) is not None
-        }
-        if len(applied) < 2:
-            # One member (or none) has published: nothing has been replaced.
-            return None, None
-        # The member in effect is the one whose overlays the deployment carries.
-        # Every member reads the same deployment, so they agree on it.
-        in_effect = max(applied, key=lambda member: len(applied[member] or []))
-        if address == in_effect:
-            return None, None
-        return str(Freshness.SUPERSEDED), in_effect
-    return None, None
+            if evidence[in_effect]["action"] != run_actions.Action.PROVISION:
+                return None, None
+            if address == in_effect:
+                return Standing.ACTIVE, None
+            return Standing.SUPERSEDED, in_effect
+        return None, None
 
 
 def _ordered_workflow_row(
-    row: dict, *, standing: str | None, freshness: str | None, members: list[dict],
+    row: dict, *, standing: Standing | None, freshness: str | None, members: list[dict],
     superseded_by: str | None = None,
 ) -> dict:
     """One field order for every workflow row: status, standing, freshness, at,
@@ -827,10 +919,15 @@ def _ordered_workflow_row(
     if standing is not None:
         ordered["standing"] = standing
     if superseded_by is not None:
-        ordered["superseded_by"] = run_addressing.qualified_address("workflow", superseded_by)
+        ordered["superseded_by"] = run_addressing.qualified_address(
+            "workflow", superseded_by
+        )
     if freshness is not None:
         ordered["freshness"] = freshness
-    for key in ("last_operation", "time", "run_id", "selectors", "default_action"):
+    for key in (
+        "last_operation", "actions", "time", "run_id", "selectors",
+        "default_action",
+    ):
         if key in row:
             ordered[key] = row[key]
     if members:
@@ -838,62 +935,6 @@ def _ordered_workflow_row(
     for key, value in row.items():
         ordered.setdefault(key, value)
     return ordered
-
-
-def resolve_workflow_standing(
-    namespace_root: Path,
-    action: str,
-    exclusive_workflow_relations: dict,
-    address: str,
-    member_rows: list[dict],
-) -> tuple[str | None, str | None]:
-    """`(standing, superseded_by)` for a workflow instance inside an exclusive relation.
-
-    A workflow publishes no state, so it cannot say which alternative is in
-    effect on its own — its MEMBERS can, and do. This maps that back up: the
-    workflow is superseded when a member is, and the sibling it names is the one
-    whose composition contains the target that replaced it.
-
-    Reported for an ACTIVE member too. Silence would be indistinguishable from
-    "not in a relation at all", and knowing which member holds is the
-    reason the group is declared.
-    """
-
-    key, segments = run_addressing.split_target_instance_address(address)
-    for group in (exclusive_workflow_relations or {}).values():
-        member_keys = list((group or {}).get("members") or [])
-        if key not in member_keys:
-            continue
-        members = [
-            run_addressing.workflow_instance_address(member_key, segments)
-            for member_key in member_keys
-        ]
-        replaced_by = {
-            run_addressing.unqualified_address(str(entry["superseded_by"]))
-            for entry in member_rows
-            if entry.get("standing") == str(Freshness.SUPERSEDED) and entry.get("superseded_by")
-        }
-        if not replaced_by:
-            return "active", None
-        for sibling in members:
-            if sibling == address:
-                continue
-            sibling_key, sibling_segments = run_addressing.split_target_instance_address(sibling)
-            for _, run_row in workflow_last_run_by_group(
-                namespace_root, sibling_key, sibling_segments
-            ).items():
-                sibling_targets = {
-                    run_addressing.unqualified_address(
-                        entry["instance"] if isinstance(entry, dict) else entry
-                    )
-                    for entry in (run_row.get("target_instances") or [])
-                }
-                if sibling_targets & replaced_by:
-                    return str(Freshness.SUPERSEDED), sibling
-        # A member was replaced by a target no sibling has run: the group says
-        # these exclude each other, and something outside it took effect.
-        return str(Freshness.SUPERSEDED), None
-    return None, None
 
 
 def workflow_member_freshness(
@@ -935,12 +976,16 @@ def workflow_member_freshness(
         entry = {"address": run_addressing.qualified_address("target", unqualified)}
         if isinstance(recorded, dict) and recorded.get("action"):
             entry["action"] = str(recorded["action"])
-        if child.get("standing") is not None:
-            entry["standing"] = str(child["standing"])
-        if child.get("superseded_by") is not None:
-            entry["superseded_by"] = str(child["superseded_by"])
-        if child.get("freshness") is not None:
-            entry["freshness"] = str(child["freshness"])
+        # A nested workflow table is useful only when its members answer as
+        # target rows rather than as address-only annotations. The child has
+        # already computed these facts, so retain the status-report vocabulary
+        # here instead of making the renderer read state or invent another report.
+        for field in (
+            "status", "last_action", "standing", "superseded_by",
+            "freshness", "time", "label",
+        ):
+            if child.get(field) is not None:
+                entry[field] = str(child[field])
         members.append(entry)
 
     verdicts = {entry["freshness"] for entry in members if "freshness" in entry}
@@ -982,11 +1027,8 @@ def workflow_last_run_by_group(
         metadata = state_run_store.load_run_metadata(run_dir)
         if not metadata.get("updated_at"):
             continue
-        # Read from the record when the run wrote one, otherwise DERIVED from the
-        # members it recorded — a run from before the field existed still answers.
-        # Falling back to the run's OWN action covers a record that names what it
-        # did without listing members; defaulting to a group instead is what put
-        # a failed plan under `mutative`.
+        # Prefer the record's group. A record without one derives it from its
+        # members; its own action is the final available group evidence.
         group = metadata.get("group") or run_addressing.workflow_group(metadata)
         if not group and metadata.get("action"):
             group = run_actions.action_group(str(metadata["action"]))
@@ -996,6 +1038,53 @@ def workflow_last_run_by_group(
         if previous is None or str(metadata.get("updated_at")) > str(previous.get("updated_at")):
             latest[str(group)] = metadata
     return {group: _workflow_run_row(metadata) for group, metadata in latest.items()}
+
+
+def workflow_last_run_by_effect(
+    namespace_root: Path, key: str, segments: list[str] | None = None
+) -> dict[str, dict]:
+    """The latest workflow run for each public mutability effect.
+
+    Internal plan and readonly state channels remain independent on disk. Public
+    workflow status combines them as ``non_mutative`` and selects the newest run
+    of that effect; its exact member actions remain on the row. Mutative runs are
+    unaffected because provision and destroy already share one internal channel.
+    """
+
+    runs_dir = (
+        Path(namespace_root)
+        / run_addressing.compose_state_relpath("workflow", key, segments or [])
+        / "runs"
+    )
+    if not runs_dir.is_dir():
+        return {}
+    latest: dict[str, tuple[str, dict]] = {}
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        metadata = state_run_store.load_run_metadata(run_dir)
+        if not metadata.get("updated_at"):
+            continue
+        state_group = metadata.get("group") or run_addressing.workflow_group(metadata)
+        if not state_group and metadata.get("action"):
+            state_group = run_actions.action_group(str(metadata["action"]))
+        if not state_group or state_group == run_actions.Group.MAINTENANCE:
+            continue
+        effect = metadata.get("effect") or run_addressing.workflow_effect(metadata)
+        if not effect:
+            continue
+        previous = latest.get(str(effect))
+        if previous is None or str(metadata["updated_at"]) > str(
+            previous[1].get("updated_at")
+        ):
+            latest[str(effect)] = (str(state_group), metadata)
+    return {
+        effect: {
+            "state_group": state_group,
+            "row": _workflow_run_row(metadata),
+        }
+        for effect, (state_group, metadata) in latest.items()
+    }
 
 
 def workflow_last_run(
@@ -1037,6 +1126,9 @@ def _workflow_run_row(metadata: dict) -> dict:
     row: dict = {"status": _run_conclusion(metadata), "time": metadata.get("updated_at")}
     if metadata.get("operation"):
         row["last_operation"] = metadata["operation"]
+    actions = metadata.get("actions") or run_addressing.workflow_actions(metadata)
+    if actions:
+        row["actions"] = list(actions)
     # The matched member's own selector block, copied verbatim: it points back at
     # the cfg that produced this run, and nothing depends on the engine knowing a
     # field called "operation". A member that matched with none omits it.
@@ -1048,10 +1140,8 @@ def _workflow_run_row(metadata: dict) -> dict:
     # invocation label can be read from.
     if metadata.get("label"):
         row["label"] = metadata["label"]
-    # The group this run belonged to. Read from the record when the
-    # run wrote one, otherwise DERIVED from the members it recorded — a run from
-    # before the field existed still answers, rather than filtering out as though
-    # it had no group at all.
+    # The group this run belonged to. Prefer the recorded value; a record without
+    # one derives it from its available member or runner action evidence.
     group = metadata.get("group") or run_addressing.workflow_group(metadata)
     if group:
         row["group"] = group
@@ -1080,20 +1170,155 @@ def _run_conclusion(metadata: dict) -> str:
     return Verdict.FAILED if status else Verdict.PASSED
 
 
+def maintenance_status_rows(namespace_root: Path) -> list[dict]:
+    """Durable maintenance activity, newest first.
+
+    Direct target maintenance remains under the target owner. Maintenance-runner
+    activity uses the dedicated ``maintenance`` owner. Ctl-state history pruning
+    is intentionally out of band and owns an immutable audit manifest instead.
+    This projection reads every owner without folding maintenance into ordinary
+    target/workflow status.
+    """
+
+    namespace_root = Path(namespace_root)
+    rows: list[dict] = []
+
+    target_instances: set[tuple[str, tuple[str, ...]]] = set()
+    maintenance_group = run_actions.Group.MAINTENANCE
+    target_paths = [
+        pointer.parent.parent
+        for pointer in namespace_root.rglob(f"committed/{maintenance_group}.yaml")
+    ]
+    for state in state_run_store.STATE_SLOT_NAMES:
+        target_paths.extend(
+            slot.parent.parent.parent
+            for slot in namespace_root.rglob(
+                f"{state}/{maintenance_group}/STATUS.yaml"
+            )
+        )
+    for instance_dir in target_paths:
+        parsed = run_addressing.parse_state_relpath(namespace_root, instance_dir)
+        if parsed is None or parsed["kind"] != run_actions.ResultKind.TARGET:
+            continue
+        target_instances.add(
+            (parsed["key"], tuple(parsed["instance_segments"]))
+        )
+    for key, segments_tuple in target_instances:
+        segments = list(segments_tuple)
+        address = run_addressing.target_instance_address(key, segments)
+        computed = compute_target_instance_status(
+            namespace_root,
+            run_actions.Action.MAINTENANCE,
+            {
+                "kind": "target",
+                "key": key,
+                "segments": segments,
+                "address": address,
+                "relations": {},
+            },
+        )
+        if not computed.get("status"):
+            continue
+        row = {
+            "source": "target",
+            "operation": run_actions.Action.MAINTENANCE,
+            "status": computed["status"],
+            "subject": run_addressing.qualified_address("target", address),
+            "time": computed.get("time"),
+            "id": computed.get("run_id"),
+        }
+        for field in ("last_action", "label"):
+            if computed.get(field):
+                row[field] = computed[field]
+        rows.append(row)
+
+    maintenance_root = namespace_root / run_actions.ResultKind.MAINTENANCE
+    if maintenance_root.is_dir():
+        for runs_dir in maintenance_root.rglob("runs"):
+            parsed = run_addressing.parse_state_relpath(
+                namespace_root, runs_dir.parent
+            )
+            if parsed is None or parsed["kind"] != run_actions.ResultKind.MAINTENANCE:
+                continue
+            operation, separator, subject = str(parsed["key"]).partition("/")
+            for run_dir in runs_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                metadata = state_run_store.load_run_metadata(run_dir)
+                if not metadata.get("updated_at"):
+                    continue
+                row = {
+                    "source": "run",
+                    "operation": metadata.get("maintenance_operation") or operation,
+                    "status": _run_conclusion(metadata),
+                    "time": metadata["updated_at"],
+                    "id": metadata.get("run_id") or run_dir.name,
+                }
+                resolved_subject = metadata.get("maintenance_subject") or (
+                    subject if separator else None
+                )
+                if resolved_subject:
+                    row["subject"] = resolved_subject
+                if metadata.get("maintenance_scope"):
+                    row["scope"] = metadata["maintenance_scope"]
+                if (metadata.get("error") or {}).get("summary"):
+                    row["error"] = metadata["error"]["summary"]
+                rows.append(row)
+
+    audit_root = namespace_root / "_maintenance"
+    if audit_root.is_dir():
+        for manifest_path in audit_root.rglob("manifest.yaml"):
+            manifest = kernel_yaml_io.load_yaml(manifest_path) or {}
+            if not isinstance(manifest, dict):
+                continue
+            operation = manifest.get("operation")
+            timestamp = manifest.get("applied_at") or manifest.get("created_at")
+            identifier = manifest.get("maintenance_id") or manifest_path.parent.name
+            if not operation or not timestamp:
+                continue
+            row = {
+                "source": "manifest",
+                "operation": operation,
+                "status": (
+                    "applied"
+                    if manifest.get("applied_at")
+                    else "dry_run"
+                    if manifest.get("dry_run") is True
+                    else "recorded"
+                ),
+                "time": timestamp,
+                "id": identifier,
+            }
+            for field in (
+                "scope", "selection", "candidate_run_ids", "object_keys",
+                "delete_object_versions",
+            ):
+                if field in manifest:
+                    row[field] = manifest[field]
+            rows.append(row)
+
+    return sorted(
+        rows,
+        key=lambda row: (str(row.get("time") or ""), str(row.get("id") or "")),
+        reverse=True,
+    )
+
+
 def compute_namespace_status_map(
     namespace_root: Path,
     relations: dict | None = None,
     exclusive_workflow_relations: dict | None = None,
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
-    """Every target and workflow instance under the namespace root, one row per
-    published GROUP.
+    """Every target and workflow instance under the namespace root.
 
-    the tree is partitioned by group rather than by action, so an
-    instance appears once and each of its groups reports independently:
+    Target rows retain their internal result groups. Workflow rows expose only
+    their public mutability effect and preserve exact actions as row data:
 
         status      running | passed | failed
+        group       mutative | non_mutative       (workflows)
+        actions     exact resolved member actions (workflows)
         freshness   up_to_date | outdated     (a published deployment only)
-        at          when the record was published
+        time        when the record was published
 
     `status` comes from the live run slots — a success clears the failed slot, so
     `failed` cannot outlive the run that caused it — and `freshness` from the
@@ -1131,7 +1356,7 @@ def compute_namespace_status_map(
             if parsed is not None and parsed["kind"] == "workflow":
                 workflows.add((parsed["key"], tuple(parsed["instance_segments"])))
     rows: dict[str, dict[str, dict[str, dict[str, str]]]] = {
-        kind: {} for kind in run_actions.RESULT_KINDS
+        kind: {} for kind in run_actions.STATUS_RESULT_KINDS
     }
     for key, seg in targets:
         segments = list(seg)
@@ -1144,7 +1369,7 @@ def compute_namespace_status_map(
             "address": address,
             "relations": relations or {},
         }
-        for group in run_actions.RESULT_GROUPS:
+        for group in run_actions.STATUS_RESULT_GROUPS:
             axes = run_addressing._axis_row(
                 compute_target_instance_status(
                     namespace_root, run_actions.STATUS_GROUP_ACTION[group], spec
@@ -1158,25 +1383,35 @@ def compute_namespace_status_map(
             run_addressing._place_instance(rows, "target", key, segments, groups)
     for key, seg in workflows:
         segments = list(seg)
-        # A workflow row is keyed by GROUP like a target's, and holds EVERY group
-        # it has run — a `plan` run and a `provision` run are separate facts about
-        # one instance. Reporting only the newest collapsed them, so a failed plan
-        # read as a failed deployment under the wrong group.
+        # Workflow rows are keyed by public EFFECT. Internal plan and readonly
+        # channels are deliberately not exposed as competing workflow statuses;
+        # the exact resolved actions state what the selected run actually did.
         groups: dict[str, dict] = {}
-        for group, run_row in workflow_last_run_by_group(namespace_root, key, segments).items():
+        for effect, result in workflow_last_run_by_effect(
+            namespace_root, key, segments
+        ).items():
+            state_group = result["state_group"]
+            run_row = result["row"]
             row = {k: v for k, v in run_row.items() if k not in ("group", "target_instances")}
             members = list(run_row.get("target_instances") or [])
+            default_action = run_row.get("default_action") or (
+                run_actions.STATUS_GROUP_ACTION[state_group]
+            )
             freshness, member_rows, _ = workflow_member_freshness(
-                namespace_root, run_actions.STATUS_GROUP_ACTION[group], members, relations
+                namespace_root,
+                str(default_action),
+                members,
+                relations,
             )
             # No `reasons`: every member carries its own verdict below, so a
             # reason string would restate what the reader can already see.
             address = run_addressing.workflow_instance_address(key, segments)
-            standing, superseded_by = resolve_workflow_standing(
-                namespace_root, run_actions.STATUS_GROUP_ACTION[group],
-                exclusive_workflow_relations or {}, address, member_rows,
+            standing, superseded_by = StandingResolver(namespace_root).workflow(
+                exclusive_workflow_relations or {},
+                address,
+                member_rows,
             )
-            groups[group] = _ordered_workflow_row(
+            groups[effect] = _ordered_workflow_row(
                 row,
                 standing=standing,
                 superseded_by=superseded_by,
@@ -1216,8 +1451,8 @@ class SortField(StrEnum):
     STATUS = "status"
     LAST_ACTION = "last_action"
     LAST_OPERATION = "last_operation"
+    ACTIONS = "actions"
     STANDING = "standing"
-    SUPERSEDED_BY = "superseded_by"
     FRESHNESS = "freshness"
     TIME = "time"
     MEMBERS = "members"
@@ -1266,10 +1501,10 @@ FILTER_FIELDS = ("kind", *SORT_FIELDS)
 def parse_filters(items: list[str] | None) -> dict[str, list[str]]:
     """`FIELD=VALUE` pairs -> `{field: [values]}`, order preserved.
 
-    Repeating a field collects ALTERNATIVES rather than overwriting: `group=plan,
-    group=mutative` is either of them, and different fields all have to hold. That
-    is the only reading under which adding a filter narrows a result — a second
-    `group=` that replaced the first would silently widen it back.
+    Repeating a field collects ALTERNATIVES rather than overwriting:
+    `group=non_mutative,group=mutative` is either of them, and different fields
+    all have to hold. A single trailing `*` declares prefix matching; every
+    other value is exact.
     """
 
     filters: dict[str, list[str]] = {}
@@ -1284,6 +1519,13 @@ def parse_filters(items: list[str] | None) -> dict[str, list[str]]:
             raise RuntimeError(
                 f"❌ --filter field {field!r} unknown; expected one of "
                 f"{', '.join(FILTER_FIELDS)}"
+            )
+        if "*" in value and (
+            value == "*" or value.count("*") != 1 or not value.endswith("*")
+        ):
+            raise RuntimeError(
+                "❌ --filter supports one trailing * after a non-empty prefix, "
+                f"got: {value!r}"
             )
         values = filters.setdefault(field, [])
         if value not in values:
@@ -1355,19 +1597,28 @@ def sort_rows(rows: list[dict], keys: list[tuple[str, bool]]) -> list[dict]:
     return ordered
 
 
+def actions_text(actions) -> str:
+    """Exact workflow actions as one shell-safe table/filter value."""
+
+    return "+".join(str(action) for action in actions) if isinstance(actions, list) else ""
+
+
 def sort_value(row: dict, field: str):
     """One row's ordering value for one field.
 
     `members` orders by HOW MANY, not by the text of a list: the flat shape
     already renders it as a count, because a row carrying its own address has
-    nowhere to nest the objects. Every other field orders as text, and an absent
-    value sorts as empty — which puts the rows that never had one together at one
-    end rather than scattering them.
+    nowhere to nest the objects. `actions` uses the same plus-separated text the
+    table displays. Every other field orders as text, and an absent value sorts
+    as empty — which puts the rows that never had one together at one end rather
+    than scattering them.
     """
 
     if field == SortField.MEMBERS:
         members = row.get("members")
         return len(members) if isinstance(members, list) else 0
+    if field == SortField.ACTIONS:
+        return actions_text(row.get("actions"))
     return str(row.get(field) or "")
 
 
@@ -1476,12 +1727,20 @@ def structure_status_map(instances: dict, structure: str, sort: str) -> dict:
     return ordered
 
 
+def _filter_value_matches(value, pattern: str) -> bool:
+    """Exact match, or prefix match when the declared pattern ends in `*`."""
+
+    text = str(value)
+    return text.startswith(pattern[:-1]) if pattern.endswith("*") else text == pattern
+
+
 def filter_status_map(instances: dict, filters: dict[str, list[str]] | None) -> dict:
     """Narrow a namespace map to the rows matching every filter.
 
-    Values of ONE field are alternatives (`group=plan,group=mutative` is either),
-    and different fields all have to hold — which is the only reading that lets a
-    filter be added to narrow a result rather than to widen it by accident.
+    Values of ONE field are alternatives
+    (`group=non_mutative,group=mutative` is either), and different fields all
+    have to hold. A value with one trailing `*` matches that prefix; a value
+    without it remains exact.
 
     A template or instance whose every row is filtered out is DROPPED rather than
     shown empty: an empty one would read as "nothing happened here", which is a
@@ -1498,8 +1757,11 @@ def filter_status_map(instances: dict, filters: dict[str, list[str]] | None) -> 
     def matches(kind, template, segments, group, row) -> bool:
         candidate = {"kind": kind, **flat_row(kind, template, segments, group, row)}
         return all(
-            any(str(sort_value(candidate, field)) == value for value in values)
-            for field, values in filters.items()
+            any(
+                _filter_value_matches(sort_value(candidate, field), pattern)
+                for pattern in patterns
+            )
+            for field, patterns in filters.items()
         )
 
     selected: dict = {}
@@ -1557,8 +1819,12 @@ def up_to_date_child_revision(
     a workflow holding one target under two actions skips BOTH members — the six
     content fields match either way, because source and cfg are identical — so a
     run that destroyed and then failed to re-provision reports success while the
-    instance is still destroyed."""
+    instance is still destroyed. The target's resolved per-action policy is
+    checked here as a final defensive gate, so no caller can reuse a committed
+    result for an action the target classified as non-reusable."""
 
+    if target_run.get("reuse_committed_result") is not True:
+        return None
     if target_run.get("ref_policy") != "commit_required":
         return None
     if target_run.get("source_state") != "clean":

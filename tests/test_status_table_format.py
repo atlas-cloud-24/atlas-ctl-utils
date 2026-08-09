@@ -30,7 +30,11 @@ from engine.state import status as state_status
 MEMBER = {
     "address": "target/env/seed/baseline/instances/env.type=dev/aws.account=dev",
     "action": "plan",
+    "status": "passed",
+    "last_action": "plan",
     "freshness": "undetermined",
+    "time": "2026-08-05T18:20Z",
+    "label": "release-2026.07",
 }
 
 NESTED_REPORT = {
@@ -58,8 +62,9 @@ NESTED_REPORT = {
         "env/seed": {
             "instances": {
                 "env.type=dev/aws.account=dev": {
-                    "plan": {
+                    "non_mutative": {
                         "status": "passed",
+                        "actions": ["plan"],
                         "freshness": "undetermined",
                         "time": "2026-08-05T18:21Z",
                         "selectors": {"match": {"execution_context.params.env.type": "dev"}},
@@ -81,8 +86,9 @@ FLAT_REPORT = {
     "instances": [
         {
             "address": "workflow/env/seed/instances/env.type=dev/aws.account=dev",
-            "group": "plan",
+            "group": "non_mutative",
             "status": "passed",
+            "actions": ["plan"],
             "freshness": "undetermined",
             "time": "2026-08-05T18:21Z",
             "selectors": {"match": {"execution_context.params.env.type": "dev"}},
@@ -106,8 +112,10 @@ def _status_args(**overrides) -> argparse.Namespace:
         "execution_param": [],
         "scope": "local",
         "all": False,
+        "maintenance": False,
         "structure": None,
         "output_format": None,
+        "hide_members": False,
         "write_cache": False,
         "hydrate_to": None,
         "ctl_state_local_root": None,
@@ -133,6 +141,18 @@ class FormatIsDeclaredAsAReadingChoiceTest(unittest.TestCase):
         action = next(a for a in parser._actions if "--format" in a.option_strings)
         self.assertIsNone(action.default)
         self.assertEqual(list(action.choices), ["yaml", "table"])
+
+    def test_hide_members_is_a_declared_boolean_flag(self):
+        parser = argparse.ArgumentParser()
+        cli_args.add_status_args(parser)
+        args = parser.parse_args(
+            [
+                "--ctl-cfg", "/cfg", "--ctl-profile", "local_dev", "--all",
+                "--structure", "nested", "--format", "table", "--hide-members",
+                "--scope", "local", "--ctl-state-local-root", "/tmp/state",
+            ]
+        )
+        self.assertTrue(args.hide_members)
 
     def test_it_renders_all_and_refuses_a_targeted_query(self):
         """A targeted query names ONE instance, which is what the YAML report is
@@ -188,29 +208,94 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         self.assertEqual(members_cell, str(len(FLAT_REPORT["instances"][0]["members"])))
 
     def test_the_nested_table_renders_members_as_rows_under_their_group(self):
-        """Nesting exists to show what a composition ran with, so the shape that
-        has room for members uses it."""
+        """A nested member is the current target row, not a partial annotation."""
 
         rendered = state_render.render_status_map(NESTED_REPORT)
-        self.assertIn(MEMBER["address"], rendered)
+        short_address = "env/seed/baseline"
+        self.assertIn(short_address, rendered)
         member_line = next(
-            line for line in rendered.splitlines() if MEMBER["address"] in line
+            line for line in rendered.splitlines()
+            if short_address in line and line.startswith("        \u2514")
         )
-        self.assertIn(MEMBER["freshness"], member_line)
-        # A member's `action` fills the same column a group's `last_action` does:
-        # one column grid for the whole table is what makes it scannable.
-        self.assertIn(MEMBER["action"], member_line)
+        for field in ("status", "last_action", "freshness", "time", "label"):
+            with self.subTest(field=field):
+                self.assertIn(MEMBER[field], member_line)
 
-    def test_the_tree_column_is_sized_by_the_tree_and_not_by_its_members(self):
-        """A member sits at the deepest indent and carries the longest text.
-        Letting it set the width pushed every group's axes off to the right and
-        made the one column a reader scans down unreadable."""
+    def test_every_nested_level_has_an_explicit_tree_edge(self):
+        rendered = state_render.render_status_map(NESTED_REPORT)
+        lines = rendered.splitlines()
+
+        self.assertIn("target", lines)
+        self.assertIn("workflow", lines)
+        self.assertTrue(any(line.startswith("  \u2514 env/seed") for line in lines))
+        self.assertTrue(any(line.startswith("    \u2514 env.type=") for line in lines))
+        self.assertTrue(any(line.startswith("      \u2514 mutative") for line in lines))
+        self.assertTrue(
+            any(line.startswith("      \u2514 non_mutative") for line in lines)
+        )
+        self.assertTrue(any(line.startswith("        \u2514 env/seed/baseline") for line in lines))
+
+    def test_tree_lines_continue_across_later_siblings(self):
+        import copy
+
+        report = copy.deepcopy(NESTED_REPORT)
+        instances = report["workflow"]["env/seed"]["instances"]
+        instances["env.type=prod/aws.account=prod"] = copy.deepcopy(
+            instances["env.type=dev/aws.account=dev"]
+        )
+
+        rendered = state_render.render_status_map(report)
+        self.assertIn("    \u251c env.type=dev/aws.account=dev", rendered)
+        self.assertIn("    \u2502 \u2514 non_mutative", rendered)
+        self.assertIn("    \u2514 env.type=prod/aws.account=prod", rendered)
+
+    def test_members_can_be_hidden_without_changing_the_report(self):
+        import copy
+
+        report = copy.deepcopy(NESTED_REPORT)
+        before = copy.deepcopy(report)
+        rendered = state_render.render_status_map(report, hide_members=True)
+
+        self.assertFalse(
+            any(
+                line.startswith("        \u2514 env/seed/baseline")
+                for line in rendered.splitlines()
+            )
+        )
+        self.assertIn("      \u2514 non_mutative", rendered)
+        self.assertEqual(before, report)
+
+    def test_members_cannot_be_hidden_from_a_flat_table(self):
+        with self.assertRaisesRegex(RuntimeError, "--structure nested"):
+            state_render.render_status_map(FLAT_REPORT, hide_members=True)
+
+    def test_a_differing_member_instance_stays_qualified_without_repeating_kind(self):
+        import copy
+
+        report = copy.deepcopy(NESTED_REPORT)
+        member = report["workflow"]["env/seed"]["instances"][
+            "env.type=dev/aws.account=dev"
+        ]["non_mutative"]["members"][0]
+        member["address"] = (
+            "target/env/seed/baseline/instances/"
+            "env.type=shared/aws.account=shared"
+        )
+
+        member_line = next(
+            line for line in state_render.render_status_map(report).splitlines()
+            if line.startswith("        \u2514 env/seed/baseline/instances/")
+        )
+        self.assertNotIn("target/env/seed/baseline", member_line)
+
+    def test_matching_member_instance_axes_are_not_repeated(self):
+        """The parent already names the instance, leaving room for target facts."""
 
         rendered = state_render.render_status_map(NESTED_REPORT)
-        group_line = next(
-            line for line in rendered.splitlines() if line.startswith("    mutative")
+        member_line = next(
+            line for line in rendered.splitlines()
+            if "env/seed/baseline" in line and line.startswith("        \u2514")
         )
-        self.assertLess(group_line.index("passed"), len(MEMBER["address"]))
+        self.assertNotIn("instances/", member_line)
 
     def test_a_nested_mapping_has_no_column_and_stays_in_the_yaml(self):
         """`selectors` belongs to a definition rather than to a result, so it is
@@ -233,13 +318,60 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         ]
         self.assertNotIn("17 USD", state_render.render_status_map(invented))
 
-    def test_a_conditional_column_no_row_fills_is_dropped(self):
-        """`standing` exists only inside an exclusive relation. A namespace with
-        none was never asked the question, so a column of dashes would answer
-        one nobody posed."""
+    def test_standing_is_always_visible(self):
+        self.assertIn("standing", state_render.UNCONDITIONAL_COLUMNS)
+        self.assertIn("STANDING", state_render.render_status_map(FLAT_REPORT))
 
-        self.assertNotIn("standing", state_render.UNCONDITIONAL_COLUMNS)
-        self.assertNotIn("STANDING", state_render.render_status_map(FLAT_REPORT))
+    def test_exact_workflow_actions_are_a_shell_safe_column(self):
+        rendered = state_render.render_status_map(FLAT_REPORT)
+        self.assertIn("ACTIONS", rendered)
+        self.assertIn("plan", rendered)
+
+
+class MaintenanceTableTest(unittest.TestCase):
+    REPORT = {
+        "namespace": "aws/nonprod",
+        "scope": "local",
+        "computed_at": "2026-08-09T12:00:00Z",
+        "maintenance": [{
+            "source": "run",
+            "operation": "unlock-ctl-state",
+            "status": "passed",
+            "subject": "lock-1",
+            "scope": "both",
+            "time": "2026-08-09T11:59:00Z",
+            "id": "run-1",
+        }],
+    }
+
+    def test_maintenance_has_its_own_table(self):
+        rendered = state_render.render_maintenance_status(self.REPORT)
+        for value in ("unlock-ctl-state", "passed", "lock-1", "both", "run-1"):
+            self.assertIn(value, rendered)
+
+    def test_maintenance_format_is_allowed_without_all(self):
+        args = _status_args(
+            maintenance=True,
+            target=None,
+            action=None,
+            output_format="table",
+            ctl_state_local_root="/tmp/state",
+        )
+        cli_args.finalize_status_args(args)
+        self.assertTrue(args.maintenance)
+
+    def test_superseded_by_stays_in_yaml_and_out_of_the_table(self):
+        import copy
+
+        report = copy.deepcopy(FLAT_REPORT)
+        detail = "target/env/replacement/instances/env.type=dev"
+        report["instances"][0]["standing"] = "superseded"
+        report["instances"][0]["superseded_by"] = detail
+
+        rendered = state_render.render_status_map(report)
+        self.assertNotIn("SUPERSEDED_BY", rendered)
+        self.assertNotIn(detail, rendered)
+        self.assertEqual(detail, report["instances"][0]["superseded_by"])
 
     def test_an_unconditional_column_stays_and_marks_the_absence(self):
         """Every run could carry a label, so a namespace where none does has to
@@ -268,13 +400,11 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cli_args.normalize_run_label(state_render.EMPTY_CELL)
 
-    def test_a_line_that_names_something_stays_blank(self):
-        """A template, an instance and a member NAME a thing rather than report a
-        run. A member points at a target row that appears elsewhere in the same
-        map, so a dash on either would answer a question they were never asked."""
+    def test_a_line_that_only_names_something_stays_blank(self):
+        """Templates and instances name things; groups and members report runs."""
 
         rendered = state_render.render_status_map(NESTED_REPORT)
-        for prefix in ("target  ", "  env.type=", "      └ "):
+        for prefix in ("target", "    \u2514 env.type="):
             line = next(
                 line for line in rendered.splitlines() if line.startswith(prefix)
             )

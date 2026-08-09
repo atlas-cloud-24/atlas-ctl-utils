@@ -42,8 +42,12 @@ MAP = {
                         "time": "2026-08-06T11:39Z",
                         "members": [1],
                     },
-                    "plan": {
+                    "non_mutative": {
                         "status": "failed",
+                        "last_operation": "plan",
+                        "actions": ["plan", "readonly"],
+                        "standing": "superseded",
+                        "superseded_by": "workflow/env/core/instances/env.type=dev",
                         "time": "2026-08-07T09:00Z",
                         "members": [1, 2, 3],
                     },
@@ -55,6 +59,7 @@ MAP = {
                 "env.type=dev": {
                     "mutative": {
                         "status": "failed",
+                        "last_operation": "provision",
                         "freshness": "outdated",
                         "time": "2026-08-05T10:00Z",
                         "members": [1, 2],
@@ -105,6 +110,13 @@ class OneVocabularyTest(unittest.TestCase):
         self.assertEqual(
             state_status.FILTER_FIELDS, ("kind", *state_status.SORT_FIELDS)
         )
+
+    def test_yaml_only_relation_detail_survives_report_structuring(self):
+        row = next(item for item in _flat(MAP) if item.get("standing") == "superseded")
+        self.assertEqual(
+            "workflow/env/core/instances/env.type=dev", row["superseded_by"]
+        )
+        self.assertNotIn("superseded_by", state_status.SORT_FIELDS)
 
     def test_the_time_axis_and_the_time_sort_field_are_one_word(self):
         """They were `at` and `time`: one fact, two names, and `--sort at` reads
@@ -184,9 +196,8 @@ class SortRefusalsTest(unittest.TestCase):
         spelling that hides it is `time:asc,time:desc`, which looks deliberate."""
 
         for raw in ("time,time", "time:asc,time:desc"):
-            with self.subTest(raw=raw):
-                with self.assertRaises(RuntimeError):
-                    state_status.parse_sort(raw)
+            with self.subTest(raw=raw), self.assertRaises(RuntimeError):
+                state_status.parse_sort(raw)
 
     def test_an_empty_sort_is_refused(self):
         with self.assertRaises(RuntimeError):
@@ -201,14 +212,13 @@ class SortRefusalsTest(unittest.TestCase):
             with self.subTest(field=field):
                 state_status.parse_sort(field, structure="nested")
         for field in ("status", "members", "label", "group"):
-            with self.subTest(field=field):
-                with self.assertRaises(RuntimeError):
-                    state_status.parse_sort(field, structure="nested")
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                state_status.parse_sort(field, structure="nested")
 
 
 class FilterNarrowsTest(unittest.TestCase):
     def test_values_of_one_field_are_alternatives(self):
-        rows = _flat(_filtered("group=plan", "group=mutative"))
+        rows = _flat(_filtered("group=non_mutative", "group=mutative"))
         self.assertEqual(len(rows), 4)
 
     def test_different_fields_all_have_to_hold(self):
@@ -232,13 +242,28 @@ class FilterNarrowsTest(unittest.TestCase):
 
     def test_every_row_field_can_be_filtered_on(self):
         for pair, expected in (
-            ("status=failed", 2),
-            ("freshness=outdated", 1),
-            ("last_action=provision", 1),
-            ("label=release-2026.07", 1),
-            ("members=3", 1),
-            ("time=2026-08-06T11:40Z", 1),
+            ("kind=target", 1),
             ("address=workflow/env/seed/instances/env.type=dev", 2),
+            ("group=non_mutative", 1),
+            ("status=failed", 2),
+            ("last_action=provision", 1),
+            ("last_operation=provision", 1),
+            ("actions=plan+readonly", 1),
+            ("standing=superseded", 1),
+            ("freshness=outdated", 1),
+            ("time=2026-08-06T11:40Z", 1),
+            ("members=3", 1),
+            ("label=release-2026.07", 1),
+        ):
+            with self.subTest(pair=pair):
+                self.assertEqual(len(_flat(_filtered(pair))), expected)
+
+    def test_a_trailing_star_matches_a_prefix_on_any_text_field(self):
+        for pair, expected in (
+            ("address=workflow/env/*", 3),
+            ("address=target/env/*", 1),
+            ("status=pass*", 2),
+            ("label=release-*", 1),
         ):
             with self.subTest(pair=pair):
                 self.assertEqual(len(_flat(_filtered(pair))), expected)
@@ -285,11 +310,23 @@ class FilterRefusalsTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             state_status.parse_filters(["cost=17"])
 
+    def test_yaml_only_relation_detail_is_not_a_query_field(self):
+        with self.assertRaises(RuntimeError):
+            state_status.parse_filters(["superseded_by=workflow/env/core"])
+        with self.assertRaises(RuntimeError):
+            state_status.parse_sort("superseded_by")
+
     def test_a_pair_without_a_value_is_refused(self):
         for item in ("group", "group=", "=mutative"):
-            with self.subTest(item=item):
-                with self.assertRaises(RuntimeError):
-                    state_status.parse_filters([item])
+            with self.subTest(item=item), self.assertRaises(RuntimeError):
+                state_status.parse_filters([item])
+
+    def test_a_wildcard_is_only_a_single_trailing_prefix_marker(self):
+        for value in ("*", "*failed", "fail*ed", "fail**"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError, "one trailing"
+            ):
+                state_status.parse_filters([f"status={value}"])
 
     def test_the_echoed_filters_parse_back(self):
         """The report prints its filters so a reader can copy the line into the
@@ -297,7 +334,7 @@ class FilterRefusalsTest(unittest.TestCase):
         PAIRS."""
 
         filters = state_status.parse_filters(
-            ["group=plan", "group=mutative", "kind=workflow"]
+            ["group=non_mutative", "group=mutative", "kind=workflow"]
         )
         echoed = state_render._field_text(filters)
         self.assertEqual(filters, state_status.parse_filters(echoed.split()))

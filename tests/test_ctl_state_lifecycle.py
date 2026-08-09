@@ -52,6 +52,8 @@ TARGETS = (
     "targets:\n"
     "  env/tfstate_backend:\n"
     "    actions: [provision]\n"
+    "    committed_result_reuse:\n"
+    "      provision: true\n"
     "    source_key: target_sources.bootstrap\n"
     "    ref_key: env/${execution_context.params.env.type}\n"
     "    procedure_key: tfstate_backend\n"
@@ -180,7 +182,7 @@ class LifecycleWiringTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = make_cfg(self, tmp)
+            make_cfg(self, tmp)
             # the target declares provision only, so a destroy action omits it
             union, complete = catalog_workflow.workflow_member_instance_params(
                 {"target_runs": ["env/absent_here"]}, {}, label="workflow 'w'"
@@ -198,7 +200,7 @@ class LifecycleWiringTests(unittest.TestCase):
 
     def test_under_declaration_is_flagged_even_when_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = make_cfg(self, tmp)
+            make_cfg(self, tmp)
             targets = {"a": {"target_instance_params": ["account"]}}
             with self.assertRaisesRegex(RuntimeError, "missing"):
                 catalog_workflow.validate_workflow_instance_params(

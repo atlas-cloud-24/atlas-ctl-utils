@@ -199,7 +199,11 @@ class WorkflowHistoryTest(unittest.TestCase):
     def test_a_workflow_row_is_its_last_run(self):
         self.ns.workflow_run(WORKFLOW, run_id="w1")
         self.assertEqual(
-            {"status": "passed", "time": "2026-07-30T10:00:05Z"},
+            {
+                "status": "passed",
+                "actions": ["provision"],
+                "time": "2026-07-30T10:00:05Z",
+            },
             self.ns.rows()["workflow"][WORKFLOW]["mutative"],
         )
 
@@ -377,7 +381,10 @@ class SkipUpToDateUnderHistoryTest(unittest.TestCase):
             child, state_status.build_status_payload(child, "ok")
         )
         self.target_run = {
-            "target": TARGET, "target_instance_params": ["account"], **self.FACTS
+            "target": TARGET,
+            "target_instance_params": ["account"],
+            "reuse_committed_result": True,
+            **self.FACTS,
         }
         self.context = {"execution_context.params.account": "dev"}
 

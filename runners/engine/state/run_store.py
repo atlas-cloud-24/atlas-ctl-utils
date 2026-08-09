@@ -14,7 +14,6 @@ import os
 import shutil
 import socket
 import uuid
-
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -620,10 +619,8 @@ class CtlResultsLock:
                 self._file.truncate()
                 self._file.flush()
                 os.fsync(self._file.fileno())
-                try:
+                with contextlib.suppress(FileNotFoundError):
                     self.lock_path.unlink()
-                except FileNotFoundError:
-                    pass
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
         finally:
             self._file.close()
@@ -696,10 +693,28 @@ def write_ctl_state_lock_metadata(
     )
 
 
-def hydrate_ctl_state_index(syncer) -> list[str]:
+def hydrate_ctl_state_index(
+    syncer, *, include_maintenance_manifests: bool = False
+) -> list[str]:
+    """Hydrate the immutable runs and mutable pointers needed by state readers.
+
+    Maintenance manifests are opt-in so ordinary namespace status does not pay
+    to download an audit domain it deliberately excludes.
+    """
+
     keys = syncer.list_object_keys()
     for key in keys:
-        if key.endswith("/committed.yaml") or key.endswith("/RUN.yaml"):
+        grouped_pointer = "/committed/" in key and key.endswith(".yaml")
+        maintenance_manifest = (
+            include_maintenance_manifests
+            and key.startswith("_maintenance/")
+            and key.endswith("/manifest.yaml")
+        )
+        if (
+            grouped_pointer
+            or key.endswith("/RUN.yaml")
+            or maintenance_manifest
+        ):
             syncer.pull_object(key)
     return keys
 

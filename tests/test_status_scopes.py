@@ -17,9 +17,12 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.commands import maintenance as commands_maintenance
-from engine.kernel import yaml_io as kernel_yaml_io
 from engine.cli import args as cli_args
+from engine.commands import maintenance as commands_maintenance
+from engine.execution import run_context as execution_run_context
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.state import run_store as state_run_store
+from engine.state import sync as state_sync
 
 LOCAL_ONLY_POINTER = {"run_id": "force-skipped-run-x", "status": "ok"}
 NAMESPACE = "live"
@@ -30,18 +33,9 @@ def _seed_local_only_pointer(root: Path) -> Path:
     """A run made with --force-skip-ctl-state-backend-sync: it exists ONLY
     locally and can never reach the bucket."""
 
-    pointer = root / NAMESPACE / PREFIX / "committed.yaml"
+    pointer = root / NAMESPACE / PREFIX / "committed" / "mutative.yaml"
     kernel_yaml_io.write_yaml_file(pointer, LOCAL_ONLY_POINTER)
     return pointer
-
-
-from engine.execution import run_context as execution_run_context
-
-
-from engine.state import run_store as state_run_store
-
-
-from engine.state import sync as state_sync
 
 
 class _RecordingSyncer:
@@ -54,7 +48,7 @@ class _RecordingSyncer:
         self.root = root
         self.hydrated: list[str] = []
 
-    def hydrate_instance(self, prefix, child_prefixes=None):
+    def hydrate_instance(self, prefix, child_prefixes=None, *, committed_groups):
         self.hydrated.append(prefix)
         kernel_yaml_io.write_yaml_file(
             self.root / prefix / "committed" / "mutative.yaml",

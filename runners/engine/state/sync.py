@@ -12,10 +12,10 @@ and the note are one coherent state that a cluster of operations both reads and
 replaces.
 """
 
+import contextlib
 import fcntl
 import logging
 import re
-
 from pathlib import Path
 
 from engine.execution import adapters as execution_adapters
@@ -25,6 +25,7 @@ from engine.execution import run_context as execution_run_context
 from engine.kernel import ids as kernel_ids
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
@@ -595,17 +596,24 @@ class CtlStatePublication:
         run_prefix = run_dir.relative_to(results_root).as_posix()
         instance_dir = state_run_store.ctl_state_dir_from_run_dir(run_dir).resolve()
         instance_prefix = instance_dir.relative_to(results_root).as_posix()
-        keys = [
-            f"{instance_prefix}/identity.yaml",
-            f"{instance_prefix}/committed.yaml",
-        ]
         metadata = state_run_store.load_run_metadata(run_dir)
         action = str(metadata.get("action") or "")
+        instance_prefixes = [instance_prefix]
         for address in metadata.get("target_addresses") or []:
-            child_prefix = ctl_state_target_address_prefix(action, str(address))
-            keys.extend(
-                [f"{child_prefix}/identity.yaml", f"{child_prefix}/committed.yaml"]
+            instance_prefixes.append(
+                ctl_state_target_address_prefix(action, str(address))
             )
+        keys = [
+            key
+            for prefix in dict.fromkeys(instance_prefixes)
+            for key in (
+                f"{prefix}/identity.yaml",
+                *(
+                    f"{prefix}/committed/{group}.yaml"
+                    for group in run_actions.RESULT_GROUPS
+                ),
+            )
+        ]
         return sorted(set(keys)), [run_prefix]
 
     def _arm(self, config: dict, *, tolerate_not_ready: bool) -> bool:
@@ -752,7 +760,11 @@ class CtlStatePublication:
             )
             for address in (metadata.get("target_addresses") or [])
         ]
-        syncer.hydrate_instance(instance_prefix, child_prefixes)
+        syncer.hydrate_instance(
+            instance_prefix,
+            child_prefixes,
+            committed_groups=run_actions.RESULT_GROUPS,
+        )
         state_run_store.enforce_mutation_lock(
             syncer,
             action=str(metadata.get("action") or ""),
@@ -830,14 +842,10 @@ class CtlStatePublication:
                 drained += len(entries)
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             lock_path.unlink(missing_ok=True)
-            try:
+            with contextlib.suppress(OSError):
                 manifest_path.parent.rmdir()
-            except OSError:
-                pass
-        try:
+        with contextlib.suppress(OSError):
             pending_root.rmdir()
-        except OSError:
-            pass
         if base_config is not None:
             self._arm(base_config, tolerate_not_ready=False)
         return drained

@@ -9,8 +9,8 @@ import json
 import logging
 import shutil
 import sys
-
 from pathlib import Path
+
 import yaml
 
 from engine.catalog import targets as catalog_targets
@@ -25,6 +25,7 @@ from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
+
 
 def _resolve_entry_references(entries: list, *, label: str) -> list:
     """A member list: a target reference, or a mapping carrying one.
@@ -141,6 +142,26 @@ def validate_workflow_actions_declared(workflows: dict) -> None:
             continue
         for entries, default_action in workflow_target_branches(workflow, name=name):
             if default_action:
+                is_reference = (
+                    isinstance(default_action, str)
+                    and default_action.startswith("${")
+                    and default_action.endswith("}")
+                )
+                if not is_reference and default_action not in run_actions.WORKFLOW_ACTIONS:
+                    raise RuntimeError(
+                        f"❌ workflow {name!r} default_action {default_action!r} must "
+                        f"be one of {sorted(run_actions.WORKFLOW_ACTIONS)}; "
+                        "maintenance uses the maintenance runner"
+                    )
+            for entry in entries:
+                entry_action = entry.get("action") if isinstance(entry, dict) else None
+                if entry_action is not None and entry_action not in run_actions.WORKFLOW_ACTIONS:
+                    raise RuntimeError(
+                        f"❌ workflow {name!r} member action {entry_action!r} must be "
+                        f"one of {sorted(run_actions.WORKFLOW_ACTIONS)}; maintenance "
+                        "uses the maintenance runner"
+                    )
+            if default_action:
                 continue
             bare = [
                 entry for entry in entries
@@ -166,7 +187,12 @@ def workflow_member_actions(workflow_cfg: dict) -> set[str]:
 
 
 def workflow_representative_action(workflow_cfg: dict) -> str:
-    """Internal action used by state APIs after a workflow composition resolves."""
+    """Internal action used by state APIs after a workflow composition resolves.
+
+    Public workflow status reports effect + exact actions. This representative
+    exists only to select the run's internal state channel before its recorded
+    composition is available.
+    """
 
     actions = workflow_member_actions(workflow_cfg)
     if workflow_cfg.get("default_action"):
@@ -174,7 +200,14 @@ def workflow_representative_action(workflow_cfg: dict) -> str:
     groups = {run_actions.action_group(action) for action in actions}
     if not groups:
         raise RuntimeError("❌ workflow resolves no target actions")
-    group = next(group for group in run_actions.GROUP_PRECEDENCE if group in groups)
+    if run_actions.Group.MAINTENANCE in groups:
+        raise RuntimeError(
+            "❌ workflow members cannot use maintenance; use the maintenance runner"
+        )
+    group = next(
+        group for group in run_actions.WORKFLOW_STATE_GROUP_PRECEDENCE
+        if group in groups
+    )
     return str(run_actions.group_representative_action(group))
 
 
@@ -1074,6 +1107,10 @@ def build_procedure_cfg(
         "procedure": procedure,
         "domains": [domain],
         "cfg_keys": {domain: ["*"]},
+        "allowed_actions": [action],
+        # Synthetic procedures never publish reusable target state, but they use
+        # the same resolved target shape and therefore state that policy explicitly.
+        "committed_result_reuse": {action: False},
     }
     if execution_provider:
         # The synthetic target gets the same execution_identity block a declared

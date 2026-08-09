@@ -9,13 +9,13 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 import ctl_cfg_fixture
 from engine.catalog import targets as catalog_targets
 from engine.catalog import workflow as catalog_workflow
+from engine.cli import args as cli_args
 from engine.commands import pipeline as commands_pipeline
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
-from engine.cli import args as cli_args
 
 LIVE_CTX = {"execution_context.params.landing_zone": "live"}
 CANARY_CTX = {"execution_context.params.landing_zone": "canary"}
@@ -204,6 +204,8 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
             "targets:\n"
             "  lz/tfstate_backend:\n"
             "    actions: [provision]\n"
+            "    committed_result_reuse:\n"
+            "      provision: true\n"
             "    source_key: target_sources.bootstrap\n"
             "    ref_key: state_backend\n"
             "    procedure_key: tfstate_backend\n"
@@ -268,6 +270,8 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "targets:\n"
                 "  t:\n"
                 "    actions: [provision]\n"
+            "    committed_result_reuse:\n"
+            "      provision: true\n"
                 "    source_key: target_sources.bootstrap\n"
                 "    ref_key: r\n"
                 "    procedure_key: s\n"
@@ -286,6 +290,8 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
                 "targets:\n"
                 "  t:\n"
                 "    actions: [provision]\n"
+            "    committed_result_reuse:\n"
+            "      provision: true\n"
                 "    source_key: target_sources.bootstrap\n"
                 "    ref_key: r\n"
                 "    procedure_key: s\n"
@@ -312,7 +318,8 @@ class TargetInputParamsTests(unittest.TestCase):
                "param_sets:\n  base:\n    input_params: [main_tag, landing_zone]\n")
         (root / "targets" / "provision").mkdir(parents=True)
         _write(root / "targets" / "provision", "t.yaml",
-               "targets:\n  t:\n    actions: [provision]\n    source_key: target_sources.bootstrap\n"
+               "targets:\n  t:\n    actions: [provision]\n    committed_result_reuse:\n"
+               "      provision: true\n    source_key: target_sources.bootstrap\n"
                "    ref_key: r\n    procedure_key: s\n    domains: [domains.env]\n"
                "    cfg_key_sets:\n      env: [cfg_key_sets.k]\n" + target_body)
         return ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))

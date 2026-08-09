@@ -9,12 +9,10 @@ import json
 import logging
 import os
 import shutil
-
 from pathlib import Path
 
 from engine.catalog import targets as catalog_targets
 from engine.catalog import workflow as catalog_workflow
-from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tooling as cfg_tooling
@@ -24,6 +22,7 @@ from engine.commands import maintenance as commands_maintenance
 from engine.commands import selection as commands_selection
 from engine.execution import providers as execution_providers
 from engine.execution import run_context as execution_run_context
+from engine.guardrails import verify as guardrails_verify
 from engine.kernel import git as kernel_git
 from engine.kernel import paths as kernel_paths
 from engine.kernel import process as kernel_process
@@ -34,6 +33,7 @@ from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+
 
 def run_targets(
     active_target_runs: dict,
@@ -84,7 +84,7 @@ def run_targets(
             )
             if revision is not None:
                 logging.info(
-                    "Skipping committed target instance %s (commits unchanged)",
+                    "Skipping committed target instance %s (published result is reusable)",
                     revision["address"],
                 )
                 child_revisions.append(revision)

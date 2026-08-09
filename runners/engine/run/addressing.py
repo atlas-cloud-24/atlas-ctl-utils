@@ -5,11 +5,11 @@ is derived from the address, so the two cannot be separated without letting them
 disagree. Params ADDRESS an instance; a hash would only identify it."""
 
 import re
-
 from pathlib import Path
 
 from engine.execution import references as execution_references
 from engine.run import actions as run_actions
+
 
 def workflow_target_run_signature(target_run_entry) -> tuple[str, str | None]:
     """Return `(target key, action)` for one workflow target_run entry.
@@ -145,9 +145,9 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 # detailed row, where a reader is already investigating.
 # Outcome first (`last_action` qualifies `status`, so it stays adjacent), then
 # which alternative is in effect, then whether it still matches its cfg, then
-# when. `standing`/`superseded_by` sit AHEAD of `freshness` because a superseded
-# row's freshness describes it against its OWN cfg, which reads as reassuring
-# until you know it is not the one deployed.
+# when. `standing` and its YAML-only `superseded_by` detail sit AHEAD of
+# `freshness` because a superseded row's freshness describes it against its OWN
+# cfg, which reads as reassuring until you know it is not the one deployed.
 # `label` is LAST: it names the invocation a row belonged to rather than saying
 # anything about the row's own outcome, so it is the fact a reader reaches for
 # after the ones they act on.
@@ -335,19 +335,67 @@ def recorded_member_actions(facts: dict) -> list[str]:
 
 
 def workflow_group(facts: dict) -> str | None:
-    """The group a workflow belongs to, derived from its members' actions.
+    """The internal state group a workflow run uses.
 
     None when the composition records no action at all — an empty or malformed
     record answers nothing rather than defaulting into a group it may not be in.
+    Public status uses :func:`workflow_effect` and :func:`workflow_actions`;
+    this choice exists only because an open run needs one state slot.
     """
 
     groups = {run_actions.action_group(action) for action in recorded_member_actions(facts)}
     if not groups:
         return None
-    for group in run_actions.GROUP_PRECEDENCE:
+    if run_actions.Group.MAINTENANCE in groups:
+        raise RuntimeError(
+            "❌ workflow members cannot use maintenance; maintenance has its own "
+            "runner and status report"
+        )
+    for group in run_actions.WORKFLOW_STATE_GROUP_PRECEDENCE:
         if group in groups:
             return group
     raise RuntimeError(f"❌ workflow members resolve to unknown group(s): {sorted(groups)}")
+
+
+def workflow_actions(facts: dict) -> list[str]:
+    """Resolved workflow actions, unique in first-member order.
+
+    A record without member actions may carry the workflow runner's
+    representative ``action``. That is the record's available action evidence.
+    """
+
+    actions: list[str] = []
+    recorded = recorded_member_actions(facts)
+    if not recorded and facts.get("action"):
+        recorded = [str(facts["action"])]
+    for action in recorded:
+        # Validate through the one registry before publishing the vocabulary.
+        run_actions.action_group(action)
+        if action not in actions:
+            actions.append(action)
+    return actions
+
+
+def workflow_effect(facts: dict) -> str | None:
+    """Public workflow classification: mutative or non_mutative.
+
+    Exact actions remain alongside this value. There is no strongest-action
+    precedence in the public report.
+    """
+
+    actions = workflow_actions(facts)
+    if not actions:
+        return None
+    if run_actions.Action.MAINTENANCE in actions:
+        raise RuntimeError(
+            "❌ workflow members cannot use maintenance; maintenance has its own "
+            "runner and status report"
+        )
+    return str(
+        run_actions.WorkflowEffect.MUTATIVE
+        if any(run_actions.ACTIONS[action].mutating for action in actions)
+        else run_actions.WorkflowEffect.NON_MUTATIVE
+    )
 
 
 STATE_STRUCTURAL_NAMES = frozenset({"runs", "committed.yaml", "identity.yaml", "locks"})

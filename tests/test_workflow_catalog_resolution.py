@@ -1,23 +1,12 @@
-"""Two guards that were reading cfg in a shape real cfg never has.
+"""Workflow catalog guards operate on the loaded catalog shape.
 
-Both defects came from the same place — the difference between a workflow as
-DECLARED and a workflow as LOADED — and both were invisible because the tests
-around them hand-built the loaded shape and got it wrong the same way the code
-did. So every test here goes through `load_workflow_catalog` over cfg written on
-disk the way real cfg is written, rather than through a literal.
+Member keys are declared as qualified target references and resolved by
+load_workflow_catalog before instance-parameter validation. Context-dependent
+member selection resolves only the selected workflow and its import closure, so
+an unrelated workflow need not declare a branch for the current operation.
 
-Phase 94 — a member key is declared as `targets.<key>` and the loader resolves it
-to `<key>`. The static instance-param gate was handed the RAW collection, so
-every member looked up as missing: the union of member params was always empty,
-the `missing` half could never fire, and the `extra` half fired on any
-declaration. The dead half is the dangerous one — it exists to stop two target
-instances sharing one workflow address and merging their histories.
-
-Phase 95 — `load_workflow_cfg` resolved every workflow in the catalog against the
-running context, so a workflow declaring no branch for the current operation
-raised even when the run never touched it. A workflow with no `destroy` branch is
-not malformed; member selectors are exactly how it says which operations it
-applies to.
+Every test writes cfg in the real declared shape and loads it through the catalog
+boundary before exercising consumers of that loaded shape.
 """
 
 import sys
@@ -28,8 +17,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.cfg import resources as cfg_resources
 from engine.catalog import workflow as catalog_workflow
+from engine.cfg import resources as cfg_resources
 
 # Written the way real cfg writes it: member keys are QUALIFIED references, and
 # `default_action` lives inside the list it governs.
@@ -100,7 +89,7 @@ def _cfg_root(stack: unittest.TestCase) -> Path:
 
 
 class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
-    """Phase 94."""
+    """Qualified member references resolve before target lookup."""
 
     def setUp(self):
         self.root = _cfg_root(self)
@@ -128,9 +117,7 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
         )
 
     def test_a_missing_axis_is_refused(self):
-        """THE dead half. Its members instance over `env.type` and the workflow
-        does not declare it, so two target instances would share one workflow
-        address and merge their histories. Before Phase 94 this passed."""
+        """Every member axis belongs in the workflow instance address."""
 
         with self.assertRaisesRegex(RuntimeError, "missing"):
             catalog_workflow.validate_all_workflow_instance_params(
@@ -139,22 +126,15 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
             )
 
     def test_raw_cfg_diagnoses_it_backwards(self):
-        """Pins the defect itself, so the fix cannot be undone quietly.
-
-        Handed the UNRESOLVED collection the union is empty, so this declaration
-        — which really IS missing an axis — is reported as declaring one too
-        many. Both halves wrong at once, and the error still names a real
-        workflow, which is why it read as a cfg problem rather than an engine
-        one.
-        """
+        """The validator refuses unresolved qualified member keys."""
 
         raw = cfg_resources.collect_resource(self.root, "workflows", entry_depth=1)
         with self.assertRaisesRegex(RuntimeError, "declares"):
             catalog_workflow.validate_all_workflow_instance_params(
                 {"env/missing_an_axis": raw["env/missing_an_axis"]}, self.targets
             )
-        # A CORRECT declaration is refused too, which is why validate_cfg.py
-        # could not complete for either consumer family.
+        # Validation consumes the loaded catalog; the raw collection is outside
+        # that contract for every workflow shape.
         with self.assertRaisesRegex(RuntimeError, "declares"):
             catalog_workflow.validate_all_workflow_instance_params(
                 {"env/correct": raw["env/correct"]}, self.targets
@@ -162,7 +142,7 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
 
 
 class OnlyTheSelectedWorkflowMustApplyToTheOperationTest(unittest.TestCase):
-    """Phase 95."""
+    """Context-dependent resolution is limited to the selected import closure."""
 
     def setUp(self):
         self.root = _cfg_root(self)
@@ -185,8 +165,7 @@ class OnlyTheSelectedWorkflowMustApplyToTheOperationTest(unittest.TestCase):
         )
 
     def test_a_run_is_not_blocked_by_a_workflow_it_never_touches(self):
-        """The reported failure: `--execution-params operation=destroy` on one workflow died on
-        another that declares only provision."""
+        """An unrelated workflow need not apply to the selected operation."""
 
         cfg = self._load("env/destroyable", "destroy")
         self.assertEqual(cfg["operation"], "destroy")

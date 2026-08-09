@@ -6,22 +6,112 @@ mutation lock, which is what makes it safe to point at a live backend."""
 import argparse
 import contextlib
 import tempfile
-
 from pathlib import Path
+
 import yaml
 
 from engine.catalog import workflow as catalog_workflow
+from engine.cfg import resources as cfg_resources
 from engine.commands import selection as commands_selection
 from engine.execution import run_context as execution_run_context
 from engine.kernel import ids as kernel_ids
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
-from engine.run import addressing as run_addressing
-from engine.state import run_store as state_run_store
-from engine.cfg import resources as cfg_resources
 from engine.state import render as state_render
+from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+
+
+def _read_namespace(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    execution_context: dict[str, object],
+    reader,
+    *,
+    provider_implementation_key: str,
+    include_maintenance_manifests: bool = False,
+):
+    """Read one complete namespace locally or from an isolated hydration."""
+
+    namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
+        ctl_cfg_root, execution_context
+    )
+    if args.status == "local":
+        namespace_root = Path(args.ctl_state_local_root) / namespace_key
+        return namespace_key, reader(namespace_root)
+
+    keep = getattr(args, "hydrate_to", None)
+    scratch = (
+        contextlib.nullcontext(str(Path(keep).expanduser()))
+        if keep
+        else tempfile.TemporaryDirectory(prefix="atlas-ctl-state-remote-all-")
+    )
+    with scratch as scratch_root:
+        _, namespace_root, syncer = state_sync.CtlStateAccess.arm_operation(
+            ctl_cfg_root,
+            execution_context,
+            Path(scratch_root),
+            operation="read",
+            provider_implementation_key=provider_implementation_key,
+            execution_access_modes=args.execution_access_modes,
+            provider_options=args.provider_options,
+        )
+        state_run_store.hydrate_ctl_state_index(
+            syncer,
+            include_maintenance_manifests=include_maintenance_manifests,
+        )
+        result = reader(namespace_root)
+        if keep:
+            kernel_yaml_io.write_yaml_file(
+                Path(scratch_root) / "hydrated_from.yaml",
+                {
+                    "namespace": namespace_key,
+                    "hydrated_at": kernel_ids.utc_timestamp(),
+                    "source": "remote ctl-state backend",
+                },
+            )
+        return namespace_key, result
+
+
+def run_status_maintenance_command(
+    ctl_cfg_root: Path,
+    args: argparse.Namespace,
+    *,
+    provider_implementation_key: str = "local",
+) -> dict:
+    """Report durable maintenance activity outside normal instance status."""
+
+    execution_context = execution_run_context.build_execution_context(
+        ctl_cfg_root,
+        action=args.action,
+        ctl_profile=args.ctl_profile,
+        execution_params=args.execution_params,
+        providers=getattr(args, "providers", ()),
+        execution_access_modes=args.execution_access_modes,
+        execution_runtime_mode=args.execution_runtime_mode,
+    )
+    namespace_key, rows = _read_namespace(
+        ctl_cfg_root,
+        args,
+        execution_context,
+        state_status.maintenance_status_rows,
+        provider_implementation_key=provider_implementation_key,
+        include_maintenance_manifests=True,
+    )
+    report = {
+        "namespace": namespace_key,
+        "scope": args.status,
+        "computed_at": kernel_ids.utc_timestamp(),
+        "maintenance": rows,
+    }
+    print(
+        state_render.render_maintenance_status(report)
+        if getattr(args, "output_format", None) == state_render.StatusFormat.TABLE
+        else yaml.safe_dump(report, sort_keys=False).rstrip()
+    )
+    return report
+
 
 def run_status_command(
     ctl_cfg_root: Path,
@@ -133,21 +223,11 @@ def run_status_command(
                 child_prefixes = [
                     target["prefix"] for target in spec.get("target_specs", [])
                 ]
-                syncer.hydrate_instance(spec["prefix"], child_prefixes)
-                # Lifecycle status needs the sibling pointers of BOTH directions,
-                # which is what the mutating actions are.
-                target_specs = spec.get("target_specs") or (
-                    [spec] if spec["kind"] == "target" else []
+                syncer.hydrate_instance(
+                    spec["prefix"],
+                    child_prefixes,
+                    committed_groups=run_actions.RESULT_GROUPS,
                 )
-                for target_spec in target_specs:
-                    for lifecycle_action in run_actions.MUTATING_ACTIONS:
-                        syncer.pull_object(
-                            run_addressing.compose_state_relpath("target",
-                                target_spec["key"],
-                                target_spec["segments"],
-                            ).as_posix()
-                            + "/committed.yaml"
-                        )
             results = state_status._compute_status_results(
                 namespace_root, args.action, selection_labels, specs
             )
@@ -224,45 +304,23 @@ def run_status_all_command(
         execution_access_modes=args.execution_access_modes,
         execution_runtime_mode=args.execution_runtime_mode,
     )
-    namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(ctl_cfg_root, execution_context)
     # An exclusive relation names targets that are ALTERNATIVES over one
     # deployment. ctl
     # cannot derive that — a target names a procedure, a procedure names steps —
     # so it is read from cfg, and an empty registry leaves every row unchanged.
     exclusive_target_relations = cfg_resources.collect_resource(ctl_cfg_root, "exclusive_target_relations")
     exclusive_workflow_relations = cfg_resources.collect_resource(ctl_cfg_root, "exclusive_workflow_relations")
-    if args.status == "local":
-        namespace_root = Path(args.ctl_state_local_root) / namespace_key
-        instances = state_status.compute_namespace_status_map(namespace_root, exclusive_target_relations, exclusive_workflow_relations)
-    else:
-        keep = getattr(args, "hydrate_to", None)
-        scratch = (
-            contextlib.nullcontext(str(Path(keep).expanduser()))
-            if keep
-            else tempfile.TemporaryDirectory(prefix="atlas-ctl-state-remote-all-")
-        )
-        with scratch as scratch_root:
-            _, namespace_root, syncer = state_sync.CtlStateAccess.arm_operation(
-                ctl_cfg_root,
-                execution_context,
-                Path(scratch_root),
-                operation="read",
-                provider_implementation_key=provider_implementation_key,
-                execution_access_modes=args.execution_access_modes,
-                provider_options=args.provider_options,
-            )
-            state_run_store.hydrate_ctl_state_index(syncer)
-            instances = state_status.compute_namespace_status_map(namespace_root, exclusive_target_relations, exclusive_workflow_relations)
-            if keep:
-                # Provenance, not a guard: ctl refuses nothing on account of it.
-                kernel_yaml_io.write_yaml_file(
-                    Path(scratch_root) / "hydrated_from.yaml",
-                    {
-                        "namespace": namespace_key,
-                        "hydrated_at": kernel_ids.utc_timestamp(),
-                        "source": "remote ctl-state backend",
-                    },
-                )
+    namespace_key, instances = _read_namespace(
+        ctl_cfg_root,
+        args,
+        execution_context,
+        lambda namespace_root: state_status.compute_namespace_status_map(
+            namespace_root,
+            exclusive_target_relations,
+            exclusive_workflow_relations,
+        ),
+        provider_implementation_key=provider_implementation_key,
+    )
     filters = getattr(args, "filters", None) or {}
     instances = state_status.filter_status_map(instances, filters)
     instances = state_status.structure_status_map(instances, args.structure, args.sort)
@@ -317,7 +375,9 @@ def run_status_all_command(
     # report itself: how it was printed is not a fact about the namespace, and a
     # cached map claiming a format would be a claim about a file nobody kept.
     print(
-        state_render.render_status_map(report)
+        state_render.render_status_map(
+            report, hide_members=getattr(args, "hide_members", False),
+        )
         if getattr(args, "output_format", None) == state_render.StatusFormat.TABLE
         else yaml.safe_dump(report, sort_keys=False).rstrip()
     )
@@ -330,10 +390,14 @@ def run_status(
     *,
     provider_implementation_key: str = "local",
 ) -> dict:
-    """ dispatcher: whole-namespace (--all) or targeted."""
+    """Dispatch whole-namespace, maintenance-audit, or targeted status."""
 
     if args.all:
         return run_status_all_command(
+            ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+        )
+    if getattr(args, "maintenance", False):
+        return run_status_maintenance_command(
             ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
         )
     run_type = (

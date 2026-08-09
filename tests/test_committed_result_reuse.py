@@ -1,0 +1,229 @@
+"""Committed-result reuse is target policy, resolved for one concrete action.
+
+The invocation may request reuse, but it cannot grant it. A target must classify
+all of its actions explicitly, and the active run carries only the boolean for
+the action that member will execute.
+"""
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "runners"))
+
+from engine.catalog import targets as catalog_targets
+from engine.catalog import workflow as catalog_workflow
+from engine.commands import pipeline as commands_pipeline
+from engine.kernel import yaml_io as kernel_yaml_io
+from engine.state import run_store as state_run_store
+from engine.state import status as state_status
+from engine_surface import patch_engine
+
+
+class TargetReusePolicySchemaTest(unittest.TestCase):
+    def test_synthetic_procedure_explicitly_disallows_reuse(self):
+        with (
+            mock.patch.object(
+                catalog_workflow.cfg_resources,
+                "collect_resource",
+                return_value={"source": {"repo_path": "/tmp/source"}},
+            ),
+            mock.patch.object(
+                catalog_workflow.execution_run_context,
+                "load_domain_registry",
+                return_value={},
+            ),
+            mock.patch.object(catalog_workflow.execution_run_context, "validate_domain_value"),
+            mock.patch.object(catalog_targets, "target_consent_opt_in_fields", return_value=set()),
+        ):
+            workflow_cfg, action_cfg = catalog_workflow.build_procedure_cfg(
+                Path("/cfg"),
+                "plan",
+                source="source",
+                ref="context",
+                domain_name="env",
+                procedure="steps",
+            )
+            active = catalog_targets.build_active_target_runs(
+                workflow_cfg,
+                action_cfg,
+                repo_key="repo_path",
+                require_branch_or_commit=False,
+            )["procedure"]
+
+        self.assertEqual(
+            {"plan": False},
+            action_cfg["targets"]["procedure"]["committed_result_reuse"],
+        )
+        self.assertIs(False, active["reuse_committed_result"])
+
+    def test_policy_must_match_actions_exactly(self):
+        entry = {
+            "actions": ["plan", "provision"],
+            "committed_result_reuse": {"plan": False, "provision": True},
+        }
+        self.assertEqual(
+            {"plan": False, "provision": True},
+            catalog_targets.TargetActionPolicy(entry, label="target 't'").committed_result_reuse(),
+        )
+
+        for policy, reason in (
+            (None, "must declare 'committed_result_reuse'"),
+            ({"plan": True}, "missing actions"),
+            ({"plan": True, "provision": True, "destroy": True}, "undeclared actions"),
+            ({"plan": True, "provision": "yes"}, "must be booleans"),
+        ):
+            with self.subTest(policy=policy):
+                candidate = {"actions": ["plan", "provision"]}
+                if policy is not None:
+                    candidate["committed_result_reuse"] = policy
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    catalog_targets.TargetActionPolicy(
+                        candidate, label="target 't'"
+                    ).committed_result_reuse()
+
+    def test_policy_preserves_declared_mapping_order(self):
+        policy = catalog_targets.TargetActionPolicy(
+            {
+                "actions": ["plan", "provision"],
+                "committed_result_reuse": {"provision": True, "plan": False},
+            },
+            label="target 't'",
+        ).committed_result_reuse()
+
+        self.assertEqual(["provision", "plan"], list(policy))
+
+    def test_active_member_carries_only_its_actions_resolved_policy(self):
+        action_cfg = {
+            "target_sources": {"source": {"repo_path": "/tmp/source"}},
+            "targets": {
+                "target": {
+                    "source": "source",
+                    "ref": "context",
+                    "procedure": "steps",
+                    "domains": ["env"],
+                    "cfg_keys": {"env": ["*"]},
+                    "allowed_actions": ["plan", "provision"],
+                    "committed_result_reuse": {"plan": False, "provision": True},
+                }
+            },
+        }
+        with mock.patch.object(catalog_targets, "target_consent_opt_in_fields", return_value=set()):
+            inherited = catalog_targets.build_active_target_runs(
+                {
+                    "meta": {"action": "provision"},
+                    "target_runs": [{"id": "run", "target": "target"}],
+                },
+                action_cfg,
+                repo_key="repo_path",
+                require_branch_or_commit=False,
+            )["run"]
+            overridden = catalog_targets.build_active_target_runs(
+                {
+                    "meta": {"action": "provision"},
+                    "target_runs": [{"id": "run", "target": "target", "action": "plan"}],
+                },
+                action_cfg,
+                repo_key="repo_path",
+                require_branch_or_commit=False,
+            )["run"]
+            overridden_definition = catalog_targets.target_definition_document(overridden)
+
+        self.assertIs(True, inherited["reuse_committed_result"])
+        self.assertIs(False, overridden["reuse_committed_result"])
+        self.assertIs(False, overridden_definition["reuse_committed_result"])
+
+    def test_status_reuse_predicate_is_defensively_closed(self):
+        with mock.patch.object(
+            state_status.state_run_store, "target_instance_dir_for_run"
+        ) as resolve_instance:
+            revision = state_status.up_to_date_child_revision(
+                Path("/unused"),
+                {"reuse_committed_result": False},
+                {},
+                "provision",
+            )
+        self.assertIsNone(revision)
+        resolve_instance.assert_not_called()
+
+
+class WorkflowReuseGateTest(unittest.TestCase):
+    def _run(self, *, reuse_committed_result: bool):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            kernel_yaml_io.write_yaml_file(
+                state_run_store.run_metadata_path(run_dir),
+                {"run_id": "w1", "run_type": "workflow", "action": "plan"},
+            )
+            cwd = Path.cwd()
+            try:
+                with patch_engine(
+                    build_tooling_env=mock.DEFAULT,
+                    materialize_step_utils=mock.DEFAULT,
+                    build_child_target_command=mock.DEFAULT,
+                    mint_child_lock_grant=mock.DEFAULT,
+                    latest_child_revision=mock.DEFAULT,
+                    up_to_date_child_revision=mock.DEFAULT,
+                    run_and_log=mock.DEFAULT,
+                ) as patched:
+                    patched["build_tooling_env"].return_value = {}
+                    patched["materialize_step_utils"].return_value = run_dir
+                    patched["build_child_target_command"].return_value = ["ctl.py"]
+                    patched["mint_child_lock_grant"].return_value = "grant"
+                    patched["latest_child_revision"].return_value = None
+                    patched["up_to_date_child_revision"].side_effect = (
+                        lambda _run_dir, target_run, _context, _action: (
+                            {"address": "target/instances/x", "run_id": "old"}
+                            if target_run.get("reuse_committed_result")
+                            else None
+                        )
+                    )
+                    commands_pipeline.run_targets(
+                        {
+                            "member": {
+                                "target": "target",
+                                "reuse_committed_result": reuse_committed_result,
+                            }
+                        },
+                        run_dir,
+                        Path(tmp),
+                        Path(tmp) / "context.yaml",
+                        "plan",
+                        {},
+                        "w1",
+                        {},
+                        False,
+                        None,
+                        {},
+                        "provider",
+                        "local",
+                        skip_up_to_date=True,
+                        child_command_spec={"ctl_state_local_root": tmp},
+                    )
+                    return {
+                        "reuse_checks": patched["up_to_date_child_revision"].call_count,
+                        "child_runs": patched["run_and_log"].call_count,
+                    }
+            finally:
+                os.chdir(cwd)
+
+    def test_false_policy_executes_even_when_reuse_was_requested(self):
+        self.assertEqual(
+            {"reuse_checks": 1, "child_runs": 1},
+            self._run(reuse_committed_result=False),
+        )
+
+    def test_true_policy_reuses_when_evidence_is_eligible(self):
+        self.assertEqual(
+            {"reuse_checks": 1, "child_runs": 0},
+            self._run(reuse_committed_result=True),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

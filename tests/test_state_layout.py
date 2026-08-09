@@ -19,7 +19,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import ctl_cfg_fixture
-from engine_surface import engine_defines
 from engine.catalog import targets as catalog_targets
 from engine.catalog import workflow as catalog_workflow
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -28,6 +27,7 @@ from engine.run import addressing as run_addressing
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine_surface import engine_defines
 
 KEY, SEGMENTS = "env/seed/baseline", ["env.type=dev", "aws.account=dev"]
 SPEC = {
@@ -67,6 +67,14 @@ class PathShapeTest(unittest.TestCase):
         self.assertEqual(
             "workflow/org/bootstrap_admin",
             run_addressing.compose_state_relpath("workflow", "org/bootstrap_admin", []).as_posix(),
+        )
+
+    def test_maintenance_has_a_separate_state_owner(self):
+        self.assertEqual(
+            "maintenance/unlock-ctl-state/lock-1",
+            run_addressing.compose_state_relpath(
+                "maintenance", "unlock-ctl-state/lock-1", []
+            ).as_posix(),
         )
 
     def test_an_unknown_kind_is_refused(self):
@@ -289,6 +297,12 @@ class MemberEntryActionTest(unittest.TestCase):
                 [{"key": "env/ops/app", "action": "rebuild"}], label="wf"
             )
 
+    def test_maintenance_is_refused_as_a_workflow_member_action(self):
+        with self.assertRaisesRegex(RuntimeError, "maintenance runner"):
+            catalog_targets.normalize_target_entries(
+                [{"key": "env/ops/app", "action": "maintenance"}], label="wf"
+            )
+
     def test_an_unsupported_field_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "unsupported keys"):
             catalog_targets.normalize_target_entries(
@@ -379,30 +393,27 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
         self.assertEqual("provision", argv[argv.index("--action") + 1])
 
 
-class OperationSpellingTest(unittest.TestCase):
-    """A workflow declares `operations:`, a target declares `actions:`."""
+class TargetActionPolicyTest(unittest.TestCase):
+    """A target declares concrete engine actions and their policy."""
 
-    def test_a_workflow_may_spell_it_operations(self):
-        self.assertEqual(
-            ["plan", "provision"],
-            catalog_targets.entry_actions({"operations": ["plan", "provision"]}, label="wf"),
-        )
-
-    def test_a_target_still_spells_it_actions(self):
+    def test_a_target_declares_actions(self):
         self.assertEqual(
             ["provision"],
-            catalog_targets.entry_actions({"actions": ["provision"]}, label="tg"),
+            catalog_targets.TargetActionPolicy(
+                {"actions": ["provision"]}, label="target 't'"
+            ).actions(),
         )
 
-    def test_declaring_both_is_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "both 'actions' and 'operations'"):
-            catalog_targets.entry_actions(
-                {"actions": ["provision"], "operations": ["provision"]}, label="wf"
-            )
+    def test_workflow_operation_vocabulary_is_not_target_policy(self):
+        with self.assertRaisesRegex(RuntimeError, "does not accept 'operations'"):
+            catalog_targets.TargetActionPolicy(
+                {"actions": ["provision"], "operations": ["provision"]},
+                label="target 't'",
+            ).actions()
 
-    def test_neither_is_still_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "must declare"):
-            catalog_targets.entry_actions({}, label="wf")
+    def test_actions_are_required(self):
+        with self.assertRaisesRegex(RuntimeError, "must declare 'actions'"):
+            catalog_targets.TargetActionPolicy({}, label="target 't'").actions()
 
 
 class DispatchGuardTest(unittest.TestCase):
@@ -412,9 +423,9 @@ class DispatchGuardTest(unittest.TestCase):
     def _members(self, ref, value="provision"):
         return [{"keys": ["a/b"], "selectors": {"match": {ref: value}}}]
 
-    def test_dispatching_on_the_operation_is_allowed(self):
+    def test_dispatching_on_operation_is_an_instance_axis(self):
         self.assertEqual(
-            set(),
+            {"operation"},
             run_selectors.collect_member_dispatch_axes(
                 self._members("execution_context.params.operation"), label="wf"
             ),
@@ -578,7 +589,9 @@ class ActionMustBeDeclaredTest(unittest.TestCase):
             self.skipTest("oxygen ctl cfg not present")
         workflows = {}
         for path in glob.glob(str(root / "*.yaml")):
-            workflows.update((yaml.safe_load(open(path)) or {}).get("workflows") or {})
+            workflows.update(
+                (yaml.safe_load(Path(path).read_text()) or {}).get("workflows") or {}
+            )
         self.assertGreater(len(workflows), 10)
         catalog_workflow.validate_workflow_actions_declared(workflows)
 

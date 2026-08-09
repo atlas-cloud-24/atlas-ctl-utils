@@ -40,6 +40,12 @@ kernel/            no domain knowledge at all
 | `commands/` | `selection`, `pipeline`, `status`, `maintenance`. |
 | `cli/` | `args`. Nothing in the engine calls it; entry points do. |
 
+Status keeps storage vocabulary and operator vocabulary separate. Target state
+uses internal result groups. Workflow rows expose the derived public effect
+`mutative|non_mutative` and retain exact resolved `actions`. Maintenance is not a
+workflow action: direct target maintenance results, maintenance-owned runs, and
+durable maintenance manifests are projected only by `status --maintenance`.
+
 ## Rules this package is held to
 
 Enforced by tests, not convention:

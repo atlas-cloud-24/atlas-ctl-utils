@@ -15,6 +15,7 @@ from engine.catalog import workflow as catalog_workflow
 from engine.cfg import overlays as cfg_overlays
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import actions as run_actions
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
@@ -31,6 +32,62 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             ),
             "target/env/core/instances/account=dev/env_type=dev",
         )
+
+    def test_publication_scope_names_every_grouped_pointer_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            namespace_root = Path(tmp) / "live"
+            run_dir = namespace_root / "target/env/core/runs/r1"
+            run_dir.mkdir(parents=True)
+            state_run_store.write_run_metadata(
+                run_dir,
+                {
+                    "action": "provision",
+                    "target_addresses": ["env/child"],
+                },
+            )
+
+            keys, run_prefixes = state_sync.CtlStatePublication._run_access_scope(
+                {"results_root": namespace_root, "run_dir": run_dir}
+            )
+
+            expected_prefixes = ("target/env/core", "target/env/child")
+            for prefix in expected_prefixes:
+                self.assertIn(f"{prefix}/identity.yaml", keys)
+                for group in run_actions.RESULT_GROUPS:
+                    self.assertIn(f"{prefix}/committed/{group}.yaml", keys)
+            self.assertFalse(any(key.endswith("/committed.yaml") for key in keys))
+            self.assertEqual(["target/env/core/runs/r1"], run_prefixes)
+
+    def test_adapter_hydrates_only_the_requested_grouped_pointers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            syncer = aws.CtlStateSyncer(
+                Path(tmp),
+                "state-bucket",
+                "eu-west-2",
+                "profile",
+                Path(tmp),
+                required=True,
+            )
+            with patch.object(
+                syncer, "ensure_ready", return_value=True
+            ), patch.object(syncer, "pull_object") as pull_object:
+                syncer.hydrate_instance(
+                    "target/env/core",
+                    ["target/env/child"],
+                    committed_groups=("mutative", "plan"),
+                )
+
+            self.assertEqual(
+                [
+                    "target/env/core/identity.yaml",
+                    "target/env/core/committed/mutative.yaml",
+                    "target/env/core/committed/plan.yaml",
+                    "target/env/child/identity.yaml",
+                    "target/env/child/committed/mutative.yaml",
+                    "target/env/child/committed/plan.yaml",
+                ],
+                [entry.args[0] for entry in pull_object.call_args_list],
+            )
 
     def test_duplicate_fan_out_materializations_fail(self):
         # resolving each selection's owner goes through the adapter
@@ -104,6 +161,7 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             target_run = {
                 "target": "env/core",
                 "target_instance_params": ["account"],
+                "reuse_committed_result": True,
                 **facts,
             }
             context = {"execution_context.params.account": "dev"}
@@ -223,7 +281,10 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
 
     def test_active_target_keeps_cfg_overlay_and_backend_facts(self):
         active = catalog_targets.build_active_target_runs(
-            {"target_runs": [{"id": "run", "target": "target"}]},
+            {
+                "meta": {"action": "provision"},
+                "target_runs": [{"id": "run", "target": "target"}],
+            },
             {
                 "target_sources": {
                     "source": {"repo_path": "/tmp/source"}
@@ -235,6 +296,8 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                         "procedure": "steps",
                         "domains": ["env"],
                         "cfg_keys": {"env": ["*"]},
+                        "allowed_actions": ["provision"],
+                        "committed_result_reuse": {"provision": True},
                         "requires_plt_overlays": ["required"],
                         "provisions_ctl_state_backend": True,
                     }
@@ -453,6 +516,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 "ref_policy": "commit_required",
                 "target_definition_sha256": "c" * 64,
                 "target_cfg_view_sha256": "d" * 64,
+                "reuse_committed_result": True,
             }
             self.assertIsNone(
                 state_status.up_to_date_child_revision(
@@ -520,4 +584,3 @@ class SkipUpToDateActionTest(unittest.TestCase):
             run_dir, state_status.build_status_payload(run_dir, "ok")
         )
         return parent
-
