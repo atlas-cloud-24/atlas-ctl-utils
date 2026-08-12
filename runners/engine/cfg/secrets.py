@@ -18,6 +18,7 @@ from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
 from engine.execution import adapters as execution_adapters
+from engine.plt import providers as plt_providers
 
 RESOURCE_KEY = "ctl_secrets"
 
@@ -142,27 +143,33 @@ def validate_declared_secrets(ctl_cfg_root: Path) -> None:
 
     A provider-backed secret whose adapter is itself fetched using a secret is a
     cycle. It cannot be detected by following one entry, because the fetch chain
-    runs through `ctl_providers`, so the check is the invariant that makes the
+    runs through a provider registry, so the check is the invariant that makes the
     cycle impossible: the secret that fetches an adapter must be primitive.
     """
 
     store = SecretStore(ctl_cfg_root)
     declared = store.declared
-    for provider, spec in (
-        execution_adapters.load_ctl_providers(ctl_cfg_root) or {}
-    ).items():
-        secret_key = ((spec or {}).get("source") or {}).get("secret_key")
-        if secret_key is None:
-            continue
-        entry = store.entry(secret_key, label=f"ctl_providers.{provider}.source")
-        entry_provider = entry.get("provider")
-        if entry_provider not in PRIMITIVE_PROVIDERS:
-            raise RuntimeError(
-                f"❌ ctl_providers.{provider}.source uses secret {secret_key!r}, "
-                f"which resolves through provider {entry_provider!r}. The secret "
-                f"that FETCHES an adapter must resolve without one — declare it "
-                f"with a primitive provider ({', '.join(PRIMITIVE_PROVIDERS)})"
-            )
+    provider_registries = (
+        (
+            "execution_providers",
+            execution_adapters.load_execution_providers(ctl_cfg_root) or {},
+        ),
+        ("plt_providers", plt_providers.ProviderRegistry(ctl_cfg_root).entries),
+    )
+    for registry_key, providers in provider_registries:
+        for provider, spec in providers.items():
+            secret_key = ((spec or {}).get("source") or {}).get("secret_key")
+            if secret_key is None:
+                continue
+            entry = store.entry(secret_key, label=f"{registry_key}.{provider}.source")
+            entry_provider = entry.get("provider")
+            if entry_provider not in PRIMITIVE_PROVIDERS:
+                raise RuntimeError(
+                    f"❌ {registry_key}.{provider}.source uses secret {secret_key!r}, "
+                    f"which resolves through provider {entry_provider!r}. The secret "
+                    f"that FETCHES an adapter must resolve without one — declare it "
+                    f"with a primitive provider ({', '.join(PRIMITIVE_PROVIDERS)})"
+                )
     for secret_key, entry in declared.items():
         if not isinstance(entry, dict) or not entry.get("provider"):
             raise RuntimeError(f"❌ {RESOURCE_KEY}.{secret_key} must declare a provider")

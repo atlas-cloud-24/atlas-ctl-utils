@@ -368,6 +368,39 @@ class TargetInputParamsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "BOTH an input param and a"):
                 catalog_targets.load_action_cfg(root, "provision", {})
 
+    def test_static_vars_reach_the_run_and_the_target_context(self):
+        """The catalog validated `static_vars` and nothing carried them onto the
+        active target run, so `execution_context.target.static_vars.*` was ALWAYS
+        empty and a PLT scope selecting on one could never match. The three
+        refusals above all passed throughout — they check the declaration, and
+        the delivery had no test at all.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp,
+                "    input_param_sets: [param_sets.base]\n"
+                "    static_vars:\n      plt_scope: ecr_repos\n")
+            action_cfg = catalog_targets.load_action_cfg(root, "provision", {})
+            self.assertEqual(
+                action_cfg["targets"]["t"]["static_vars"], {"plt_scope": "ecr_repos"}
+            )
+            runs = catalog_targets.build_active_target_runs(
+                {"target_runs": [{"id": "t", "target": "t"}],
+                 "meta": {"action": "provision"}},
+                action_cfg,
+                require_branch_or_commit=False,
+            )
+            run = runs["t"]
+            self.assertEqual(run["static_vars"], {"plt_scope": "ecr_repos"})
+            context = execution_run_context.build_target_execution_context(
+                "t", run,
+                {"execution_context.params.main_tag": "bubble",
+                 "execution_context.params.landing_zone": "live"},
+            )
+            self.assertEqual(
+                context["execution_context.target.static_vars.plt_scope"], "ecr_repos"
+            )
+
     def test_static_var_must_be_literal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp,
@@ -500,7 +533,7 @@ class ChildTargetCommandTests(unittest.TestCase):
         "action": "plan",
         "providers": ["aws"],
         "execution_params": {"landing_zone": "live", "env.type": "dev"},
-        "provider_options": {"aws.credential_implementation": "profile"},
+        "provider_options": {"aws.credential_acquisition": "sso"},
         "execution_access_modes": {"aws": "force_bypass"},
         "force_skip_execution_identity_preflight_check": ["aws"],
         "agreed_defer_ctl_state_backend_sync": False,
@@ -541,7 +574,7 @@ class ChildTargetCommandTests(unittest.TestCase):
     def test_settings_are_carried_verbatim(self):
         argv = self._argv()
         for expected in ("landing_zone=live", "env.type=dev",
-                         "aws.credential_implementation=profile", "aws=force_bypass",
+                         "aws.credential_acquisition=sso", "aws=force_bypass",
                          "--force-skip-full-cfg-validation-gate"):
             self.assertIn(expected, argv, f"child would run without {expected!r}")
         # a false flag must NOT appear

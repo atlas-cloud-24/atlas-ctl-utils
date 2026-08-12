@@ -9,9 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
-
 from pathlib import Path
-from engine.kernel.git import write_git_meta_to_file
 
 from engine.cfg import layout as cfg_layout
 from engine.cfg import resources as cfg_resources
@@ -23,6 +21,7 @@ from engine.kernel import git as kernel_git
 from engine.kernel import ids as kernel_ids
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.kernel.git import write_git_meta_to_file
 from engine.run import policy as run_policy
 from engine.state import run_store as state_run_store
 
@@ -53,14 +52,24 @@ def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
         if not isinstance(raw, dict) or not raw:
             raise RuntimeError(f"❌ {label} must be a non-empty mapping")
         keys = set(raw)
-        if keys == {"repo_path"}:
+        provider = raw.get("provider") if key == "plt" else None
+        source_keys = keys - ({"provider"} if key == "plt" else set())
+        if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+            raise RuntimeError(
+                f"❌ {label}.provider must be a non-empty string when declared"
+            )
+        if source_keys == {"repo_path"}:
             value = raw["repo_path"]
             if not isinstance(value, str) or not value.strip():
                 raise RuntimeError(f"❌ {label}.repo_path must be a non-empty string")
             normalized[key] = {"repo_path": value.strip()}
+            if provider is not None:
+                normalized[key]["provider"] = provider.strip()
             continue
-        if keys != {"repo_url", "ref"}:
-            raise RuntimeError(f"❌ {label} must contain either repo_path only or exactly repo_url + ref")
+        if source_keys != {"repo_url", "ref"}:
+            raise RuntimeError(
+                f"❌ {label} must contain either repo_path only or exactly repo_url + ref"
+            )
         url, ref = raw["repo_url"], raw["ref"]
         if not isinstance(url, str) or not url.strip():
             raise RuntimeError(f"❌ {label}.repo_url must be a non-empty string")
@@ -70,6 +79,8 @@ def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
         if kind not in {"branch", "commit"} or not isinstance(value, str) or not value.strip():
             raise RuntimeError(f"❌ {label}.ref must contain a non-empty branch or commit")
         normalized[key] = {"repo_url": url.strip(), "ref": {kind: value.strip()}}
+        if provider is not None:
+            normalized[key]["provider"] = provider.strip()
     return normalized
 
 
@@ -106,7 +117,9 @@ def materialize_cfg_sources(
             raise RuntimeError(f"❌ cfg source destination escapes run cfg dir: {root}") from exc
         if root.exists():
             shutil.rmtree(root)
-        kernel_git.git_clone(str(entry["repo_url"]), ref.get("branch"), ref.get("commit"), root, token)
+        kernel_git.git_clone(
+            str(entry["repo_url"]), ref.get("branch"), ref.get("commit"), root, token
+        )
         roots[key] = root
     return roots
 
@@ -148,14 +161,26 @@ def write_ctl_cfg_snapshot(
     if ctl_dir.exists():
         shutil.rmtree(ctl_dir)
     ctl_dir.mkdir(parents=True)
-    kernel_yaml_io.write_yaml_file(ctl_dir / "profile.yaml", {"ctl_profile": ctl_profile, "policy": ctl_profile_policy_cfg})
-    kernel_yaml_io.write_yaml_file(ctl_dir / "workflow.yaml", execution_run_context.resolve_ctl_structure(workflow_cfg, execution_context, label="workflow"))
+    kernel_yaml_io.write_yaml_file(
+        ctl_dir / "profile.yaml", {"ctl_profile": ctl_profile, "policy": ctl_profile_policy_cfg}
+    )
+    kernel_yaml_io.write_yaml_file(
+        ctl_dir / "workflow.yaml",
+        execution_run_context.resolve_ctl_structure(
+            workflow_cfg, execution_context, label="workflow"
+        ),
+    )
     kernel_yaml_io.write_yaml_file(
         ctl_dir / "action.yaml",
-        execution_run_context.resolve_ctl_structure(action_cfg, execution_context, label=f"action.{action}"),
+        execution_run_context.resolve_ctl_structure(
+            action_cfg, execution_context, label=f"action.{action}"
+        ),
     )
     kernel_yaml_io.write_yaml_file(ctl_dir / "active_target_runs.yaml", active_target_runs)
-    kernel_yaml_io.write_yaml_file(ctl_dir / "refs.yaml", execution_run_context.resolve_ctl_structure(refs, execution_context, label="refs"))
+    kernel_yaml_io.write_yaml_file(
+        ctl_dir / "refs.yaml",
+        execution_run_context.resolve_ctl_structure(refs, execution_context, label="refs"),
+    )
     logging.info("Wrote resolved ctl cfg snapshot: %s", ctl_dir)
     return ctl_dir
 
@@ -172,7 +197,7 @@ def write_git_metas(
         git_dir=ctl_cfg_root,
         dest_dir=artifacts_dir,
         filename="piepeline_orchestrator_cfg_git_meta.yaml",
-        generator=kernel_ids.SERVICE_ID
+        generator=kernel_ids.SERVICE_ID,
     )
 
     # orchestrator_git_meta
@@ -180,7 +205,7 @@ def write_git_metas(
         git_dir=os.getcwd(),
         dest_dir=artifacts_dir,
         filename="piepeline_orchestrator_git_meta.yaml",
-        generator=kernel_ids.SERVICE_ID
+        generator=kernel_ids.SERVICE_ID,
     )
 
     # plt_cfg_git_meta
@@ -188,7 +213,7 @@ def write_git_metas(
         git_dir=plt_cfg_root,
         dest_dir=artifacts_dir,
         filename="plt_cfg_git_meta.yaml",
-        generator=kernel_ids.SERVICE_ID
+        generator=kernel_ids.SERVICE_ID,
     )
     write_git_meta_to_file(
         git_dir=guardrails_cfg_root,
@@ -206,6 +231,7 @@ def _step_utils_module(name: str):
     step_utils because it also executes inside target_run containers."""
 
     import importlib.util
+
     if name in sys.modules:
         return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, source_step_utils_dir() / f"{name}.py")
@@ -245,8 +271,7 @@ def run_cfg_distribution(
             raise RuntimeError(f"Target run {target_run_name!r} cfg_keys must be a mapping")
 
         view_dir = (
-            plt_targets_dir_path if run_type == "target"
-            else plt_targets_dir_path / target_run_name
+            plt_targets_dir_path if run_type == "target" else plt_targets_dir_path / target_run_name
         )
         rendered_root = view_dir / "rendered"
         target_input_dir = view_dir / "input"
@@ -271,7 +296,8 @@ def run_cfg_distribution(
                     f"❌ target_run {target_run_name!r} declares domain {domain!r} with no cfg_keys"
                 )
             projected = execution_references.project_cfg_keys(
-                merged, list(entries),
+                merged,
+                list(entries),
                 label=f"target_run {target_run_name!r} domain {domain!r}",
             )
             kernel_yaml_io.write_yaml_file(target_input_dir / f"{domain}.yaml", projected)
@@ -424,8 +450,7 @@ def prepare_target_repo(
     workspace = state_run_store.run_workspace_dir(run_dir)
     if workspace is None:
         raise RuntimeError(
-            "❌ cannot materialize a target_run workspace: the run records no "
-            "ctl_state_local_root"
+            "❌ cannot materialize a target_run workspace: the run records no ctl_state_local_root"
         )
     repo_path = workspace / target_run_id
     if os.path.exists(repo_path):
@@ -457,7 +482,11 @@ def prepare_target_repo(
     target_env.update(tooling_env)
     target_env["ATLAS_STEP_UTILS_DIR"] = str(materialize_step_utils(run_dir).parent)
     if provider_adapter is not None:
-        if provider_catalogs is None or execution_context is None or provider_implementation_key is None:
+        if (
+            provider_catalogs is None
+            or execution_context is None
+            or provider_implementation_key is None
+        ):
             raise RuntimeError("❌ incomplete provider inputs for target_run preparation")
         adapter_access_mode, adapter_options = execution_providers.provider_inputs(
             provider_adapter.PROVIDER_NAME, execution_access_modes, provider_options
@@ -504,6 +533,11 @@ def _repo_local_active_steps(
                     f"{expected_prefix!r}"
                 )
         step_meta = kernel_yaml_io.load_yaml(step_meta_path) or {}
+        if "plt" in step_meta:
+            raise RuntimeError(
+                f"❌ source step metadata must not declare plt; providers materialize "
+                f"the target source before universal step execution: {step_meta_path}"
+            )
         runtime_cfg = step_meta.get("runtime") or {}
         if not isinstance(runtime_cfg, dict):
             raise RuntimeError(f"Step metadata runtime must be a mapping: {step_meta_path}")
@@ -520,8 +554,12 @@ def _repo_local_active_steps(
             )
         docker_build = runtime_cfg.get("docker_build", False)
         if not isinstance(docker_build, bool):
-            raise RuntimeError(f"Step metadata runtime.docker_build must be a boolean: {step_meta_path}")
-        supported_execution_runtime_modes = run_policy.step_supported_execution_runtime_modes(runtime_cfg, label=str(step_meta_path))
+            raise RuntimeError(
+                f"Step metadata runtime.docker_build must be a boolean: {step_meta_path}"
+            )
+        supported_execution_runtime_modes = run_policy.step_supported_execution_runtime_modes(
+            runtime_cfg, label=str(step_meta_path)
+        )
         # The STEP is the true consumer (its root declares the
         # variables), so it declares content keys, not files.
         # A step declares PURE CONTENT KEYS. `cfg_key_sets` is a
@@ -539,8 +577,10 @@ def _repo_local_active_steps(
         # target receives every credential set — a silent over-grant on the one
         # path that must not widen by default.
         step_providers = step_meta.get("providers")
-        if not isinstance(step_providers, list) or not step_providers or not all(
-            isinstance(item, str) and item.strip() for item in step_providers
+        if (
+            not isinstance(step_providers, list)
+            or not step_providers
+            or not all(isinstance(item, str) and item.strip() for item in step_providers)
         ):
             raise RuntimeError(
                 f"❌ Step metadata providers must be a non-empty list of provider names: "

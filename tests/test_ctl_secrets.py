@@ -22,13 +22,23 @@ from engine.cfg import secrets as cfg_secrets
 from engine.execution import providers as execution_providers
 
 
-def cfg_root(tmp: str, *, secrets: dict, providers: dict | None = None) -> Path:
+def cfg_root(
+    tmp: str,
+    *,
+    secrets: dict,
+    providers: dict | None = None,
+    plt_provider_entries: dict | None = None,
+) -> Path:
     root = Path(tmp)
     (root / "__meta__.yaml").write_text(yaml.safe_dump({"cfg_root": {"kind": "ctl"}}))
     (root / "ctl_secrets.yaml").write_text(yaml.safe_dump({"ctl_secrets": secrets}))
     if providers is not None:
-        (root / "ctl_providers.yaml").write_text(
-            yaml.safe_dump({"ctl_providers": providers})
+        (root / "execution_providers.yaml").write_text(
+            yaml.safe_dump({"execution_providers": providers})
+        )
+    if plt_provider_entries is not None:
+        (root / "plt_providers.yaml").write_text(
+            yaml.safe_dump({"plt_providers": plt_provider_entries})
         )
     return root
 
@@ -88,9 +98,7 @@ class FileProviderTest(unittest.TestCase):
             secret_file = Path(tmp) / "secret"
             secret_file.write_text("s3cret\n")
             root = cfg_root(tmp, secrets={"k": {"provider": "file", "path": str(secret_file)}})
-            self.assertEqual(
-                "s3cret", cfg_secrets.SecretStore(root).resolve("k", label="a source")
-            )
+            self.assertEqual("s3cret", cfg_secrets.SecretStore(root).resolve("k", label="a source"))
 
     def test_a_missing_file_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,7 +112,8 @@ class ProviderBackedSecretsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = cfg_root(tmp, secrets={"k": {"provider": "somecloud", "id": "x"}})
             with mock.patch.object(
-                cfg_secrets.execution_adapters, "get_adapter",
+                cfg_secrets.execution_adapters,
+                "get_adapter",
                 return_value=object(),
             ):
                 with self.assertRaisesRegex(RuntimeError, "does not implement"):
@@ -126,7 +135,8 @@ class ProviderBackedSecretsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = cfg_root(tmp, secrets={"k": {"provider": "somecloud", "id": "x", "key": "p"}})
             with mock.patch.object(
-                cfg_secrets.execution_adapters, "get_adapter",
+                cfg_secrets.execution_adapters,
+                "get_adapter",
                 return_value=Adapter,
             ):
                 value = cfg_secrets.SecretStore(root).resolve("k", label="a source")
@@ -135,8 +145,13 @@ class ProviderBackedSecretsTest(unittest.TestCase):
         # the adapter reaches AWS, so it is given the run's identity — not left
         # to whatever credentials the process happens to hold
         self.assertEqual(
-            {"ctl_cfg_root", "execution_context", "implementation_key",
-             "execution_access_mode", "provider_options"},
+            {
+                "ctl_cfg_root",
+                "execution_context",
+                "implementation_key",
+                "execution_access_mode",
+                "provider_options",
+            },
             set(calls),
         )
 
@@ -153,8 +168,12 @@ class AdapterFetchSecretMustBePrimitiveTest(unittest.TestCase):
             root = cfg_root(
                 tmp,
                 secrets={"github_token": {"provider": "env", "name": "X"}},
-                providers={"somecloud": {"implements": ["secrets"],
-                                         "source": {"secret_key": "github_token"}}},
+                providers={
+                    "somecloud": {
+                        "implements": ["secrets"],
+                        "source": {"secret_key": "github_token"},
+                    }
+                },
             )
             cfg_secrets.validate_declared_secrets(root)
 
@@ -163,8 +182,9 @@ class AdapterFetchSecretMustBePrimitiveTest(unittest.TestCase):
             root = cfg_root(
                 tmp,
                 secrets={"circular": {"provider": "somecloud", "id": "x"}},
-                providers={"somecloud": {"implements": ["secrets"],
-                                         "source": {"secret_key": "circular"}}},
+                providers={
+                    "somecloud": {"implements": ["secrets"], "source": {"secret_key": "circular"}}
+                },
             )
             with self.assertRaisesRegex(RuntimeError, "must resolve without one"):
                 cfg_secrets.validate_declared_secrets(root)
@@ -177,6 +197,43 @@ class AdapterFetchSecretMustBePrimitiveTest(unittest.TestCase):
                 providers={"somecloud": {"source": {"secret_key": "absent"}}},
             )
             with self.assertRaisesRegex(RuntimeError, "not declared"):
+                cfg_secrets.validate_declared_secrets(root)
+
+    def test_a_primitive_secret_may_fetch_a_plt_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = cfg_root(
+                tmp,
+                secrets={"github_token": {"provider": "env", "name": "X"}},
+                plt_provider_entries={
+                    "runtime": {
+                        "implements": ["materialize"],
+                        "source": {
+                            "repo_url": "https://example.test/provider.git",
+                            "secret_key": "github_token",
+                        },
+                        "package": "sample_plt_adapter",
+                    }
+                },
+            )
+            cfg_secrets.validate_declared_secrets(root)
+
+    def test_a_provider_backed_secret_may_not_fetch_a_plt_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = cfg_root(
+                tmp,
+                secrets={"circular": {"provider": "somecloud", "id": "x"}},
+                plt_provider_entries={
+                    "runtime": {
+                        "implements": ["materialize"],
+                        "source": {
+                            "repo_url": "https://example.test/provider.git",
+                            "secret_key": "circular",
+                        },
+                        "package": "sample_plt_adapter",
+                    }
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "must resolve without one"):
                 cfg_secrets.validate_declared_secrets(root)
 
 
@@ -220,7 +277,8 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
                 providers={"somecloud": {"implements": ["secrets"]}},
             )
             with mock.patch.object(
-                cfg_secrets.execution_adapters, "get_adapter",
+                cfg_secrets.execution_adapters,
+                "get_adapter",
                 return_value=Adapter,
             ):
                 with self.assertRaisesRegex(RuntimeError, "resolve_secret"):

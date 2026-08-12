@@ -6,8 +6,9 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
+sys.path.insert(0, str(REPO_ROOT / "cfg"))
 
-from engine.cfg import layout as cfg_layout
+import create_dev_cfg
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import validate as cfg_validate
 
@@ -27,7 +28,7 @@ class CfgSourceTests(unittest.TestCase):
     def test_requires_exact_companion_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write_sources(root, "  plt:\n    repo_path: ../plt\n")
+            self._write_sources(root, "  plt:\n    provider: runtime\n    repo_path: ../plt\n")
             with self.assertRaisesRegex(RuntimeError, "must define exactly"):
                 cfg_materialize.load_cfg_sources(root)
 
@@ -36,7 +37,7 @@ class CfgSourceTests(unittest.TestCase):
             root = Path(tmp)
             self._write_sources(
                 root,
-                "  plt:\n    repo_path: ../plt\n"
+                "  plt:\n    provider: runtime\n    repo_path: ../plt\n"
                 "  guardrails:\n    repo_path: ../guardrails\n",
             )
             self.assertEqual(
@@ -44,9 +45,22 @@ class CfgSourceTests(unittest.TestCase):
                 "../guardrails",
             )
 
+    def test_plt_source_allows_scope_owned_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_sources(
+                root,
+                "  plt:\n    repo_path: ../plt\n  guardrails:\n    repo_path: ../guardrails\n",
+            )
+            self.assertNotIn("provider", cfg_materialize.load_cfg_sources(root)["plt"])
+
     def test_commit_policy_rejects_branch_and_local_path(self):
         sources = {
-            "plt": {"repo_url": "https://example.invalid/plt.git", "ref": {"branch": "main"}},
+            "plt": {
+                "provider": "runtime",
+                "repo_url": "https://example.invalid/plt.git",
+                "ref": {"branch": "main"},
+            },
             "guardrails": {"repo_path": "../guardrails"},
         }
         with self.assertRaisesRegex(RuntimeError, "commit-pinned cfg sources"):
@@ -54,11 +68,17 @@ class CfgSourceTests(unittest.TestCase):
 
     def test_commit_policy_accepts_exact_commits(self):
         sources = {
-            key: {"repo_url": f"https://example.invalid/{key}.git", "ref": {"commit": "abc123"}}
-            for key in cfg_layout.CFG_SOURCE_KEYS
+            "plt": {
+                "provider": "runtime",
+                "repo_url": "https://example.invalid/plt.git",
+                "ref": {"commit": "abc123"},
+            },
+            "guardrails": {
+                "repo_url": "https://example.invalid/guardrails.git",
+                "ref": {"commit": "abc123"},
+            },
         }
         cfg_validate.CommitPinning("commit_required").check_cfg_sources(sources)
-
 
     def test_materializes_bound_local_roots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -68,7 +88,7 @@ class CfgSourceTests(unittest.TestCase):
             (root / "guardrails").mkdir()
             self._write_sources(
                 ctl,
-                "  plt:\n    repo_path: ../plt\n"
+                "  plt:\n    provider: runtime\n    repo_path: ../plt\n"
                 "  guardrails:\n    repo_path: ../guardrails\n",
             )
             roots = cfg_materialize.materialize_cfg_sources(
@@ -83,7 +103,7 @@ class CfgSourceTests(unittest.TestCase):
             ctl = root / "ctl"
             self._write_sources(
                 ctl,
-                "  plt:\n    repo_url: https://example.invalid/plt.git\n"
+                "  plt:\n    provider: runtime\n    repo_url: https://example.invalid/plt.git\n"
                 "    ref:\n      commit: plt-sha\n"
                 "  guardrails:\n    repo_url: https://example.invalid/guardrails.git\n"
                 "    ref:\n      commit: guard-sha\n",
@@ -97,7 +117,9 @@ class CfgSourceTests(unittest.TestCase):
                     ctl, ref_policy="commit_required", run_cfg_dir=root / "run", token="token"
                 )
             self.assertEqual(set(roots), {"plt", "guardrails"})
-            self.assertEqual([call.args[2] for call in clone.call_args_list], ["plt-sha", "guard-sha"])
+            self.assertEqual(
+                [call.args[2] for call in clone.call_args_list], ["plt-sha", "guard-sha"]
+            )
 
     def test_orchestrator_exposes_only_ctl_cfg_selection(self):
         runner_common = (
@@ -105,6 +127,23 @@ class CfgSourceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("--plt-cfg", runner_common)
         self.assertIn("materialize_cfg_sources", runner_common)
+
+    def test_local_rewrite_preserves_plt_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg_sources.yaml"
+            self._write_sources(
+                Path(tmp),
+                "  plt:\n    provider: atmos\n    repo_url: https://example.invalid/plt.git\n"
+                "    ref:\n      commit: abc123\n"
+                "  guardrails:\n    repo_url: https://example.invalid/guardrails.git\n"
+                "    ref:\n      commit: abc123\n",
+            )
+            create_dev_cfg.rewrite_cfg_source_file(
+                path, {"plt": "/tmp/plt", "guardrails": "/tmp/guardrails"}
+            )
+            rewritten = cfg_materialize.load_cfg_sources(Path(tmp))
+            self.assertEqual("atmos", rewritten["plt"]["provider"])
+            self.assertEqual("/tmp/plt", rewritten["plt"]["repo_path"])
 
 
 if __name__ == "__main__":

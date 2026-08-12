@@ -76,27 +76,47 @@ def require_env(name: str) -> str:
     return value
 
 
-def get_caller_identity(profile_name: str | None = None) -> dict:
-    """STS caller identity for the ambient credentials, or for a named profile.
+def get_caller_identity(
+    profile_name: str | None = None, *, credentials: dict | None = None
+) -> dict:
+    """STS caller identity for the ambient credentials, a named profile, or a
+    supplied credential set.
 
     IN THE BOX: no argument — every access path arrives as ambient env
     credentials and the box has no AWS config or profiles. ON THE HOST: the
-    engine reuses this module (`aws.assert_profile_caller`) to probe a specific
-    host profile, which is the one place profiles still exist.
+    engine reuses this module (`aws.assert_caller`) to probe either a specific
+    host profile — the one place profiles still exist — or credentials it has
+    just acquired from a non-profile source, which have no profile to name.
+
+    `profile_name` and `credentials` are alternatives, never both: each selects
+    a different principal, so accepting the pair would leave which one was
+    actually asserted undecidable.
     """
 
+    if profile_name and credentials:
+        raise RuntimeError(
+            "get_caller_identity takes a profile OR credentials, never both"
+        )
     cmd = ["aws", "sts", "get-caller-identity", "--output", "json"]
     if profile_name:
         cmd += ["--profile", profile_name]
+    # Overlay rather than replace: the AWS CLI still needs PATH and HOME, and a
+    # bare credential mapping would leave it unable to find its own binary.
+    env = {**os.environ, **credentials} if credentials else None
     result = subprocess.run(
         cmd,
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
-        source = f"profile {profile_name!r}" if profile_name else "ambient env credentials"
+        source = (
+            f"profile {profile_name!r}" if profile_name
+            else "supplied credentials" if credentials
+            else "ambient env credentials"
+        )
         raise RuntimeError(f"AWS access assertion failed for {source}: {detail}")
 
     try:

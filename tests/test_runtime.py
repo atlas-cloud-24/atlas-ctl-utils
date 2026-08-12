@@ -7,7 +7,6 @@ runtime constraint (supported_execution_runtime_modes); CTL reconciles the selec
 against the ctl profile and every active target_run.
 """
 
-
 import sys
 import tempfile
 import unittest
@@ -26,9 +25,14 @@ ATLAS_STACK = REPO_ROOT.parent
 
 class RuntimePrimitivesTests(unittest.TestCase):
     def test_step_supported_execution_runtimes_default_and_validate(self):
-        self.assertEqual(run_policy.step_supported_execution_runtime_modes({}, label="x"), {"local", "ci"})
         self.assertEqual(
-            run_policy.step_supported_execution_runtime_modes({"supported_execution_runtime_modes": ["ci"]}, label="x"), {"ci"}
+            run_policy.step_supported_execution_runtime_modes({}, label="x"), {"local", "ci"}
+        )
+        self.assertEqual(
+            run_policy.step_supported_execution_runtime_modes(
+                {"supported_execution_runtime_modes": ["ci"]}, label="x"
+            ),
+            {"ci"},
         )
         for bad in (
             {"supported_execution_runtime_modes": ["teleport"]},
@@ -46,8 +50,12 @@ class RuntimePrimitivesTests(unittest.TestCase):
                 "  open: { ref_policy: commit_required }\n"
                 "  local_only: { ref_policy: commit_required, allowed_execution_runtime_modes: [local] }\n"
             )
-            self.assertEqual(run_policy.ctl_allowed_execution_runtime_modes(root, "open"), {"local", "ci"})
-            self.assertEqual(run_policy.ctl_allowed_execution_runtime_modes(root, "local_only"), {"local"})
+            self.assertEqual(
+                run_policy.ctl_allowed_execution_runtime_modes(root, "open"), {"local", "ci"}
+            )
+            self.assertEqual(
+                run_policy.ctl_allowed_execution_runtime_modes(root, "local_only"), {"local"}
+            )
 
     def test_validate_execution_runtime_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,13 +120,18 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertTrue(step_yamls, "no step.yaml files discovered")
         for sy in step_yamls:
             meta = kernel_yaml_io.load_yaml(sy) or {}
+            self.assertNotIn(
+                "plt", meta, f"{sy} must remain PLT-provider-independent"
+            )
             runtime_cfg = meta.get("runtime") or {}
             self.assertIn(
-                runtime_cfg.get("image"), cfg_materialize.STEP_IMAGES,
+                runtime_cfg.get("image"),
+                cfg_materialize.STEP_IMAGES,
                 f"{sy} runtime.image missing/invalid",
             )
             self.assertIsInstance(
-                runtime_cfg.get("docker_build", False), bool,
+                runtime_cfg.get("docker_build", False),
+                bool,
                 f"{sy} runtime.docker_build must be bool",
             )
             # supported_execution_runtime_modes (if present) must validate
@@ -131,7 +144,8 @@ class RuntimeContractTests(unittest.TestCase):
         for step_sh in ATLAS_STACK.glob("*/atlas_ctl_adapter/steps/*/*/src/step.sh"):
             text = step_sh.read_text()
             self.assertNotRegex(
-                text, r"(?m)^\s*docker\s+(build|run)\b",
+                text,
+                r"(?m)^\s*docker\s+(build|run)\b",
                 f"{step_sh} invokes docker directly; the box is CTL-owned",
             )
 

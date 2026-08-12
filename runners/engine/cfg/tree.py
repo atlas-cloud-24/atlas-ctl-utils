@@ -8,15 +8,15 @@ import collections
 import logging
 import os
 import shutil
-
 from pathlib import Path
+
 import yaml
-from engine.cfg import presets as cfg_presets
 
 from engine.cfg import layout as cfg_layout
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import merge as cfg_merge
 from engine.cfg import overlays as cfg_overlays
+from engine.cfg import presets as cfg_presets
 from engine.cfg import resources as cfg_resources
 from engine.cfg import validate as cfg_validate
 from engine.execution import references as execution_references
@@ -25,7 +25,10 @@ from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import selectors as run_selectors
 
-def validate_cross_scope_leaf_conflicts(scopes: list[dict], *, target_path: str, skip_filenames: set[str]) -> None:
+
+def validate_cross_scope_leaf_conflicts(
+    scopes: list[dict], *, target_path: str, skip_filenames: set[str]
+) -> None:
     """
 
     reject shared-target producers that define different final values for one YAML leaf."""
@@ -34,7 +37,9 @@ def validate_cross_scope_leaf_conflicts(scopes: list[dict], *, target_path: str,
         return
     owners: dict[tuple[str, tuple[object, ...]], tuple[object, dict]] = {}
     for scope in scopes:
-        for leaf_key, leaf_value in cfg_merge._scope_final_yaml_leaves(scope, skip_filenames=skip_filenames).items():
+        for leaf_key, leaf_value in cfg_merge._scope_final_yaml_leaves(
+            scope, skip_filenames=skip_filenames
+        ).items():
             previous = owners.get(leaf_key)
             if previous is None:
                 owners[leaf_key] = (leaf_value, scope)
@@ -56,10 +61,14 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
         return {}
     data = kernel_yaml_io.load_yaml(path) or {}
     if not isinstance(data, dict):
-        raise RuntimeError(f"❌ {cfg_layout.SCOPE_COMPOSITION_FILENAME} must contain a mapping: {path}")
+        raise RuntimeError(
+            f"❌ {cfg_layout.SCOPE_COMPOSITION_FILENAME} must contain a mapping: {path}"
+        )
     unknown = set(data) - {"scope_composition"}
     if unknown:
-        raise RuntimeError(f"❌ {cfg_layout.SCOPE_COMPOSITION_FILENAME} has unsupported keys {sorted(unknown)}: {path}")
+        raise RuntimeError(
+            f"❌ {cfg_layout.SCOPE_COMPOSITION_FILENAME} has unsupported keys {sorted(unknown)}: {path}"
+        )
     raw_rules = data.get("scope_composition") or []
     if not isinstance(raw_rules, list):
         raise RuntimeError(f"❌ scope_composition must be a list: {path}")
@@ -72,9 +81,13 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
         unknown = set(raw_rule) - {"target_path", "scopes"}
         if unknown:
             raise RuntimeError(f"❌ {label} has unsupported keys {sorted(unknown)}")
-        target_path = kernel_paths.normalize_cfg_absolute_path(raw_rule.get("target_path"), label=f"{label}.target_path")
+        target_path = kernel_paths.normalize_cfg_absolute_path(
+            raw_rule.get("target_path"), label=f"{label}.target_path"
+        )
         if target_path in rules:
-            raise RuntimeError(f"❌ duplicate scope composition target_path {target_path!r}: {path}")
+            raise RuntimeError(
+                f"❌ duplicate scope composition target_path {target_path!r}: {path}"
+            )
         raw_scopes = raw_rule.get("scopes") or []
         if not isinstance(raw_scopes, list) or not raw_scopes:
             raise RuntimeError(f"❌ {label}.scopes must be a non-empty list")
@@ -90,13 +103,13 @@ def load_scope_composition(plt_cfg_root: Path) -> dict[str, dict]:
     return rules
 
 
-def load_scope_candidate(
+def load_scope_selection(
     plt_cfg_root: Path,
     meta_path: Path,
     meta_cfg: dict,
     execution_context: dict[str, object],
 ) -> dict | None:
-    """Load one scope __meta__.yaml and return an active merge scope, or None."""
+    """Return one selector-active scope without reading provider-owned payload."""
     cfg_root = plt_cfg_root.resolve()
     scope_root = meta_path.parent.resolve()
     try:
@@ -114,20 +127,58 @@ def load_scope_candidate(
             )
 
     selectors = meta_cfg.get("selectors") or {}
-    if not run_selectors.selector_matches(selectors, execution_context, label=str(meta_path), structured_only=True):
+    if not run_selectors.selector_matches(
+        selectors, execution_context, label=str(meta_path), structured_only=True
+    ):
         return None
 
     nested = cfg_resources.find_nested_cfg_meta(scope_root, exclude=meta_path)
     if nested is not None:
-        raise RuntimeError(f"❌ nested cfg metadata is not allowed under scope {scope_id}: {nested}")
+        raise RuntimeError(
+            f"❌ nested cfg metadata is not allowed under scope {scope_id}: {nested}"
+        )
 
     if "target_path" not in meta_cfg:
-        raise RuntimeError(f"target_path is required in scope {cfg_layout.SCOPE_META_FILENAME}: {meta_path}")
+        raise RuntimeError(
+            f"target_path is required in scope {cfg_layout.SCOPE_META_FILENAME}: {meta_path}"
+        )
     target_path = kernel_paths.normalize_cfg_absolute_path(
         meta_cfg["target_path"],
         label=f"target_path in {meta_path}",
         allow_root=False,
     )
+
+    return {
+        "type": meta_cfg["type"],
+        "meta_path": meta_path,
+        "scope_root": scope_root,
+        "scope_path": scope_id,
+        "scope_id": scope_id,
+        "target_path": target_path,
+        "plt": dict(meta_cfg.get("plt") or {}),
+        "selectors": selectors,
+    }
+
+
+def load_scope_candidate(
+    plt_cfg_root: Path,
+    meta_path: Path,
+    meta_cfg: dict,
+    execution_context: dict[str, object],
+) -> dict | None:
+    """Load one active scope for the built-in cfg composition path."""
+    selection = load_scope_selection(
+        plt_cfg_root,
+        meta_path,
+        meta_cfg,
+        execution_context,
+    )
+    if selection is None:
+        return None
+
+    cfg_root = plt_cfg_root.resolve()
+    scope_root = Path(selection["scope_root"])
+    scope_id = str(selection["scope_id"])
 
     # Imports are declared in their own file, so a preset can import
     # without being a scope. A scope declaring them in __meta__.yaml is stale.
@@ -155,14 +206,22 @@ def load_scope_candidate(
             label=f"import path in {scope_id}",
             allow_root=False,
         )
-        src = kernel_paths.cfg_abs_path_to_dir(cfg_root, import_path, label=f"import path in {scope_id}")
+        src = kernel_paths.cfg_abs_path_to_dir(
+            cfg_root, import_path, label=f"import path in {scope_id}"
+        )
         if not src.exists():
             raise RuntimeError(f"Import path not found: {src}")
         if not src.is_dir():
             raise RuntimeError(f"Import path must be a directory: {src}")
-        if not any(p.is_file() and ".git" not in p.relative_to(src).parts for p in src.rglob("*.yaml")):
-            raise RuntimeError(f"Import path must contain at least one yaml cfg file: {src} ({scope_id})")
-        cfg_validate.CfgTreeShape.reject_meta_inside_data_dir(src, import_path=import_path, meta_path=meta_path)
+        if not any(
+            p.is_file() and ".git" not in p.relative_to(src).parts for p in src.rglob("*.yaml")
+        ):
+            raise RuntimeError(
+                f"Import path must contain at least one yaml cfg file: {src} ({scope_id})"
+            )
+        cfg_validate.CfgTreeShape.reject_meta_inside_data_dir(
+            src, import_path=import_path, meta_path=meta_path
+        )
         if src == scope_root:
             raise RuntimeError(f"Scope imports itself in {scope_id}: {import_path}")
         seen_imports.add(src)
@@ -180,14 +239,37 @@ def load_scope_candidate(
 
     source_dirs.append(str(scope_root))
     return {
-        "meta_path": meta_path,
-        "scope_root": scope_root,
-        "scope_path": scope_id,
-        "scope_id": scope_id,
-        "target_path": target_path,
-        "selectors": selectors,
+        **selection,
         "source_dirs": source_dirs,
     }
+
+
+def discover_active_scope_selections(
+    plt_cfg_root: Path,
+    *,
+    scope_params: dict[str, str],
+    execution_context: dict[str, object] | None = None,
+) -> list[dict]:
+    """Select scope envelopes without validating or loading their payload."""
+    cfg_root = plt_cfg_root.resolve()
+    runtime_context = (
+        execution_context or execution_run_context.execution_context_from_scope_params(scope_params)
+    )
+    active_scopes: list[dict] = []
+
+    for meta_path in cfg_resources.discover_cfg_meta_paths(cfg_root):
+        meta_cfg = cfg_resources.load_cfg_meta(meta_path)
+        if meta_cfg["type"] in ("overlay", "shared_scope"):
+            continue
+        scope = load_scope_selection(cfg_root, meta_path, meta_cfg, runtime_context)
+        if scope is not None:
+            active_scopes.append(scope)
+
+    if not active_scopes:
+        raise RuntimeError(f"No active cfg scopes found under: {cfg_root}")
+
+    run_selectors.validate_scope_composition(active_scopes, load_scope_composition(cfg_root))
+    return active_scopes
 
 
 def discover_active_cfg_scopes(
@@ -198,14 +280,16 @@ def discover_active_cfg_scopes(
 ) -> list[dict]:
     """Discover active cfg merge scopes from type: scope metadata."""
     cfg_root = plt_cfg_root.resolve()
-    runtime_context = execution_context or execution_run_context.execution_context_from_scope_params(scope_params)
+    runtime_context = (
+        execution_context or execution_run_context.execution_context_from_scope_params(scope_params)
+    )
     cfg_validate.CfgTreeShape.require_all_payload_reachable(cfg_root)
     cfg_materialize._release_materialized_imports()
     active_scopes: list[dict] = []
 
     for meta_path in cfg_resources.discover_cfg_meta_paths(cfg_root):
         meta_cfg = cfg_resources.load_cfg_meta(meta_path)
-        if meta_cfg["type"] == "overlay":
+        if meta_cfg["type"] in ("overlay", "shared_scope"):
             continue
 
         scope = load_scope_candidate(cfg_root, meta_path, meta_cfg, runtime_context)
@@ -239,14 +323,14 @@ def merge_plt_cfg_dirs(
 ) -> dict[str, list[str]]:
     """Build scoped merged cfg trees from typed __meta__.yaml metadata.
 
-    Scope and overlay activation both use the uniform selectors.match/selectors.in
-    execution-context selector model.
-/61: a scope declares its own CONDITION
-    (`selectors.contains: {execution_context.target.domains: <domain>}`), so it
-    activates iff the run reads its domain. `target_path` stays purely the
-    DESTINATION. The former `required_target_paths` filter did the same job from
-    the other side and was removed — two mechanisms deciding one thing can
-    disagree."""
+        Scope and overlay activation both use the uniform selectors.match/selectors.in
+        execution-context selector model.
+    /61: a scope declares its own CONDITION
+        (`selectors.contains: {execution_context.target.domains: <domain>}`), so it
+        activates iff the run reads its domain. `target_path` stays purely the
+        DESTINATION. The former `required_target_paths` filter did the same job from
+        the other side and was removed — two mechanisms deciding one thing can
+        disagree."""
 
     if plt_merged_dir.exists():
         shutil.rmtree(plt_merged_dir)
@@ -261,7 +345,9 @@ def merge_plt_cfg_dirs(
     runtime_selectors = scope_params or {}
     composition_files = set(cfg_layout.SCOPE_META_SKIP_FILENAMES)
 
-    def merge_scopes(effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]) -> list[dict]:
+    def merge_scopes(
+        effective_cfg_root: Path, effective_source_log_roots: tuple[Path, ...]
+    ) -> list[dict]:
         active_scopes = discover_active_cfg_scopes(
             effective_cfg_root,
             scope_params=runtime_selectors,
@@ -286,7 +372,9 @@ def merge_plt_cfg_dirs(
             try:
                 target_dest.relative_to(plt_merged_dir.resolve())
             except ValueError as exc:
-                raise RuntimeError(f"Scope target_path escapes merged cfg dir: {target_path}") from exc
+                raise RuntimeError(
+                    f"Scope target_path escapes merged cfg dir: {target_path}"
+                ) from exc
 
             logging.info(
                 "Merging cfg scope %s to %s",

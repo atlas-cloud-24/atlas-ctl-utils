@@ -54,7 +54,7 @@ class RealCfgSelectionTest(unittest.TestCase):
             target_repo_key="repo_path",
             require_target_ref=False,
             execution_runtime_mode="local",
-            provider_options={"credential_implementation": "profile"},
+            provider_options={"credential_acquisition": "sso"},
             execution_access_modes={"aws": "force_bypass"},
             target_name=target,
             force_skip_full_cfg_validation_gate=True,

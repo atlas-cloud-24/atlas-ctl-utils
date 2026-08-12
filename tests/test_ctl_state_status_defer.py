@@ -68,9 +68,10 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
                 Path(tmp),
                 required=True,
             )
-            with patch.object(
-                syncer, "ensure_ready", return_value=True
-            ), patch.object(syncer, "pull_object") as pull_object:
+            with (
+                patch.object(syncer, "ensure_ready", return_value=True),
+                patch.object(syncer, "pull_object") as pull_object,
+            ):
                 syncer.hydrate_instance(
                     "target/env/core",
                     ["target/env/child"],
@@ -105,17 +106,12 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(RuntimeError, "duplicate state owners"):
-            catalog_workflow.validate_unique_fan_out_materializations(
-                [selection, dict(selection)]
-            )
+            catalog_workflow.validate_unique_fan_out_materializations([selection, dict(selection)])
 
     def test_committed_rerun_requires_matching_clean_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            parent = (
-                root
-                / "live/workflow/env/baseline/instances/sha256-x/runs/w1"
-            )
+            parent = root / "live/workflow/env/baseline/instances/sha256-x/runs/w1"
             parent.mkdir(parents=True)
             state_run_store.write_run_metadata(
                 parent,
@@ -128,10 +124,7 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
                     "ctl_state_locator": ["live"],
                 },
             )
-            run_dir = (
-                root
-                / "live/target/env/core/instances/account=dev/runs/r1"
-            )
+            run_dir = root / "live/target/env/core/instances/account=dev/runs/r1"
             run_dir.mkdir(parents=True)
             facts = {
                 "source_commit": "a" * 40,
@@ -171,9 +164,7 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             self.assertEqual(revision["run_id"], "r1")
             target_run["source_state"] = "dirty"
             self.assertIsNone(
-                state_status.up_to_date_child_revision(
-                    parent, target_run, context, "provision"
-                )
+                state_status.up_to_date_child_revision(parent, target_run, context, "provision")
             )
 
     def test_pending_manifest_drains_runs_before_pointers(self):
@@ -221,11 +212,8 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             syncer = FakeSyncer(root / "live")
             state_sync.PUBLICATION.syncer = syncer
             self.assertEqual(state_sync.PUBLICATION.drain_pending(), 1)
-            self.assertEqual(
-                [kind for kind, _ in syncer.events], ["run", "pointer"]
-            )
+            self.assertEqual([kind for kind, _ in syncer.events], ["run", "pointer"])
             self.assertFalse(manifest.exists())
-
 
 
 class OverlayAndDefinitionHashTests(unittest.TestCase):
@@ -247,9 +235,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
             {
                 "type": "overlay",
                 "name": name,
-                "selectors": {
-                    "in": {"execution_context.params.env.type": ["dev"]}
-                },
+                "selectors": {"in": {"execution_context.params.env.type": ["dev"]}},
             },
         )
         kernel_yaml_io.write_yaml_file(
@@ -270,14 +256,16 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 "selectors": {"match": {"execution_context.params.env.type": "dev"}},
             },
         )
-        kernel_yaml_io.write_yaml_file(scope_root / "common.yaml", payload or {"service": {"mode": "base"}})
-        return [{
-            "scope_root": scope_root,
-            "target_path": "/env",
-            "scope_path": "/domains/env/dev",
-        }]
-
-
+        kernel_yaml_io.write_yaml_file(
+            scope_root / "common.yaml", payload or {"service": {"mode": "base"}}
+        )
+        return [
+            {
+                "scope_root": scope_root,
+                "target_path": "/env",
+                "scope_path": "/domains/env/dev",
+            }
+        ]
 
     def test_active_target_keeps_cfg_overlay_and_backend_facts(self):
         active = catalog_targets.build_active_target_runs(
@@ -286,9 +274,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 "target_runs": [{"id": "run", "target": "target"}],
             },
             {
-                "target_sources": {
-                    "source": {"repo_path": "/tmp/source"}
-                },
+                "target_sources": {"source": {"repo_path": "/tmp/source"}},
                 "targets": {
                     "target": {
                         "source": "source",
@@ -395,27 +381,19 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                 ["explicit"],
                 {
                     "first": {"requires_plt_overlays": ["required_a"]},
-                    "second": {
-                        "requires_plt_overlays": ["required_a", "required_b"]
-                    },
+                    "second": {"requires_plt_overlays": ["required_a", "required_b"]},
                 },
                 execution_context=self.context,
             )
-            self.assertEqual(
-                resolved, ["explicit", "required_a", "required_b"]
-            )
+            self.assertEqual(resolved, ["explicit", "required_a", "required_b"])
 
     def test_two_overlays_may_not_set_one_leaf_differently(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.add_overlay(root, "explicit", {"service": {"mode": "one"}})
             self.add_overlay(root, "required", {"service": {"mode": "two"}})
-            active = {
-                "target": {"requires_plt_overlays": ["required"]}
-            }
-            with self.assertRaisesRegex(
-                RuntimeError, "cannot set one leaf differently"
-            ):
+            active = {"target": {"requires_plt_overlays": ["required"]}}
+            with self.assertRaisesRegex(RuntimeError, "cannot set one leaf differently"):
                 cfg_overlays.resolve_run_plt_overlays(
                     root,
                     ["explicit"],
@@ -447,9 +425,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
             "repo_path": "/machine/one",
             "secret_key": "IGNORED_SECRET",
         }
-        first = kernel_paths.canonical_sha256(
-            catalog_targets.target_definition_document(target)
-        )
+        first = kernel_paths.canonical_sha256(catalog_targets.target_definition_document(target))
         same_definition = dict(target, repo_path="/machine/two")
         same_definition["plt_overlays"] = ["unrelated"]
         self.assertEqual(
@@ -461,9 +437,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
         changed = dict(target, procedure="other")
         self.assertNotEqual(
             first,
-            kernel_paths.canonical_sha256(
-                catalog_targets.target_definition_document(changed)
-            ),
+            kernel_paths.canonical_sha256(catalog_targets.target_definition_document(changed)),
         )
 
     def test_cfg_view_hash_is_path_and_content_sensitive(self):
@@ -492,10 +466,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
                     "ctl_state_locator": ["live"],
                 },
             )
-            instance = (
-                root
-                / "live/target/env/core/instances/account=dev"
-            )
+            instance = root / "live/target/env/core/instances/account=dev"
             kernel_yaml_io.write_yaml_file(
                 instance / "committed.yaml",
                 {
@@ -535,14 +506,15 @@ class AwsBackendProbeTests(unittest.TestCase):
             ("Could not connect to the endpoint URL", "failed"),
         ]
         for stderr, expected in cases:
-            with self.subTest(expected=expected), patch.object(
-                aws.subprocess,
-                "run",
-                return_value=CompletedProcess([], 255, "", stderr),
+            with (
+                self.subTest(expected=expected),
+                patch.object(
+                    aws.subprocess,
+                    "run",
+                    return_value=CompletedProcess([], 255, "", stderr),
+                ),
             ):
-                result = aws.probe_state_backend(
-                    "bucket", "eu-west-2", "profile"
-                )
+                result = aws.probe_state_backend("bucket", "eu-west-2", "profile")
                 self.assertEqual(result["status"], expected)
 
 
@@ -566,20 +538,36 @@ class SkipUpToDateActionTest(unittest.TestCase):
     def _tree(self, root, published_action):
         parent = root / "live/workflow/env/seed/instances/sha256-x/runs/w1"
         parent.mkdir(parents=True)
-        state_run_store.write_run_metadata(parent, {
-            "run_id": "w1", "action": "provision", "run_type": "workflow",
-            "result_name": "env/seed", "ctl_state_local_root": str(root),
-            "ctl_state_locator": ["live"],
-        })
-        run_dir = (root / f"live/{published_action}/target/env/seed/baseline"
-                        / "instances/account=dev/runs/r1")
+        state_run_store.write_run_metadata(
+            parent,
+            {
+                "run_id": "w1",
+                "action": "provision",
+                "run_type": "workflow",
+                "result_name": "env/seed",
+                "ctl_state_local_root": str(root),
+                "ctl_state_locator": ["live"],
+            },
+        )
+        run_dir = (
+            root
+            / f"live/{published_action}/target/env/seed/baseline"
+            / "instances/account=dev/runs/r1"
+        )
         run_dir.mkdir(parents=True)
-        state_run_store.write_run_metadata(run_dir, {
-            "run_id": "r1", "action": published_action, "run_type": "target",
-            "result_name": "env/seed/baseline",
-            "ctl_state_local_root": str(root), "ctl_state_locator": ["live"],
-            "instance": ["account=dev"], **self.FACTS,
-        })
+        state_run_store.write_run_metadata(
+            run_dir,
+            {
+                "run_id": "r1",
+                "action": published_action,
+                "run_type": "target",
+                "result_name": "env/seed/baseline",
+                "ctl_state_local_root": str(root),
+                "ctl_state_locator": ["live"],
+                "instance": ["account=dev"],
+                **self.FACTS,
+            },
+        )
         state_run_store.publish_committed_pointer(
             run_dir, state_status.build_status_payload(run_dir, "ok")
         )

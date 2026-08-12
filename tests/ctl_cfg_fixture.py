@@ -1,7 +1,7 @@
 """Minimal ctl cfg a test can point the engine at.
 
 The engine holds NO list of providers — which ones exist is declared by the
-consumer, in `ctl_providers.yaml`. That means a test exercising anything that
+consumer, in `execution_providers.yaml`. That means a test exercising anything that
 reaches an adapter has to declare one too, exactly as a real cfg tree does.
 
 Stated per test rather than activated once for the suite. A suite-wide default
@@ -18,11 +18,11 @@ from engine.execution import adapters
 
 
 def declare_providers(root: Path, *names: str) -> Path:
-    """Write `ctl_providers.yaml` into a cfg root, declaring these providers."""
+    """Write `execution_providers.yaml` into a cfg root, declaring these providers."""
     if not names:
         raise AssertionError("declare at least one provider, or the fixture proves nothing")
-    (Path(root) / "ctl_providers.yaml").write_text(
-        yaml.safe_dump({"ctl_providers": {name: {"implements": ["execution"]} for name in names}}),
+    (Path(root) / "execution_providers.yaml").write_text(
+        yaml.safe_dump({"execution_providers": {name: {"implements": ["execution"]} for name in names}}),
         encoding="utf-8",
     )
     return Path(root)

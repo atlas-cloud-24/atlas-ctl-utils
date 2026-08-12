@@ -2,7 +2,7 @@
 
 A bare key leaves the collection implied by the field name, which holds only
 where the two match. They often do not: `input_param_sets` resolves against
-`param_sets`, `providers` against `ctl_providers`, `account` against
+`param_sets`, `providers` against `execution_providers`, `account` against
 `accounts_registry`. So the value carries the path, and a path naming the wrong
 collection is REFUSED — that check is what the extra text buys; without it the
 path is a comment.

@@ -8,7 +8,6 @@ while pointing at another action's directory — which is what the step-level
 of the manifest's own grouping.
 """
 
-
 import sys
 import tempfile
 import textwrap
@@ -55,7 +54,10 @@ class DistinctTargetSignatureTest(unittest.TestCase):
 
     def test_an_incomplete_declaration_is_left_to_its_own_validator(self):
         catalog_targets.validate_distinct_target_signatures(
-            {"env/a": {"source_key": "target_sources.seed"}, "env/b": {"source_key": "target_sources.seed"}}
+            {
+                "env/a": {"source_key": "target_sources.seed"},
+                "env/b": {"source_key": "target_sources.seed"},
+            }
         )
 
     def test_the_real_ctl_cfg_has_no_duplicates(self):
@@ -80,7 +82,8 @@ class StepPathMatchesActionTest(unittest.TestCase):
         (adapter / "steps/provision/infra/src").mkdir(parents=True)
         for action in ("destroy", "provision"):
             (adapter / f"steps/{action}/infra/step.yaml").write_text(
-                "id: provision/infra\nproviders: [ctl_providers.aws]\nruntime:\n  image: infra\n"
+                "id: provision/infra\nproviders: [execution_providers.aws]\n"
+                "runtime:\n  image: infra\n"
             )
         (adapter / "manifest.yaml").write_text(
             textwrap.dedent(f"""
@@ -113,6 +116,7 @@ class StepPathMatchesActionTest(unittest.TestCase):
             ids, steps = cfg_materialize.get_repo_local_steps(repo, "provision", "baseline")
             self.assertEqual(["provision/infra"], ids)
             self.assertEqual(1, len(steps))
+            self.assertNotIn("plt", steps[0])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """Test-time path setup, in ONE place.
 
-The AWS adapter is its own repository, not a subpackage of the engine. Its location is DECLARED — `ctl-adapter-aws` is a
+The AWS adapter is its own repository, not a subpackage of the engine. Its location is DECLARED — `execution-provider-aws` is a
 tooling ref, and the dev cfg reflection resolves it to a local checkout in
 `local_repos.yaml` — so the tests read that declaration instead of guessing at
 the filesystem.
@@ -28,7 +28,7 @@ def _declared_tooling_paths() -> list[Path]:
     return [
         Path(entry["repo_path"])
         for name, entry in tooling.items()
-        if name.startswith("ctl-adapter-") and entry.get("repo_path")
+        if name.startswith("execution-provider-") and entry.get("repo_path")
     ]
 
 

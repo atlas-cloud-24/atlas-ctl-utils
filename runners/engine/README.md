@@ -19,6 +19,7 @@ preflight/         what must hold before the first target runs
 state/             run records, their meaning, and their publication
 catalog/           what is declared: targets and workflows
 guardrails/        rendered cfg checked against recorded baselines
+plt/               PLT-provider registry, handshake and invocation
 execution/         the run's identity, and the provider seam
 cfg/               finding, merging, rendering and staging cfg
 run/               the vocabulary a run is described in
@@ -34,6 +35,7 @@ kernel/            no domain knowledge at all
 | `cfg/` | `layout` (the few filenames the engine may know), `resources`, `merge`, `tooling`, `validate`, `overlays`, `tree`, `materialize`, `views`, `presets`. |
 | `execution/` | `references` (the `${execution_context.*}` language), `run_context` (assembling the context a run is carried out under), `providers` + `adapters` (the provider seam). |
 | `guardrails/` | `policies` (declarations and baselines) and `verify`. |
+| `plt/` | `providers` (the CTL-owned implementation registry) and `dispatch` (selected-unit/source-step handshake, provider materialization, neutral guardrail view, and execution). |
 | `catalog/` | `targets` (what is declared and what may run it) and `workflow` (composing an ordered run). |
 | `state/` | `run_store` (storage), `status` (what the records MEAN), `sync` (publication), `lifecycle` (the transitions). |
 | `preflight/` | `reports` (build), `render` (draw), `gates` (decide). |
@@ -54,7 +56,7 @@ Enforced by tests, not convention:
   consumer declares — no `landing_zone`, no `main_tag`, no environment name.
   `scripts/tests/test_engine_names_no_consumer_vocabulary.py` reads the axes from
   the consumer's ctl cfg, so declaring a new one extends the check.
-- **No provider name.** Which providers exist is `ctl_providers.yaml`; the engine
+- **No provider name.** Which providers exist is `execution_providers.yaml`; the engine
   reads the declaration. `tests/test_provider_boundary.py` walks this package and
   has no exemptions.
 - **No tool name.** No `terraform`, `tofu`, `tfstate`, `.tf` — a tool lives inside

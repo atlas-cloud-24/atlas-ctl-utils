@@ -126,10 +126,6 @@ def build_commands(model: dict) -> list[str]:
                 profile.get("role_name"),
                 f"profiles.{profile_key}.role_name",
             ),
-            "region": require_string(
-                profile.get("region"),
-                f"profiles.{profile_key}.region",
-            ),
         }
 
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
@@ -174,7 +170,6 @@ def build_commands(model: dict) -> list[str]:
             configure_set(f"profile.{profile_name}.sso_account_id", profile["account_id"])
         )
         lines.append(configure_set(f"profile.{profile_name}.sso_role_name", profile["role_name"]))
-        lines.append(configure_set(f"profile.{profile_name}.region", profile["region"]))
         lines.append("")
 
     lines.append("# Login/verify examples")

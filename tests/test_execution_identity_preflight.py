@@ -112,7 +112,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 execution_param=[],
                 ctl_state_local_root=tmp,
                 providers=["aws"],
-                provider_options={"aws.credential_implementation": "profile"},
+                provider_options={"aws.credential_acquisition": "sso"},
                 execution_access_modes={"aws": "standard"},
                 execution_identity_preflight_check_only=True,
                 force_skip_execution_identity_preflight_check=["aws"],
@@ -128,7 +128,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 ctl_state_local_root=tmp,
                 providers=["aws"],
                 provider_options={
-                    "aws.credential_implementation": "profile",
+                    "aws.credential_acquisition": "sso",
                     "aws.force_bypass_credential_profile": "substitute",
                 },
                 execution_access_modes={"aws": "standard"},
@@ -146,7 +146,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 ctl_state_local_root=tmp,
                 providers=["aws"],
                 provider_options={
-                    "aws.credential_implementation": "profile",
+                    "aws.credential_acquisition": "sso",
                     "aws.force_bypass_credential_profile": "substitute",
                 },
                 execution_access_modes={"aws": "force_bypass"},
@@ -165,7 +165,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 "ctl_profiles:\n  strict:\n    ref_policy: commit_required\n"
                 "    allowed_providers: [aws]\n"
                 "    aws:\n      allowed_execution_access_modes: [standard]\n"
-                "      allowed_credential_implementation: [profile]\n"
+                "      allowed_credential_acquisition: [sso]\n"
             )
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -194,7 +194,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 "ctl_profiles:\n  strict:\n    ref_policy: commit_required\n"
                 "    allowed_providers: [aws]\n"
                 "    aws:\n      allowed_execution_access_modes: [standard]\n"
-                "      allowed_credential_implementation: [profile]\n"
+                "      allowed_credential_acquisition: [sso]\n"
             )
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -294,7 +294,7 @@ class PreflightArtifactTests(unittest.TestCase):
         }
         report = preflight_reports.build_execution_identity_preflight_report(
             selection,
-            implementation_key="profile",
+            implementation_key="sso",
             execution_access_modes={"aws": "standard"},
             provider_options={},
             force_skip_providers=[],
@@ -665,14 +665,14 @@ class AwsPreflightTests(unittest.TestCase):
         with mock.patch.object(
             aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
-            aws_adapter.execution, "assert_profile_caller", return_value=caller
+            aws_adapter.execution, "assert_caller", return_value=caller
         ) as assertion:
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
                 {"execution_identity_key": "dev"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="agreed_direct",
             )
         self.assertEqual(result["status"], "passed")
@@ -699,13 +699,13 @@ class AwsPreflightTests(unittest.TestCase):
         }
         with mock.patch.object(
             aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(aws_adapter.execution, "assert_profile_caller") as assertion:
+        ), mock.patch.object(aws_adapter.execution, "assert_caller") as assertion:
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="profile",
+                implementation_key="sso",
                 live_check=False,
             )
         self.assertEqual(result["status"], "force_skipped")
@@ -749,7 +749,7 @@ class AwsPreflightTests(unittest.TestCase):
         with mock.patch.object(
             aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
-            aws_adapter.execution, "assert_profile_caller", return_value=entry
+            aws_adapter.execution, "assert_caller", return_value=entry
         ), mock.patch.object(
             aws_adapter.execution, "_assume_role_credentials", side_effect=assume_results
         ) as assume, mock.patch.object(
@@ -760,7 +760,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="profile",
+                implementation_key="sso",
             )
         self.assertEqual(result["status"], "passed")
         self.assertEqual(assume.call_count, 2)
@@ -792,7 +792,7 @@ class AwsPreflightTests(unittest.TestCase):
             aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
         ), mock.patch.object(
             aws_adapter.execution,
-            "assert_profile_caller",
+            "assert_caller",
             return_value={
                 "Account": "111111111111",
                 "Arn": "arn:aws:sts::111111111111:assumed-role/Entry/session",
@@ -809,7 +809,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="profile",
+                implementation_key="sso",
             )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["provider_path"][-1]["status"], "failed")
@@ -825,7 +825,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="profile",
+                implementation_key="sso",
                 live_check=False,
             )
         self.assertEqual(result["status"], "failed")
@@ -842,7 +842,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "env_dev_deploy"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="force_bypass",
                 provider_options={"force_bypass_credential_profile": "do-not-render"},
                 live_check=False,

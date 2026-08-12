@@ -7,6 +7,7 @@ lay its cfg out however it likes."""
 from pathlib import Path
 
 from engine.cfg import layout as cfg_layout
+from engine.cfg import plt_provider as cfg_plt_provider
 from engine.execution import references as execution_references
 from engine.kernel import yaml_io as kernel_yaml_io
 
@@ -113,10 +114,16 @@ def load_cfg_meta(meta_path: Path) -> dict:
         raise RuntimeError(f"{cfg_layout.SCOPE_META_FILENAME} must contain a mapping: {meta_path}")
 
     meta_type = meta_cfg.get("type")
-    if meta_type not in ("scope", "overlay"):
+    if meta_type not in ("scope", "shared_scope", "overlay"):
         raise RuntimeError(
-            f"{cfg_layout.SCOPE_META_FILENAME} type must be 'scope' or 'overlay': {meta_path}"
+            f"{cfg_layout.SCOPE_META_FILENAME} type must be 'scope', "
+            f"'shared_scope', or 'overlay': {meta_path}"
         )
+    binding = cfg_plt_provider.ProviderBinding.selectable_unit(meta_cfg, label=str(meta_path))
+    if binding:
+        meta_cfg["plt"] = binding
+    else:
+        meta_cfg.pop("plt", None)
     return meta_cfg
 
 

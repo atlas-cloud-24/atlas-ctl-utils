@@ -46,7 +46,7 @@ sees another provider's mode or options.
 # An adapter lives in its OWN repository — the engine depends on it, never the
 # other way round — so it is imported by PACKAGE NAME rather than by reaching into
 # a subdirectory of this one. Where that package comes from is DECLARED, not
-# discovered: `ctl-adapter-{provider}` is a tooling ref in `refs.global`,
+# discovered: `execution-provider-{provider}` is a tooling ref in `refs.global`,
 # materialized by the same path as the rest of the engine's tooling. The engine
 # never globs the filesystem for adapters — that would make whatever happens to
 # sit beside the checkout into the registry.
@@ -62,8 +62,8 @@ from engine.kernel import yaml_io as kernel_yaml_io
 # — DECLARED in `refs.global`, materialized by the same path as ctl-utils, never
 # discovered by looking at what sits beside the engine on disk.
 # The names are DERIVED from the provider, so engine core never spells a provider
-# out; `ctl_providers.yaml` is the only place a provider is named.
-PROVIDER_ADAPTER_TOOLING_TEMPLATE = "ctl-adapter-{provider}"
+# out; `execution_providers.yaml` is the only place a provider is named.
+PROVIDER_ADAPTER_TOOLING_TEMPLATE = "execution-provider-{provider}"
 
 
 def provider_adapter_tooling_name(provider: str) -> str:
@@ -74,7 +74,7 @@ def provider_adapter_tooling_name(provider: str) -> str:
     return PROVIDER_ADAPTER_TOOLING_TEMPLATE.format(provider=provider)
 
 
-def load_ctl_providers(ctl_cfg_root) -> dict:
+def load_execution_providers(ctl_cfg_root) -> dict:
     """The declared providers: what each implements, and where its adapter lives.
 
     Read from cfg rather than carried as a constant, so adding a provider — or
@@ -84,10 +84,10 @@ def load_ctl_providers(ctl_cfg_root) -> dict:
 
     if not ctl_cfg_root:
         return {}
-    path = Path(ctl_cfg_root) / "ctl_providers.yaml"
+    path = Path(ctl_cfg_root) / "execution_providers.yaml"
     if not path.is_file():
         return {}
-    return (kernel_yaml_io.load_yaml(path) or {}).get("ctl_providers") or {}
+    return (kernel_yaml_io.load_yaml(path) or {}).get("execution_providers") or {}
 
 
 def provider_adapter_package(provider: str, ctl_cfg_root=None) -> str:
@@ -97,7 +97,7 @@ def provider_adapter_package(provider: str, ctl_cfg_root=None) -> str:
     package, and naming it by our convention would assume they forked ours.
     """
 
-    declared = (load_ctl_providers(ctl_cfg_root).get(provider) or {}).get("package")
+    declared = (load_execution_providers(ctl_cfg_root).get(provider) or {}).get("package")
     return declared or f"atlas_ctl_adapter_{provider}"
 
 
@@ -115,7 +115,7 @@ def registered_providers(ctl_cfg_root=None) -> tuple[str, ...]:
     There is no engine-side list, because a list in code is a SECOND registry:
     a second place for the answer to be wrong, and one that cannot name a
     consumer's own provider without the engine already knowing it exists. The
-    declaration in `ctl_providers.yaml` is the only registry, and an entry whose
+    declaration in `execution_providers.yaml` is the only registry, and an entry whose
     adapter will not import fails at `get_adapter` with a message that says so.
     """
 
@@ -124,9 +124,9 @@ def registered_providers(ctl_cfg_root=None) -> tuple[str, ...]:
         raise RuntimeError(
             "❌ no ctl cfg root is active, so the declared providers cannot be read"
         )
-    declared = load_ctl_providers(root)
+    declared = load_execution_providers(root)
     if not declared:
-        raise RuntimeError(f"❌ {root} declares no providers in ctl_providers.yaml")
+        raise RuntimeError(f"❌ {root} declares no providers in execution_providers.yaml")
     return tuple(declared)
 
 
@@ -146,7 +146,7 @@ def describe_all(ctl_cfg_root=None) -> dict[str, dict]:
 def get_adapter(provider: str, ctl_cfg_root=None):
     """Return the adapter module for a provider; unknown providers are a hard error.
 
-    The package name comes from `ctl_providers.yaml` when a cfg root is known —
+    The package name comes from `execution_providers.yaml` when a cfg root is known —
     a consumer's adapter is THEIR package — falling back to the convention only
     when nothing declared one.
     """
@@ -154,7 +154,7 @@ def get_adapter(provider: str, ctl_cfg_root=None):
     root = ctl_cfg_root or _ACTIVE_CTL_CFG_ROOT
     if provider not in registered_providers(root):
         raise RuntimeError(
-            f"❌ provider {provider!r} is not declared in ctl_providers.yaml; "
+            f"❌ provider {provider!r} is not declared in execution_providers.yaml; "
             f"declared: {list(registered_providers(root))}"
         )
     package = provider_adapter_package(provider, root)

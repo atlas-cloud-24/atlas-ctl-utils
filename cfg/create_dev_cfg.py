@@ -24,7 +24,6 @@ Examples:
         --force
 """
 
-
 from __future__ import annotations
 
 import argparse
@@ -193,7 +192,11 @@ def required_cfg_source_entries(paths: list[Path]) -> set[str]:
         if not isinstance(entries, dict):
             continue
         for name, entry in entries.items():
-            if isinstance(name, str) and isinstance(entry, dict) and isinstance(entry.get("repo_url"), str):
+            if (
+                isinstance(name, str)
+                and isinstance(entry, dict)
+                and isinstance(entry.get("repo_url"), str)
+            ):
                 names.add(name)
     return names
 
@@ -240,8 +243,7 @@ def run_git(cmd: list[str], cwd: Path | None = None) -> None:
         cwd=cwd,
         check=True,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
 
 
@@ -386,7 +388,11 @@ def rewrite_cfg_source_file(path: Path, repo_map: dict[str, str]) -> int:
     for name, entry in entries.items():
         if not isinstance(entry, dict) or "repo_url" not in entry:
             continue
-        entries[name] = {"repo_path": repo_map[name]}
+        replacement = {}
+        if "provider" in entry:
+            replacement["provider"] = entry["provider"]
+        replacement["repo_path"] = repo_map[name]
+        entries[name] = replacement
         replacements += 1
     path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
     return replacements
@@ -435,8 +441,7 @@ def write_local_global_file(root_dir: Path, global_ref_map: dict[str, str]) -> P
     # concept). The strict path reads refs.global; the local-dev path reads tooling.
     local_global_cfg = {
         "tooling": {
-            ref_name: {"repo_path": repo_path}
-            for ref_name, repo_path in global_ref_map.items()
+            ref_name: {"repo_path": repo_path} for ref_name, repo_path in global_ref_map.items()
         }
     }
     local_global_path = root_dir / LOCAL_GLOBAL_CFG_NAME
@@ -498,14 +503,10 @@ def main() -> int:
             required_global_ref_names = required_global_refs(source_refs)
 
             repo_map = {
-                name: path
-                for name, path in path_map.items()
-                if name in required_path_names
+                name: path for name, path in path_map.items() if name in required_path_names
             }
             global_ref_map = {
-                name: path
-                for name, path in path_map.items()
-                if name in required_global_ref_names
+                name: path for name, path in path_map.items() if name in required_global_ref_names
             }
 
             missing = sorted(required_path_names - set(repo_map))

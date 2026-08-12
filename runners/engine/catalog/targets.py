@@ -130,7 +130,7 @@ TARGET_REFERENCE_FIELDS = {
     "source_key": "target_sources",
     "domains": "domains",
     "input_param_sets": "param_sets",
-    "providers": "ctl_providers",
+    "providers": "execution_providers",
 }
 
 
@@ -424,6 +424,14 @@ def build_active_target_runs(
             "procedure": child_procedure,
             "domains": target_domains,
             "cfg_keys": target_cfg_keys,
+            # The CONSTANTS the target always uses, carried onto the run because
+            # `build_target_execution_context` publishes them as
+            # `execution_context.target.static_vars.*` and a PLT scope selects on
+            # them. The catalog validated them (identifier keys, literal scalars,
+            # no overlap with input params) and then nothing carried them here, so
+            # the namespace was always empty and a scope gated on it could never
+            # match.
+            "static_vars": dict(target_cfg.get("static_vars") or {}),
             "reuse_committed_result": reuse_committed_result,
         }
         if member_action is not None:

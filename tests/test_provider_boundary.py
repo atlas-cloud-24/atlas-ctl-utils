@@ -189,7 +189,7 @@ class ProviderBoundaryTests(unittest.TestCase):
         declaration, and the error has to say which one it read."""
 
         ctl_cfg_fixture.cfg_root(self, "aws")
-        with self.assertRaisesRegex(RuntimeError, "is not declared in ctl_providers.yaml"):
+        with self.assertRaisesRegex(RuntimeError, "is not declared in execution_providers.yaml"):
             get_adapter("gcp")
 
     def test_adapter_contract_operations_exist(self):
@@ -230,6 +230,7 @@ class ContractWrapperTests(unittest.TestCase):
             "credential_sources": {},
             "account_registry": {},
             "ctl_role_chain": None,
+            "sso_sessions": {},
             "target_roles": {},
         }
         target_runs = {"target_run": {}}
@@ -237,7 +238,7 @@ class ContractWrapperTests(unittest.TestCase):
             target_runs,
             catalogs,
             execution_context={},
-            implementation_key="profile",
+            implementation_key="sso",
             execution_access_mode="force_bypass",
             provider_options={"force_bypass_credential_profile": "substitute"},
         )
@@ -253,7 +254,7 @@ class ContractWrapperTests(unittest.TestCase):
                 target_env,
                 catalogs,
                 execution_context={},
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="force_bypass",
                 provider_options={"force_bypass_credential_profile": "substitute"},
             )
@@ -277,37 +278,43 @@ class CtlRoleChainLoaderTests(unittest.TestCase):
                 aws_adapter.load_aws_ctl_role_chain_cfg(root)
 
 
-class ProfileBindingTests(unittest.TestCase):
-    def test_profile_resolves_to_env_credentials_only(self):
-        # The host resolves the profile (`aws configure export-credentials`);
-        # the box receives plain env credentials — no file is ever written.
+class SsoCredentialAcquisitionTests(unittest.TestCase):
+    """A credential source returns the env triple; nothing else crosses.
+
+    The box receives ONLY env credentials — no config file, no mounted
+    credential material, no profile concept inside the box.
+    """
+
+    def test_sso_acquisition_returns_env_credentials_only(self):
+        response = {"roleCredentials": {
+            "accessKeyId": "AKIA", "secretAccessKey": "SECRET",
+            "sessionToken": "TOKEN", "expiration": 123,
+        }}
         with unittest.mock.patch.object(
-            aws_adapter.credentials,
-            "_run_aws_json",
-            return_value={
-                "AccessKeyId": "AKIAWANTED",
-                "SecretAccessKey": "secret",
-                "SessionToken": "token",
-            },
-        ) as run_json:
-            credentials = aws_adapter.export_profile_credentials("wanted")
+            aws_adapter.credentials, "_run_aws_json", return_value=response
+        ), unittest.mock.patch.object(
+            aws_adapter.credentials, "_sso_access_token", return_value="t"
+        ):
+            creds = aws_adapter.acquire_aws_sso_credentials(
+                {"start_url": "https://x", "sso_region": "eu-west-2", "session_name": "s"},
+                "111111111111", "CtlEntryAccess", label="test",
+            )
         self.assertEqual(
-            credentials,
-            {
-                "AWS_ACCESS_KEY_ID": "AKIAWANTED",
-                "AWS_SECRET_ACCESS_KEY": "secret",
-                "AWS_SESSION_TOKEN": "token",
-            },
+            sorted(creds),
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
         )
-        self.assertIn("--profile", run_json.call_args.args[0])
 
-    def test_incomplete_export_fails_loud(self):
+    def test_incomplete_sso_response_fails_loud(self):
+        response = {"roleCredentials": {"accessKeyId": "AKIA", "sessionToken": "T"}}
         with unittest.mock.patch.object(
-            aws_adapter.credentials, "_run_aws_json", return_value={"AccessKeyId": "AKIA"}
-        ), self.assertRaisesRegex(RuntimeError, "SecretAccessKey"):
-            aws_adapter.export_profile_credentials("wanted")
-
-
+            aws_adapter.credentials, "_run_aws_json", return_value=response
+        ), unittest.mock.patch.object(
+            aws_adapter.credentials, "_sso_access_token", return_value="t"
+        ), self.assertRaisesRegex(RuntimeError, "secretAccessKey"):
+            aws_adapter.acquire_aws_sso_credentials(
+                {"start_url": "https://x", "sso_region": "eu-west-2", "session_name": "s"},
+                "111111111111", "CtlEntryAccess", label="test",
+            )
 
 class CredentialPathIteratorTests(unittest.TestCase):
     """§12.3: the AWS credential-path executor makes no assumption about the
@@ -344,7 +351,9 @@ class CredentialPathIteratorTests(unittest.TestCase):
             seen.clear()
             with unittest.mock.patch("subprocess.run", side_effect=fake_run):
                 creds = aws_adapter.assume_ctl_role_chain(
-                    "entry-profile", hops,
+                    {"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "SK",
+                     "AWS_SESSION_TOKEN": "ST"},
+                    hops,
                     session_name="s", entry_expected_account_id="111111111111",
                     entry_role_name="Entry",
                 )
@@ -361,7 +370,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 "  strict:\n    ref_policy: commit_required\n"
                 "  boot:\n    ref_policy: commit_required\n    allowed_providers: [aws]\n"
                 "    aws:\n      allowed_execution_access_modes: [standard, agreed_direct]\n"
-                "      allowed_credential_implementation: [profile]\n"
+                "      allowed_credential_acquisition: [sso]\n"
             )
             ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
             # provider policy is DECLARED: no allowed_providers is a hard error
@@ -375,7 +384,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
             )
             aws_adapter.authorize_run(
                 policy, execution_access_mode="standard",
-                provider_options={"credential_implementation": "profile"}, label="p",
+                provider_options={"credential_acquisition": "sso"}, label="p",
             )
             with self.assertRaisesRegex(RuntimeError, "is not allowed by"):
                 aws_adapter.authorize_run(
@@ -411,7 +420,7 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 "ctl_profiles:\n  boot:\n    ref_policy: commit_required\n"
                 "    allowed_providers: [aws]\n"
                 "    aws:\n      allowed_execution_access_modes: [agreed_direct]\n"
-                "      allowed_credential_implementation: [profile]\n"
+                "      allowed_credential_acquisition: [sso]\n"
             )
             ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
 
@@ -445,15 +454,15 @@ class ExecutionAccessModeTests(unittest.TestCase):
         self.assertTrue(aws_adapter.resolves_execution_identity("standard"))
         self.assertEqual(aws_adapter.normal_execution_access_mode(), "standard")
 
-    def test_credential_implementation_is_required(self):
-        with self.assertRaisesRegex(RuntimeError, "aws.credential_implementation"):
+    def test_credential_acquisition_is_required(self):
+        with self.assertRaisesRegex(RuntimeError, "aws.credential_acquisition"):
             aws_adapter.validate_provider_options({})
-        aws_adapter.validate_provider_options({"credential_implementation": "profile"})
+        aws_adapter.validate_provider_options({"credential_acquisition": "sso"})
 
     def test_option_grants_are_enforced_from_the_provider_block(self):
         policy = {
             "allowed_execution_access_modes": ["force_bypass"],
-            "allowed_credential_implementation": ["profile"],
+            "allowed_credential_acquisition": ["sso"],
         }
         opts = {"force_skip_account_expectation_check": "true"}
         with self.assertRaisesRegex(RuntimeError, "allow_force_skip_account_expectation_check"):
@@ -466,10 +475,10 @@ class ExecutionAccessModeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "credential implementation"):
             aws_adapter.authorize_run(
                 granted, execution_access_mode="force_bypass",
-                provider_options={"credential_implementation": "web_identity"}, label="p")
+                provider_options={"credential_acquisition": "web_identity"}, label="p")
         with self.assertRaisesRegex(RuntimeError, "must be 'true' or 'false'"):
             aws_adapter.validate_provider_options({
-                "credential_implementation": "profile",
+                "credential_acquisition": "sso",
                 "force_skip_account_expectation_check": "yes",
             })
 

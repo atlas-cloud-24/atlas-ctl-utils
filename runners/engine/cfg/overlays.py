@@ -14,6 +14,7 @@ from engine.cfg import merge as cfg_merge
 from engine.cfg import resources as cfg_resources
 from engine.run import selectors as run_selectors
 
+
 def normalize_overlay_name(raw_value, *, label: str) -> str:
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise RuntimeError(f"{label} must be a non-empty string")
@@ -39,7 +40,9 @@ def validate_overlay_data_tree(overlay_root: Path, *, meta_path: Path) -> None:
                 f"Overlay data must not contain nested {cfg_layout.SCOPE_META_FILENAME}: {path}"
             )
         if path.name == cfg_layout.PLT_GUARDRAILS_FILENAME:
-            raise RuntimeError(f"Overlay data must not contain {cfg_layout.PLT_GUARDRAILS_FILENAME}: {path}")
+            raise RuntimeError(
+                f"Overlay data must not contain {cfg_layout.PLT_GUARDRAILS_FILENAME}: {path}"
+            )
 
 
 def load_overlay_candidate(
@@ -68,6 +71,7 @@ def load_overlay_candidate(
         "name": overlay_name,
         "root": overlay_root,
         "meta_path": meta_path,
+        "plt": dict(meta_cfg.get("plt") or {}),
         "selectors": selectors,
         "matches": matches,
     }
@@ -141,9 +145,7 @@ def resolve_run_plt_overlays(
     append target-required overlays in target order and validate conflicts."""
 
     duplicates = [
-        item
-        for item, count in collections.Counter(explicit_overlays).items()
-        if count > 1
+        item for item, count in collections.Counter(explicit_overlays).items() if count > 1
     ]
     if duplicates:
         raise RuntimeError(
@@ -161,9 +163,7 @@ def resolve_run_plt_overlays(
     if not final_overlays:
         return []
 
-    candidates = discover_overlay_candidates(
-        plt_cfg_root, execution_context=execution_context
-    )
+    candidates = discover_overlay_candidates(plt_cfg_root, execution_context=execution_context)
     for overlay_name in final_overlays:
         overlay = candidates.get(overlay_name)
         if overlay is None:
@@ -237,7 +237,9 @@ def apply_selected_overlays_to_merged_cfg(
 
     duplicates = [item for item, count in collections.Counter(plt_overlays).items() if count > 1]
     if duplicates:
-        raise RuntimeError(f"plt overlays must be unique; duplicates: {', '.join(sorted(duplicates))}")
+        raise RuntimeError(
+            f"plt overlays must be unique; duplicates: {', '.join(sorted(duplicates))}"
+        )
 
     cfg_root = plt_cfg_root.resolve()
     candidates = discover_overlay_candidates(plt_cfg_root, execution_context=execution_context)

@@ -8,7 +8,6 @@ a last-wins merge by file path: the failures that exist are an overlay broken on
 its own and two overlays writing one path, and those two passes cover both.
 """
 
-
 from __future__ import annotations
 
 import argparse
@@ -21,25 +20,30 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
+from engine.catalog import targets as catalog_targets
 from engine.catalog import workflow as catalog_workflow
-from engine.guardrails import verify as guardrails_verify
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import overlays as cfg_overlays
 from engine.cfg import resources as cfg_resources
 from engine.cfg import secrets as cfg_secrets
 from engine.cfg import tree as cfg_tree
+from engine.cli import args as cli_args
 from engine.execution import providers as execution_providers
 from engine.execution import run_context as execution_run_context
+from engine.guardrails import verify as guardrails_verify
 from engine.kernel import scalars as kernel_scalars
+from engine.plt import dispatch as plt_dispatch
+from engine.plt import providers as plt_providers
 from engine.run import policy as run_policy
-from engine.cli import args as cli_args
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ctl-cfg-root", required=True)
     parser.add_argument("--ctl-profile", required=True)
-    parser.add_argument("--execution-runtime-mode", required=True, choices=run_policy.EXECUTION_RUNTIME_MODES)
+    parser.add_argument(
+        "--execution-runtime-mode", required=True, choices=run_policy.EXECUTION_RUNTIME_MODES
+    )
     parser.add_argument(
         "--execution-params",
         dest="execution_param",
@@ -103,31 +107,78 @@ def _validate_variation(
             ctl_cfg_root,
             ref_policy=run_policy.ctl_ref_policy(ctl_cfg_root, ctl_profile),
             run_cfg_dir=temp_root / "cfg",
-            token=os.getenv("cfg_source_token"),
+            token=os.getenv("cfg_source_token"),  # noqa: SIM112 — established secret name
         )
         plt_cfg_root = roots["plt"]
         guardrails_cfg_root = roots["guardrails"]
-        merged_dir = temp_root / "merged"
-        cfg_tree.merge_plt_cfg_dirs(
-            plt_cfg_root=plt_cfg_root,
-            plt_merged_dir=merged_dir,
-            ctl_profile="validate-cfg",
-            plt_overlays=plt_overlays,
-            scope_params=scope_params,
-            execution_context=execution_context,
-        )
-        rendered_dir = cfg_tree.render_plt_cfg(merged_dir, temp_root, execution_context)
-        if plt_overlays:
-            print(f"OK: cfg valid with overlays {label} (guardrails skipped — baselines are base-only)")
-        else:
-            guardrails_verify.verify_guardrails(
-                ctl_cfg_root,
-                plt_cfg_root,
-                guardrails_cfg_root,
-                rendered_dir,
-                execution_context,
-                scope_params,
+        provider_dispatch = plt_dispatch.ProviderDispatch(ctl_cfg_root, plt_cfg_root)
+        rendered_views: list[tuple[Path, dict[str, object]]] = []
+        if provider_dispatch.enabled and provider_dispatch.provider is None:
+            declared_targets = catalog_targets.load_target_catalog(ctl_cfg_root)
+            actions = sorted(
+                {
+                    action
+                    for target in declared_targets.values()
+                    if isinstance(target, dict)
+                    for action in (target.get("actions") or [])
+                }
             )
+            validation_targets: dict[str, dict] = {}
+            for action in actions:
+                action_cfg = catalog_targets.load_action_cfg(
+                    ctl_cfg_root, action, execution_context
+                )
+                validation_targets.update(action_cfg["targets"])
+            for target_name, target_run in sorted(validation_targets.items()):
+                target_context = execution_run_context.build_target_execution_context(
+                    target_name, target_run, execution_context
+                )
+                rendered_dir, _ = provider_dispatch.prepare_target_view(
+                    target_name,
+                    {**target_run, "plt_overlays": plt_overlays},
+                    execution_context=target_context,
+                    target_cfg_dir=temp_root / "provider-views" / target_name,
+                    scope_params=execution_run_context.scope_params_from_context(
+                        target_context
+                    ),
+                )
+                rendered_views.append((rendered_dir, target_context))
+        elif provider_dispatch.enabled:
+            rendered_dir, _ = provider_dispatch.prepare_target_view(
+                "full-cfg-validation",
+                {"plt_overlays": plt_overlays},
+                execution_context=execution_context,
+                target_cfg_dir=temp_root / "provider-view",
+                scope_params=scope_params,
+            )
+            rendered_views.append((rendered_dir, execution_context))
+        else:
+            merged_dir = temp_root / "merged"
+            cfg_tree.merge_plt_cfg_dirs(
+                plt_cfg_root=plt_cfg_root,
+                plt_merged_dir=merged_dir,
+                ctl_profile="validate-cfg",
+                plt_overlays=plt_overlays,
+                scope_params=scope_params,
+                execution_context=execution_context,
+            )
+            rendered_dir = cfg_tree.render_plt_cfg(merged_dir, temp_root, execution_context)
+            rendered_views.append((rendered_dir, execution_context))
+        if plt_overlays:
+            print(
+                f"OK: cfg valid with overlays {label} "
+                "(guardrails skipped — baselines are base-only)"
+            )
+        else:
+            for rendered_dir, rendered_context in rendered_views:
+                guardrails_verify.verify_guardrails(
+                    ctl_cfg_root,
+                    plt_cfg_root,
+                    guardrails_cfg_root,
+                    rendered_dir,
+                    rendered_context,
+                    execution_run_context.scope_params_from_context(rendered_context),
+                )
             print(f"OK: full bound plt cfg valid for params {scope_params or '{}'}")
     finally:
         if keep_artifacts:
@@ -147,7 +198,8 @@ def _sweep_variations(plt_cfg_root: Path, execution_context: dict) -> list[list[
     """
 
     permitted = sorted(
-        name for name, candidate in cfg_overlays.discover_overlay_candidates(
+        name
+        for name, candidate in cfg_overlays.discover_overlay_candidates(
             plt_cfg_root, execution_context=execution_context
         ).items()
         if candidate.get("matches")
@@ -179,6 +231,10 @@ def main() -> int:
     # what each provider promises, and that every secret is declared and
     # resolvable without a cycle.
     execution_providers.validate_declared_contracts(ctl_cfg_root)
+    plt_provider_registry = plt_providers.ProviderRegistry(ctl_cfg_root)
+    if plt_provider_registry.entries:
+        plt_provider_registry.activate_local_adapters()
+        plt_provider_registry.validate_declared_contracts()
     cfg_secrets.validate_declared_secrets(ctl_cfg_root)
     # Every workflow's instance params, not just the one a run selects.
     # The per-run guard is exact but sees one workflow, so a misdeclaration
@@ -197,7 +253,9 @@ def main() -> int:
         cfg_resources.collect_resource(ctl_cfg_root, "targets"),
     )
     # whole-tree tooling activates every declared domain (see helper)
-    execution_context = execution_run_context.whole_tree_execution_context(ctl_cfg_root, execution_context)
+    execution_context = execution_run_context.whole_tree_execution_context(
+        ctl_cfg_root, execution_context
+    )
     scope_params = execution_run_context.scope_params_from_context(execution_context)
 
     variations = [args.plt_overlays]
@@ -208,7 +266,7 @@ def main() -> int:
                 ctl_cfg_root,
                 ref_policy=run_policy.ctl_ref_policy(ctl_cfg_root, args.ctl_profile),
                 run_cfg_dir=probe / "cfg",
-                token=os.getenv("cfg_source_token"),
+                token=os.getenv("cfg_source_token"),  # noqa: SIM112 — established secret name
             )
             variations = _sweep_variations(roots["plt"], execution_context)
         finally:

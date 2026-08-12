@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,40 +28,49 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # these resolve against the adapter, which the engine reaches only via
         # the providers a cfg root declares
         ctl_cfg_fixture.cfg_root(self, "aws")
-        # EVERY local credential source declares its real principal;
-        # the entry source also declares its account (expect.account_key)
+        # A source declares HOW it is acquired: `sso` is a root (session +
+        # account + permission set); `assume_role` continues from a source it
+        # names. Nothing names a host profile.
+        self.sso_sessions = {
+            "main": {
+                "session_name": "${execution_context.params.main_tag}-main",
+                "start_url": "https://example.awsapps.com/start",
+                "sso_region": "eu-west-2",
+            }
+        }
         self.credential_sources = {
             "org_admin": {
-                "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-org-admin",
-                    "expect": {"permission_set_name": "AdministratorAccess"},
+                "sso": {
+                    "session_key": "providers.aws.sso_sessions.main",
+                    "account_key": "providers.aws.accounts_registry.management",
+                    "permission_set_name": "AdministratorAccess",
                 }
             },
             "non_prod_deploy": {
-                "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env.type}-deploy",
-                    "expect": {"permission_set_name": "NonProdDeployAccess"},
+                "sso": {
+                    "session_key": "providers.aws.sso_sessions.main",
+                    "account_key": "providers.aws.accounts_registry.dev",
+                    "permission_set_name": "NonProdDeployAccess",
                 }
             },
             "non_prod_readonly": {
-                "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-${execution_context.params.env.type}-readonly",
-                    "expect": {"permission_set_name": "NonProdReadOnlyAccess"},
+                "sso": {
+                    "session_key": "providers.aws.sso_sessions.main",
+                    "account_key": "providers.aws.accounts_registry.dev",
+                    "permission_set_name": "NonProdReadOnlyAccess",
                 }
             },
             "ctl_state_synchronizer": {
-                "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-${identity.account_key}-ctl-state-synchronizer",
-                    "expect": {"role_name": "oxygen-ctl-state-synchronizer"},
+                "assume_role": {
+                    "from": "providers.aws.credential_sources.ctl_entry",
+                    "role_name": "oxygen-ctl-state-synchronizer",
                 }
             },
             "ctl_entry": {
-                "profile": {
-                    "profile_name": "${execution_context.params.main_tag}-ctl-entry",
-                    "expect": {
-                        "account_key": "ctl_plane",
-                        "permission_set_name": "CtlEntryAccess",
-                    },
+                "sso": {
+                    "session_key": "providers.aws.sso_sessions.main",
+                    "account_key": "providers.aws.accounts_registry.ctl_plane",
+                    "permission_set_name": "CtlEntryAccess",
                 }
             },
         }
@@ -144,7 +154,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -168,7 +178,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -182,7 +192,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -220,7 +230,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -234,13 +244,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
             )
         )
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_unimplemented_credential_implementation_fails(self):
+    def test_unimplemented_credential_acquisition_fails(self):
         # Only 'local' (profile-based) acquisition is built; 'ci'
         # (AssumeRoleWithWebIdentity — planned rename: web_identity) is declared and
         # validated in cfg but not implemented, so it must fail explicitly.
@@ -283,7 +293,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -297,7 +307,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.credential_sources,
             execution_context=self.context,
-            implementation_key="profile",
+            implementation_key="sso",
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
             target_roles=self.target_roles,
@@ -329,7 +339,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.credential_sources,
             execution_context=self.context,
-            implementation_key="profile",
+            implementation_key="sso",
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
             target_roles=self.target_roles,
@@ -348,7 +358,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
                 target_roles=self.target_roles,
@@ -362,7 +372,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
             )
 
@@ -375,7 +385,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.credential_sources,
             execution_context=self.context,
-            implementation_key="profile",
+            implementation_key="sso",
             execution_access_mode="force_bypass",
             provider_options={"force_bypass_credential_profile": "my-sandbox-admin"},
         )
@@ -391,7 +401,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="force_bypass",
             )
 
@@ -412,7 +422,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry={},
                 execution_access_mode="force_bypass",
                 provider_options={"force_bypass_credential_profile": "my-sandbox-admin"},
@@ -465,7 +475,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -492,7 +502,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
             )
@@ -509,7 +519,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 self.credential_sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=account_registry,
                 ctl_role_chain=self.ctl_role_chain,
                 target_roles=self.target_roles,
@@ -530,7 +540,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.identities,
                 sources,
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
                 target_roles=self.target_roles,
@@ -581,7 +591,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             self.identities,
             self.credential_sources,
             execution_context=self.context,
-            implementation_key="profile",
+            implementation_key="sso",
             account_registry={},
         )
         self.assertNotIn("AWS_PROFILE", target_env)
@@ -607,13 +617,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 "resolve_configured_profile_account_id",
                 return_value="111111111111",
             ),
-            mock.patch.object(aws_adapter.ctl_state, "assert_profile_caller") as assertion,
+            mock.patch.object(aws_adapter.ctl_state, "assert_caller") as assertion,
         ):
             credential = aws_adapter.resolve_ctl_state_credential(
                 self.executions["ctl_state_dev_synchronizer"],
                 Path("/cfg"),
                 execution_context=self.context,
-                implementation_key="profile",
+                implementation_key="sso",
                 operation="sync",
                 bucket_name="oxygen-live-ctl-state",
                 execution_access_mode="agreed_direct",
@@ -627,6 +637,69 @@ class AwsAccessResolutionTests(unittest.TestCase):
             label="ctl-state sync execution",
         )
 
+
+
+class CallerAssertionTakesACredentialBindingTests(unittest.TestCase):
+    """§105: a profile is one way to HOLD a credential, not the only one.
+
+    `web_identity` and `atmos_auth` acquire credentials with no profile to name,
+    and the assertion they must pass is identical — prove the account, then prove
+    the principal. The probe was already ambient-capable in the box; only the
+    host-side wrapper insisted on a profile.
+    """
+
+    def _module(self):
+        import importlib.util
+        script = (Path(__file__).resolve().parents[1]
+                  / "step_utils" / "assert_aws_access.py")
+        spec = importlib.util.spec_from_file_location("aaa_under_test", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_credentials_are_overlaid_on_the_environment_not_substituted(self):
+        """A bare credential mapping would leave the AWS CLI unable to find its
+        own binary: no PATH, no HOME."""
+
+        module = self._module()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["env"] = kwargs.get("env")
+            return types.SimpleNamespace(
+                returncode=0, stdout='{"Account":"1","Arn":"a"}', stderr=""
+            )
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            module.get_caller_identity(credentials={"AWS_ACCESS_KEY_ID": "AKIA"})
+        self.assertEqual(seen["env"]["AWS_ACCESS_KEY_ID"], "AKIA")
+        self.assertIn("PATH", seen["env"])
+        self.assertNotIn("--profile", seen["cmd"])
+
+    def test_a_profile_still_takes_the_profile_flag_and_no_env(self):
+        module = self._module()
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["env"] = kwargs.get("env")
+            return types.SimpleNamespace(
+                returncode=0, stdout='{"Account":"1","Arn":"a"}', stderr=""
+            )
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            module.get_caller_identity("some-profile")
+        self.assertIn("--profile", seen["cmd"])
+        self.assertIsNone(seen["env"])
+
+    def test_a_profile_and_credentials_together_are_refused(self):
+        """They select different principals, so which one was asserted would be
+        undecidable."""
+
+        module = self._module()
+        with self.assertRaisesRegex(RuntimeError, "OR credentials"):
+            module.get_caller_identity("p", credentials={"AWS_ACCESS_KEY_ID": "x"})
 
 class CallerIdentityAssertionTests(unittest.TestCase):
     @mock.patch.dict(

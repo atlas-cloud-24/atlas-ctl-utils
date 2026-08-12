@@ -4,7 +4,6 @@ Each test names the assertion it pins, so a future edit that drops one fails
 here rather than silently widening what a preset may do.
 """
 
-
 from __future__ import annotations
 
 import sys
@@ -117,7 +116,7 @@ class ImportTest(PresetTestCase):
         write(self.root / "base" / "a.yaml", "key: 1\n")
         write(
             self.root / "consumer" / cfg_presets.IMPORTS_FILENAME,
-            'imports:\n'
+            "imports:\n"
             '  - from: /base\n    import: "*"\n    as: one\n'
             '  - from: /base\n    import: "*"\n    as: two\n',
         )
@@ -262,7 +261,10 @@ class ParamTest(PresetTestCase):
 
 class AliasTest(PresetTestCase):
     def test_alias_resolves_inside_the_preset(self):
-        write(self.root / "base" / cfg_presets.ALIASES_FILENAME, "tag: ${execution_context.params.main_tag}\n")
+        write(
+            self.root / "base" / cfg_presets.ALIASES_FILENAME,
+            "tag: ${execution_context.params.main_tag}\n",
+        )
         write(self.root / "base" / "a.yaml", "role_name: ${tag}-runner\n")
         write(
             self.root / "consumer" / cfg_presets.IMPORTS_FILENAME,
@@ -335,8 +337,7 @@ class CompositionTest(PresetTestCase):
         for side, value in (("left", left_value), ("right", right_value)):
             write(
                 self.root / side / cfg_presets.IMPORTS_FILENAME,
-                'imports:\n  - from: /leaf\n    import: "*"\n'
-                f"    with:\n      flavour: {value}\n",
+                f'imports:\n  - from: /leaf\n    import: "*"\n    with:\n      flavour: {value}\n',
             )
             write(self.root / side / f"{side}.yaml", f"{side}_key: 1\n")
         write(

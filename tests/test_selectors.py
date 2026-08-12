@@ -237,24 +237,24 @@ class ProviderOptionsTests(unittest.TestCase):
         parser.add_argument("--provider-options", dest="provider_options",
                             action=execution_providers.ProviderOptionsAction, default={})
         args = parser.parse_args([
-            "--provider-options", "aws.credential_implementation=profile,aws.x=1",
+            "--provider-options", "aws.credential_acquisition=sso,aws.x=1",
             "--provider-options", "azure.y=2",
         ])
         self.assertEqual(args.provider_options, {
-            "aws.credential_implementation": "profile", "aws.x": "1", "azure.y": "2"})
+            "aws.credential_acquisition": "sso", "aws.x": "1", "azure.y": "2"})
 
     def test_key_must_be_provider_namespaced(self):
         with self.assertRaisesRegex(Exception, "provider-namespaced"):
-            execution_providers.parse_provider_options("credential_implementation=profile")
+            execution_providers.parse_provider_options("credential_acquisition=sso")
 
     def test_malformed_pair_rejected(self):
         with self.assertRaisesRegex(Exception, "<provider>.<key>=<value>"):
             execution_providers.parse_provider_options("aws.bogus")
 
     def test_subset_for_one_provider_strips_the_prefix(self):
-        options = {"aws.credential_implementation": "profile", "azure.k": "v"}
+        options = {"aws.credential_acquisition": "sso", "azure.k": "v"}
         self.assertEqual(execution_providers.provider_options_for(options, "aws"),
-                         {"credential_implementation": "profile"})
+                         {"credential_acquisition": "sso"})
         self.assertEqual(execution_providers.provider_options_for(options, "gcp"), {})
 
     def test_options_must_address_a_declared_provider(self):
@@ -262,11 +262,11 @@ class ProviderOptionsTests(unittest.TestCase):
             execution_providers.validate_provider_options_addressing({"azure.k": "v"}, ["aws"])
         execution_providers.validate_provider_options_addressing({"aws.k": "v"}, ["aws"])
 
-    def test_credential_implementation_is_independent_of_runtime_mode(self):
+    def test_credential_acquisition_is_independent_of_runtime_mode(self):
         # WHERE you run and HOW you authenticate are separate axes.
         self.assertEqual(
             execution_providers.resolve_provider_implementation_key(
-                {"aws.credential_implementation": "web_identity"}, "aws"),
+                {"aws.credential_acquisition": "web_identity"}, "aws"),
             "web_identity")
         # REQUIRED — the engine has no implementation to default to
         with self.assertRaisesRegex(RuntimeError, "no credential implementation declared"):

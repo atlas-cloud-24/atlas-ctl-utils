@@ -107,7 +107,7 @@ class FinalizeStatusArgsTests(unittest.TestCase):
     def test_remote_default_is_the_providers_normal_mode(self):
         args = self._ns(
             all=True, scope="remote", ctl_state_local_root=None,
-            provider_options={"aws.credential_implementation": "profile"},
+            provider_options={"aws.credential_acquisition": "sso"},
         )
         cli_args.finalize_status_args(args)
         self.assertEqual(args.providers, ["aws"])
@@ -117,7 +117,7 @@ class FinalizeStatusArgsTests(unittest.TestCase):
         args = self._ns(
             all=True, scope="remote", ctl_state_local_root=None,
             provider_options={
-                "aws.credential_implementation": "profile",
+                "aws.credential_acquisition": "sso",
                 "aws.force_bypass_credential_profile": "dev-profile",
             },
         )

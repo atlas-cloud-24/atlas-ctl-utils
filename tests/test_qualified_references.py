@@ -2,7 +2,7 @@
 
 A bare key leaves the collection implied by the field NAME, which holds only
 where the two match. In this cfg they often do not — `input_param_sets` resolves
-against `param_sets`, `providers` against `ctl_providers` — so the value carries
+against `param_sets`, `providers` against `execution_providers` — so the value carries
 the path and a path naming the wrong collection is refused. That refusal is the
 whole point: without it the extra text is a comment.
 
@@ -56,7 +56,7 @@ class ResolveTest(unittest.TestCase):
         and find it."""
 
         with self.assertRaisesRegex(RuntimeError, "expected target_sources"):
-            cfg_references.resolve("ctl_providers.core", "target_sources", label="t")
+            cfg_references.resolve("execution_providers.core", "target_sources", label="t")
 
     def test_a_wildcard_segment_is_supplied_by_the_declaration(self):
         """One call covers every provider, so the adapter needs one rule per
@@ -130,7 +130,7 @@ class TheMechanismNamesNoCollectionTest(unittest.TestCase):
                                  ast.AsyncFunctionDef)) and ast.get_docstring(node):
                 node.body = node.body[1:]
         code = ast.unparse(tree)
-        for collection in ("target_sources", "param_sets", "ctl_providers",
+        for collection in ("target_sources", "param_sets", "execution_providers",
                            "accounts_registry", "target_roles", "credential_sources"):
             self.assertNotIn(collection, code, f"{collection} must be passed in, not held here")
 
@@ -151,7 +151,7 @@ class TheCatalogOwnsItsVocabularyTest(unittest.TestCase):
             {"source_key": "target_sources",
              "domains": "domains",
              "input_param_sets": "param_sets",
-             "providers": "ctl_providers"},
+             "providers": "execution_providers"},
             catalog_targets.TARGET_REFERENCE_FIELDS,
         )
 

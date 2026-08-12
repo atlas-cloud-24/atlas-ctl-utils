@@ -14,12 +14,12 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import tree as cfg_tree
+from engine.cli import args as cli_args
 from engine.execution import run_context as execution_run_context
+from engine.guardrails import policies as guardrails
 from engine.kernel import scalars as kernel_scalars
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import policy as run_policy
-from engine.cli import args as cli_args
-from engine.guardrails import policies as guardrails
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,9 +105,7 @@ def build_context(
 COVERAGE_FILENAME = "coverage.yaml"
 
 
-def load_coverage_assignments(
-    guardrails_cfg_root: Path, mode: str
-) -> list[dict[str, str]]:
+def load_coverage_assignments(guardrails_cfg_root: Path, mode: str) -> list[dict[str, str]]:
     """The DECLARED assignments needing a baseline, for one mode.
 
     Read from `coverage.yaml` in the guardrails repository, beside the baselines
@@ -150,9 +148,7 @@ def load_coverage_assignments(
                 f"{path}: guardrail_coverage.{mode}.assignments[{index}] "
                 "must be a non-empty mapping of params"
             )
-        merged = {
-            str(k): str(v) for k, v in {**shared, **entry}.items()
-        }
+        merged = {str(k): str(v) for k, v in {**shared, **entry}.items()}
         fingerprint = tuple(sorted(merged.items()))
         if fingerprint in seen:
             raise RuntimeError(
@@ -192,6 +188,7 @@ class NoMatchingPolicy(RuntimeError):
     broader than any one domain's policies, and `--policy` narrows it further.
     """
 
+
 def select_entries(
     entries: list[dict],
     policies: list[str] | None,
@@ -202,9 +199,7 @@ def select_entries(
     unknown = sorted(set(policies) - known_policies)
     if unknown:
         raise RuntimeError(f"unknown guardrail policies: {unknown}")
-    selected = [
-        entry for entry in entries if set(entry["policies"]) & set(policies)
-    ]
+    selected = [entry for entry in entries if set(entry["policies"]) & set(policies)]
     if not selected:
         # Same meaning as "no policy matched": under --all with --policy, most
         # assignments legitimately contain none of the requested policies.
@@ -227,8 +222,7 @@ def emit_coverage(entries: list[dict], *, status: str) -> None:
 
 def write_entries(entries: list[dict], guardrails_cfg_root: Path) -> None:
     for entry in entries:
-        path = guardrails.write_guardrail_baseline(
-            guardrails_cfg_root,
+        path = guardrails.BaselineStore(guardrails_cfg_root).write(
             subject=entry["subject"],
             values=entry["values"],
         )
@@ -245,7 +239,9 @@ def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None
         execution_context,
     )
     # whole-tree tooling activates every declared domain (see helper)
-    execution_context = execution_run_context.whole_tree_execution_context(ctl_cfg_root, execution_context)
+    execution_context = execution_run_context.whole_tree_execution_context(
+        ctl_cfg_root, execution_context
+    )
     scope_params = execution_run_context.scope_params_from_context(execution_context)
     temp_root = Path(tempfile.mkdtemp(prefix="atlas-guardrails-plt-"))
     try:
@@ -253,11 +249,9 @@ def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None
             ctl_cfg_root,
             temp_root,
         )
-        policies = guardrails.load_guardrail_policies(plt_cfg_root, owner="plt")
+        policies = guardrails.PolicySet("plt").load(plt_cfg_root)
         if not policies:
-            raise RuntimeError(
-                f"no PLT guardrail policies found under {plt_cfg_root}"
-            )
+            raise RuntimeError(f"no PLT guardrail policies found under {plt_cfg_root}")
         merged_dir = temp_root / "merged"
         cfg_tree.merge_plt_cfg_dirs(
             plt_cfg_root=plt_cfg_root,
@@ -272,24 +266,18 @@ def run_plt(args: argparse.Namespace, extra_params: dict[str, str] | None = None
             temp_root,
             execution_context,
         )
-        entries = guardrails.materialize_plt_guardrails(
+        entries = guardrails.Materializer(execution_context).plt(
             ctl_cfg_root,
             plt_cfg_root,
             rendered_dir,
-            execution_context,
             scope_params,
         )
         entries = select_entries(entries, args.policies, set(policies))
         if not entries:
-            raise NoMatchingPolicy(
-                f"no active PLT guardrail policy matched params {scope_params}"
-            )
+            raise NoMatchingPolicy(f"no active PLT guardrail policy matched params {scope_params}")
         if args.check:
-            guardrails.verify_materialized_guardrails(
-                entries,
-                guardrails_cfg_root,
-                policies,
-                owner="plt",
+            guardrails.Verifier(guardrails_cfg_root).check_materialized(
+                entries, policies, owner="plt"
             )
             emit_coverage(entries, status="covered")
         else:
@@ -312,13 +300,10 @@ def run_ctl(args: argparse.Namespace, extra_params: dict[str, str] | None = None
         ctl_cfg_root,
         execution_context,
     )
-    policies = guardrails.load_guardrail_policies(ctl_cfg_root, owner="ctl")
+    policies = guardrails.PolicySet("ctl").load(ctl_cfg_root)
     if not policies:
         raise RuntimeError("no CTL guardrail policies found")
-    entries = guardrails.materialize_ctl_guardrails(
-        ctl_cfg_root,
-        execution_context,
-    )
+    entries = guardrails.Materializer(execution_context).ctl(ctl_cfg_root)
     entries = select_entries(entries, args.policies, set(policies))
     if not entries:
         raise NoMatchingPolicy("no active CTL guardrail policy matched this context")
@@ -326,11 +311,8 @@ def run_ctl(args: argparse.Namespace, extra_params: dict[str, str] | None = None
     try:
         _, guardrails_cfg_root = bound_local_roots(ctl_cfg_root, temp_root)
         if args.check:
-            guardrails.verify_materialized_guardrails(
-                entries,
-                guardrails_cfg_root,
-                policies,
-                owner="ctl",
+            guardrails.Verifier(guardrails_cfg_root).check_materialized(
+                entries, policies, owner="ctl"
             )
             emit_coverage(entries, status="covered")
         else:

@@ -27,6 +27,7 @@ from engine.kernel import git as kernel_git
 from engine.kernel import paths as kernel_paths
 from engine.kernel import process as kernel_process
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.plt import dispatch as plt_dispatch
 from engine.run import actions as run_actions
 from engine.run import policy as run_policy
 from engine.state import lifecycle as state_lifecycle
@@ -55,6 +56,7 @@ def run_targets(
     child_command_spec: dict | None = None,
     credential_refresh_modes: dict | None = None,
     secret_store=None,
+    plt_provider_dispatch: plt_dispatch.ProviderDispatch | None = None,
 ) -> None:
     """Clone and run all active target runs.
 
@@ -96,20 +98,24 @@ def run_targets(
         # this run's log, so the workflow keeps the aggregate. It executes under this
         # run's ctl-state lock — flock is exclusive and non-blocking, so acquiring it
         # again would fail outright.
-        if child_command_spec is not None and state_run_store.load_run_metadata(run_dir).get(
-            "run_type"
-        ) == "workflow":
+        if (
+            child_command_spec is not None
+            and state_run_store.load_run_metadata(run_dir).get("run_type") == "workflow"
+        ):
             target_key = target_run.get("target")
             argv = catalog_workflow.build_child_target_command(
-                child_command_spec, target_key,
-                parent_run_dir=run_dir, parent_run_id=run_id,
+                child_command_spec,
+                target_key,
+                parent_run_dir=run_dir,
+                parent_run_id=run_id,
                 action=target_run.get("action"),
             )
             logging.info("Spawning child target run: %s", target_key)
             child_env = dict(os.environ)
             child_env[state_run_store.CHILD_LOCK_GRANT_ENV] = state_run_store.mint_child_lock_grant(
                 Path(child_command_spec["ctl_state_local_root"]),
-                child_kind="target", child_key=target_key,
+                child_kind="target",
+                child_key=target_key,
             )
             # The workflow's OWN slot has to record the mutation. This branch
             # spawns and `continue`s, so it never reaches the inline mark below
@@ -141,21 +147,29 @@ def run_targets(
             provider_implementation_key=provider_implementation_key,
             execution_access_modes=execution_access_modes,
             provider_options=provider_options,
-            )
+        )
 
         procedure_key = target_run.get("procedure")
         if not isinstance(procedure_key, str) or not procedure_key:
             raise RuntimeError(f"❌ target run {target_run_id!r} must define a non-empty procedure")
+        provider_selection = target_run.get("plt_provider")
         target_view_dir = (
             plt_targets_dir_path
             if (plt_targets_dir_path / "input").is_dir()
+            or (plt_targets_dir_path / "selection.yaml").is_file()
             else plt_targets_dir_path / target_run_id
         )
         origin_cfg_path = target_view_dir / "input"
-        if not origin_cfg_path.is_dir():
-            raise RuntimeError(f"❌ target_run input cfg dir not found for target_run {target_run_id!r}: {origin_cfg_path}")
         target_cfg_dir = target_view_dir / "resolved"
-        os.makedirs(target_cfg_dir, exist_ok=True)
+        if provider_selection is None:
+            if not origin_cfg_path.is_dir():
+                raise RuntimeError(
+                    f"❌ target_run input cfg dir not found for target_run "
+                    f"{target_run_id!r}: {origin_cfg_path}"
+                )
+            os.makedirs(target_cfg_dir, exist_ok=True)
+        elif plt_provider_dispatch is None:
+            raise RuntimeError("❌ PLT provider selection has no provider dispatcher")
         target_state_run_dir, target_instance_address = state_lifecycle.begin_workflow_target_run(
             run_dir, target_run, execution_context
         )
@@ -166,14 +180,18 @@ def run_targets(
         )
         os.makedirs(target_artifacts_dir, exist_ok=True)
 
-        copied_execution_context = execution_run_context.ensure_repo_execution_context(repo_path, execution_context_path)
+        copied_execution_context = execution_run_context.ensure_repo_execution_context(
+            repo_path, execution_context_path
+        )
         # Everything this target emits also lands in its own log.
         target_log = state_run_store.target_run_log(
             target_state_run_dir if target_instance_address is not None else None
         )
         target_log.__enter__()
         try:
-            repo_step_ids, repo_steps = cfg_materialize.get_repo_local_steps(repo_path, member_action, procedure_key)
+            repo_step_ids, repo_steps = cfg_materialize.get_repo_local_steps(
+                repo_path, member_action, procedure_key
+            )
             run_manifest = {
                 "run_id": run_id,
                 "branch": target_run.get("branch"),
@@ -181,7 +199,7 @@ def run_targets(
                 "action": member_action,
                 "procedure": procedure_key,
                 "active_steps": repo_step_ids,
-                "origin_cfg": str(origin_cfg_path),
+                **({"origin_cfg": str(origin_cfg_path)} if provider_selection is None else {}),
                 "execution_context_file": str(execution_context_path),
                 "execution_context_keys": sorted(execution_context),
             }
@@ -194,9 +212,15 @@ def run_targets(
             for repo_step in repo_steps:
                 repo_step_id = repo_step["id"]
                 repo_step_path = repo_step["path"]
-                state_lifecycle.log_target_run_banner(f"[{member_action}] [{target_run_id}] [{repo_step_id}]", ch="-")
+                state_lifecycle.log_target_run_banner(
+                    f"[{member_action}] [{target_run_id}] [{repo_step_id}]", ch="-"
+                )
                 repo_step_runtime = repo_step.get("runtime", {})
-                supported = set(repo_step_runtime.get("supported_execution_runtime_modes", run_policy.EXECUTION_RUNTIME_MODES))
+                supported = set(
+                    repo_step_runtime.get(
+                        "supported_execution_runtime_modes", run_policy.EXECUTION_RUNTIME_MODES
+                    )
+                )
                 if execution_runtime_mode not in supported:
                     raise RuntimeError(
                         f"❌ execution runtime {execution_runtime_mode!r} not supported by target_run "
@@ -204,7 +228,9 @@ def run_targets(
                     )
                 step_run_cmd = [runtime_dispatcher]
                 repo_step_env = dict(target_env)
-                repo_step_env["ATLAS_EXECUTION_CONTEXT_FILE"] = execution_run_context.EXECUTION_CONTEXT_FILENAME
+                repo_step_env["ATLAS_EXECUTION_CONTEXT_FILE"] = (
+                    execution_run_context.EXECUTION_CONTEXT_FILENAME
+                )
                 repo_step_env["cfg_keys"] = json.dumps(repo_step.get("cfg_keys") or {})
                 repo_step_env["STEP_WRITE_VALUES_JSON"] = (
                     "true" if repo_step_runtime.get("values_json", True) else "false"
@@ -218,7 +244,9 @@ def run_targets(
                 # CTL owns the box; hand the dispatcher the runtime + the
                 # target_run's declared box spec. step_dir locates src/step.sh in the repo.
                 repo_step_env["ATLAS_EXECUTION_RUNTIME_MODE"] = execution_runtime_mode
-                repo_step_env["ATLAS_STEP_NAME"] = kernel_process._step_box_name(target_run_id, repo_step_id)
+                repo_step_env["ATLAS_STEP_NAME"] = kernel_process._step_box_name(
+                    target_run_id, repo_step_id
+                )
                 repo_step_env["ATLAS_STEP_IMAGE"] = repo_step_runtime["image"]
                 repo_step_env["ATLAS_STEP_DOCKER_BUILD"] = (
                     "true" if repo_step_runtime.get("docker_build", False) else "false"
@@ -268,7 +296,9 @@ def run_targets(
             raise
         finally:
             target_log.__exit__(None, None, None)
-            repo_execution_context_path = repo_path / execution_run_context.EXECUTION_CONTEXT_FILENAME
+            repo_execution_context_path = (
+                repo_path / execution_run_context.EXECUTION_CONTEXT_FILENAME
+            )
             if copied_execution_context and repo_execution_context_path.is_file():
                 repo_execution_context_path.unlink()
 
@@ -342,9 +372,7 @@ def run_pipeline(
             agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
             force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
             force_skip_guardrails=force_skip_guardrails,
-            force_skip_full_cfg_validation_gate=(
-                force_skip_full_cfg_validation_gate
-            ),
+            force_skip_full_cfg_validation_gate=(force_skip_full_cfg_validation_gate),
             force_skip_execution_identity_preflight_check=(
                 force_skip_execution_identity_preflight_check
             ),
@@ -381,7 +409,9 @@ def run_pipeline(
 
     # Preserve the runtime binding contract after the live gate passes.
     adapter_access_mode, adapter_options = execution_providers.provider_inputs(
-        execution_providers.run_provider(execution_context), execution_access_modes, provider_options
+        execution_providers.run_provider(execution_context),
+        execution_access_modes,
+        provider_options,
     )
     provider_adapter.validate_active_target_access(
         active_target_runs,
@@ -435,14 +465,18 @@ def run_pipeline(
         run_dir,
         agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
         force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        provisions_ctl_state_backend=state_sync.run_provisions_ctl_state_backend(workflow_cfg, action_cfg),
+        provisions_ctl_state_backend=state_sync.run_provisions_ctl_state_backend(
+            workflow_cfg, action_cfg
+        ),
         selected_graph_provisions_ctl_state_backend=selected_graph_provisions_backend,
         backend_absence_confirmed=backend_absence_confirmed,
         execution_access_modes=execution_access_modes,
         provider_options=provider_options,
         provider_implementation_key=provider_implementation_key,
     )
-    execution_context_path = execution_run_context.write_execution_context_artifact(run_dir, execution_context)
+    execution_context_path = execution_run_context.write_execution_context_artifact(
+        run_dir, execution_context
+    )
 
     if use_local_tooling_cfg:
         tooling_refs = cfg_tooling.load_local_tooling_cfg(ctl_cfg_root)
@@ -452,20 +486,24 @@ def run_pipeline(
 
     logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
 
+    provider_dispatch = plt_dispatch.ProviderDispatch(ctl_cfg_root, plt_cfg_root)
+
     # Prepare pipeline config
-    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = commands_selection.prepare_pipeline_cfg(
-        plt_cfg_root,
-        workflow_cfg,
-        action_cfg,
-        artifacts_dir,
-        ctl_profile,
-        scope_params=scope_params,
-        execution_context=execution_context,
-        target_repo_key=target_repo_key,
-        require_target_ref=require_target_ref,
-        require_commit_refs=require_commit_refs,
-        refs=refs,
-        active_target_runs=active_target_runs,
+    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = (
+        commands_selection.prepare_pipeline_cfg(
+            plt_cfg_root,
+            workflow_cfg,
+            action_cfg,
+            artifacts_dir,
+            ctl_profile,
+            scope_params=scope_params,
+            execution_context=execution_context,
+            target_repo_key=target_repo_key,
+            require_target_ref=require_target_ref,
+            require_commit_refs=require_commit_refs,
+            refs=refs,
+            active_target_runs=active_target_runs,
+        )
     )
     state_run_store.update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
     # chain, PER TARGET: each target_run merges its own
@@ -479,7 +517,10 @@ def run_pipeline(
     # trades fail-fast (catch a bad target before target #1 mutates anything) for not
     # doing the work twice. A target run has no children, so the flag is a no-op.
     precheck_runs = active_target_runs
-    if skip_children_precheck and state_run_store.load_run_metadata(run_dir).get("run_type") == "workflow":
+    if (
+        skip_children_precheck
+        and state_run_store.load_run_metadata(run_dir).get("run_type") == "workflow"
+    ):
         logging.info(
             "Skipping the child pre-check (--skip-children-precheck); each target "
             "renders and validates its own cfg when it runs"
@@ -492,14 +533,26 @@ def run_pipeline(
         target_context = execution_run_context.build_target_execution_context(
             target_run_id, target_run, execution_context
         )
-        target_rendered_dir = cfg_views.prepare_target_cfg_view(
-            target_run_id, target_run,
-            plt_cfg_root=plt_cfg_root,
-            target_cfg_dir=cfg_views.target_cfg_view_dir(run_dir, run_type_now, target_run_id),
-            ctl_profile=ctl_profile,
-            scope_params=execution_run_context.scope_params_from_context(target_context),
-            execution_context=target_context,
-        )
+        target_cfg_dir = cfg_views.target_cfg_view_dir(run_dir, run_type_now, target_run_id)
+        if provider_dispatch.enabled:
+            target_rendered_dir, provider_selection = provider_dispatch.prepare_target_view(
+                target_run_id,
+                target_run,
+                execution_context=target_context,
+                target_cfg_dir=target_cfg_dir,
+                scope_params=execution_run_context.scope_params_from_context(target_context),
+            )
+            target_run["plt_provider"] = provider_selection
+        else:
+            target_rendered_dir = cfg_views.prepare_target_cfg_view(
+                target_run_id,
+                target_run,
+                plt_cfg_root=plt_cfg_root,
+                target_cfg_dir=target_cfg_dir,
+                ctl_profile=ctl_profile,
+                scope_params=execution_run_context.scope_params_from_context(target_context),
+                execution_context=target_context,
+            )
         guardrails_verify.verify_guardrails(
             ctl_cfg_root,
             plt_cfg_root,
@@ -519,7 +572,9 @@ def run_pipeline(
     run_metadata = state_run_store.load_run_metadata(run_dir)
     ctl_state_local_root_value = run_metadata.get("ctl_state_local_root")
     if isinstance(ctl_state_local_root_value, str) and ctl_state_local_root_value:
-        state_status.mark_removed_definitions_outdated(Path(ctl_state_local_root_value), ctl_cfg_root)
+        state_status.mark_removed_definitions_outdated(
+            Path(ctl_state_local_root_value), ctl_cfg_root
+        )
 
     catalog_workflow.write_target_flow_artifact(
         ctl_cfg_root,
@@ -550,6 +605,10 @@ def run_pipeline(
         execution_context=execution_context,
     )
 
+    pipeline_cfg_now = kernel_yaml_io.load_yaml(pipeline_run_cfg_path) or {}
+    pipeline_cfg_now["target_runs"] = active_target_runs
+    kernel_yaml_io.write_yaml_file(pipeline_run_cfg_path, pipeline_cfg_now)
+
     # Distribute target_run input views from the rendered tree
     plt_targets_dir_path = cfg_materialize.run_cfg_distribution(
         pipeline_run_cfg_path, plt_targets_dir_path, run_type_now
@@ -569,9 +628,7 @@ def run_pipeline(
                 run_dir,
                 {
                     key: only_target[key]
-                    for key in (
-                        "target_definition_sha256", "target_cfg_view_sha256"
-                    )
+                    for key in ("target_definition_sha256", "target_cfg_view_sha256")
                 },
             )
     # Prepared snapshot: cfg layers + run-level metadata are immutable from here.
@@ -584,9 +641,7 @@ def run_pipeline(
         target_run["source_commit"] = source_commit
         target_run["cfg_source_commit"] = cfg_source_commit
         target_run["source_state"] = (
-            "clean"
-            if target_source_state == "clean" and cfg_source_state == "clean"
-            else "dirty"
+            "clean" if target_source_state == "clean" and cfg_source_state == "clean" else "dirty"
         )
         target_run["ref_policy"] = ctl_ref_policy
     if state_run_store.load_run_metadata(run_dir).get("run_type") == "target":
@@ -596,9 +651,7 @@ def run_pipeline(
                 run_dir,
                 {
                     key: only_target[key]
-                    for key in (
-                        "source_commit", "cfg_source_commit", "source_state", "ref_policy"
-                    )
+                    for key in ("source_commit", "cfg_source_commit", "source_state", "ref_policy")
                 },
             )
 
@@ -609,7 +662,8 @@ def run_pipeline(
     run_metadata_now = state_run_store.load_run_metadata(run_dir)
     child_command_spec = {
         "ctl_entrypoint": kernel_paths.ctl_utils_root().parent
-            / "atlas-ctl-orchestrator" / "ctl.py",
+        / "atlas-ctl-orchestrator"
+        / "ctl.py",
         "ctl_cfg_root": ctl_cfg_root,
         "ctl_profile": ctl_profile,
         "ctl_state_local_root": run_metadata_now.get("ctl_state_local_root"),
@@ -620,8 +674,9 @@ def run_pipeline(
         "provider_options": dict(provider_options or {}),
         "execution_access_modes": dict(execution_access_modes or {}),
         "plt_overlays": list(final_plt_overlays or []),
-        "force_skip_execution_identity_preflight_check":
-            list(force_skip_execution_identity_preflight_check or []),
+        "force_skip_execution_identity_preflight_check": list(
+            force_skip_execution_identity_preflight_check or []
+        ),
         "agreed_defer_ctl_state_backend_sync": agreed_defer_ctl_state_backend_sync,
         "force_skip_ctl_state_backend_sync": force_skip_ctl_state_backend_sync,
         "force_skip_guardrails": force_skip_guardrails,
@@ -636,12 +691,20 @@ def run_pipeline(
 
     # Run target runs
     credential_refresh_modes = run_policy.validate_credential_refresh_modes(
-        ctl_cfg_root, ctl_profile, credential_refresh_modes, providers,
+        ctl_cfg_root,
+        ctl_profile,
+        credential_refresh_modes,
+        providers,
         execution_access_modes,
     )
     run_targets(
-        active_target_runs, run_dir, plt_targets_dir_path, execution_context_path,
-        action, execution_context, run_id,
+        active_target_runs,
+        run_dir,
+        plt_targets_dir_path,
+        execution_context_path,
+        action,
+        execution_context,
+        run_id,
         secret_store=cfg_secrets.SecretStore(
             ctl_cfg_root,
             execution_context=execution_context,
@@ -659,9 +722,10 @@ def run_pipeline(
         provider_options=provider_options,
         execution_runtime_mode=execution_runtime_mode,
         skip_up_to_date=skip_up_to_date,
+        plt_provider_dispatch=provider_dispatch,
     )
 
-    #(b3): a WORKFLOW owns ordering, policy and the run verdict — not cfg.
+    # (b3): a WORKFLOW owns ordering, policy and the run verdict — not cfg.
     # Each child has received its complete derivation, so the workflow-side copy is
     # dropped rather than published twice.
     if state_run_store.load_run_metadata(run_dir).get("run_type") == "workflow":

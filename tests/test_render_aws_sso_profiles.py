@@ -30,14 +30,12 @@ def profile_model() -> dict:
                 "session_key": "non_prod",
                 "account_id": "111111111111",
                 "role_name": "NonProdDeployAccess",
-                "region": "eu-west-2",
             },
             "test_readonly": {
                 "profile_name": "oxygen-live-test-readonly",
                 "session_key": "non_prod",
                 "account_id": "222222222222",
                 "role_name": "NonProdReadOnlyAccess",
-                "region": "eu-west-2",
             },
         },
     }
@@ -51,6 +49,17 @@ class AwsSsoProfileRendererTests(unittest.TestCase):
         self.assertIn('"${SSO_START_URL}"', rendered)
         self.assertIn("profile.oxygen-live-dev-deploy.sso_account_id 111111111111", rendered)
         self.assertIn("profile.oxygen-live-test-readonly.sso_role_name NonProdReadOnlyAccess", rendered)
+
+    def test_a_profile_carries_no_region(self):
+        """The session declares `sso_region`, where Identity Center lives. A
+        profile region only defaults an interactive `aws --profile x` with no
+        `--region`, and every Atlas run states the region as a run input."""
+
+        rendered = renderer.render_model(profile_model())
+
+        self.assertIn("sso-session.oxygen-non-prod.sso_region eu-west-2", rendered)
+        self.assertNotIn("profile.oxygen-live-dev-deploy.region", rendered)
+        self.assertNotIn("profile.oxygen-live-test-readonly.region", rendered)
 
     def test_rejects_profile_with_missing_session(self):
         model = profile_model()

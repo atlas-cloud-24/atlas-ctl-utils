@@ -18,10 +18,7 @@ def write(path: Path, content: str) -> None:
 
 
 def context(**params) -> dict[str, object]:
-    return {
-        f"execution_context.params.{key}": value
-        for key, value in params.items()
-    }
+    return {f"execution_context.params.{key}": value for key, value in params.items()}
 
 
 def write_plt_policy(
@@ -58,7 +55,7 @@ def write_env_scope(plt_root: Path) -> None:
         "target_path: /env\n"
         "selectors:\n"
         "  match:\n"
-        "    execution_context.params.env.type: dev\n"
+        "    execution_context.params.env.type: dev\n",
     )
 
 
@@ -77,9 +74,7 @@ class JsonPointerTest(unittest.TestCase):
         )
 
     def test_explicit_null_differs_from_missing(self):
-        self.assertIsNone(
-            guardrails.JsonPointer.get({"value": None}, "/value", label="test")
-        )
+        self.assertIsNone(guardrails.JsonPointer.get({"value": None}, "/value", label="test"))
         with self.assertRaisesRegex(RuntimeError, "does not exist"):
             guardrails.JsonPointer.get({}, "/value", label="test")
 
@@ -282,15 +277,15 @@ class VerificationTest(unittest.TestCase):
             )
             write(
                 ctl / "settings.yaml",
-                "settings:\n"
-                "  enabled: true\n",
+                "settings:\n  enabled: true\n",
             )
-            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={"/settings/enabled": True})
-            guardrails.BaselineStore(baselines).write(subject={"kind": "execution_context"}, values={"/params/main_tag": "oxygen"})
-            guardrails.Verifier(baselines).check_ctl(
-                ctl,
-                context(main_tag="oxygen")
-                )
+            guardrails.BaselineStore(baselines).write(
+                subject={"kind": "ctl_cfg"}, values={"/settings/enabled": True}
+            )
+            guardrails.BaselineStore(baselines).write(
+                subject={"kind": "execution_context"}, values={"/params/main_tag": "oxygen"}
+            )
+            guardrails.Verifier(baselines).check_ctl(ctl, context(main_tag="oxygen"))
 
     def test_false_differs_from_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,7 +301,9 @@ class VerificationTest(unittest.TestCase):
                 "    protected_paths: [/settings/enabled]\n",
             )
             write(ctl / "settings.yaml", "settings:\n  enabled: 0\n")
-            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={"/settings/enabled": False})
+            guardrails.BaselineStore(baselines).write(
+                subject={"kind": "ctl_cfg"}, values={"/settings/enabled": False}
+            )
             with self.assertRaisesRegex(RuntimeError, "guardrail mismatch"):
                 guardrails.Verifier(baselines).check_ctl(ctl, {})
 
@@ -325,9 +322,7 @@ class VerificationTest(unittest.TestCase):
             write_env_scope(plt)
             write(
                 rendered / "env" / "settings.yaml",
-                "settings:\n"
-                "  regions:\n"
-                "    - eu-west-2\n",
+                "settings:\n  regions:\n    - eu-west-2\n",
             )
             subject = {
                 "kind": "plt_rendered_target",
@@ -338,14 +333,12 @@ class VerificationTest(unittest.TestCase):
                     }
                 },
             }
-            guardrails.BaselineStore(baselines).write(subject=subject, values={"/settings/regions/0": "eu-west-2"})
+            guardrails.BaselineStore(baselines).write(
+                subject=subject, values={"/settings/regions/0": "eu-west-2"}
+            )
             guardrails.Verifier(baselines).check_plt(
-                ctl,
-                plt,
-                rendered,
-                context(**{"env.type": "dev"}),
-                {"env.type": "dev"}
-                )
+                ctl, plt, rendered, context(**{"env.type": "dev"}), {"env.type": "dev"}
+            )
 
     def test_universal_policy_covers_new_scope_and_fails_without_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,17 +357,13 @@ class VerificationTest(unittest.TestCase):
                 "target_path: /env\n"
                 "selectors:\n"
                 "  match:\n"
-                "    execution_context.params.env.type: test\n"
-                    )
+                "    execution_context.params.env.type: test\n",
+            )
             write(rendered / "env" / "value.yaml", "region: eu-west-2\n")
             with self.assertRaisesRegex(RuntimeError, "has no baseline"):
                 guardrails.Verifier(root / "baselines").check_plt(
-                    ctl,
-                    plt,
-                    rendered,
-                    context(**{"env.type": "test"}),
-                    {"env.type": "test"}
-                    )
+                    ctl, plt, rendered, context(**{"env.type": "test"}), {"env.type": "test"}
+                )
 
     def test_missing_baseline_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -390,10 +379,7 @@ class VerificationTest(unittest.TestCase):
             )
             write(ctl / "settings.yaml", "settings:\n  value: stable\n")
             with self.assertRaisesRegex(RuntimeError, "has no baseline"):
-                guardrails.Verifier(root / "baselines").check_ctl(
-                    ctl,
-                    {}
-                    )
+                guardrails.Verifier(root / "baselines").check_ctl(ctl, {})
 
     def test_baseline_path_without_policy_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,7 +395,9 @@ class VerificationTest(unittest.TestCase):
                 "    protected_paths: [/settings/value]\n",
             )
             write(ctl / "settings.yaml", "settings:\n  value: stable\n")
-            guardrails.BaselineStore(baselines).write(subject={"kind": "ctl_cfg"}, values={
+            guardrails.BaselineStore(baselines).write(
+                subject={"kind": "ctl_cfg"},
+                values={
                     "/settings/value": "stable",
                     "/settings/unowned": "bad",
                 },

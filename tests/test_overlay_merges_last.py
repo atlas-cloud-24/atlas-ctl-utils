@@ -16,6 +16,7 @@ version of this test failed to catch.
 Last means last BEFORE render — an overlay's values interpolate like any other
 cfg, and `alarms_disabled` sets `alarms_cfg: ${alarms_disabled_empty_map}`.
 """
+
 import sys
 import tempfile
 import unittest
@@ -36,7 +37,11 @@ def _write_scope(root: Path, rel: str, *, target_path: str, selectors: dict, pay
     scope_root = root / rel
     kernel_yaml_io.write_yaml_file(
         scope_root / "__meta__.yaml",
-        {"type": "scope", "target_path": target_path, "selectors": selectors},
+        {
+            "type": "scope",
+            "target_path": target_path,
+            "selectors": selectors,
+        },
     )
     kernel_yaml_io.write_yaml_file(scope_root / "service.yaml", payload)
 
@@ -62,7 +67,8 @@ class OverlayMergesLastTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "cfg"
             _write_scope(
-                root, "domains/env/dev",
+                root,
+                "domains/env/dev",
                 target_path="/env",
                 selectors={
                     "contains": {"execution_context.target.domains": "env"},
@@ -71,7 +77,8 @@ class OverlayMergesLastTest(unittest.TestCase):
                 payload={"service_cfg": {"a-api": {"mode": "composed", "port": 8080}}},
             )
             _write_overlay(
-                root, "maintenance",
+                root,
+                "maintenance",
                 scope_rel="domains/env/dev",
                 payload={"service_cfg": {"a-api": {"mode": "maintenance"}}},
             )

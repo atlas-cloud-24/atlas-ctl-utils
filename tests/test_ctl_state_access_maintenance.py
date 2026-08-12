@@ -155,7 +155,7 @@ class AccountRegistryTests(unittest.TestCase):
             }
             catalogs["credential_sources"] = {
                 key: {
-                    "profile": {
+                    "sso": {
                         "profile_name": key,
                         "expect": {"account_key": account_key, "role_name": "Admin"},
                     }
@@ -171,7 +171,7 @@ class AccountRegistryTests(unittest.TestCase):
                 {"execution_identities": {"aws": executions["dev_direct"]}},
                 catalogs,
                 execution_context=context,
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(dev_cfg_result["status"], "passed")
@@ -181,7 +181,7 @@ class AccountRegistryTests(unittest.TestCase):
                 {"execution_identities": {"aws": executions["management_direct"]}},
                 catalogs,
                 execution_context=context,
-                implementation_key="profile",
+                implementation_key="sso",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(management_cfg_result["status"], "failed")
@@ -199,7 +199,7 @@ class AccountRegistryTests(unittest.TestCase):
                     {"dev": {"execution_identities": {"aws": executions["dev_direct"]}}},
                     catalogs,
                     execution_context=context,
-                    implementation_key="profile",
+                    implementation_key="sso",
                     execution_access_mode="agreed_direct",
                 )
             self.assertEqual(
@@ -219,7 +219,7 @@ class AccountRegistryTests(unittest.TestCase):
                     },
                     catalogs,
                     execution_context=context,
-                    implementation_key="profile",
+                    implementation_key="sso",
                     execution_access_mode="agreed_direct",
                 )
 

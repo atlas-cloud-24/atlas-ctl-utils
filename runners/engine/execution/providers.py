@@ -59,7 +59,7 @@ def activate_provider_adapters(ctl_cfg_root) -> list[str]:
         return []                       # strict runs materialize refs elsewhere
     added = []
     for name, entry in (tooling or {}).items():
-        if not name.startswith("ctl-adapter-"):
+        if not name.startswith("execution-provider-"):
             continue
         repo_path = (entry or {}).get("repo_path")
         if repo_path and Path(repo_path).is_dir() and repo_path not in sys.path:
@@ -287,11 +287,11 @@ def resolve_provider_implementation_key(
     """
 
     options = provider_options_for(provider_options, provider)
-    implementation_key = options.get("credential_implementation")
+    implementation_key = options.get("credential_acquisition")
     if not implementation_key:
         raise RuntimeError(
             f"❌ no credential implementation declared for provider {provider!r}; "
-            f"pass --provider-options {provider}.credential_implementation=... "
+            f"pass --provider-options {provider}.credential_acquisition=... "
             f"(see `ctl.py providers`)"
         )
     return implementation_key
@@ -378,18 +378,18 @@ def validate_declared_contracts(ctl_cfg_root) -> None:
     honoured — the silent acceptance this registry exists to prevent.
     """
 
-    declared = adapters.load_ctl_providers(ctl_cfg_root) or {}
+    declared = adapters.load_execution_providers(ctl_cfg_root) or {}
     for provider, spec in declared.items():
         contracts = (spec or {}).get("implements")
         if not isinstance(contracts, list) or not contracts:
             raise RuntimeError(
-                f"❌ ctl_providers.{provider} must declare a non-empty `implements` "
+                f"❌ execution_providers.{provider} must declare a non-empty `implements` "
                 f"list; there is no default"
             )
         unknown = sorted(set(contracts) - set(CONTRACT_CALLABLES))
         if unknown:
             raise RuntimeError(
-                f"❌ ctl_providers.{provider} declares unknown contracts {unknown}; "
+                f"❌ execution_providers.{provider} declares unknown contracts {unknown}; "
                 f"known: {sorted(CONTRACT_CALLABLES)}"
             )
         adapter = adapters.get_adapter(provider, ctl_cfg_root)
@@ -400,6 +400,6 @@ def validate_declared_contracts(ctl_cfg_root) -> None:
             ]
             if missing:
                 raise RuntimeError(
-                    f"❌ ctl_providers.{provider} declares contract {contract!r} but "
+                    f"❌ execution_providers.{provider} declares contract {contract!r} but "
                     f"its adapter does not implement {missing}"
                 )
