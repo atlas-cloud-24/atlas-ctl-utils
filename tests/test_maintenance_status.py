@@ -123,9 +123,7 @@ class MaintenanceStatusTest(unittest.TestCase):
         )
 
         maintenance = Syncer()
-        state_run_store.hydrate_ctl_state_index(
-            maintenance, include_maintenance_manifests=True
-        )
+        state_run_store.hydrate_ctl_state_index(maintenance, include_maintenance_manifests=True)
         self.assertEqual(
             [
                 "target/env/repair/committed/maintenance.yaml",

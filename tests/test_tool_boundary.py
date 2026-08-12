@@ -17,7 +17,6 @@ Every tool interaction belongs inside a step, behind a contract the engine alrea
 has. This test is the ratchet that keeps it there.
 """
 
-
 import re
 import unittest
 from pathlib import Path

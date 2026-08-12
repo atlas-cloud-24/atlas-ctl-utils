@@ -12,13 +12,14 @@ ctl-model fields are declared by the catalog that owns them, and the fields
 inside `execution_identities` are resolved by the provider ADAPTER — engine core
 may not spell `providers.<provider>.target_roles`, and a test enforces that.
 """
+
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 
-from engine.catalog import targets as catalog_targets  # noqa: E402
+from engine.catalog import target_catalog  # noqa: E402
 from engine.cfg import references as cfg_references  # noqa: E402
 
 
@@ -42,7 +43,8 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(
             "${execution_context.params.domain}",
             cfg_references.resolve(
-                "domains.${execution_context.params.domain}", "domains", label="t"),
+                "domains.${execution_context.params.domain}", "domains", label="t"
+            ),
         )
 
     def test_a_bare_key_is_refused(self):
@@ -66,14 +68,16 @@ class ResolveTest(unittest.TestCase):
             "ctl_target_readonly",
             cfg_references.resolve(
                 "providers.aws.target_roles.ctl_target_readonly",
-                "providers.*.target_roles", label="t"),
+                "providers.*.target_roles",
+                label="t",
+            ),
         )
 
     def test_a_wildcard_does_not_match_a_different_shape(self):
         with self.assertRaisesRegex(RuntimeError, "does not name its collection"):
             cfg_references.resolve(
-                "providers.aws.ctl_state_roles.reader",
-                "providers.*.target_roles", label="t")
+                "providers.aws.ctl_state_roles.reader", "providers.*.target_roles", label="t"
+            )
 
     def test_a_non_string_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "expected a targets reference"):
@@ -94,17 +98,20 @@ class ResolveEachTest(unittest.TestCase):
         self.assertEqual(
             {"readonly": "a", "readwrite": "b"},
             cfg_references.resolve_each(
-                {"readonly": "providers.aws.target_roles.a",
-                 "readwrite": "providers.aws.target_roles.b"},
-                "providers.*.target_roles", label="t"),
+                {
+                    "readonly": "providers.aws.target_roles.a",
+                    "readwrite": "providers.aws.target_roles.b",
+                },
+                "providers.*.target_roles",
+                label="t",
+            ),
         )
 
     def test_resolve_fields_leaves_undeclared_fields_alone(self):
         entry = {"source_key": "target_sources.core", "procedure_key": "baseline"}
         self.assertEqual(
             {"source_key": "core", "procedure_key": "baseline"},
-            cfg_references.resolve_fields(
-                entry, {"source_key": "target_sources"}, label="t"),
+            cfg_references.resolve_fields(entry, {"source_key": "target_sources"}, label="t"),
         )
 
 
@@ -119,25 +126,34 @@ class TheMechanismNamesNoCollectionTest(unittest.TestCase):
     def test_the_module_spells_no_ctl_collection(self):
         import ast
 
-        source = (Path(__file__).resolve().parents[1]
-                  / "runners/engine/cfg/references.py").read_text()
+        source = (
+            Path(__file__).resolve().parents[1] / "runners/engine/cfg/references.py"
+        ).read_text()
         # Prose NAMES collections while explaining the rule, so docstrings and
         # comments are dropped and only executable code is scanned. Parsing and
         # re-emitting drops both, without a regex guessing where they end.
         tree = ast.parse(source)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
-                                 ast.AsyncFunctionDef)) and ast.get_docstring(node):
+            if isinstance(
+                node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ) and ast.get_docstring(node):
                 node.body = node.body[1:]
         code = ast.unparse(tree)
-        for collection in ("target_sources", "param_sets", "execution_providers",
-                           "accounts_registry", "target_roles", "credential_sources"):
+        for collection in (
+            "target_sources",
+            "param_sets",
+            "execution_providers",
+            "accounts_registry",
+            "target_roles",
+            "credential_sources",
+        ):
             self.assertNotIn(collection, code, f"{collection} must be passed in, not held here")
 
     def test_the_scan_would_see_a_table_if_one_appeared(self):
         """Guards the check above: an empty scan would pass for the wrong reason."""
 
         import ast
+
         tree = ast.parse('FIELDS = {"source_key": "target_sources"}')
         self.assertIn("target_sources", ast.unparse(tree))
 
@@ -148,11 +164,13 @@ class TheCatalogOwnsItsVocabularyTest(unittest.TestCase):
         provider collections, which engine core may not spell."""
 
         self.assertEqual(
-            {"source_key": "target_sources",
-             "domains": "domains",
-             "input_param_sets": "param_sets",
-             "providers": "execution_providers"},
-            catalog_targets.TARGET_REFERENCE_FIELDS,
+            {
+                "source_key": "target_sources",
+                "domains": "domains",
+                "input_param_sets": "param_sets",
+                "providers": "execution_providers",
+            },
+            target_catalog.TARGET_REFERENCE_FIELDS,
         )
 
 

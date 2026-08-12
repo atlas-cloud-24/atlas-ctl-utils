@@ -17,7 +17,6 @@ The value validators below stay functions: two of them, sharing nothing, called
 from four different classes.
 """
 
-
 import collections
 import json
 import math
@@ -77,8 +76,7 @@ def _validate_schema(data, schema_name: str, *, origin: Path) -> None:
         error = errors[0]
         location = ".".join(str(part) for part in error.absolute_path) or "<root>"
         raise RuntimeError(
-            f"❌ guardrail schema validation failed at {location}: "
-            f"{error.message}: {origin}"
+            f"❌ guardrail schema validation failed at {location}: {error.message}: {origin}"
         )
 
 
@@ -91,8 +89,7 @@ def _validate_native(value, *, label: str):
         return value
     if isinstance(value, list):
         return [
-            _validate_native(item, label=f"{label}[{index}]")
-            for index, item in enumerate(value)
+            _validate_native(item, label=f"{label}[{index}]") for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
         result = {}
@@ -102,8 +99,7 @@ def _validate_native(value, *, label: str):
             result[key] = _validate_native(item, label=f"{label}.{key}")
         return result
     raise RuntimeError(
-        f"❌ {label} must be a YAML/JSON-compatible native value, got "
-        f"{type(value).__name__}"
+        f"❌ {label} must be a YAML/JSON-compatible native value, got {type(value).__name__}"
     )
 
 
@@ -144,21 +140,15 @@ class JsonPointer:
         for token in JsonPointer.tokens(pointer, label=label):
             if isinstance(current, dict):
                 if token not in current:
-                    raise RuntimeError(
-                        f"❌ {label} does not exist; missing mapping key {token!r}"
-                    )
+                    raise RuntimeError(f"❌ {label} does not exist; missing mapping key {token!r}")
                 current = current[token]
                 continue
             if isinstance(current, list):
                 if not token.isdigit() or (len(token) > 1 and token.startswith("0")):
-                    raise RuntimeError(
-                        f"❌ {label} uses invalid list index {token!r}"
-                    )
+                    raise RuntimeError(f"❌ {label} uses invalid list index {token!r}")
                 index = int(token)
                 if index >= len(current):
-                    raise RuntimeError(
-                        f"❌ {label} list index {index} is out of range"
-                    )
+                    raise RuntimeError(f"❌ {label} list index {index} is out of range")
                 current = current[index]
                 continue
             raise RuntimeError(
@@ -174,17 +164,13 @@ class JsonPointer:
         outer path while contradicting the inner one.
         """
 
-        token_paths = [
-            (path, JsonPointer.tokens(path, label=f"{label}.{path}"))
-            for path in paths
-        ]
+        token_paths = [(path, JsonPointer.tokens(path, label=f"{label}.{path}")) for path in paths]
         for index, (left, left_tokens) in enumerate(token_paths):
             for right, right_tokens in token_paths[index + 1 :]:
                 prefix_len = min(len(left_tokens), len(right_tokens))
                 if left_tokens[:prefix_len] == right_tokens[:prefix_len]:
                     raise RuntimeError(
-                        f"❌ {label} contains overlapping protected paths "
-                        f"{left!r} and {right!r}"
+                        f"❌ {label} contains overlapping protected paths {left!r} and {right!r}"
                     )
 
 
@@ -217,23 +203,17 @@ class Subject:
         subject = {"kind": kind}
         if kind == "plt_rendered_target":
             if "target_path" not in raw:
-                raise RuntimeError(
-                    f"❌ {label}.target_path is required for plt_rendered_target"
-                )
+                raise RuntimeError(f"❌ {label}.target_path is required for plt_rendered_target")
             subject["target_path"] = kernel_paths.normalize_cfg_absolute_path(
                 raw["target_path"],
                 label=f"{label}.target_path",
             )
         elif "target_path" in raw:
-            raise RuntimeError(
-                f"❌ {label}.target_path is valid only for plt_rendered_target"
-            )
+            raise RuntimeError(f"❌ {label}.target_path is valid only for plt_rendered_target")
         if "instance" in raw:
             instance = raw["instance"]
             if not isinstance(instance, dict) or set(instance) != {"params"}:
-                raise RuntimeError(
-                    f"❌ {label}.instance must contain exactly non-empty params"
-                )
+                raise RuntimeError(f"❌ {label}.instance must contain exactly non-empty params")
             raw_params = instance["params"]
             if not isinstance(raw_params, dict) or not raw_params:
                 raise RuntimeError(f"❌ {label}.instance.params must be a non-empty mapping")
@@ -299,9 +279,7 @@ class PolicySet:
             if file_path.is_file():
                 sources.append(file_path)
             if dir_path.is_dir():
-                sources.extend(
-                    sorted(path for path in dir_path.rglob("*.yaml") if path.is_file())
-                )
+                sources.extend(sorted(path for path in dir_path.rglob("*.yaml") if path.is_file()))
             return sources
         return sorted(path for path in cfg_root.rglob("*.yaml") if path.is_file())
 
@@ -338,8 +316,7 @@ class PolicySet:
                 name = raw_name.strip()
                 if name in policies:
                     raise RuntimeError(
-                        f"❌ duplicate guardrail policy {name!r}: {path} "
-                        f"(also in {origins[name]})"
+                        f"❌ duplicate guardrail policy {name!r}: {path} (also in {origins[name]})"
                     )
                 label = f"{POLICIES_KEY}.{name} in {path}"
                 if not isinstance(raw_policy, dict):
@@ -382,13 +359,9 @@ class PolicySet:
                             f"❌ {label}.instance_params entries must be params refs"
                         )
                     if ref in instance_params:
-                        raise RuntimeError(
-                            f"❌ duplicate instance param {ref!r}: {label}"
-                        )
+                        raise RuntimeError(f"❌ duplicate instance param {ref!r}: {label}")
                     instance_params.append(ref)
-                missing_selector_params = sorted(
-                    set(selector_refs) - set(instance_params)
-                )
+                missing_selector_params = sorted(set(selector_refs) - set(instance_params))
                 if missing_selector_params:
                     raise RuntimeError(
                         f"❌ {label}.instance_params must include every selector ref; "
@@ -400,20 +373,14 @@ class PolicySet:
                     or not raw_paths
                     or any(not isinstance(item, str) for item in raw_paths)
                 ):
-                    raise RuntimeError(
-                        f"❌ {label}.protected_paths must be a non-empty list"
-                    )
+                    raise RuntimeError(f"❌ {label}.protected_paths must be a non-empty list")
                 protected_paths = []
                 for pointer in raw_paths:
                     JsonPointer.tokens(pointer, label=f"{label}.protected_paths")
                     if pointer in protected_paths:
-                        raise RuntimeError(
-                            f"❌ duplicate protected path {pointer!r}: {label}"
-                        )
+                        raise RuntimeError(f"❌ duplicate protected path {pointer!r}: {label}")
                     protected_paths.append(pointer)
-                JsonPointer.reject_overlapping(
-                    protected_paths, label=f"{label}.protected_paths"
-                )
+                JsonPointer.reject_overlapping(protected_paths, label=f"{label}.protected_paths")
                 policies[name] = {
                     "name": name,
                     "subject": subject,
@@ -462,9 +429,7 @@ class PolicySet:
             by_base[Subject.identity(policy["subject"])].append(policy)
         groups = []
         for base_policies in by_base.values():
-            declarations = {
-                policy["instance_params"] for policy in base_policies
-            }
+            declarations = {policy["instance_params"] for policy in base_policies}
             if len(declarations) != 1:
                 detail = ", ".join(
                     f"{policy['name']}={list(policy['instance_params'])}"
@@ -488,11 +453,7 @@ class PolicySet:
                         label=f"guardrail instance param {ref}",
                     )
                 subject["instance"] = {"params": dict(sorted(values.items()))}
-            paths = [
-                pointer
-                for policy in base_policies
-                for pointer in policy["protected_paths"]
-            ]
+            paths = [pointer for policy in base_policies for pointer in policy["protected_paths"]]
             if len(paths) != len(set(paths)):
                 raise RuntimeError(
                     f"❌ active policies for subject {subject} protect a path more than once"
@@ -520,9 +481,7 @@ class Materializer:
         active = policy_set.active(policies, self.execution_context)
         result = []
         for subject, group in policy_set.groups(active, self.execution_context):
-            paths = sorted(
-                pointer for policy in group for pointer in policy["protected_paths"]
-            )
+            paths = sorted(pointer for policy in group for pointer in policy["protected_paths"])
             result.append(
                 {
                     "subject": subject,
@@ -571,9 +530,7 @@ class Materializer:
         self._require_scope_selector_params(groups, scopes_by_target)
         result = []
         for subject, group in groups:
-            paths = sorted(
-                pointer for policy in group for pointer in policy["protected_paths"]
-            )
+            paths = sorted(pointer for policy in group for pointer in policy["protected_paths"])
             result.append(
                 {
                     "subject": subject,
@@ -600,9 +557,9 @@ class Materializer:
         if kind == "ctl_cfg":
             document = self._ctl_document(ctl_cfg_root)
         elif kind == "execution_context":
-            document = execution_references.execution_context_nested(
-                self.execution_context
-            )[execution_references.EXECUTION_CONTEXT_ROOT]
+            document = execution_references.execution_context_nested(self.execution_context)[
+                execution_references.EXECUTION_CONTEXT_ROOT
+            ]
         elif kind == "plt_rendered_target":
             if plt_rendered_dir is None:
                 raise RuntimeError("❌ plt rendered cfg is required for PLT guardrails")
@@ -676,9 +633,7 @@ class Materializer:
             if not isinstance(data, dict):
                 raise RuntimeError(f"❌ ctl cfg file must contain a mapping: {path}")
             data = {
-                key: value
-                for key, value in data.items()
-                if key not in {POLICIES_KEY, *LEGACY_KEYS}
+                key: value for key, value in data.items() if key not in {POLICIES_KEY, *LEGACY_KEYS}
             }
             document = cfg_merge.merge_cfg_values(document, data)
         return document
@@ -777,9 +732,7 @@ class BaselineStore:
             for index, raw in enumerate(entries):
                 label = f"{BASELINES_KEY}[{index}] in {path}"
                 if not isinstance(raw, dict) or set(raw) != {"subject", "values"}:
-                    raise RuntimeError(
-                        f"❌ {label} must contain exactly subject and values"
-                    )
+                    raise RuntimeError(f"❌ {label} must contain exactly subject and values")
                 subject = Subject.normalize(
                     raw["subject"],
                     label=f"{label}.subject",
@@ -874,9 +827,7 @@ class BaselineStore:
         replaced = False
         for index, raw in enumerate(entries):
             if not isinstance(raw, dict) or set(raw) != {"subject", "values"}:
-                raise RuntimeError(
-                    f"❌ invalid guardrail baseline entry [{index}]: {path}"
-                )
+                raise RuntimeError(f"❌ invalid guardrail baseline entry [{index}]: {path}")
             raw_subject = Subject.normalize(
                 raw["subject"],
                 label=f"guardrail baseline entry [{index}].subject",
@@ -884,9 +835,7 @@ class BaselineStore:
             )
             if Subject.identity(raw_subject) == identity:
                 if replaced:
-                    raise RuntimeError(
-                        f"❌ duplicate guardrail baseline subject in {path}"
-                    )
+                    raise RuntimeError(f"❌ duplicate guardrail baseline subject in {path}")
                 kept.append(replacement)
                 replaced = True
             else:
@@ -1014,14 +963,9 @@ class Verifier:
                     f"❌ baseline paths {extras} in {entry['origin']} have no "
                     f"authored policy for subject {base}"
                 )
-            actual_params = tuple(
-                entry["subject"].get("instance", {}).get("params", {}).keys()
-            )
+            actual_params = tuple(entry["subject"].get("instance", {}).get("params", {}).keys())
             if actual_params not in allowed_instance_params[base_identity]:
-                expected = sorted(
-                    list(params)
-                    for params in allowed_instance_params[base_identity]
-                )
+                expected = sorted(list(params) for params in allowed_instance_params[base_identity])
                 raise RuntimeError(
                     f"❌ baseline subject {entry['subject']} in {entry['origin']} "
                     f"uses instance params {list(actual_params)}; expected one of {expected}"

@@ -98,7 +98,9 @@ class CommitPinning:
                 continue
 
             if tooling_ref.get("branch"):
-                errors.append(f"tooling '{tooling_name}' uses branch='{tooling_ref['branch']}' but commit is required")
+                errors.append(
+                    f"tooling '{tooling_name}' uses branch='{tooling_ref['branch']}' but commit is required"
+                )
             else:
                 errors.append(f"tooling '{tooling_name}' is missing commit")
 
@@ -167,7 +169,10 @@ class CfgTreeShape:
         orphans: list[str] = []
         for path in sorted(cfg_root.rglob("*.yaml")):
             parts = path.relative_to(cfg_root).parts
-            if parts[0] in (".git", "_overlays", "diagrams") or cfg_layout.PLT_GUARDRAILS_DIRNAME in parts:
+            if (
+                parts[0] in (".git", "_overlays", "diagrams")
+                or cfg_layout.PLT_GUARDRAILS_DIRNAME in parts
+            ):
                 continue
             if path.name in cfg_layout.SCOPE_META_SKIP_FILENAMES:
                 continue

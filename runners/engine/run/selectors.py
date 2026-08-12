@@ -11,6 +11,7 @@ import re
 
 from engine.execution import references as execution_references
 
+
 def selectors_to_map(items: list[tuple[str, str]], *, label: str) -> dict[str, str]:
     selectors: dict[str, str] = {}
     for key, value in items:
@@ -58,9 +59,7 @@ def resolve_selector_group_member(
         raise RuntimeError(f"❌ {label}: group members must be a non-empty list")
     for member in members:
         if not isinstance(member, dict) or set(member) - {value_field, "selectors"}:
-            raise RuntimeError(
-                f"❌ {label}: group member must be {{{value_field}, selectors}}"
-            )
+            raise RuntimeError(f"❌ {label}: group member must be {{{value_field}, selectors}}")
         value = member.get(value_field)
         if not isinstance(value, str) or not value.strip():
             raise RuntimeError(f"❌ {label}: group member {value_field} must be a non-empty string")
@@ -68,9 +67,11 @@ def resolve_selector_group_member(
         {m.get(value_field): m.get("selectors") for m in members}, label=label
     )
     matches = [
-        member for member in members
+        member
+        for member in members
         if selector_matches(
-            member.get("selectors"), execution_context,
+            member.get("selectors"),
+            execution_context,
             label=f"{label} member {member.get(value_field)}",
             structured_only=True,
         )
@@ -107,7 +108,7 @@ def _selector_param_axes(members: object) -> set[str]:
             continue
         for ref in requirements:
             if ref.startswith(prefix):
-                axes.add(ref[len(prefix):])
+                axes.add(ref[len(prefix) :])
     return axes
 
 
@@ -116,9 +117,7 @@ def _template_param_axes(value: object) -> set[str]:
 
     if not isinstance(value, str):
         return set()
-    pattern = (
-        rf"\$\{{{re.escape(execution_references.EXECUTION_CONTEXT_ROOT)}\.params\.([A-Za-z_][A-Za-z0-9_]*)\}}"
-    )
+    pattern = rf"\$\{{{re.escape(execution_references.EXECUTION_CONTEXT_ROOT)}\.params\.([A-Za-z_][A-Za-z0-9_]*)\}}"
     return set(re.findall(pattern, value))
 
 
@@ -146,7 +145,7 @@ def collect_member_dispatch_axes(members: object, *, label: str) -> set[str]:
         )
         for ref in requirements:
             if ref.startswith(params_prefix):
-                axes.add(ref[len(params_prefix):])
+                axes.add(ref[len(params_prefix) :])
             elif ref not in safe_refs:
                 raise RuntimeError(
                     f"❌ {label}: dispatch on {ref!r} is not allowed — target "
@@ -177,8 +176,11 @@ def resolve_list_members(
         raise RuntimeError(f"❌ {label}: members-shaped declaration must be {{members: [...]}}")
     for member in members:
         allowed = {value_field, "selectors", *extra_fields}
-        if not isinstance(member, dict) or not {value_field, "selectors"} <= set(member) \
-                or not set(member) <= allowed:
+        if (
+            not isinstance(member, dict)
+            or not {value_field, "selectors"} <= set(member)
+            or not set(member) <= allowed
+        ):
             raise RuntimeError(
                 f"❌ {label}: each member must be {{{value_field}, selectors"
                 + (", " + ", ".join(extra_fields) if extra_fields else "")
@@ -191,10 +193,13 @@ def resolve_list_members(
     if execution_context is None:
         return None
     matches = [
-        member for member in members
+        member
+        for member in members
         if selector_matches(
-            member["selectors"], execution_context,
-            label=f"{label} member", structured_only=True,
+            member["selectors"],
+            execution_context,
+            label=f"{label} member",
+            structured_only=True,
         )
     ]
     if not matches:
@@ -221,15 +226,20 @@ def resolve_list_member(
     """
 
     resolved = resolve_list_members(
-        entry, execution_context, value_field=value_field, label=label,
+        entry,
+        execution_context,
+        value_field=value_field,
+        label=label,
         extra_fields=extra_fields,
     )
     if resolved is None:
         return None
     for member in entry.get("members") or []:
         if list(member.get(value_field) or []) == resolved and selector_matches(
-            member["selectors"], execution_context or {},
-            label=f"{label} member", structured_only=True,
+            member["selectors"],
+            execution_context or {},
+            label=f"{label} member",
+            structured_only=True,
         ):
             return member
     return None
@@ -249,29 +259,26 @@ def resolve_scalar_member(
             raise RuntimeError(f"❌ {label} must be a non-empty single-line string")
         return value
     if not isinstance(entry, dict) or set(entry) != {"members"}:
-        raise RuntimeError(
-            f"❌ {label} must be a non-empty string or {{members: [...]}}"
-        )
+        raise RuntimeError(f"❌ {label} must be a non-empty string or {{members: [...]}}")
     members = entry.get("members")
     if not isinstance(members, list) or not members:
         raise RuntimeError(f"❌ {label} members must be a non-empty list")
     for member in members:
         if not isinstance(member, dict) or set(member) != {"value", "selectors"}:
-            raise RuntimeError(
-                f"❌ {label}: each member must be {{value, selectors}}"
-            )
+            raise RuntimeError(f"❌ {label}: each member must be {{value, selectors}}")
         value = member.get("value")
         if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
-            raise RuntimeError(
-                f"❌ {label}: member value must be a non-empty single-line string"
-            )
+            raise RuntimeError(f"❌ {label}: member value must be a non-empty single-line string")
     if execution_context is None:
         return None
     matches = [
-        member for member in members
+        member
+        for member in members
         if selector_matches(
-            member["selectors"], execution_context,
-            label=f"{label} member", structured_only=True,
+            member["selectors"],
+            execution_context,
+            label=f"{label} member",
+            structured_only=True,
         )
     ]
     if len(matches) != 1:
@@ -290,7 +297,7 @@ def workflow_effective_selectors(action_workflows: dict, name: str, _stack: tupl
         return {}
     wf = action_workflows.get(name) or {}
     effective = selector_requirements(wf.get("selectors") or {}, label=f"workflow {name} selectors")
-    for workflow_key in (wf.get("import_workflows") or []):
+    for workflow_key in wf.get("import_workflows") or []:
         imported = selector_requirements(
             workflow_effective_selectors(action_workflows, workflow_key, (*_stack, name)),
             label=f"workflow {workflow_key} effective selectors",
@@ -362,7 +369,9 @@ def selector_contains_requirements(selectors: object, *, label: str) -> dict[str
         if not isinstance(raw, dict):
             raise RuntimeError(f"❌ selectors.contains must be a mapping: {label}")
         for ref, expected in raw.items():
-            ref = execution_references.validate_execution_context_ref(ref, label=f"{label}.contains")
+            ref = execution_references.validate_execution_context_ref(
+                ref, label=f"{label}.contains"
+            )
             requirements[ref] = set(
                 selector_expected_values(expected, label=f"{label}.contains.{ref}")
             )
@@ -391,7 +400,9 @@ def _context_fact_members(value: object) -> set[str]:
     return {str(value)}
 
 
-def selector_requirements(selectors: dict | None, *, label: str, structured_only: bool = False) -> dict[str, set[str]]:
+def selector_requirements(
+    selectors: dict | None, *, label: str, structured_only: bool = False
+) -> dict[str, set[str]]:
     """Normalize selector requirements to ref -> allowed string values.
 
     New selector metadata uses {match: {ref: scalar}, in: {ref: [values]}}.
@@ -420,7 +431,9 @@ def selector_requirements(selectors: dict | None, *, label: str, structured_only
             raise RuntimeError(f"❌ selectors.in must be a mapping: {label}")
         overlap = set(raw_match) & set(raw_in)
         if overlap:
-            raise RuntimeError(f"❌ selector refs cannot appear in both match and in: {sorted(overlap)} ({label})")
+            raise RuntimeError(
+                f"❌ selector refs cannot appear in both match and in: {sorted(overlap)} ({label})"
+            )
         for ref, expected in raw_match.items():
             ref = execution_references.validate_execution_context_ref(ref, label=f"{label}.match")
             values = selector_expected_values(expected, label=f"{label}.match.{ref}")
@@ -486,13 +499,21 @@ def selector_matches(
     requirements = selector_requirements(selectors, label=label, structured_only=structured_only)
     for ref, allowed_values in requirements.items():
         if ref not in execution_context:
-            logging.debug("Selector %s: %s", label, execution_references.execution_context_miss_message(execution_context, ref))
+            logging.debug(
+                "Selector %s: %s",
+                label,
+                execution_references.execution_context_miss_message(execution_context, ref),
+            )
             return False
         if str(execution_context[ref]) not in allowed_values:
             return False
     for ref, required_members in selector_contains_requirements(selectors, label=label).items():
         if ref not in execution_context:
-            logging.debug("Selector %s: %s", label, execution_references.execution_context_miss_message(execution_context, ref))
+            logging.debug(
+                "Selector %s: %s",
+                label,
+                execution_references.execution_context_miss_message(execution_context, ref),
+            )
             return False
         if not required_members <= _context_fact_members(execution_context[ref]):
             return False
@@ -503,29 +524,6 @@ def selectors_to_in_shape(requirements: dict[str, set[str]]) -> dict:
     if not requirements:
         return {}
     return {"in": {ref: sorted(values) for ref, values in sorted(requirements.items())}}
-
-
-def selector_subset(child: dict | None, parent: dict | None, *, child_label: str, parent_label: str) -> tuple[bool, str | None]:
-    child_req = selector_requirements(child, label=child_label)
-    parent_req = selector_requirements(parent, label=parent_label)
-    for ref, child_values in child_req.items():
-        parent_values = parent_req.get(ref)
-        if parent_values is None:
-            continue
-        extra = sorted(child_values - parent_values)
-        if extra:
-            return False, f"{ref}={extra} not allowed by target {ref}={sorted(parent_values)}"
-    return True, None
-
-
-def selector_requirements_cover_scope(declaration_selectors: dict | None, scope_selectors: dict | None, *, label: str) -> bool:
-    declaration_req = selector_requirements(declaration_selectors, label=label)
-    scope_req = selector_requirements(scope_selectors, label=f"{label} scope", structured_only=True)
-    for ref, declaration_values in declaration_req.items():
-        scope_values = scope_req.get(ref)
-        if scope_values is None or not scope_values <= declaration_values:
-            return False
-    return True
 
 
 def scope_prefix_matches(scope_id: str, prefix: str) -> bool:
@@ -549,7 +547,9 @@ def validate_scope_composition(active_scopes: list[dict], composition: dict[str,
         seen_prefixes: dict[str, dict] = {}
         seen_match: dict[tuple[tuple[str, tuple[str, ...]], ...], dict] = {}
         for scope in scopes:
-            matches = [prefix for prefix in prefixes if scope_prefix_matches(scope["scope_id"], prefix)]
+            matches = [
+                prefix for prefix in prefixes if scope_prefix_matches(scope["scope_id"], prefix)
+            ]
             if len(matches) != 1:
                 raise RuntimeError(
                     f"❌ active cfg scope {scope['scope_id']} -> {target_path} must match exactly one "
@@ -564,8 +564,14 @@ def validate_scope_composition(active_scopes: list[dict], composition: dict[str,
                 )
             seen_prefixes[prefix] = scope
 
-            match_req = selector_requirements((scope.get("selectors") or {}).get("match") and {"match": (scope.get("selectors") or {}).get("match")}, label=f"scope {scope['scope_id']} match")
-            match_key = tuple(sorted((ref, tuple(sorted(values))) for ref, values in match_req.items()))
+            match_req = selector_requirements(
+                (scope.get("selectors") or {}).get("match")
+                and {"match": (scope.get("selectors") or {}).get("match")},
+                label=f"scope {scope['scope_id']} match",
+            )
+            match_key = tuple(
+                sorted((ref, tuple(sorted(values))) for ref, values in match_req.items())
+            )
             previous_match = seen_match.get(match_key)
             if match_key and previous_match is not None:
                 raise RuntimeError(
@@ -632,7 +638,8 @@ def collect_target_consumed_axes(
         consumed |= _selector_param_axes(ref_entry.get("members"))
         try:
             member_template = resolve_selector_group_member(
-                ref_entry, execution_context,
+                ref_entry,
+                execution_context,
                 value_field="ref_key",
                 label=f"target {target_key!r} ref group",
                 tolerate_none=True,

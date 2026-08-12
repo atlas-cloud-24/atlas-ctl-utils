@@ -179,8 +179,7 @@ class CtlStateBackends:
             return state_run_store.MUTATION_LOCK_TTL_SECONDS
         if not isinstance(declared, int) or isinstance(declared, bool) or declared <= 0:
             raise RuntimeError(
-                f"❌ {field} must be a positive integer of seconds, "
-                f"got {declared!r}"
+                f"❌ {field} must be a positive integer of seconds, got {declared!r}"
             )
         return declared
 
@@ -188,10 +187,10 @@ class CtlStateBackends:
     def load(ctl_cfg_root: Path) -> dict | None:
         """Load the optional ctl-state backend registry.
 
-        Schema is ``ctl_state_backends``:
-        {namespace: {selectors, provider, backend_type, bucket_name,
-        bucket_region, execution}}. The backend declares its own `execution_identity:` block
-     — one account, and a role per ctl-state OPERATION.
+           Schema is ``ctl_state_backends``:
+           {namespace: {selectors, provider, backend_type, bucket_name,
+           bucket_region, execution}}. The backend declares its own `execution_identity:` block
+        — one account, and a role per ctl-state OPERATION.
         """
         merged: dict = {}
         seen_sources: dict[str, Path] = {}
@@ -203,30 +202,48 @@ class CtlStateBackends:
             for namespace_key, entry in section.items():
                 # Namespaces are consumer-defined vocabulary (the engine stays cfg-shape
                 # agnostic): any non-empty snake_case key is a valid state namespace.
-                if not isinstance(namespace_key, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", namespace_key):
-                    raise RuntimeError(f"❌ {section_name} namespace must be a snake_case key: {namespace_key!r} in {path}")
+                if not isinstance(namespace_key, str) or not re.fullmatch(
+                    r"[a-z][a-z0-9_]*", namespace_key
+                ):
+                    raise RuntimeError(
+                        f"❌ {section_name} namespace must be a snake_case key: {namespace_key!r} in {path}"
+                    )
                 if namespace_key in merged:
-                    raise RuntimeError(f"❌ duplicate {section_name} namespace {namespace_key!r}: {path} (first: {seen_sources[namespace_key]})")
+                    raise RuntimeError(
+                        f"❌ duplicate {section_name} namespace {namespace_key!r}: {path} (first: {seen_sources[namespace_key]})"
+                    )
                 if not isinstance(entry, dict):
-                    raise RuntimeError(f"❌ {section_name}.{namespace_key} must be a mapping: {path}")
+                    raise RuntimeError(
+                        f"❌ {section_name}.{namespace_key} must be a mapping: {path}"
+                    )
                 allowed = {
-                    "provider", "backend_type", "bucket_name", "bucket_region",
-                    "execution_identity", "selectors",
+                    "provider",
+                    "backend_type",
+                    "bucket_name",
+                    "bucket_region",
+                    "execution_identity",
+                    "selectors",
                     # Optional — how long a mutation may hold this
                     # namespace before its lock becomes breakable.
                     CtlStateBackends.MUTATION_LOCK_TTL_FIELD,
                 }
                 unknown = set(entry) - allowed
                 if unknown:
-                    raise RuntimeError(f"❌ {section_name}.{namespace_key} has unsupported keys {sorted(unknown)}: {path}")
+                    raise RuntimeError(
+                        f"❌ {section_name}.{namespace_key} has unsupported keys {sorted(unknown)}: {path}"
+                    )
                 provider = entry.get("provider")
                 backend_type = entry.get("backend_type")
                 for field, value in (("provider", provider), ("backend_type", backend_type)):
                     if not isinstance(value, str) or not value.strip():
-                        raise RuntimeError(f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}")
+                        raise RuntimeError(
+                            f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}"
+                        )
                 for field in ("bucket_name", "bucket_region"):
                     if not isinstance(entry.get(field), str) or not entry[field].strip():
-                        raise RuntimeError(f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}")
+                        raise RuntimeError(
+                            f"❌ {section_name}.{namespace_key}.{field} must be a non-empty string: {path}"
+                        )
                 resolved = {
                     "provider": provider.strip(),
                     "backend_type": backend_type.strip(),
@@ -238,7 +255,9 @@ class CtlStateBackends:
                 # this block passes validation and is then silently dropped, which
                 # looks exactly like a declaration that had no effect.
                 if CtlStateBackends.MUTATION_LOCK_TTL_FIELD in entry:
-                    resolved[CtlStateBackends.MUTATION_LOCK_TTL_FIELD] = CtlStateBackends.mutation_lock_ttl(entry)
+                    resolved[CtlStateBackends.MUTATION_LOCK_TTL_FIELD] = (
+                        CtlStateBackends.mutation_lock_ttl(entry)
+                    )
                 execution = entry.get("execution_identity")
                 if execution is not None:
                     resolved["execution_identity"] = CtlStateBackends.validate_execution(
@@ -249,7 +268,9 @@ class CtlStateBackends:
                     # A backend entry IS the namespace — its selectors
                     # resolve exactly one entry per invocation (item 13c collapse).
                     run_selectors.selector_requirements(
-                        selectors, label=f"{section_name}.{namespace_key}.selectors", structured_only=True
+                        selectors,
+                        label=f"{section_name}.{namespace_key}.selectors",
+                        structured_only=True,
                     )
                     resolved["selectors"] = selectors
                 merged[namespace_key] = resolved
@@ -277,11 +298,14 @@ class CtlStateBackends:
         if not backends:
             raise RuntimeError(f"❌ no 'ctl_state_backends' defined under: {ctl_cfg_root}")
         matches = [
-            key for key, entry in backends.items()
+            key
+            for key, entry in backends.items()
             if entry.get("selectors") is not None
             and run_selectors.selector_matches(
-                entry.get("selectors"), execution_context,
-                label=f"ctl_state_backends.{key}.selectors", structured_only=True,
+                entry.get("selectors"),
+                execution_context,
+                label=f"ctl_state_backends.{key}.selectors",
+                structured_only=True,
             )
         ]
         if len(matches) != 1:
@@ -328,9 +352,7 @@ class CtlStateAccess:
         object_keys: list[str] | tuple[str, ...] = (),
         object_prefixes: list[str] | tuple[str, ...] = (),
     ):
-        namespace_key, entry = CtlStateBackends.resolve_namespace(
-            ctl_cfg_root, execution_context
-        )
+        namespace_key, entry = CtlStateBackends.resolve_namespace(ctl_cfg_root, execution_context)
         adapter = execution_adapters.get_adapter(entry["provider"])
         adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
         bucket_name = str(
@@ -453,17 +475,15 @@ class PendingSyncQueue:
             run_rel = Path(run_dir).resolve().relative_to(namespace_root.resolve()).as_posix()
             instance_dir = state_run_store.ctl_state_dir_from_run_dir(run_dir)
             identity_path = instance_dir / "identity.yaml"
-            object_paths = [
-                path
-                for path in sorted(Path(run_dir).rglob("*"))
-                if path.is_file()
-            ]
+            object_paths = [path for path in sorted(Path(run_dir).rglob("*")) if path.is_file()]
             if identity_path.is_file():
                 object_paths.append(identity_path)
             if pointer_path is not None:
                 object_paths.append(pointer_path)
             hashes = {
-                path.resolve().relative_to(namespace_root.resolve()).as_posix(): kernel_paths._sha256_file(path)
+                path.resolve()
+                .relative_to(namespace_root.resolve())
+                .as_posix(): kernel_paths._sha256_file(path)
                 for path in dict.fromkeys(object_paths)
             }
             entry = {
@@ -486,15 +506,17 @@ class PendingSyncQueue:
                 "status": "pending",
             }
             entries = [
-                item for item in (manifest.get("entries") or [])
-                if item.get("run_path") != run_rel
+                item for item in (manifest.get("entries") or []) if item.get("run_path") != run_rel
             ]
             entries.append(entry)
             kernel_yaml_io.write_yaml_file(
                 manifest_path,
                 {
                     "version": 1,
-                    "namespace": (metadata.get("ctl_state_namespace") or (metadata.get("ctl_state_locator") or [None])[0]),
+                    "namespace": (
+                        metadata.get("ctl_state_namespace")
+                        or (metadata.get("ctl_state_locator") or [None])[0]
+                    ),
                     "top_level_run_id": manifest_path.parent.name,
                     "status": "pending",
                     "updated_at": kernel_ids.utc_timestamp(),
@@ -512,9 +534,7 @@ class PendingSyncQueue:
                 raise RuntimeError(f"❌ pending ctl-state object is missing: {path}")
             actual = kernel_paths._sha256_file(path)
             if actual != expected_sha:
-                raise RuntimeError(
-                    f"❌ pending ctl-state object hash changed: {relative_path}"
-                )
+                raise RuntimeError(f"❌ pending ctl-state object hash changed: {relative_path}")
 
     @staticmethod
     def manifest_paths(local_root: Path, namespace_key: str) -> list[Path]:
@@ -600,18 +620,13 @@ class CtlStatePublication:
         action = str(metadata.get("action") or "")
         instance_prefixes = [instance_prefix]
         for address in metadata.get("target_addresses") or []:
-            instance_prefixes.append(
-                ctl_state_target_address_prefix(action, str(address))
-            )
+            instance_prefixes.append(ctl_state_target_address_prefix(action, str(address)))
         keys = [
             key
             for prefix in dict.fromkeys(instance_prefixes)
             for key in (
                 f"{prefix}/identity.yaml",
-                *(
-                    f"{prefix}/committed/{group}.yaml"
-                    for group in run_actions.RESULT_GROUPS
-                ),
+                *(f"{prefix}/committed/{group}.yaml" for group in run_actions.RESULT_GROUPS),
             )
         ]
         return sorted(set(keys)), [run_prefix]
@@ -664,9 +679,7 @@ class CtlStatePublication:
         )
         if not syncer.ensure_ready("ctl-state publication readiness"):
             if not tolerate_not_ready:
-                raise RuntimeError(
-                    f"❌ ctl-state backend {config['bucket_name']!r} is not ready"
-                )
+                raise RuntimeError(f"❌ ctl-state backend {config['bucket_name']!r} is not ready")
             self.note = {
                 "mode": "deferred",
                 "reason": "backend_absent",
@@ -750,14 +763,15 @@ class CtlStatePublication:
         syncer = self.syncer
         if syncer is None:
             raise RuntimeError("❌ ctl-state syncer was not armed")
-        instance_prefix = state_run_store.ctl_state_dir_from_run_dir(run_dir).resolve().relative_to(
-            syncer.results_root
-        ).as_posix()
+        instance_prefix = (
+            state_run_store.ctl_state_dir_from_run_dir(run_dir)
+            .resolve()
+            .relative_to(syncer.results_root)
+            .as_posix()
+        )
         metadata = state_run_store.load_run_metadata(run_dir)
         child_prefixes = [
-            ctl_state_target_address_prefix(
-                str(metadata.get("action") or ""), str(address)
-            )
+            ctl_state_target_address_prefix(str(metadata.get("action") or ""), str(address))
             for address in (metadata.get("target_addresses") or [])
         ]
         syncer.hydrate_instance(
@@ -853,9 +867,7 @@ class CtlStatePublication:
     def retry_deferred(self) -> bool:
         if self.defer_config is None:
             return self.syncer is not None
-        if self.syncer is None and not self._arm(
-            self.defer_config, tolerate_not_ready=True
-        ):
+        if self.syncer is None and not self._arm(self.defer_config, tolerate_not_ready=True):
             return False
         drained = self.drain_pending()
         self.note = self.syncer.summary()
@@ -876,7 +888,9 @@ class CtlStatePublication:
             publication_config["run_dir"] = Path(run_dir)
             self._arm(publication_config, tolerate_not_ready=False)
         if self.syncer is not None:
-            instance_identity = state_run_store.ctl_state_dir_from_run_dir(run_dir) / "identity.yaml"
+            instance_identity = (
+                state_run_store.ctl_state_dir_from_run_dir(run_dir) / "identity.yaml"
+            )
             if instance_identity.is_file():
                 self.syncer.publish_identity(instance_identity)
             self.syncer.push_run(run_dir, reason)

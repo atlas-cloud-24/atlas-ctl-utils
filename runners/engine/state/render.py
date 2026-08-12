@@ -42,7 +42,12 @@ STATUS_FORMATS = tuple(StatusFormat)
 # filter prints only when one was applied, for the same reason the report omits
 # it — an absent filter is not a fact about the namespace.
 HEADER_FIELDS = (
-    "namespace", "scope", "structure", "sort", "filters", "computed_at",
+    "namespace",
+    "scope",
+    "structure",
+    "sort",
+    "filters",
+    "computed_at",
 )
 
 # The paths `--write-cache` wrote. They are the one thing a reader needs back out
@@ -60,8 +65,14 @@ FLAT_COLUMNS = state_status.SORT_FIELDS
 # are POSITIONS there rather than cells, and members become child rows instead of
 # a count.
 NESTED_COLUMNS = (
-    "status", "last_action", "last_operation", "actions", "standing",
-    "freshness", "time", "label",
+    "status",
+    "last_action",
+    "last_operation",
+    "actions",
+    "standing",
+    "freshness",
+    "time",
+    "label",
 )
 
 # The columns EVERY row could carry, whatever kind it is and whatever the cfg
@@ -94,7 +105,12 @@ NESTED_COLUMNS = (
 # need a second cell vocabulary inside one grid, and the grid is what makes the
 # table scannable.
 UNCONDITIONAL_COLUMNS = (
-    "address", "group", "status", "standing", "time", "label",
+    "address",
+    "group",
+    "status",
+    "standing",
+    "time",
+    "label",
 )
 
 # What an unconditional column shows when the row has no value.
@@ -120,7 +136,13 @@ INDENT = "  "
 EMPTY_MAP_LINE = "(no instances)"
 
 MAINTENANCE_COLUMNS = (
-    "operation", "status", "subject", "scope", "time", "id", "source",
+    "operation",
+    "status",
+    "subject",
+    "scope",
+    "time",
+    "id",
+    "source",
 )
 
 
@@ -171,8 +193,7 @@ def _present_columns(rows: list[dict], columns: tuple[str, ...]) -> list[str]:
     return [
         column
         for column in columns
-        if column in UNCONDITIONAL_COLUMNS
-        or any(_value(row, column) for row in rows)
+        if column in UNCONDITIONAL_COLUMNS or any(_value(row, column) for row in rows)
     ]
 
 
@@ -195,9 +216,7 @@ def _grid_lines(
     if first_column_width is not None:
         widths[0] = first_column_width
     return [
-        COLUMN_GAP.join(
-            cell.ljust(width) for cell, width in zip(row, widths, strict=True)
-        ).rstrip()
+        COLUMN_GAP.join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)).rstrip()
         for row in grid
     ]
 
@@ -213,9 +232,7 @@ def _field_text(value) -> str:
         # One `field=value` per value, never `field=a,b`: the line is meant to be
         # copied back into the next command, and a comma in --filter separates
         # PAIRS, so the compact spelling would not parse.
-        return "  ".join(
-            f"{field}={item}" for field, values in value.items() for item in values
-        )
+        return "  ".join(f"{field}={item}" for field, values in value.items() for item in values)
     if isinstance(value, list):
         return ", ".join(str(item) for item in value)
     return str(value)
@@ -228,9 +245,9 @@ def _field_lines(report: dict, fields: tuple[str, ...]) -> list[str]:
     giving them column headings would claim they vary per row.
     """
 
-    pairs = [(field, _field_text(value))
-             for field in fields
-             if (value := report.get(field)) is not None]
+    pairs = [
+        (field, _field_text(value)) for field in fields if (value := report.get(field)) is not None
+    ]
     if not pairs:
         return []
     width = max(len(name) for name, _ in pairs)
@@ -249,10 +266,7 @@ def _flat_lines(rows: list[dict]) -> list[str]:
     columns = _present_columns(rows, FLAT_COLUMNS)
     return _grid_lines(
         [column.upper() for column in columns],
-        [
-            [_cell(row, column, reports_a_run=True) for column in columns]
-            for row in rows
-        ],
+        [[_cell(row, column, reports_a_run=True) for column in columns] for row in rows],
     )
 
 
@@ -275,8 +289,7 @@ def _tree_branch(ancestors_are_last: tuple[bool, ...], *, is_last: bool) -> str:
     return (
         INDENT
         + "".join(
-            INDENT if ancestor_is_last else "\u2502 "
-            for ancestor_is_last in ancestors_are_last
+            INDENT if ancestor_is_last else "\u2502 " for ancestor_is_last in ancestors_are_last
         )
         + ("\u2514" if is_last else "\u251c")
         + " "
@@ -312,7 +325,8 @@ def _group_entries(
                         is_last=member_index == len(members) - 1,
                     )
                     + _member_tree_cell(
-                        str(member.get("address", "")), parent_segments,
+                        str(member.get("address", "")),
+                        parent_segments,
                     ),
                     member,
                 )
@@ -321,7 +335,9 @@ def _group_entries(
 
 
 def _nested_entries(
-    kinds: dict, *, hide_members: bool,
+    kinds: dict,
+    *,
+    hide_members: bool,
 ) -> list[tuple[str, dict | None]]:
     """Flatten the nested map to connected tree cells and optional status rows.
 
@@ -337,9 +353,7 @@ def _nested_entries(
         template_items = list(templates.items())
         for template_index, (template, body) in enumerate(template_items):
             template_is_last = template_index == len(template_items) - 1
-            entries.append(
-                (_tree_branch((), is_last=template_is_last) + str(template), None)
-            )
+            entries.append((_tree_branch((), is_last=template_is_last) + str(template), None))
             template_ancestors = (template_is_last,)
             if run_addressing.INSTANCES_MARKER in body:
                 instance_items = list(body[run_addressing.INSTANCES_MARKER].items())
@@ -348,7 +362,8 @@ def _nested_entries(
                     entries.append(
                         (
                             _tree_branch(
-                                template_ancestors, is_last=instance_is_last,
+                                template_ancestors,
+                                is_last=instance_is_last,
                             )
                             + str(segments),
                             None,
@@ -382,9 +397,7 @@ def _nested_lines(kinds: dict, *, hide_members: bool) -> list[str]:
     entries = _nested_entries(kinds, hide_members=hide_members)
     if not entries:
         return []
-    columns = _present_columns(
-        [row for _, row in entries if row is not None], NESTED_COLUMNS
-    )
+    columns = _present_columns([row for _, row in entries if row is not None], NESTED_COLUMNS)
     # Matching member instance axes are shortened above, so members participate
     # in the common grid without pushing their values away from their identity.
     # A genuinely different instance keeps its full address and widens the tree.
@@ -397,10 +410,7 @@ def _nested_lines(kinds: dict, *, hide_members: bool) -> list[str]:
         [
             [
                 tree,
-                *[
-                    _cell(row, column, reports_a_run=row is not None)
-                    for column in columns
-                ],
+                *[_cell(row, column, reports_a_run=row is not None) for column in columns],
             ]
             for tree, row in entries
         ],
@@ -422,11 +432,7 @@ def render_status_map(report: dict, *, hide_members: bool = False) -> str:
         body = _flat_lines(list(report.get("instances") or []))
     elif structure == state_status.StatusStructure.NESTED:
         body = _nested_lines(
-            {
-                kind: report[kind]
-                for kind in run_actions.STATUS_RESULT_KINDS
-                if kind in report
-            },
+            {kind: report[kind] for kind in run_actions.STATUS_RESULT_KINDS if kind in report},
             hide_members=hide_members,
         )
     else:
@@ -455,10 +461,7 @@ def render_maintenance_status(report: dict) -> str:
         ]
         body = _grid_lines(
             [column.upper() for column in columns],
-            [
-                [_cell(row, column, reports_a_run=True) for column in columns]
-                for row in rows
-            ],
+            [[_cell(row, column, reports_a_run=True) for column in columns] for row in rows],
         )
     else:
         body = ["(no maintenance records)"]

@@ -15,7 +15,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.commands import pipeline as commands_pipeline
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -38,9 +38,11 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 return_value={},
             ),
             mock.patch.object(catalog_workflow.execution_run_context, "validate_domain_value"),
-            mock.patch.object(catalog_targets, "target_consent_opt_in_fields", return_value=set()),
+            mock.patch.object(
+                target_catalog.TargetCatalog, "consent_opt_in_fields", return_value=set()
+            ),
         ):
-            workflow_cfg, action_cfg = catalog_workflow.build_procedure_cfg(
+            workflow_cfg, action_cfg = catalog_workflow.WorkflowCatalog.procedure_cfg(
                 Path("/cfg"),
                 "plan",
                 source="source",
@@ -48,7 +50,7 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 domain_name="env",
                 procedure="steps",
             )
-            active = catalog_targets.build_active_target_runs(
+            active = target_catalog.ActiveTargetRuns.build(
                 workflow_cfg,
                 action_cfg,
                 repo_key="repo_path",
@@ -68,7 +70,7 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
         }
         self.assertEqual(
             {"plan": False, "provision": True},
-            catalog_targets.TargetActionPolicy(entry, label="target 't'").committed_result_reuse(),
+            target_catalog.TargetActionPolicy(entry, label="target 't'").committed_result_reuse(),
         )
 
         for policy, reason in (
@@ -82,12 +84,12 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 if policy is not None:
                     candidate["committed_result_reuse"] = policy
                 with self.assertRaisesRegex(RuntimeError, reason):
-                    catalog_targets.TargetActionPolicy(
+                    target_catalog.TargetActionPolicy(
                         candidate, label="target 't'"
                     ).committed_result_reuse()
 
     def test_policy_preserves_declared_mapping_order(self):
-        policy = catalog_targets.TargetActionPolicy(
+        policy = target_catalog.TargetActionPolicy(
             {
                 "actions": ["plan", "provision"],
                 "committed_result_reuse": {"provision": True, "plan": False},
@@ -112,8 +114,10 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 }
             },
         }
-        with mock.patch.object(catalog_targets, "target_consent_opt_in_fields", return_value=set()):
-            inherited = catalog_targets.build_active_target_runs(
+        with mock.patch.object(
+            target_catalog.TargetCatalog, "consent_opt_in_fields", return_value=set()
+        ):
+            inherited = target_catalog.ActiveTargetRuns.build(
                 {
                     "meta": {"action": "provision"},
                     "target_runs": [{"id": "run", "target": "target"}],
@@ -122,7 +126,7 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 repo_key="repo_path",
                 require_branch_or_commit=False,
             )["run"]
-            overridden = catalog_targets.build_active_target_runs(
+            overridden = target_catalog.ActiveTargetRuns.build(
                 {
                     "meta": {"action": "provision"},
                     "target_runs": [{"id": "run", "target": "target", "action": "plan"}],
@@ -131,7 +135,7 @@ class TargetReusePolicySchemaTest(unittest.TestCase):
                 repo_key="repo_path",
                 require_branch_or_commit=False,
             )["run"]
-            overridden_definition = catalog_targets.target_definition_document(overridden)
+            overridden_definition = target_catalog.ActiveTargetRuns.definition_document(overridden)
 
         self.assertIs(True, inherited["reuse_committed_result"])
         self.assertIs(False, overridden["reuse_committed_result"])
@@ -163,9 +167,9 @@ class WorkflowReuseGateTest(unittest.TestCase):
             cwd = Path.cwd()
             try:
                 with patch_engine(
+                    {"WorkflowChildren.build_command": mock.DEFAULT},
                     build_tooling_env=mock.DEFAULT,
                     materialize_step_utils=mock.DEFAULT,
-                    build_child_target_command=mock.DEFAULT,
                     mint_child_lock_grant=mock.DEFAULT,
                     latest_child_revision=mock.DEFAULT,
                     up_to_date_child_revision=mock.DEFAULT,
@@ -173,7 +177,7 @@ class WorkflowReuseGateTest(unittest.TestCase):
                 ) as patched:
                     patched["build_tooling_env"].return_value = {}
                     patched["materialize_step_utils"].return_value = run_dir
-                    patched["build_child_target_command"].return_value = ["ctl.py"]
+                    patched["WorkflowChildren.build_command"].return_value = ["ctl.py"]
                     patched["mint_child_lock_grant"].return_value = "grant"
                     patched["latest_child_revision"].return_value = None
                     patched["up_to_date_child_revision"].side_effect = (

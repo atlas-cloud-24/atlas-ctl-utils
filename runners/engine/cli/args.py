@@ -106,8 +106,7 @@ def normalize_run_label(value: str | None) -> str | None:
         raise RuntimeError("❌ --label must be a non-empty name when given")
     if len(label) > RUN_LABEL_MAX_LENGTH:
         raise RuntimeError(
-            f"❌ --label must be at most {RUN_LABEL_MAX_LENGTH} characters, "
-            f"got {len(label)}"
+            f"❌ --label must be at most {RUN_LABEL_MAX_LENGTH} characters, got {len(label)}"
         )
     if not label.isprintable():
         raise RuntimeError("❌ --label must be one printable line")
@@ -126,7 +125,9 @@ def normalize_run_label(value: str | None) -> str | None:
 
 def finalize_common_args(args: argparse.Namespace) -> None:
     """Normalize execution-params CLI args into a map and common values."""
-    args.execution_params = run_selectors.selectors_to_map(args.execution_param, label="execution param")
+    args.execution_params = run_selectors.selectors_to_map(
+        args.execution_param, label="execution param"
+    )
     args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
     # hasattr, because a maintenance run declares no label at all (see
     # add_common_args) — normalizing one in would invent an attribute its parser
@@ -136,10 +137,14 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     # BEFORE the first adapter call: provider options are validated by the adapter
     # itself, so its repository has to be importable by then.
     execution_providers.activate_provider_adapters(getattr(args, "ctl_cfg", None))
-    execution_providers.validate_provider_options(
-        getattr(args, "provider_options", None), getattr(args, "providers", ()) or ()
-    )
     args.execution_access_modes = normalize_execution_access_modes(args)
+    # after the modes: an option can be required in one mode and meaningless in
+    # another, and only the adapter knows which of its options those are
+    execution_providers.validate_provider_options(
+        getattr(args, "provider_options", None),
+        getattr(args, "providers", ()) or (),
+        execution_access_modes=args.execution_access_modes,
+    )
     args.credential_refresh_modes = run_selectors.selectors_to_map(
         getattr(args, "credential_refresh_modes", []) or [],
         label="credential refresh mode",
@@ -151,9 +156,8 @@ def finalize_common_args(args: argparse.Namespace) -> None:
         normalize_force_skip_execution_identity_preflight_check(args)
     )
     # --status is gone from the run parsers (status is standalone).
-    if (
-        getattr(args, "execution_identity_preflight_check_only", False)
-        and getattr(args, "force_skip_execution_identity_preflight_check", None)
+    if getattr(args, "execution_identity_preflight_check_only", False) and getattr(
+        args, "force_skip_execution_identity_preflight_check", None
     ):
         raise RuntimeError(
             "❌ --execution-identity-preflight-check-only and "
@@ -163,9 +167,7 @@ def finalize_common_args(args: argparse.Namespace) -> None:
     # reaches the reuse-vs-rerun decision and must state intent; the exit-early
     # preflight-only mode never does, so it stays optional there.
     if hasattr(args, "skip_up_to_date"):
-        exits_before_execution = getattr(
-            args, "execution_identity_preflight_check_only", False
-        )
+        exits_before_execution = getattr(args, "execution_identity_preflight_check_only", False)
         if args.skip_up_to_date is None and not exits_before_execution:
             raise RuntimeError(
                 "❌ --skip-up-to-date is required (true or false) for a normal run; "
@@ -199,7 +201,6 @@ def normalize_execution_access_modes(args: argparse.Namespace) -> dict[str, str]
             "❌ --execution-access-mode must state the mode for every declared "
             f"provider (no default): missing {missing}"
         )
-
 
     options = getattr(args, "provider_options", None)
     for provider, mode in modes.items():
@@ -245,7 +246,6 @@ def normalize_force_skip_execution_identity_preflight_check(
             f"declared in --providers {declared}: {stray}"
         )
 
-
     modes = getattr(args, "execution_access_modes", None) or {}
     for provider in requested:
         adapter = execution_adapters.get_adapter(provider)
@@ -282,9 +282,7 @@ def parse_overlays_arg(value: str) -> list[str]:
 
     for item in raw:
         if "/" in item or "\\" in item:
-            raise argparse.ArgumentTypeError(
-                f"Overlay must be a metadata name, not a path: {item}"
-            )
+            raise argparse.ArgumentTypeError(f"Overlay must be a metadata name, not a path: {item}")
         if item in (".", ".."):
             raise argparse.ArgumentTypeError(f"Overlay name is invalid: {item}")
 
@@ -308,14 +306,10 @@ class ExecutionAccessModesAction(argparse.Action):
         merged = dict(getattr(namespace, self.dest, None) or {})
         for pair in kernel_scalars.parse_comma_list(values):
             if "=" not in pair:
-                raise argparse.ArgumentError(
-                    self, f"expected PROVIDER=MODE, got {pair!r}"
-                )
+                raise argparse.ArgumentError(self, f"expected PROVIDER=MODE, got {pair!r}")
             provider, mode = (part.strip() for part in pair.split("=", 1))
             if not provider or not mode:
-                raise argparse.ArgumentError(
-                    self, f"expected PROVIDER=MODE, got {pair!r}"
-                )
+                raise argparse.ArgumentError(self, f"expected PROVIDER=MODE, got {pair!r}")
             if provider in merged and merged[provider] != mode:
                 raise argparse.ArgumentError(
                     self, f"conflicting execution access modes for provider {provider!r}"
@@ -852,9 +846,7 @@ def add_status_args(parser: argparse.ArgumentParser) -> None:
         help="whole-namespace maintenance audit, separate from target/workflow status",
     )
     breadth.add_argument("--target", metavar="NAME", help="one declared target instance")
-    breadth.add_argument(
-        "--workflow", metavar="NAME", help="one declared workflow instance"
-    )
+    breadth.add_argument("--workflow", metavar="NAME", help="one declared workflow instance")
     breadth.add_argument(
         "--fan-out",
         dest="fan_out",
@@ -985,8 +977,7 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     write_cache = getattr(args, "write_cache", False)
     if write_cache and not args.all:
         raise RuntimeError(
-            "❌ --write-cache requires --all: the status cache is a "
-            "whole-namespace map"
+            "❌ --write-cache requires --all: the status cache is a whole-namespace map"
         )
     if getattr(args, "hydrate_to", None) and args.scope != "remote":
         raise RuntimeError("❌ --hydrate-to keeps a REMOTE hydration; use --scope remote")
@@ -1019,9 +1010,7 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     raw_filters = getattr(args, "filters", None) or []
     if raw_filters and not args.all:
         raise RuntimeError("❌ --filter narrows --all; a targeted query names one instance")
-    args.filters = state_status.parse_filters(
-        [f"{field}={value}" for field, value in raw_filters]
-    )
+    args.filters = state_status.parse_filters([f"{field}={value}" for field, value in raw_filters])
     if args.scope == "local":
         if not args.ctl_state_local_root:
             raise RuntimeError("❌ --scope local requires --ctl-state-local-root")
@@ -1030,9 +1019,7 @@ def finalize_status_args(args: argparse.Namespace) -> None:
                 "❌ --provider-options is not valid with --scope local "
                 "(local reads the dir — no remote ctl-state backend, no credentials)"
             )
-        args.ctl_state_local_root = normalize_ctl_state_local_root(
-            args.ctl_state_local_root
-        )
+        args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
     else:
         # Remote reads pointers from the bucket into a throwaway temp, so it
         # needs no local root — UNLESS --write-cache, where the local root is the
@@ -1044,9 +1031,7 @@ def finalize_status_args(args: argparse.Namespace) -> None:
                     "❌ --write-cache with --scope remote requires "
                     "--ctl-state-local-root (the cache write target)"
                 )
-            args.ctl_state_local_root = normalize_ctl_state_local_root(
-                args.ctl_state_local_root
-            )
+            args.ctl_state_local_root = normalize_ctl_state_local_root(args.ctl_state_local_root)
         elif args.ctl_state_local_root:
             raise RuntimeError(
                 "❌ --ctl-state-local-root is not valid with --scope remote "
@@ -1070,23 +1055,26 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     args.providers = [read_provider] if read_provider and args.scope == "remote" else []
     args.execution_access_modes = {}
     if args.providers:
-        execution_providers.validate_provider_options(args.provider_options, args.providers)
         adapter = execution_adapters.get_adapter(read_provider)
-        adapter_options = execution_providers.provider_options_for(args.provider_options, read_provider)
+        adapter_options = execution_providers.provider_options_for(
+            args.provider_options, read_provider
+        )
         args.execution_access_modes = {
             read_provider: (
                 adapter.execution_access_mode_from_options(adapter_options)
                 or adapter.normal_execution_access_mode()
             )
         }
+        # after the mode: which options are required depends on it
+        execution_providers.validate_provider_options(
+            args.provider_options,
+            args.providers,
+            execution_access_modes=args.execution_access_modes,
+        )
     # Inert for a read (no box is built) but required by the shared context
     # builders / selection resolvers.
     args.execution_runtime_mode = "local"
-    if (
-        not args.all
-        and not getattr(args, "maintenance", False)
-        and args.action is None
-    ):
+    if not args.all and not getattr(args, "maintenance", False) and args.action is None:
         raise RuntimeError(
             "❌ a targeted status (--target/--workflow/--fan-out) requires "
             "--action provision|destroy"

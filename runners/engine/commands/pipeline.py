@@ -11,7 +11,7 @@ import os
 import shutil
 from pathlib import Path
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import secrets as cfg_secrets
@@ -34,6 +34,8 @@ from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+from engine.units import step as units_step
+from engine.units import target as units_target
 
 
 def run_targets(
@@ -103,7 +105,7 @@ def run_targets(
             and state_run_store.load_run_metadata(run_dir).get("run_type") == "workflow"
         ):
             target_key = target_run.get("target")
-            argv = catalog_workflow.build_child_target_command(
+            argv = catalog_workflow.WorkflowChildren.build_command(
                 child_command_spec,
                 target_key,
                 parent_run_dir=run_dir,
@@ -124,7 +126,12 @@ def run_targets(
             # surface on the composition row at all. Marked BEFORE the child
             # runs, on the same conservative rule as the inline path: from here
             # resources may change, and claiming possible damage beats denying it.
-            if member_action in run_actions.MUTATING_ACTIONS and not mutation_marked:
+            # the MEMBER action is what this run performs; a target's own action
+            # is what it declares it can do
+            target = units_target.Target.from_target_run(
+                target_run_id, {**target_run, "action": member_action}
+            )
+            if target.is_mutating and not mutation_marked:
                 state_lifecycle.mark_mutation_started(run_dir, target_run_id)
                 mutation_marked = True
             kernel_process.run_and_log(argv, cwd=str(run_dir), env=child_env)
@@ -205,82 +212,62 @@ def run_targets(
             }
             logging.info(json.dumps(run_manifest, indent=4))
 
-            if member_action in run_actions.MUTATING_ACTIONS and not mutation_marked:
-                state_lifecycle.mark_mutation_started(run_dir, target_run_id)
-                mutation_marked = True
-
-            for repo_step in repo_steps:
-                repo_step_id = repo_step["id"]
-                repo_step_path = repo_step["path"]
-                state_lifecycle.log_target_run_banner(
-                    f"[{member_action}] [{target_run_id}] [{repo_step_id}]", ch="-"
-                )
-                repo_step_runtime = repo_step.get("runtime", {})
-                supported = set(
-                    repo_step_runtime.get(
-                        "supported_execution_runtime_modes", run_policy.EXECUTION_RUNTIME_MODES
-                    )
-                )
-                if execution_runtime_mode not in supported:
-                    raise RuntimeError(
-                        f"❌ execution runtime {execution_runtime_mode!r} not supported by target_run "
-                        f"{target_run_id}/{repo_step_id} (supported: {sorted(supported)})"
-                    )
-                step_run_cmd = [runtime_dispatcher]
-                repo_step_env = dict(target_env)
-                repo_step_env["ATLAS_EXECUTION_CONTEXT_FILE"] = (
-                    execution_run_context.EXECUTION_CONTEXT_FILENAME
-                )
-                repo_step_env["cfg_keys"] = json.dumps(repo_step.get("cfg_keys") or {})
-                repo_step_env["STEP_WRITE_VALUES_JSON"] = (
-                    "true" if repo_step_runtime.get("values_json", True) else "false"
-                )
-                repo_step_env["STEP_WRITE_ENV_SH"] = (
-                    "true" if repo_step_runtime.get("env_sh", True) else "false"
-                )
-                repo_step_env["origin_cfg_base_dir_path"] = str(origin_cfg_path)
-                repo_step_env["TARGET_CFG_DIR"] = str(target_cfg_dir)
-                repo_step_env["TARGET_ARTIFACTS_DIR"] = str(target_artifacts_dir)
-                # CTL owns the box; hand the dispatcher the runtime + the
-                # target_run's declared box spec. step_dir locates src/step.sh in the repo.
-                repo_step_env["ATLAS_EXECUTION_RUNTIME_MODE"] = execution_runtime_mode
-                repo_step_env["ATLAS_STEP_NAME"] = kernel_process._step_box_name(
-                    target_run_id, repo_step_id
-                )
-                repo_step_env["ATLAS_STEP_IMAGE"] = repo_step_runtime["image"]
-                repo_step_env["ATLAS_STEP_DOCKER_BUILD"] = (
-                    "true" if repo_step_runtime.get("docker_build", False) else "false"
-                )
-                repo_step_env["step_dir"] = repo_step_path
-                repo_step_env["local_step_tooling_mode"] = tooling_mode
+            def _rebind(step, step_env, *, target_run_id=target_run_id, target_run=target_run):
                 if (credential_refresh_modes or {}).get(
                     getattr(provider_adapter, "PROVIDER_NAME", "")
-                ) == "per_step":
-                    cfg_materialize.rebind_step_credentials(
-                        list(repo_step.get("providers") or []),
-                        target_run_id=target_run_id,
-                        target_run=target_run,
-                        step_env=repo_step_env,
-                        provider_adapter=provider_adapter,
-                        provider_catalogs=provider_catalogs,
-                        execution_context=execution_context,
-                        provider_implementation_key=provider_implementation_key,
-                        execution_access_modes=execution_access_modes,
-                        provider_options=provider_options,
-                    )
-
-                logging.info(" ".join(step_run_cmd))
-                kernel_process.run_and_log(
-                    step_run_cmd,
-                    cwd=repo_path,
-                    env=repo_step_env,
+                ) != "per_step":
+                    return
+                cfg_materialize.rebind_step_credentials(
+                    list(step.providers),
+                    target_run_id=target_run_id,
+                    target_run=target_run,
+                    step_env=step_env,
+                    provider_adapter=provider_adapter,
+                    provider_catalogs=provider_catalogs,
+                    execution_context=execution_context,
+                    provider_implementation_key=provider_implementation_key,
+                    execution_access_modes=execution_access_modes,
+                    provider_options=provider_options,
                 )
+
+            step_context = units_step.StepContext(
+                execution_runtime_mode=execution_runtime_mode,
+                execution_context_filename=execution_run_context.EXECUTION_CONTEXT_FILENAME,
+                dispatcher=runtime_dispatcher,
+                tooling_mode=tooling_mode,
+                origin_cfg_path=origin_cfg_path,
+                target_cfg_dir=target_cfg_dir,
+                target_artifacts_dir=target_artifacts_dir,
+                box_name=lambda step_id, run_id=target_run_id: kernel_process._step_box_name(
+                    run_id, step_id
+                ),
+                launch=lambda argv, env, cwd=repo_path: kernel_process.run_and_log(
+                    argv, cwd=cwd, env=env
+                ),
+                rebind_credentials=_rebind,
+            )
+            # the MEMBER action is what this run performs; a target's own action
+            # is what it declares it can do
+            target = units_target.Target.from_target_run(
+                target_run_id, {**target_run, "action": member_action}
+            )
+            target.run(
+                repo_steps,
+                target_env,
+                context=units_target.TargetContext(
+                    step_context=step_context,
+                    mark_mutation_started=lambda run_dir=run_dir, run_id=target_run_id: (
+                        state_lifecycle.mark_mutation_started(run_dir, run_id)
+                    ),
+                    banner=lambda message: state_lifecycle.log_target_run_banner(message, ch="-"),
+                ),
+            )
             state_sync.PUBLICATION.push(f"target_run {target_run_id} completed")
             if target_instance_address is not None:
                 # Fill the child's target-level slice (cfg, execution
                 # context, source refs) now that resolved cfg exists — before the
                 # child pointer is published.
-                catalog_workflow.populate_workflow_child_slice(
+                catalog_workflow.WorkflowChildren.populate_slice(
                     target_state_run_dir,
                     target_run,
                     target_run_id,
@@ -425,7 +412,7 @@ def run_pipeline(
     selected_graph_provisions_backend = parent_graph_provisions_ctl_state_backend
     backend_absence_confirmed = parent_ctl_state_backend_absence_confirmed
     if agreed_defer_ctl_state_backend_sync and not selected_graph_provisions_backend:
-        graph_probe = commands_maintenance.inspect_selected_graph_ctl_state_backend(
+        graph_probe = commands_maintenance.CtlStateMaintenance.inspect_selected_graph_backend(
             [selection],
             ctl_cfg_root,
             implementation_key=provider_implementation_key,
@@ -567,7 +554,7 @@ def run_pipeline(
         if action in run_actions.MUTATING_ACTIONS and not target_keys:
             raise RuntimeError("❌ mutating procedure runs require affected_target_keys")
     else:
-        target_keys = catalog_targets.target_keys_from_active_target_runs(active_target_runs)
+        target_keys = target_catalog.ActiveTargetRuns.target_keys(active_target_runs)
     state_run_store.record_run_target_keys(run_dir, target_keys)
     run_metadata = state_run_store.load_run_metadata(run_dir)
     ctl_state_local_root_value = run_metadata.get("ctl_state_local_root")
@@ -576,7 +563,7 @@ def run_pipeline(
             Path(ctl_state_local_root_value), ctl_cfg_root
         )
 
-    catalog_workflow.write_target_flow_artifact(
+    catalog_workflow.WorkflowArtifacts.write_target_flow(
         ctl_cfg_root,
         artifacts_dir,
         ctl_profile=ctl_profile,

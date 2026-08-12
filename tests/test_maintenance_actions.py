@@ -15,16 +15,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine_surface import engine_source
+import contextlib
+
 from engine.commands import selection as commands_selection
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+from engine_surface import engine_source
 
 
 def _pointer(root: Path, rel: str, when: str) -> Path:
     d = root / rel
-    kernel_yaml_io.write_yaml_file(d / "committed.yaml", {"run_id": "r1", "status": "ok", "committed_at": when})
+    kernel_yaml_io.write_yaml_file(
+        d / "committed.yaml", {"run_id": "r1", "status": "ok", "committed_at": when}
+    )
     return d
 
 
@@ -33,8 +37,11 @@ class UnlockScopeTest(unittest.TestCase):
 
     def _args(self, **kw):
         base = dict(
-            maintenance_action="unlock-ctl-state", lock_id="r1",
-            ctl_state_local_root="/tmp/x", unlock_scope=None, target=None,
+            maintenance_action="unlock-ctl-state",
+            lock_id="r1",
+            ctl_state_local_root="/tmp/x",
+            unlock_scope=None,
+            target=None,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -43,24 +50,22 @@ class UnlockScopeTest(unittest.TestCase):
         """A run that dies holds both; clearing one only moves where the next is refused."""
 
         args = self._args()
-        try:
-            commands_selection.validate_maintenance_args(args)
-        except RuntimeError:
-            pass
+        with contextlib.suppress(RuntimeError):
+            commands_selection.validate_run_args("maintenance", args)
         self.assertEqual("both", args.unlock_scope)
 
     def test_local_and_both_require_a_local_root(self):
         for scope in ("local", "both"):
             with self.assertRaisesRegex(RuntimeError, "ctl-state-local-root"):
-                commands_selection.validate_maintenance_args(
-                    self._args(unlock_scope=scope, ctl_state_local_root=None)
+                commands_selection.validate_run_args(
+                    "maintenance", self._args(unlock_scope=scope, ctl_state_local_root=None)
                 )
 
     def test_remote_needs_no_local_root(self):
         """It touches nothing local."""
 
         args = self._args(unlock_scope="remote", ctl_state_local_root=None)
-        commands_selection.validate_maintenance_args(args)
+        commands_selection.validate_run_args("maintenance", args)
         self.assertEqual("remote", args.unlock_scope)
 
 
@@ -78,7 +83,9 @@ class ForgetSelectionTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _addrs(self, older_than, addresses):
-        return sorted(i["address"] for i in state_status.forget_selection(self.root, older_than, addresses))
+        return sorted(
+            i["address"] for i in state_status.forget_selection(self.root, older_than, addresses)
+        )
 
     def test_both_filters_compose(self):
         self.assertEqual([], self._addrs("2026-03-01", ["target/env/acm"]))
@@ -91,8 +98,13 @@ class ForgetSelectionTest(unittest.TestCase):
 class ForgetValidationTest(unittest.TestCase):
     def _args(self, **kw):
         base = dict(
-            maintenance_action="forget", older_than="any", forget_address=["all"],
-            ctl_state_local_root="/tmp/x", unlock_scope=None, lock_id=None, target=None,
+            maintenance_action="forget",
+            older_than="any",
+            forget_address=["all"],
+            ctl_state_local_root="/tmp/x",
+            unlock_scope=None,
+            lock_id=None,
+            target=None,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -100,11 +112,11 @@ class ForgetValidationTest(unittest.TestCase):
     def test_both_filters_are_required(self):
         for missing in ("older_than", "forget_address"):
             with self.assertRaisesRegex(RuntimeError, "both filters are"):
-                commands_selection.validate_maintenance_args(self._args(**{missing: None}))
+                commands_selection.validate_run_args("maintenance", self._args(**{missing: None}))
 
     def test_scope_defaults_to_both(self):
         args = self._args()
-        commands_selection.validate_maintenance_args(args)
+        commands_selection.validate_run_args("maintenance", args)
         self.assertEqual("both", args.forget_scope)
 
 
@@ -139,9 +151,8 @@ class ForgetGuardTest(unittest.TestCase):
     def test_a_referenced_instance_needs_cascade(self):
         refs = {self.rel: {"workflow/env/seed/instances/sha256=abc"}}
         self.assertIn("cascade", self._guard(accept_orphans=True, referenced_by=refs))
-        self.assertIsNone(
-            self._guard(accept_orphans=True, cascade=True, referenced_by=refs)
-        )
+        self.assertIsNone(self._guard(accept_orphans=True, cascade=True, referenced_by=refs))
+
 
 class UnlockRemoteTest(unittest.TestCase):
     """The namespace lock is released by ID, never blindly."""
@@ -149,8 +160,10 @@ class UnlockRemoteTest(unittest.TestCase):
     class _Syncer:
         def __init__(self, doc):
             self.doc, self.deleted = doc, False
+
         def read_mutation_lock(self):
             return self.doc
+
         def delete_mutation_lock(self):
             self.deleted = True
 
@@ -171,5 +184,3 @@ class UnlockRemoteTest(unittest.TestCase):
         s = self._Syncer({"run_id": "r1"})
         self.assertEqual("released", state_sync.release_remote_mutation_lock(s, "r1"))
         self.assertTrue(s.deleted)
-
-

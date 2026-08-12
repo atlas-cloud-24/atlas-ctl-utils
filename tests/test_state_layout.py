@@ -9,7 +9,6 @@ facts and keep their own files — the property that makes the partition earn it
 place, because a plan must never erase the record of the last deployment.
 """
 
-
 import sys
 import tempfile
 import unittest
@@ -19,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import ctl_cfg_fixture
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
@@ -84,7 +83,9 @@ class PathShapeTest(unittest.TestCase):
     def test_the_pointer_lives_under_its_group(self):
         self.assertEqual(
             "committed/mutative.yaml",
-            state_run_store.committed_pointer_path(Path("i"), "mutative").relative_to("i").as_posix(),
+            state_run_store.committed_pointer_path(Path("i"), "mutative")
+            .relative_to("i")
+            .as_posix(),
         )
 
     def test_an_unknown_group_is_refused(self):
@@ -141,11 +142,16 @@ class GroupsDoNotOverwriteTest(unittest.TestCase):
             _slot(namespace, "failed", "plan", run_id="p")
             _slot(namespace, "failed", "mutative", run_id="d")
             self.assertEqual(
-                "p", state_run_store.read_instance_state_slot(_instance(namespace), "failed", "plan")["run_id"]
+                "p",
+                state_run_store.read_instance_state_slot(_instance(namespace), "failed", "plan")[
+                    "run_id"
+                ],
             )
             self.assertEqual(
                 "d",
-                state_run_store.read_instance_state_slot(_instance(namespace), "failed", "mutative")["run_id"],
+                state_run_store.read_instance_state_slot(
+                    _instance(namespace), "failed", "mutative"
+                )["run_id"],
             )
 
     def test_a_deployment_run_publishes_only_its_own_group(self):
@@ -153,17 +159,21 @@ class GroupsDoNotOverwriteTest(unittest.TestCase):
             namespace = Path(tmp)
             run_dir = _instance(namespace) / "runs" / "r9"
             run_dir.mkdir(parents=True)
-            state_run_store.write_run_metadata(run_dir, {
-                "run_id": "r9", "action": "destroy", "run_type": "target",
-                "result_name": KEY, "ctl_state_local_root": str(namespace),
-                "ctl_state_locator": [],
-            })
+            state_run_store.write_run_metadata(
+                run_dir,
+                {
+                    "run_id": "r9",
+                    "action": "destroy",
+                    "run_type": "target",
+                    "result_name": KEY,
+                    "ctl_state_local_root": str(namespace),
+                    "ctl_state_locator": [],
+                },
+            )
             state_run_store.publish_committed_pointer(
                 run_dir, state_status.build_status_payload(run_dir, "ok")
             )
-            published = sorted(
-                q.name for q in (_instance(namespace) / "committed").iterdir()
-            )
+            published = sorted(q.name for q in (_instance(namespace) / "committed").iterdir())
             self.assertEqual(["mutative.yaml"], published)
 
 
@@ -181,7 +191,11 @@ class RowShapeTest(unittest.TestCase):
     def test_the_canonical_order_is_status_freshness_at(self):
         self.assertEqual(
             ["status", "freshness", "time"],
-            list(run_addressing.order_axes({"time": "t", "freshness": "outdated", "status": "passed"})),
+            list(
+                run_addressing.order_axes(
+                    {"time": "t", "freshness": "outdated", "status": "passed"}
+                )
+            ),
         )
 
     def test_a_live_slot_reads_running(self):
@@ -246,7 +260,7 @@ class MemberEntryActionTest(unittest.TestCase):
     def test_a_bare_key_takes_the_declared_default(self):
         self.assertEqual(
             [("env/ops/ecr", "provision")],
-            catalog_targets.normalize_target_entries(
+            target_catalog.TargetEntries.normalize(
                 ["env/ops/ecr"], label="wf", default_action="provision"
             ),
         )
@@ -257,12 +271,12 @@ class MemberEntryActionTest(unittest.TestCase):
         not runnable: the engine cannot know what to do with the target."""
 
         with self.assertRaisesRegex(RuntimeError, "has no action"):
-            catalog_targets.normalize_target_entries(["env/ops/ecr"], label="wf")
+            target_catalog.TargetEntries.normalize(["env/ops/ecr"], label="wf")
 
     def test_a_mapping_declares_its_own_action(self):
         self.assertEqual(
             [("env/ops/app", "destroy")],
-            catalog_targets.normalize_target_entries(
+            target_catalog.TargetEntries.normalize(
                 [{"key": "env/ops/app", "action": "destroy"}], label="wf"
             ),
         )
@@ -272,7 +286,7 @@ class MemberEntryActionTest(unittest.TestCase):
 
         order is load-bearing: the last write to the pointer wins."""
 
-        entries = catalog_targets.normalize_target_entries(
+        entries = target_catalog.TargetEntries.normalize(
             [
                 {"key": "env/seed/baseline", "action": "destroy"},
                 {"key": "env/seed/baseline", "action": "provision"},
@@ -286,26 +300,27 @@ class MemberEntryActionTest(unittest.TestCase):
 
     def test_the_same_key_and_action_twice_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "duplicate target entry"):
-            catalog_targets.normalize_target_entries(
-                ["env/ops/ecr", {"key": "env/ops/ecr"}], label="wf",
+            target_catalog.TargetEntries.normalize(
+                ["env/ops/ecr", {"key": "env/ops/ecr"}],
+                label="wf",
                 default_action="provision",
             )
 
     def test_an_unknown_action_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "declares action"):
-            catalog_targets.normalize_target_entries(
+            target_catalog.TargetEntries.normalize(
                 [{"key": "env/ops/app", "action": "rebuild"}], label="wf"
             )
 
     def test_maintenance_is_refused_as_a_workflow_member_action(self):
         with self.assertRaisesRegex(RuntimeError, "maintenance runner"):
-            catalog_targets.normalize_target_entries(
+            target_catalog.TargetEntries.normalize(
                 [{"key": "env/ops/app", "action": "maintenance"}], label="wf"
             )
 
     def test_an_unsupported_field_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "unsupported keys"):
-            catalog_targets.normalize_target_entries(
+            target_catalog.TargetEntries.normalize(
                 [{"key": "env/ops/app", "params": {"env.type": "dev"}}], label="wf"
             )
 
@@ -313,7 +328,8 @@ class MemberEntryActionTest(unittest.TestCase):
         self.assertEqual(
             ["a/b", "c/d"],
             run_addressing.normalize_target_keys(
-                ["a/b", {"key": "c/d", "action": "destroy"}], label="wf",
+                ["a/b", {"key": "c/d", "action": "destroy"}],
+                label="wf",
             ),
         )
 
@@ -332,15 +348,17 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
     }
 
     def test_import_expansion_keeps_the_declared_action(self):
-        runs = catalog_workflow.expand_workflow_imports(self.WORKFLOWS, "env/baseline")
+        runs = catalog_workflow.WorkflowImports.expand(self.WORKFLOWS, "env/baseline")
         self.assertEqual(
-            {"id": "env/core/baseline", "target": "env/core/baseline",
-             "action": "provision"}, runs[0])
-        self.assertEqual({"id": "env/ops/app", "target": "env/ops/app",
-                          "action": "destroy"}, runs[1])
+            {"id": "env/core/baseline", "target": "env/core/baseline", "action": "provision"},
+            runs[0],
+        )
+        self.assertEqual(
+            {"id": "env/ops/app", "target": "env/ops/app", "action": "destroy"}, runs[1]
+        )
 
     def test_a_repeated_key_with_differing_actions_expands(self):
-        runs = catalog_workflow.expand_workflow_imports(
+        runs = catalog_workflow.WorkflowImports.expand(
             {
                 "env/seed": {
                     "default_action": "provision",
@@ -356,39 +374,51 @@ class MemberActionReachesTheChildTest(unittest.TestCase):
 
     def test_the_same_key_and_action_twice_is_still_refused(self):
         with self.assertRaisesRegex(RuntimeError, "duplicate target entry"):
-            catalog_workflow.expand_workflow_imports(
-                {"w": {"default_action": "provision",
-                       "targets": ["a/b", {"key": "a/b"}]}},
+            catalog_workflow.WorkflowImports.expand(
+                {"w": {"default_action": "provision", "targets": ["a/b", {"key": "a/b"}]}},
                 "w",
             )
 
     def test_the_member_actions_are_collected_for_the_action_cfg(self):
-        cfg = {"target_runs": catalog_workflow.expand_workflow_imports(self.WORKFLOWS, "env/baseline")}
-        self.assertEqual({"provision", "destroy"},
-                         catalog_workflow.workflow_member_actions(cfg))
+        cfg = {
+            "target_runs": catalog_workflow.WorkflowImports.expand(self.WORKFLOWS, "env/baseline")
+        }
+        self.assertEqual(
+            {"provision", "destroy"}, catalog_workflow.WorkflowCatalog.member_actions(cfg)
+        )
 
     def test_the_child_argv_carries_the_member_action(self):
         spec = {
-            "ctl_entrypoint": "ctl.py", "ctl_cfg_root": "/cfg",
-            "ctl_profile": "local_dev", "ctl_state_local_root": "/state",
-            "execution_runtime_mode": "local", "action": "provision",
+            "ctl_entrypoint": "ctl.py",
+            "ctl_cfg_root": "/cfg",
+            "ctl_profile": "local_dev",
+            "ctl_state_local_root": "/state",
+            "execution_runtime_mode": "local",
+            "action": "provision",
         }
-        argv = catalog_workflow.build_child_target_command(
-            spec, "env/ops/app",
-            parent_run_dir=Path("/state/runs/w1"), parent_run_id="w1",
+        argv = catalog_workflow.WorkflowChildren.build_command(
+            spec,
+            "env/ops/app",
+            parent_run_dir=Path("/state/runs/w1"),
+            parent_run_id="w1",
             action="destroy",
         )
         self.assertEqual("destroy", argv[argv.index("--action") + 1])
 
     def test_a_child_without_a_declared_action_inherits_the_operation(self):
         spec = {
-            "ctl_entrypoint": "ctl.py", "ctl_cfg_root": "/cfg",
-            "ctl_profile": "local_dev", "ctl_state_local_root": "/state",
-            "execution_runtime_mode": "local", "action": "provision",
+            "ctl_entrypoint": "ctl.py",
+            "ctl_cfg_root": "/cfg",
+            "ctl_profile": "local_dev",
+            "ctl_state_local_root": "/state",
+            "execution_runtime_mode": "local",
+            "action": "provision",
         }
-        argv = catalog_workflow.build_child_target_command(
-            spec, "env/core/baseline",
-            parent_run_dir=Path("/state/runs/w1"), parent_run_id="w1",
+        argv = catalog_workflow.WorkflowChildren.build_command(
+            spec,
+            "env/core/baseline",
+            parent_run_dir=Path("/state/runs/w1"),
+            parent_run_id="w1",
         )
         self.assertEqual("provision", argv[argv.index("--action") + 1])
 
@@ -399,21 +429,21 @@ class TargetActionPolicyTest(unittest.TestCase):
     def test_a_target_declares_actions(self):
         self.assertEqual(
             ["provision"],
-            catalog_targets.TargetActionPolicy(
+            target_catalog.TargetActionPolicy(
                 {"actions": ["provision"]}, label="target 't'"
             ).actions(),
         )
 
     def test_workflow_operation_vocabulary_is_not_target_policy(self):
         with self.assertRaisesRegex(RuntimeError, "does not accept 'operations'"):
-            catalog_targets.TargetActionPolicy(
+            target_catalog.TargetActionPolicy(
                 {"actions": ["provision"], "operations": ["provision"]},
                 label="target 't'",
             ).actions()
 
     def test_actions_are_required(self):
         with self.assertRaisesRegex(RuntimeError, "must declare 'actions'"):
-            catalog_targets.TargetActionPolicy({}, label="target 't'").actions()
+            target_catalog.TargetActionPolicy({}, label="target 't'").actions()
 
 
 class DispatchGuardTest(unittest.TestCase):
@@ -457,15 +487,15 @@ class DispatchGuardTest(unittest.TestCase):
 class WorkflowIsAddressedByParamsTest(unittest.TestCase):
     """A workflow instance is addressed by its DECLARED params.
 
-    The composition sha256 this class used to test is gone. It was introduced to
-    keep a teardown of A and a deploy of A apart, but answered that
-    differently and better: params ADDRESS where a hash IDENTIFIES, and the two
-    directions share one instance while publishing into different GROUP files
-. The hash then survived only in the status path, where it composed
-    a prefix no run has ever written.
+        The composition sha256 this class used to test is gone. It was introduced to
+        keep a teardown of A and a deploy of A apart, but answered that
+        differently and better: params ADDRESS where a hash IDENTIFIES, and the two
+        directions share one instance while publishing into different GROUP files
+    . The hash then survived only in the status path, where it composed
+        a prefix no run has ever written.
 
-    What replaces those tests is the property that actually matters: the run side
-    and the status side must produce the SAME address.
+        What replaces those tests is the property that actually matters: the run side
+        and the status side must produce the SAME address.
     """
 
     KEY = "env/workload_permissions_boundary"
@@ -486,20 +516,24 @@ class WorkflowIsAddressedByParamsTest(unittest.TestCase):
         return run_addressing.compose_state_relpath("workflow", self.KEY, segments).as_posix()
 
     def _status_side_spec(self, action="provision"):
-        return catalog_workflow.selection_state_spec({
-            "selection_kind": "workflow",
-            "selection_key": self.KEY,
-            "workflow_cfg": {
-                "meta": {"name": f"{action}/{self.KEY}", "action": action},
-                "workflow_instance_params": self.PARAMS,
-            },
-            "execution_context": self.CONTEXT,
-            "active_target_runs": {"tr1": {
-                "target": f"{self.KEY}/baseline",
-                "target_instance_params": self.PARAMS,
-                "action": action,
-            }},
-        })
+        return catalog_workflow.WorkflowArtifacts.selection_state_spec(
+            {
+                "selection_kind": "workflow",
+                "selection_key": self.KEY,
+                "workflow_cfg": {
+                    "meta": {"name": f"{action}/{self.KEY}", "action": action},
+                    "workflow_instance_params": self.PARAMS,
+                },
+                "execution_context": self.CONTEXT,
+                "active_target_runs": {
+                    "tr1": {
+                        "target": f"{self.KEY}/baseline",
+                        "target_instance_params": self.PARAMS,
+                        "action": action,
+                    }
+                },
+            }
+        )
 
     def test_the_status_path_addresses_what_a_run_writes(self):
         """The defect: status hydrated `instances/sha256=<digest>` while runs write
@@ -519,9 +553,7 @@ class WorkflowIsAddressedByParamsTest(unittest.TestCase):
             self._status_side_spec("provision")["prefix"],
             self._status_side_spec("destroy")["prefix"],
         )
-        self.assertNotEqual(
-            run_actions.action_group("provision"), run_actions.action_group("plan")
-        )
+        self.assertNotEqual(run_actions.action_group("provision"), run_actions.action_group("plan"))
 
     def test_a_members_shaped_declaration_still_resolves(self):
         """
@@ -529,16 +561,23 @@ class WorkflowIsAddressedByParamsTest(unittest.TestCase):
         params may DISPATCH on context, and both sides must resolve it the same
         way — which is why the resolution has one definition."""
 
-        declared = {"members": [
-            {"selectors": {"match": {"execution_context.params.env.type": "dev"}},
-             "params": ["env.type"]},
-            {"selectors": {"match": {"execution_context.params.env.type": "prod"}},
-             "params": ["env.type", "aws.account"]},
-        ]}
+        declared = {
+            "members": [
+                {
+                    "selectors": {"match": {"execution_context.params.env.type": "dev"}},
+                    "params": ["env.type"],
+                },
+                {
+                    "selectors": {"match": {"execution_context.params.env.type": "prod"}},
+                    "params": ["env.type", "aws.account"],
+                },
+            ]
+        }
         self.assertEqual(
             ["env.type"],
-            catalog_workflow.resolve_declared_workflow_instance_params(
-                declared, self.CONTEXT, label="workflow"),
+            catalog_workflow.WorkflowInstanceParams.resolve_declared(
+                declared, self.CONTEXT, label="workflow"
+            ),
         )
 
     def test_the_composition_hash_is_gone(self):
@@ -556,28 +595,26 @@ class ActionMustBeDeclaredTest(unittest.TestCase):
 
     def _refuses(self, workflows):
         with self.assertRaisesRegex(RuntimeError, "no action"):
-            catalog_workflow.validate_workflow_actions_declared(workflows)
+            catalog_workflow.WorkflowCatalog.validate_actions_declared(workflows)
 
     def test_a_bare_list_with_no_default_is_refused(self):
         self._refuses({"w": {"targets": {"keys": ["a/b"]}}})
 
     def test_a_member_with_no_default_is_refused(self):
-        self._refuses({"w": {"targets": {"members": [
-            {"keys": ["a/b"], "selectors": {}}]}}})
+        self._refuses({"w": {"targets": {"members": [{"keys": ["a/b"], "selectors": {}}]}}})
 
     def test_a_declared_default_is_accepted(self):
-        catalog_workflow.validate_workflow_actions_declared(
+        catalog_workflow.WorkflowCatalog.validate_actions_declared(
             {"w": {"targets": {"default_action": "provision", "keys": ["a/b"]}}}
         )
 
     def test_per_key_actions_without_a_default_are_accepted(self):
-        catalog_workflow.validate_workflow_actions_declared(
+        catalog_workflow.WorkflowCatalog.validate_actions_declared(
             {"w": {"targets": {"keys": [{"key": "a/b", "action": "destroy"}]}}}
         )
 
     def test_one_bare_key_among_declared_ones_is_still_refused(self):
-        self._refuses({"w": {"targets": {"keys": [
-            {"key": "a/b", "action": "destroy"}, "c/d"]}}})
+        self._refuses({"w": {"targets": {"keys": [{"key": "a/b", "action": "destroy"}, "c/d"]}}})
 
     def test_the_real_ctl_cfg_declares_an_action_everywhere(self):
         import glob
@@ -589,11 +626,9 @@ class ActionMustBeDeclaredTest(unittest.TestCase):
             self.skipTest("oxygen ctl cfg not present")
         workflows = {}
         for path in glob.glob(str(root / "*.yaml")):
-            workflows.update(
-                (yaml.safe_load(Path(path).read_text()) or {}).get("workflows") or {}
-            )
+            workflows.update((yaml.safe_load(Path(path).read_text()) or {}).get("workflows") or {})
         self.assertGreater(len(workflows), 10)
-        catalog_workflow.validate_workflow_actions_declared(workflows)
+        catalog_workflow.WorkflowCatalog.validate_actions_declared(workflows)
 
 
 class DefaultActionResolutionTest(unittest.TestCase):
@@ -602,17 +637,23 @@ class DefaultActionResolutionTest(unittest.TestCase):
     CONTEXT = {"execution_context.params.operation": "destroy"}
 
     def test_a_literal_is_taken_as_is(self):
-        self.assertEqual("provision", run_selectors.resolve_default_action(
-            "provision", self.CONTEXT, label="wf"))
+        self.assertEqual(
+            "provision", run_selectors.resolve_default_action("provision", self.CONTEXT, label="wf")
+        )
 
     def test_a_reference_follows_the_invocation(self):
-        self.assertEqual("destroy", run_selectors.resolve_default_action(
-            "${execution_context.params.operation}", self.CONTEXT, label="wf"))
+        self.assertEqual(
+            "destroy",
+            run_selectors.resolve_default_action(
+                "${execution_context.params.operation}", self.CONTEXT, label="wf"
+            ),
+        )
 
     def test_an_unbound_reference_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "not bound"):
             run_selectors.resolve_default_action(
-                "${execution_context.params.operation}", {}, label="wf")
+                "${execution_context.params.operation}", {}, label="wf"
+            )
 
     def test_none_stays_none(self):
         self.assertIsNone(run_selectors.resolve_default_action(None, self.CONTEXT, label="wf"))

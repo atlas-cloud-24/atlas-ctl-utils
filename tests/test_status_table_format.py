@@ -147,9 +147,20 @@ class FormatIsDeclaredAsAReadingChoiceTest(unittest.TestCase):
         cli_args.add_status_args(parser)
         args = parser.parse_args(
             [
-                "--ctl-cfg", "/cfg", "--ctl-profile", "local_dev", "--all",
-                "--structure", "nested", "--format", "table", "--hide-members",
-                "--scope", "local", "--ctl-state-local-root", "/tmp/state",
+                "--ctl-cfg",
+                "/cfg",
+                "--ctl-profile",
+                "local_dev",
+                "--all",
+                "--structure",
+                "nested",
+                "--format",
+                "table",
+                "--hide-members",
+                "--scope",
+                "local",
+                "--ctl-state-local-root",
+                "/tmp/state",
             ]
         )
         self.assertTrue(args.hide_members)
@@ -200,7 +211,9 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
 
         rendered = state_render.render_status_map(FLAT_REPORT)
         headings, *rows = [
-            line for line in rendered.splitlines() if line.startswith(("ADDRESS", "workflow/", "target/"))
+            line
+            for line in rendered.splitlines()
+            if line.startswith(("ADDRESS", "workflow/", "target/"))
         ]
         self.assertIn("MEMBERS", headings)
         self.assertEqual(len(rows), len(FLAT_REPORT["instances"]))
@@ -214,7 +227,8 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         short_address = "env/seed/baseline"
         self.assertIn(short_address, rendered)
         member_line = next(
-            line for line in rendered.splitlines()
+            line
+            for line in rendered.splitlines()
             if short_address in line and line.startswith("        \u2514")
         )
         for field in ("status", "last_action", "freshness", "time", "label"):
@@ -230,9 +244,7 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("  \u2514 env/seed") for line in lines))
         self.assertTrue(any(line.startswith("    \u2514 env.type=") for line in lines))
         self.assertTrue(any(line.startswith("      \u2514 mutative") for line in lines))
-        self.assertTrue(
-            any(line.startswith("      \u2514 non_mutative") for line in lines)
-        )
+        self.assertTrue(any(line.startswith("      \u2514 non_mutative") for line in lines))
         self.assertTrue(any(line.startswith("        \u2514 env/seed/baseline") for line in lines))
 
     def test_tree_lines_continue_across_later_siblings(self):
@@ -273,16 +285,14 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         import copy
 
         report = copy.deepcopy(NESTED_REPORT)
-        member = report["workflow"]["env/seed"]["instances"][
-            "env.type=dev/aws.account=dev"
-        ]["non_mutative"]["members"][0]
-        member["address"] = (
-            "target/env/seed/baseline/instances/"
-            "env.type=shared/aws.account=shared"
-        )
+        member = report["workflow"]["env/seed"]["instances"]["env.type=dev/aws.account=dev"][
+            "non_mutative"
+        ]["members"][0]
+        member["address"] = "target/env/seed/baseline/instances/env.type=shared/aws.account=shared"
 
         member_line = next(
-            line for line in state_render.render_status_map(report).splitlines()
+            line
+            for line in state_render.render_status_map(report).splitlines()
             if line.startswith("        \u2514 env/seed/baseline/instances/")
         )
         self.assertNotIn("target/env/seed/baseline", member_line)
@@ -292,7 +302,8 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
 
         rendered = state_render.render_status_map(NESTED_REPORT)
         member_line = next(
-            line for line in rendered.splitlines()
+            line
+            for line in rendered.splitlines()
             if "env/seed/baseline" in line and line.startswith("        \u2514")
         )
         self.assertNotIn("instances/", member_line)
@@ -313,9 +324,7 @@ class TheTableShowsOnlyWhatTheReportHoldsTest(unittest.TestCase):
         once someone chooses a column for it — the same rule as AXIS_ORDER."""
 
         invented = dict(FLAT_REPORT)
-        invented["instances"] = [
-            {**FLAT_REPORT["instances"][0], "cloud_cost_estimate": "17 USD"}
-        ]
+        invented["instances"] = [{**FLAT_REPORT["instances"][0], "cloud_cost_estimate": "17 USD"}]
         self.assertNotIn("17 USD", state_render.render_status_map(invented))
 
     def test_standing_is_always_visible(self):
@@ -333,15 +342,17 @@ class MaintenanceTableTest(unittest.TestCase):
         "namespace": "aws/nonprod",
         "scope": "local",
         "computed_at": "2026-08-09T12:00:00Z",
-        "maintenance": [{
-            "source": "run",
-            "operation": "unlock-ctl-state",
-            "status": "passed",
-            "subject": "lock-1",
-            "scope": "both",
-            "time": "2026-08-09T11:59:00Z",
-            "id": "run-1",
-        }],
+        "maintenance": [
+            {
+                "source": "run",
+                "operation": "unlock-ctl-state",
+                "status": "passed",
+                "subject": "lock-1",
+                "scope": "both",
+                "time": "2026-08-09T11:59:00Z",
+                "id": "run-1",
+            }
+        ],
     }
 
     def test_maintenance_has_its_own_table(self):
@@ -380,8 +391,7 @@ class MaintenanceTableTest(unittest.TestCase):
 
         unlabelled = dict(FLAT_REPORT)
         unlabelled["instances"] = [
-            {k: v for k, v in row.items() if k != "label"}
-            for row in FLAT_REPORT["instances"]
+            {k: v for k, v in row.items() if k != "label"} for row in FLAT_REPORT["instances"]
         ]
         rendered = state_render.render_status_map(unlabelled)
         self.assertIn("LABEL", rendered)
@@ -405,13 +415,9 @@ class MaintenanceTableTest(unittest.TestCase):
 
         rendered = state_render.render_status_map(NESTED_REPORT)
         for prefix in ("target", "    \u2514 env.type="):
-            line = next(
-                line for line in rendered.splitlines() if line.startswith(prefix)
-            )
+            line = next(line for line in rendered.splitlines() if line.startswith(prefix))
             with self.subTest(line=prefix):
-                self.assertNotIn(
-                    f"  {state_render.EMPTY_CELL} ", f"{line} "
-                )
+                self.assertNotIn(f"  {state_render.EMPTY_CELL} ", f"{line} ")
 
     def test_the_report_still_says_where_it_came_from(self):
         """Namespace and scope are what make the rows trustworthy — local and
@@ -428,18 +434,14 @@ class MaintenanceTableTest(unittest.TestCase):
         than out of the map."""
 
         with_cache = {**FLAT_REPORT, "cache_written": "/root/ns/status_cache.yaml"}
-        self.assertIn(
-            "/root/ns/status_cache.yaml", state_render.render_status_map(with_cache)
-        )
+        self.assertIn("/root/ns/status_cache.yaml", state_render.render_status_map(with_cache))
 
     def test_an_empty_namespace_says_so(self):
         """A header with nothing under it reads as truncated output rather than
         as an answer."""
 
         empty = {**FLAT_REPORT, "instances": []}
-        self.assertIn(
-            state_render.EMPTY_MAP_LINE, state_render.render_status_map(empty)
-        )
+        self.assertIn(state_render.EMPTY_MAP_LINE, state_render.render_status_map(empty))
 
 
 class TheTableAgreesWithTheStructureItRendersTest(unittest.TestCase):

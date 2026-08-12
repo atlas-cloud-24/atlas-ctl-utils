@@ -6,7 +6,6 @@ run's terminal paths — so across the whole mutation window a dependent read
 `current` while its dependency was actively changing.
 """
 
-
 import os
 import sys
 import tempfile
@@ -16,7 +15,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine_surface import patch_engine
 from engine.commands import pipeline as commands_pipeline
 from engine.kernel import ids as kernel_ids
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -24,6 +22,7 @@ from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine_surface import patch_engine
 
 TARGET_SPEC = {
     "kind": "target",
@@ -104,9 +103,7 @@ class RunStatusAxisTest(unittest.TestCase):
             _write_committed(namespace, workflow["prefix"], workflow_definition_sha256="wf")
             _write_committed(namespace, TARGET_SPEC["prefix"])
             _write_in_progress(namespace, TARGET_SPEC["prefix"], mutation_started=True)
-            result = state_status.compute_workflow_instance_status(
-                namespace, "provision", workflow
-            )
+            result = state_status.compute_workflow_instance_status(namespace, "provision", workflow)
             self.assertEqual("running", result["status"])
 
 
@@ -133,9 +130,9 @@ class FailedAxisTest(unittest.TestCase):
             _write_failed(namespace, TARGET_SPEC["prefix"])
             _write_in_progress(namespace, TARGET_SPEC["prefix"])
             self.assertEqual(
-                state_status.compute_target_instance_status(
-                    namespace, "provision", TARGET_SPEC
-                )["status"],
+                state_status.compute_target_instance_status(namespace, "provision", TARGET_SPEC)[
+                    "status"
+                ],
                 "running",
             )
 
@@ -164,11 +161,12 @@ class FailedAxisTest(unittest.TestCase):
             _write_committed(namespace, TARGET_SPEC["prefix"])
             _write_failed(namespace, TARGET_SPEC["prefix"])
             self.assertEqual(
-                state_status.compute_workflow_instance_status(
-                    namespace, "provision", workflow
-                )["status"],
+                state_status.compute_workflow_instance_status(namespace, "provision", workflow)[
+                    "status"
+                ],
                 "failed",
             )
+
 
 class OutdateAtMutationStartTest(unittest.TestCase):
     """Mark_mutation_started must outdate the affected pointers immediately.
@@ -179,7 +177,17 @@ class OutdateAtMutationStartTest(unittest.TestCase):
     """
 
     def _run_dir(self, root: Path) -> Path:
-        run_dir = root / "provision" / "target" / "env" / "core" / "instances" / "account=dev" / "runs" / "r9"
+        run_dir = (
+            root
+            / "provision"
+            / "target"
+            / "env"
+            / "core"
+            / "instances"
+            / "account=dev"
+            / "runs"
+            / "r9"
+        )
         run_dir.mkdir(parents=True)
         kernel_yaml_io.write_yaml_file(
             state_run_store.run_metadata_path(run_dir),
@@ -217,9 +225,7 @@ class OutdateAtMutationStartTest(unittest.TestCase):
             run_dir = self._run_dir(root)
             sibling = self._sibling(root)
             state_status.mark_outdated_for_run(run_dir, include_current_result=False)
-            self.assertEqual(
-                kernel_yaml_io.load_yaml(sibling / "committed.yaml")["status"], "ok"
-            )
+            self.assertEqual(kernel_yaml_io.load_yaml(sibling / "committed.yaml")["status"], "ok")
 
 
 if __name__ == "__main__":
@@ -336,10 +342,18 @@ class StructureAndSortTest(unittest.TestCase):
 
     MAP = {
         "target": {
-            "A": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-01T00:00:00Z"}},
-                                "i2": {"mutative": {"status": "passed", "time": "2026-01-03T00:00:00Z"}}}},
-            "B": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-02T00:00:00Z"}},
-                                "i2": {"mutative": {"status": "passed", "time": "2026-01-04T00:00:00Z"}}}},
+            "A": {
+                "instances": {
+                    "i1": {"mutative": {"status": "passed", "time": "2026-01-01T00:00:00Z"}},
+                    "i2": {"mutative": {"status": "passed", "time": "2026-01-03T00:00:00Z"}},
+                }
+            },
+            "B": {
+                "instances": {
+                    "i1": {"mutative": {"status": "passed", "time": "2026-01-02T00:00:00Z"}},
+                    "i2": {"mutative": {"status": "passed", "time": "2026-01-04T00:00:00Z"}},
+                }
+            },
         }
     }
 
@@ -375,7 +389,11 @@ class StructureAndSortTest(unittest.TestCase):
         mixed = {
             **self.MAP,
             "workflow": {
-                "W": {"instances": {"i1": {"mutative": {"status": "passed", "time": "2026-01-05T00:00:00Z"}}}}
+                "W": {
+                    "instances": {
+                        "i1": {"mutative": {"status": "passed", "time": "2026-01-05T00:00:00Z"}}
+                    }
+                }
             },
         }
         got = state_status.structure_status_map(mixed, "flat", "time:desc")
@@ -475,10 +493,12 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
         cwd = Path.cwd()
         try:
             with patch_engine(
-                {"CtlStatePublication.push": mock.DEFAULT},
+                {
+                    "CtlStatePublication.push": mock.DEFAULT,
+                    "WorkflowChildren.build_command": mock.DEFAULT,
+                },
                 build_tooling_env=mock.DEFAULT,
                 materialize_step_utils=mock.DEFAULT,
-                build_child_target_command=mock.DEFAULT,
                 mint_child_lock_grant=mock.DEFAULT,
                 latest_child_revision=mock.DEFAULT,
                 run_and_log=mock.DEFAULT,
@@ -486,7 +506,7 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
             ) as patched:
                 patched["build_tooling_env"].return_value = {}
                 patched["materialize_step_utils"].return_value = run_dir
-                patched["build_child_target_command"].return_value = ["ctl.py"]
+                patched["WorkflowChildren.build_command"].return_value = ["ctl.py"]
                 patched["mint_child_lock_grant"].return_value = "grant"
                 patched["latest_child_revision"].return_value = None
                 patched["run_and_log"].side_effect = spawn
@@ -535,7 +555,6 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
             self.assertIs(True, seen["at_spawn"])
 
 
-
 class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
     """A member carries its own action, so the parent must use it.
 
@@ -563,8 +582,11 @@ class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
         run_dir = instance_dir / "runs" / "r1"
         run_dir.mkdir(parents=True)
         payload = {
-            "run_id": "r1", "run_type": "workflow", "action": run_action,
-            "status": "in_progress", "mutation_started": False,
+            "run_id": "r1",
+            "run_type": "workflow",
+            "action": run_action,
+            "status": "in_progress",
+            "mutation_started": False,
             "updated_at": kernel_ids.utc_timestamp(),
         }
         kernel_yaml_io.write_yaml_file(state_run_store.run_metadata_path(run_dir), payload)
@@ -577,10 +599,12 @@ class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
         cwd = Path.cwd()
         try:
             with patch_engine(
-                {"CtlStatePublication.push": mock.DEFAULT},
+                {
+                    "CtlStatePublication.push": mock.DEFAULT,
+                    "WorkflowChildren.build_command": mock.DEFAULT,
+                },
                 build_tooling_env=mock.DEFAULT,
                 materialize_step_utils=mock.DEFAULT,
-                build_child_target_command=mock.DEFAULT,
                 mint_child_lock_grant=mock.DEFAULT,
                 latest_child_revision=mock.DEFAULT,
                 run_and_log=mock.DEFAULT,
@@ -588,12 +612,23 @@ class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
             ) as patched:
                 patched["build_tooling_env"].return_value = {}
                 patched["materialize_step_utils"].return_value = run_dir
-                patched["build_child_target_command"].return_value = ["ctl.py"]
+                patched["WorkflowChildren.build_command"].return_value = ["ctl.py"]
                 patched["mint_child_lock_grant"].return_value = "grant"
                 patched["latest_child_revision"].return_value = None
                 commands_pipeline.run_targets(
-                    {"tr1": target_run}, run_dir, Path(tmp), Path(tmp) / "ctx.yaml",
-                    run_action, {}, "r1", {}, False, None, {}, "aws", "local",
+                    {"tr1": target_run},
+                    run_dir,
+                    Path(tmp),
+                    Path(tmp) / "ctx.yaml",
+                    run_action,
+                    {},
+                    "r1",
+                    {},
+                    False,
+                    None,
+                    {},
+                    "aws",
+                    "local",
                     child_command_spec={"ctl_state_local_root": str(tmp)},
                 )
                 revision_action = patched["latest_child_revision"].call_args[0][3]

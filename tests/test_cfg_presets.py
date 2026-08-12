@@ -14,8 +14,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.cfg import validate as cfg_validate
 from engine.cfg import presets as cfg_presets
+from engine.cfg import validate as cfg_validate
 
 
 def write(path: Path, text: str) -> None:

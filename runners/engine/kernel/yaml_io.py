@@ -88,19 +88,6 @@ def load_yaml(path: Path):
     return data
 
 
-def load_optional_yaml_mapping(path: Path) -> dict:
-    """
-
-    load an optional YAML mapping, returning {} when the file is absent."""
-
-    if not path.is_file():
-        return {}
-    data = load_yaml(path) or {}
-    if not isinstance(data, dict):
-        raise RuntimeError(f"❌ YAML file must contain a mapping: {path}")
-    return data
-
-
 def write_yaml_file(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:

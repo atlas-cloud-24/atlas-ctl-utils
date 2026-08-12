@@ -24,6 +24,7 @@ from engine.kernel import yaml_io as kernel_yaml_io
 from engine.kernel.git import write_git_meta_to_file
 from engine.run import policy as run_policy
 from engine.state import run_store as state_run_store
+from engine.units import step as units_step
 
 ADAPTER_DIR = "atlas_ctl_adapter"
 
@@ -55,9 +56,7 @@ def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
         provider = raw.get("provider") if key == "plt" else None
         source_keys = keys - ({"provider"} if key == "plt" else set())
         if provider is not None and (not isinstance(provider, str) or not provider.strip()):
-            raise RuntimeError(
-                f"❌ {label}.provider must be a non-empty string when declared"
-            )
+            raise RuntimeError(f"❌ {label}.provider must be a non-empty string when declared")
         if source_keys == {"repo_path"}:
             value = raw["repo_path"]
             if not isinstance(value, str) or not value.strip():
@@ -506,8 +505,8 @@ def prepare_target_repo(
 
 def _repo_local_active_steps(
     action_manifest: dict, active_ids: list[str], repo_root: Path, action: str | None = None
-) -> list[dict]:
-    active: list[dict] = []
+) -> list["units_step.Step"]:
+    active: list[units_step.Step] = []
     for step_id in active_ids:
         entry = action_manifest.get(step_id)
         if not isinstance(entry, dict):
@@ -612,30 +611,29 @@ def _repo_local_active_steps(
                     )
 
         active.append(
-            {
-                "id": step_id,
-                "path": step_path,
-                "providers": sorted(set(step_providers)),
-                "cfg_keys": step_contract,
-                "runtime": {
-                    "values_json": values_json,
-                    "env_sh": env_sh,
-                    "image": image,
-                    "docker_build": docker_build,
-                    "supported_execution_runtime_modes": sorted(supported_execution_runtime_modes),
-                },
-                "env_vars": {
-                    "action": {},
-                    "step": step_meta.get("env_vars", {}),
-                },
-            }
+            units_step.Step(
+                id=step_id,
+                path=step_path,
+                providers=tuple(sorted(set(step_providers))),
+                cfg_keys=step_contract,
+                runtime=units_step.StepRuntime(
+                    image=units_step.StepImage(image),
+                    docker_build=docker_build,
+                    values_json=values_json,
+                    env_sh=env_sh,
+                    supported_execution_runtime_modes=tuple(
+                        sorted(supported_execution_runtime_modes)
+                    ),
+                ),
+                env_vars={"action": {}, "step": step_meta.get("env_vars", {})},
+            )
         )
     return active
 
 
 def get_repo_local_steps(
     repo_path: Path, action: str, procedure_key: str
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list["units_step.Step"]]:
     manifest_file = repo_path / ADAPTER_DIR / "manifest.yaml"
     if not manifest_file.is_file():
         raise RuntimeError(f"❌ manifest file not found: {manifest_file}")

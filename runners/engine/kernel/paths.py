@@ -7,8 +7,8 @@ thing as before."""
 import hashlib
 import json
 import shutil
-
 from pathlib import Path
+
 
 def format_path_for_log(path: str | Path, relative_roots: tuple[Path, ...] = ()) -> str:
     """Prefer a relative display path when the path is under a known root.
@@ -84,9 +84,7 @@ def canonical_sha256(value: object) -> str:
 
     hash a JSON-compatible value with stable mapping-key ordering."""
 
-    canonical = json.dumps(
-        value, separators=(",", ":"), sort_keys=True, default=str
-    )
+    canonical = json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

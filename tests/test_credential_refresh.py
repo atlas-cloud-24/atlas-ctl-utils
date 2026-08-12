@@ -14,12 +14,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import ctl_cfg_fixture
-from engine_surface import engine_source
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import materialize as cfg_materialize
 from engine.execution import adapters as execution_adapters
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import policy as run_policy
+from engine_surface import engine_source
 
 
 class _Adapter:
@@ -78,9 +78,15 @@ class RebindScopeTest(unittest.TestCase):
 
     def test_no_adapter_is_a_no_op(self):
         cfg_materialize.rebind_step_credentials(
-            ["aws"], target_run_id="t1", target_run={}, step_env={},
-            provider_adapter=None, provider_catalogs={}, execution_context={},
-            provider_implementation_key="local", execution_access_modes=None,
+            ["aws"],
+            target_run_id="t1",
+            target_run={},
+            step_env={},
+            provider_adapter=None,
+            provider_catalogs={},
+            execution_context={},
+            provider_implementation_key="local",
+            execution_access_modes=None,
             provider_options=None,
         )
 
@@ -92,11 +98,16 @@ class RefreshPolicyTest(unittest.TestCase):
         root = Path(tmp)
         kernel_yaml_io.write_yaml_file(
             root / "ctl_profiles.yaml",
-            {"ctl_profiles": {"p": {
-                "description": "d", "ref_policy": "local_dirty_allowed",
-                "allowed_providers": ["aws"],
-                "aws": {"allowed_credential_refresh_modes": modes},
-            }}},
+            {
+                "ctl_profiles": {
+                    "p": {
+                        "description": "d",
+                        "ref_policy": "local_dirty_allowed",
+                        "allowed_providers": ["aws"],
+                        "aws": {"allowed_credential_refresh_modes": modes},
+                    }
+                }
+            },
         )
         # the cadence check asks the adapter, so the run's providers must be
         # declared in the same root the profile allows them from
@@ -106,14 +117,18 @@ class RefreshPolicyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._cfg(tmp, ["per_target"])
             with self.assertRaisesRegex(RuntimeError, "does not allow credential refresh"):
-                run_policy.validate_credential_refresh_modes(root, "p", {"aws": "per_step"}, ["aws"])
+                run_policy.validate_credential_refresh_modes(
+                    root, "p", {"aws": "per_step"}, ["aws"]
+                )
 
     def test_an_allowed_mode_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._cfg(tmp, ["per_target", "per_step"])
             self.assertEqual(
                 {"aws": "per_step"},
-                run_policy.validate_credential_refresh_modes(root, "p", {"aws": "per_step"}, ["aws"]),
+                run_policy.validate_credential_refresh_modes(
+                    root, "p", {"aws": "per_step"}, ["aws"]
+                ),
             )
 
     def test_every_participating_provider_must_be_named(self):
@@ -159,9 +174,11 @@ class ChildInheritsNothingTest(unittest.TestCase):
     }
 
     def test_the_parents_choice_reaches_the_child_argv(self):
-        argv = catalog_workflow.build_child_target_command(
-            self.SPEC, "env/core/baseline",
-            parent_run_dir=Path("/run"), parent_run_id="PARENT",
+        argv = catalog_workflow.WorkflowChildren.build_command(
+            self.SPEC,
+            "env/core/baseline",
+            parent_run_dir=Path("/run"),
+            parent_run_id="PARENT",
         )
         self.assertIn("--credential-refresh-mode", argv)
         self.assertEqual("aws=per_step", argv[argv.index("--credential-refresh-mode") + 1])
@@ -179,11 +196,16 @@ class CadenceMatchesAccessModeTest(unittest.TestCase):
         root = Path(tmp)
         kernel_yaml_io.write_yaml_file(
             root / "ctl_profiles.yaml",
-            {"ctl_profiles": {"p": {
-                "description": "d", "ref_policy": "local_dirty_allowed",
-                "allowed_providers": ["aws"],
-                "aws": {"allowed_credential_refresh_modes": ["per_target", "per_step"]},
-            }}},
+            {
+                "ctl_profiles": {
+                    "p": {
+                        "description": "d",
+                        "ref_policy": "local_dirty_allowed",
+                        "allowed_providers": ["aws"],
+                        "aws": {"allowed_credential_refresh_modes": ["per_target", "per_step"]},
+                    }
+                }
+            },
         )
         return ctl_cfg_fixture.activate(self, ctl_cfg_fixture.declare_providers(root, "aws"))
 
@@ -204,7 +226,9 @@ class CadenceMatchesAccessModeTest(unittest.TestCase):
 
     def test_per_step_is_accepted_under_standard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual({"aws": "per_step"}, self._check(self._cfg(tmp), "per_step", "standard"))
+            self.assertEqual(
+                {"aws": "per_step"}, self._check(self._cfg(tmp), "per_step", "standard")
+            )
 
     def test_per_target_is_valid_under_every_access_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,9 +250,7 @@ class AdapterOwnsCadenceVocabularyTest(unittest.TestCase):
 
     def test_adapter_declares_its_cadences(self):
         adapter = execution_adapters.get_adapter("aws")
-        self.assertEqual(
-            {"per_target", "per_step"}, adapter.supported_credential_refresh_modes()
-        )
+        self.assertEqual({"per_target", "per_step"}, adapter.supported_credential_refresh_modes())
 
     def test_an_undeclared_cadence_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "not supported by aws"):
@@ -241,9 +263,7 @@ class AdapterOwnsCadenceVocabularyTest(unittest.TestCase):
             )
 
     def test_a_cadence_is_allowed_where_the_adapter_says_it_works(self):
-        run_policy.validate_cadence_against_access_mode(
-            {"aws": "per_step"}, {"aws": "standard"}
-        )
+        run_policy.validate_cadence_against_access_mode({"aws": "per_step"}, {"aws": "standard"})
         run_policy.validate_cadence_against_access_mode(
             {"aws": "per_target"}, {"aws": "force_bypass"}
         )
@@ -252,9 +272,7 @@ class AdapterOwnsCadenceVocabularyTest(unittest.TestCase):
         """A ratchet: cadence strings belong in the adapter, not the engine."""
 
         source = (
-            engine_source()
-            .split("def validate_cadence_against_access_mode")[1]
-            .split("\ndef ")[0]
+            engine_source().split("def validate_cadence_against_access_mode")[1].split("\ndef ")[0]
         )
         self.assertNotIn("per_step", source)
         self.assertNotIn("standard", source)

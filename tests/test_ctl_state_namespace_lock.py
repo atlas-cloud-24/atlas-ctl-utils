@@ -43,6 +43,7 @@ BACKENDS = (
     "    bucket_region: eu-west-2\n"
 )
 
+
 def ctx(**params):
     return {f"execution_context.params.{k}": v for k, v in params.items()}
 
@@ -58,10 +59,14 @@ class NamespaceResolverTests(unittest.TestCase):
     def test_resolves_exactly_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
-            key, backend = state_sync.CtlStateBackends.resolve_namespace(root, ctx(landing_zone="live"))
+            key, backend = state_sync.CtlStateBackends.resolve_namespace(
+                root, ctx(landing_zone="live")
+            )
             self.assertEqual(key, "live")
             self.assertEqual(backend["bucket_name"], "oxygen-live-ctl-state")
-            self.assertEqual(backend["execution_identity"]["operations"]["sync"]["role"], "synchronizer")
+            self.assertEqual(
+                backend["execution_identity"]["operations"]["sync"]["role"], "synchronizer"
+            )
 
     def test_zero_matches_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,17 +102,18 @@ class FanOutNamespaceGateTests(unittest.TestCase):
         return root
 
     def _children(self, *zones):
-        return [
-            {"label": f"wf[{z}]", "params": {"landing_zone": z}} for z in zones
-        ]
+        return [{"label": f"wf[{z}]", "params": {"landing_zone": z}} for z in zones]
 
     def test_same_namespace_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
             ns = commands_selection.require_unique_fan_out_namespace(
-                root, self._children("live", "live"),
-                action="provision", ctl_profile=None,
-                execution_params={}, execution_runtime_mode="local",
+                root,
+                self._children("live", "live"),
+                action="provision",
+                ctl_profile=None,
+                execution_params={},
+                execution_runtime_mode="local",
             )
             self.assertEqual(ns, "live")
 
@@ -116,9 +122,12 @@ class FanOutNamespaceGateTests(unittest.TestCase):
             root = self._root(tmp)
             with self.assertRaisesRegex(RuntimeError, "must not cross namespaces"):
                 commands_selection.require_unique_fan_out_namespace(
-                    root, self._children("live", "canary"),
-                    action="provision", ctl_profile=None,
-                    execution_params={}, execution_runtime_mode="local",
+                    root,
+                    self._children("live", "canary"),
+                    action="provision",
+                    ctl_profile=None,
+                    execution_params={},
+                    execution_runtime_mode="local",
                 )
 
 
@@ -132,7 +141,7 @@ class WorkflowCompositionTests(unittest.TestCase):
     ADDRS = ["target/env/tfstate_backend/instances/account=stg/env_type=stg"]
 
     def test_identity_doc_facts_only(self):
-        doc = catalog_workflow.build_workflow_identity_doc(
+        doc = catalog_workflow.WorkflowArtifacts.identity_doc(
             "env/bootstrap", self.ADDRS, {"account": "stg", "env_type": "stg"}
         )
         wf = doc["workflow_instance"]
@@ -181,14 +190,14 @@ class MutationLockTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertEqual(
                     "proceed",
-                    state_run_store.evaluate_mutation_lock(live, action=action, run_id="r2")["decision"],
+                    state_run_store.evaluate_mutation_lock(live, action=action, run_id="r2")[
+                        "decision"
+                    ],
                 )
 
     def test_stale_lock_broken_by_mutating_only(self):
         stale = state_run_store.build_mutation_lock_doc("dead", "provision")
-        stale["expires_at"] = (
-            datetime.now(UTC) - timedelta(seconds=1)
-        ).isoformat()
+        stale["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
         out = state_run_store.evaluate_mutation_lock(stale, action="destroy", run_id="r2")
         self.assertEqual(out["decision"], "break_and_acquire")
         self.assertEqual(out["lock_doc"]["broke_lock_of"], "dead")
@@ -242,14 +251,19 @@ class ParentRunIdIsRecordedTest(unittest.TestCase):
 
     def test_setup_run_dirs_records_parent_workflow_run_id(self):
         import inspect
+
         signature = inspect.signature(commands_selection.setup_run_dirs)
         self.assertIn("parent_workflow_run_id", signature.parameters)
 
         with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
             memory_handler = logging.handlers.MemoryHandler(capacity=1024)
             run_dir, _, _ = commands_selection.setup_run_dirs(
-                "child-run", "destroy", "target", "env/seed/baseline",
-                pathlib.Path(tmp), memory_handler,
+                "child-run",
+                "destroy",
+                "target",
+                "env/seed/baseline",
+                pathlib.Path(tmp),
+                memory_handler,
                 locator_segments=["live"],
                 parent_workflow_run_id="parent-run",
             )
@@ -260,8 +274,12 @@ class ParentRunIdIsRecordedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
             memory_handler = logging.handlers.MemoryHandler(capacity=1024)
             run_dir, _, _ = commands_selection.setup_run_dirs(
-                "solo-run", "destroy", "target", "env/seed/baseline",
-                pathlib.Path(tmp), memory_handler,
+                "solo-run",
+                "destroy",
+                "target",
+                "env/seed/baseline",
+                pathlib.Path(tmp),
+                memory_handler,
                 locator_segments=["live"],
             )
             self.assertIsNone(
@@ -337,9 +355,7 @@ class MutationLockGateTests(unittest.TestCase):
 
     def test_stale_lock_broken_and_recorded(self):
         stale = state_run_store.build_mutation_lock_doc("dead", "provision")
-        stale["expires_at"] = (
-            datetime.now(UTC) - timedelta(seconds=1)
-        ).isoformat()
+        stale["expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
         syncer = _FakeSyncer(existing=stale)
         state_run_store.enforce_mutation_lock(syncer, action="provision", run_id="r2")
         self.assertEqual(syncer.deleted, 1)
@@ -453,8 +469,10 @@ class MutationLockTtlTest(unittest.TestCase):
     def _namespace_root(self, tmp, ttl):
         root = Path(tmp)
         entry = {
-            "provider": "aws", "backend_type": "s3",
-            "bucket_name": "b", "bucket_region": "eu-west-2",
+            "provider": "aws",
+            "backend_type": "s3",
+            "bucket_name": "b",
+            "bucket_region": "eu-west-2",
             "selectors": {"match": {"execution_context.params.lz": "live"}},
         }
         if ttl is not None:
@@ -473,6 +491,7 @@ class MutationLockTtlTest(unittest.TestCase):
         that never went through the loader."""
 
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             root = self._namespace_root(tmp, 900)
             _, entry = state_sync.CtlStateBackends.resolve_namespace(
@@ -492,6 +511,7 @@ class MutationLockTtlTest(unittest.TestCase):
         """
 
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             root = self._namespace_root(tmp, "not-a-number")
             with self.assertRaisesRegex(RuntimeError, "must be a positive integer"):

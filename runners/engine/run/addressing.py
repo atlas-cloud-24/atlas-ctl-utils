@@ -26,17 +26,6 @@ def workflow_target_run_signature(target_run_entry) -> tuple[str, str | None]:
     raise RuntimeError(f"❌ invalid workflow target_run entry: {target_run_entry!r}")
 
 
-def workflow_target_run_key(target_run_entry) -> str | None:
-    """Return the TARGET key an entry addresses.
-
-    Distinct from `get_workflow_target_run_id`: `id` is the run's display
-    identity, which the target-run builder may set independently of the target it
-    points at. A placement anchor names a target, so it resolves against this.
-    """
-
-    return workflow_target_run_signature(target_run_entry)[0]
-
-
 def get_workflow_target_run_id(target_run_entry) -> str:
     """
 
@@ -58,9 +47,11 @@ def normalize_target_keys(values: list[str], *, label: str) -> list[str]:
     `normalize_target_entries` with the list's declared default."""
     keys: list[str] = []
     for value in values if isinstance(values, list) else []:
-        keys.append(run_actions.normalize_result_name(
-            value.get("key") if isinstance(value, dict) else value, label=label
-        ))
+        keys.append(
+            run_actions.normalize_result_name(
+                value.get("key") if isinstance(value, dict) else value, label=label
+            )
+        )
     return keys
 
 
@@ -78,12 +69,12 @@ def parse_result_dir(ctl_state_local_root: Path, result_dir: Path) -> dict | Non
     for index in range(len(parts) - 2):
         if parts[index] in run_actions.RUN_ACTIONS and parts[index + 1] in run_actions.RUN_TYPES:
             action, run_type = parts[index], parts[index + 1]
-            rest = list(parts[index + 2:])
+            rest = list(parts[index + 2 :])
             # Strip the optional instance layer from the key.
             instance_segments: list[str] = []
             if "instances" in rest:
                 marker = rest.index("instances")
-                after = rest[marker + 1:]
+                after = rest[marker + 1 :]
                 instance_segments, _ = split_instance_segments(after)
                 rest = rest[:marker]
             result_name = "/".join(rest)
@@ -151,8 +142,17 @@ def split_target_instance_address(address: str) -> tuple[str, list[str]]:
 # `label` is LAST: it names the invocation a row belonged to rather than saying
 # anything about the row's own outcome, so it is the fact a reader reaches for
 # after the ones they act on.
-AXIS_ORDER = ("status", "last_action", "standing", "superseded_by", "freshness", "time",
-              "parent_workflow", "parent_workflow_run_id", "label")
+AXIS_ORDER = (
+    "status",
+    "last_action",
+    "standing",
+    "superseded_by",
+    "freshness",
+    "time",
+    "parent_workflow",
+    "parent_workflow_run_id",
+    "label",
+)
 
 
 def order_axes(axes: dict[str, str]) -> dict[str, str]:
@@ -187,9 +187,7 @@ def _axis_row(computed: dict) -> dict[str, str]:
     return order_axes(row)
 
 
-def _place_instance(
-    rows: dict, kind: str, key: str, segments: list[str], groups: dict
-) -> None:
+def _place_instance(rows: dict, kind: str, key: str, segments: list[str], groups: dict) -> None:
     """File one instance under its TEMPLATE, mirroring the state dir layout.
 
     `kind -> template -> instances -> <segments> -> groups`, so every
@@ -208,7 +206,7 @@ def _place_instance(
     template.setdefault(INSTANCES_MARKER, {})["/".join(segments)] = groups
 
 
-#/Q1j — target-instance identity path contract.
+# /Q1j — target-instance identity path contract.
 # Names and values in a Hive-style instance segment must match this charset
 # verbatim (no percent-encoding, no sha fallback for targets); the whole
 # instance suffix is capped so it stays well inside the S3 1024-byte key limit.
@@ -290,7 +288,7 @@ def unqualified_address(address: str) -> str:
     for kind in run_actions.RESULT_KINDS:
         prefix = f"{kind}/"
         if address.startswith(prefix):
-            return address[len(prefix):]
+            return address[len(prefix) :]
     return address
 
 
@@ -401,9 +399,7 @@ def workflow_effect(facts: dict) -> str | None:
 STATE_STRUCTURAL_NAMES = frozenset({"runs", "committed.yaml", "identity.yaml", "locks"})
 
 
-def compose_state_relpath(
-    kind: str, key: str, instance_segments: list[str]
-) -> Path:
+def compose_state_relpath(kind: str, key: str, instance_segments: list[str]) -> Path:
     """The namespace-relative instance directory for a state owner:
     `<kind>/<key...>/instances/<seg>/<seg>` — or, for a singleton, `<kind>/<key...>`
     with no instances/ layer. The namespace root is prepended by the caller.
@@ -413,7 +409,9 @@ def compose_state_relpath(
     group file they publish."""
 
     if kind not in run_actions.RESULT_KINDS:
-        raise RuntimeError(f"❌ unknown state kind {kind!r} (expected one of {run_actions.RESULT_KINDS})")
+        raise RuntimeError(
+            f"❌ unknown state kind {kind!r} (expected one of {run_actions.RESULT_KINDS})"
+        )
     key_parts = [p for p in key.split("/") if p]
     if not key_parts:
         raise RuntimeError("❌ state key must be non-empty")
@@ -438,7 +436,7 @@ def parse_state_relpath(namespace_root: Path, state_dir: Path) -> dict | None:
     if "instances" in rest:
         idx = rest.index("instances")
         key_parts = rest[:idx]
-        after = rest[idx + 1:]
+        after = rest[idx + 1 :]
         instance_segments, _ = split_instance_segments(after)
     else:
         # singleton: key runs until the first structural name
@@ -473,10 +471,10 @@ def instance_relpath(instance_segments: list[str]) -> str:
 
 def split_instance_segments(parts: list[str]) -> tuple[list[str], list[str]]:
     """Split a path fragment that begins after `instances/` into
-    (instance_segments, remaining) using the deterministic `=` boundary
-: consume leading segments that contain `=`; the first
-    segment without `=` is where structure (`runs`, `committed.yaml`,
-    `identity.yaml`, `locks`) resumes. Structural names never contain `=`."""
+        (instance_segments, remaining) using the deterministic `=` boundary
+    : consume leading segments that contain `=`; the first
+        segment without `=` is where structure (`runs`, `committed.yaml`,
+        `identity.yaml`, `locks`) resumes. Structural names never contain `=`."""
     instance: list[str] = []
     for i, part in enumerate(parts):
         if "=" in part:
@@ -496,9 +494,7 @@ def workflow_instance_address(workflow_name: str, segments: list[str]) -> str:
     return instance_address(workflow_name, segments)
 
 
-def target_instance_display(
-    target_run: dict, execution_context: dict[str, object]
-) -> str:
+def target_instance_display(target_run: dict, execution_context: dict[str, object]) -> str:
     """The target-instance identity for a report row: Hive segments joined
     (`account=dev/env_type=dev`), `<singleton>` when the target has no instance
     layer, or `<unresolved>` if its instance params don't bind."""

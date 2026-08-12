@@ -13,14 +13,16 @@ def ctx(**params):
 
 
 class TargetInstanceSegmentsTests(unittest.TestCase):
-    """ 6a / Q1g / Q1j — instance identity path contract."""
+    """6a / Q1g / Q1j — instance identity path contract."""
 
     def test_declaration_order_hive_segments(self):
         segs = run_addressing.resolve_target_instance_segments(
             ["account", "env_type"], ctx(account="dev", env_type="dev"), label="t"
         )
         self.assertEqual(segs, ["account=dev", "env_type=dev"])
-        self.assertEqual(run_addressing.instance_relpath(segs), "instances/account=dev/env_type=dev")
+        self.assertEqual(
+            run_addressing.instance_relpath(segs), "instances/account=dev/env_type=dev"
+        )
 
     def test_singleton_no_instances_layer(self):
         self.assertEqual(
@@ -30,11 +32,15 @@ class TargetInstanceSegmentsTests(unittest.TestCase):
 
     def test_missing_context_param_is_hard_error(self):
         with self.assertRaisesRegex(RuntimeError, "not in the execution context"):
-            run_addressing.resolve_target_instance_segments(["account"], ctx(env_type="dev"), label="t")
+            run_addressing.resolve_target_instance_segments(
+                ["account"], ctx(env_type="dev"), label="t"
+            )
 
     def test_bad_value_charset_is_hard_error(self):
         with self.assertRaisesRegex(RuntimeError, r"must match \[a-z0-9_.-\]\+"):
-            run_addressing.resolve_target_instance_segments(["account"], ctx(account="Dev"), label="t")
+            run_addressing.resolve_target_instance_segments(
+                ["account"], ctx(account="Dev"), label="t"
+            )
 
     def test_slash_in_value_is_hard_error(self):
         with self.assertRaisesRegex(RuntimeError, r"must match"):
@@ -75,11 +81,10 @@ class StateRelpathTests(unittest.TestCase):
     """namespace-relative state tree compose/parse."""
 
     def test_compose_target_instance(self):
-        p = run_addressing.compose_state_relpath("target", "env/core", ["account=stg", "env_type=stg"]
+        p = run_addressing.compose_state_relpath(
+            "target", "env/core", ["account=stg", "env_type=stg"]
         )
-        self.assertEqual(
-            str(p), "target/env/core/instances/account=stg/env_type=stg"
-        )
+        self.assertEqual(str(p), "target/env/core/instances/account=stg/env_type=stg")
 
     def test_compose_singleton(self):
         p = run_addressing.compose_state_relpath("target", "landing_zone/org/baseline", [])

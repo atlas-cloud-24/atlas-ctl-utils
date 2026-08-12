@@ -10,7 +10,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 import atlas_ctl_adapter_aws as aws_adapter
 import ctl_cfg_fixture
-from engine.catalog import workflow as catalog_workflow
+from engine.cfg import validate as cfg_validate
+from engine.cli import args as cli_args
 from engine.commands import selection as commands_selection
 from engine.execution import run_context as execution_run_context
 from engine.kernel import process as kernel_process
@@ -19,10 +20,7 @@ from engine.preflight import render as preflight_render
 from engine.preflight import reports as preflight_reports
 from engine.run import policy as run_policy
 from engine.state import run_store as state_run_store
-from engine.cli import args as cli_args
-
-
-from engine.cfg import validate as cfg_validate
+from engine.units import fan_out as units_fan_out
 
 
 class PreflightRollupTests(unittest.TestCase):
@@ -77,32 +75,23 @@ class PreflightPolicyTests(unittest.TestCase):
             )
 
             self.assertFalse(
-                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(
-                    root, "strict"
-                )
+                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(root, "strict")
             )
             self.assertTrue(
-                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(
-                    root, "debug"
-                )
+                run_policy.Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.granted(root, "debug")
             )
 
     def test_full_cfg_validation_gate_flag_is_on_every_execution_runner(self):
-        for run_type in (
-            "target", "workflow", "fan_out", "procedure", "maintenance"
-        ):
+        for run_type in ("target", "workflow", "fan_out", "procedure", "maintenance"):
             with self.subTest(run_type=run_type):
                 parser = argparse.ArgumentParser()
                 cli_args.add_common_args(parser, run_type=run_type)
                 action = next(
                     item
                     for item in parser._actions
-                    if "--force-skip-full-cfg-validation-gate"
-                    in item.option_strings
+                    if "--force-skip-full-cfg-validation-gate" in item.option_strings
                 )
-                self.assertEqual(
-                    action.dest, "force_skip_full_cfg_validation_gate"
-                )
+                self.assertEqual(action.dest, "force_skip_full_cfg_validation_gate")
 
     def test_check_only_and_force_skip_are_mutually_exclusive(self):
         # finalizing args asks each declared provider's adapter about its modes
@@ -128,8 +117,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 ctl_state_local_root=tmp,
                 providers=["aws"],
                 provider_options={
-                    "aws.credential_acquisition": "sso",
-                    "aws.force_bypass_credential_profile": "substitute",
+                    "aws.force_bypass_profile": "substitute",
                 },
                 execution_access_modes={"aws": "standard"},
                 execution_identity_preflight_check_only=False,
@@ -146,8 +134,7 @@ class PreflightPolicyTests(unittest.TestCase):
                 ctl_state_local_root=tmp,
                 providers=["aws"],
                 provider_options={
-                    "aws.credential_acquisition": "sso",
-                    "aws.force_bypass_credential_profile": "substitute",
+                    "aws.force_bypass_profile": "substitute",
                 },
                 execution_access_modes={"aws": "force_bypass"},
                 execution_identity_preflight_check_only=False,
@@ -183,7 +170,6 @@ class PreflightPolicyTests(unittest.TestCase):
                     provider_options={},
                     force_skip_execution_identity_preflight_check=["aws"],
                 )
-
 
     def test_full_cfg_validation_gate_skip_requires_profile_permission(self):
         workflow = {"target_runs": ["target"]}
@@ -243,9 +229,7 @@ class FullCfgValidationGateTests(unittest.TestCase):
         self.assertEqual(report["gate"]["status"], "force_skipped")
         preflight_checks.CFG_VALIDATION.assert_accepted(report)
         rendered = "\n".join(preflight_render._cfg_validation_text_lines(report))
-        self.assertIn(
-            "full cfg validation gate [ skipped ⏭ ]", rendered
-        )
+        self.assertIn("full cfg validation gate [ skipped ⏭ ]", rendered)
 
     def test_unclassified_failure_cannot_be_force_skipped(self):
         report = preflight_checks.CFG_VALIDATION.build(
@@ -266,6 +250,7 @@ class PreflightArtifactTests(unittest.TestCase):
     def test_report_is_deterministic_and_target_scoped(self):
         class Adapter:
             PROVIDER_NAME = "aws"
+
             def preflight_execution_identity(self, target_run_id, target_run, catalogs, **kwargs):
                 del target_run_id, catalogs, kwargs
                 return {
@@ -285,8 +270,18 @@ class PreflightArtifactTests(unittest.TestCase):
             "selection_kind": "workflow",
             "selection_key": "example/workflow",
             "active_target_runs": {
-                "one": {"target": "target/one", "execution_identities": {"aws": {"account": "one", "roles": {"readwrite": "ctl_target"}}}},
-                "two": {"target": "target/two", "execution_identities": {"aws": {"account": "two", "roles": {"readwrite": "ctl_target"}}}},
+                "one": {
+                    "target": "target/one",
+                    "execution_identities": {
+                        "aws": {"account": "one", "roles": {"readwrite": "ctl_target"}}
+                    },
+                },
+                "two": {
+                    "target": "target/two",
+                    "execution_identities": {
+                        "aws": {"account": "two", "roles": {"readwrite": "ctl_target"}}
+                    },
+                },
             },
             "provider_adapter": Adapter(),
             "provider_catalogs": {},
@@ -307,9 +302,7 @@ class PreflightArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             artifacts = Path(tmp)
             preflight_checks.EXECUTION_IDENTITY_PREFLIGHT.write_artifacts(artifacts, report)
-            self.assertFalse(
-                (artifacts / "execution_identity_preflight.yaml").exists()
-            )
+            self.assertFalse((artifacts / "execution_identity_preflight.yaml").exists())
             rendered = (artifacts / "execution_identity_preflight.txt").read_text()
             self.assertIn("target: target/one [ passed \u2705 ]", rendered)
             self.assertIn("principal: two [ passed \u2705 ]", rendered)
@@ -321,7 +314,9 @@ class PreflightArtifactTests(unittest.TestCase):
             "results": [
                 {
                     "target_key": "env/core/baseline",
-                    "execution_identities": {"aws": {"account": "dev", "roles": {"readwrite": "ctl_target_deploy"}}},
+                    "execution_identities": {
+                        "aws": {"account": "dev", "roles": {"readwrite": "ctl_target_deploy"}}
+                    },
                     "provider": "aws",
                     "access_mode": "force_bypass",
                     "status": "not_applicable",
@@ -346,12 +341,8 @@ class PreflightArtifactTests(unittest.TestCase):
             "execution_identity: aws:dev:readwrite=ctl_target_deploy [ skipped ⏭ ]", rendered
         )
         self.assertIn("ctl_state_backend: env [ skipped ⏭ ]", rendered)
-        self.assertIn(
-            "reason: execution identity was skipped for this run", rendered
-        )
-        self.assertIn(
-            "reason: ctl-state sync force-skipped for this run", rendered
-        )
+        self.assertIn("reason: execution identity was skipped for this run", rendered)
+        self.assertIn("reason: ctl-state sync force-skipped for this run", rendered)
         self.assertNotIn("not_applicable", rendered)
         self.assertNotIn("note:", rendered)
 
@@ -364,16 +355,15 @@ class PreflightArtifactTests(unittest.TestCase):
             "execution_context": {},
             "active_target_runs": {},
         }
-        with mock.patch.object(
-            run_policy,
-            "validate_target_policy_constraints_for_target",
-            side_effect=RuntimeError("commit-required policy"),
-        ), mock.patch.object(
-            run_policy, "validate_execution_access"
-        ), mock.patch.object(
-            run_policy, "validate_execution_runtime_mode"
-        ), mock.patch.object(
-            cfg_validate.CommitPinning, "check_target_runs"
+        with (
+            mock.patch.object(
+                run_policy,
+                "validate_target_policy_constraints_for_target",
+                side_effect=RuntimeError("commit-required policy"),
+            ),
+            mock.patch.object(run_policy, "validate_execution_access"),
+            mock.patch.object(run_policy, "validate_execution_runtime_mode"),
+            mock.patch.object(cfg_validate.CommitPinning, "check_target_runs"),
         ):
             policy_report = preflight_reports.build_ctl_policy_preflight_report(
                 selection,
@@ -395,9 +385,7 @@ class PreflightArtifactTests(unittest.TestCase):
             if target["status"] == "failed"
         }
         self.assertIn("target", failed_targets)
-        target_checks = {
-            check["name"]: check for check in failed_targets["target"]["checks"]
-        }
+        target_checks = {check["name"]: check for check in failed_targets["target"]["checks"]}
         self.assertIn("target_policy_constraints", target_checks)
         self.assertIn(
             "commit-required policy",
@@ -424,7 +412,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        dev = catalog_workflow.wrap_fan_out_preflight_child(
+        dev = units_fan_out.FanOut.wrap_preflight_child(
             workflow_report,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -448,7 +436,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        test = catalog_workflow.wrap_fan_out_preflight_child(
+        test = units_fan_out.FanOut.wrap_preflight_child(
             failed_workflow,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -466,15 +454,9 @@ class PreflightArtifactTests(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         with tempfile.TemporaryDirectory() as tmp:
             preflight_checks.EXECUTION_IDENTITY_PREFLIGHT.write_artifacts(Path(tmp), report)
-            rendered = (
-                Path(tmp) / "execution_identity_preflight.txt"
-            ).read_text()
-        self.assertIn(
-            "fan_out_param_set: non_prod_accounts.dev [ passed \u2705 ]", rendered
-        )
-        self.assertIn(
-            "fan_out_param_set: non_prod_accounts.test [ failed \u274c ]", rendered
-        )
+            rendered = (Path(tmp) / "execution_identity_preflight.txt").read_text()
+        self.assertIn("fan_out_param_set: non_prod_accounts.dev [ passed \u2705 ]", rendered)
+        self.assertIn("fan_out_param_set: non_prod_accounts.test [ failed \u274c ]", rendered)
         self.assertEqual(rendered.count("workflow: env/bootstrap"), 2)
         # per-member params fold inline onto the workflow line
         self.assertIn("(account=dev, env_type=dev)", rendered)
@@ -494,7 +476,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        self.assertIs(catalog_workflow.wrap_fan_out_preflight_child(report, child), report)
+        self.assertIs(units_fan_out.FanOut.wrap_preflight_child(report, child), report)
 
     def test_unparameterized_fan_out_child_shows_effective_params(self):
         report = {
@@ -510,7 +492,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        wrapped = catalog_workflow.wrap_fan_out_preflight_child(
+        wrapped = units_fan_out.FanOut.wrap_preflight_child(
             report,
             child,
             effective_params={
@@ -522,9 +504,7 @@ class PreflightArtifactTests(unittest.TestCase):
         rendered = "\n".join(preflight_render._preflight_text_lines(wrapped))
         # An unparameterized child has no per-member params, so nothing folds onto
         # its workflow line; run-constant params live on the fan-out header instead.
-        self.assertIn(
-            "workflow: landing_zone/org_state/bootstrap [ passed ✅ ]", rendered
-        )
+        self.assertIn("workflow: landing_zone/org_state/bootstrap [ passed ✅ ]", rendered)
         self.assertNotIn("(landing_zone=", rendered)
         self.assertNotIn("fan_out_param_set:", rendered)
 
@@ -535,13 +515,14 @@ class PreflightArtifactTests(unittest.TestCase):
                 "params": {"account": "dev", "env_type": "dev"},
             }
         ]
-        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
-            RuntimeError,
-            r"non_prod_accounts\.dev.*account.*--execution-params",
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"non_prod_accounts\.dev.*account.*--execution-params",
+            ),
         ):
-            catalog_workflow.validate_fan_out_param_collisions(
-                Path(tmp), children, {"account": "test"}
-            )
+            units_fan_out.FanOut.validate_param_collisions(Path(tmp), children, {"account": "test"})
 
     def test_fan_out_params_cannot_override_ctl_execution_params(self):
         children = [
@@ -552,13 +533,9 @@ class PreflightArtifactTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "execution_params.yaml").write_text(
-                "execution_params:\n  region: eu-west-1\n"
-            )
-            with self.assertRaisesRegex(
-                RuntimeError, r"eu_west_2.*region.*ctl execution_params"
-            ):
-                catalog_workflow.validate_fan_out_param_collisions(root, children, {})
+            (root / "execution_params.yaml").write_text("execution_params:\n  region: eu-west-1\n")
+            with self.assertRaisesRegex(RuntimeError, r"eu_west_2.*region.*ctl execution_params"):
+                units_fan_out.FanOut.validate_param_collisions(root, children, {})
 
     def test_non_overlapping_fan_out_params_are_allowed(self):
         children = [
@@ -569,12 +546,8 @@ class PreflightArtifactTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "execution_params.yaml").write_text(
-                "execution_params:\n  main_tag: oxygen\n"
-            )
-            catalog_workflow.validate_fan_out_param_collisions(
-                root, children, {"landing_zone": "live"}
-            )
+            (root / "execution_params.yaml").write_text("execution_params:\n  main_tag: oxygen\n")
+            units_fan_out.FanOut.validate_param_collisions(root, children, {"landing_zone": "live"})
 
     def test_preflight_only_dirs_do_not_materialize_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -604,14 +577,17 @@ class PreflightArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
             run_dir, _artifacts, _log = commands_selection.setup_preflight_run_dirs(
-                "run-id", "plan", "target", "example", Path(tmp), memory,
+                "run-id",
+                "plan",
+                "target",
+                "example",
+                Path(tmp),
+                memory,
                 locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
                 execution_access_modes={"aws": "force_bypass"},
             )
             meta = state_run_store.load_run_metadata(run_dir)
-            self.assertEqual(
-                meta.get("execution_access_modes"), {"aws": "force_bypass"}
-            )
+            self.assertEqual(meta.get("execution_access_modes"), {"aws": "force_bypass"})
 
     def test_command_log_redacts_provider_option_values(self):
         # the engine cannot tell which of an adapter's option keys is sensitive,
@@ -644,6 +620,7 @@ class AwsPreflightTests(unittest.TestCase):
             "credential_sources": {},
             "account_registry": {},
             "ctl_role_chain": {"runner_role_key": "runner"},
+            "sso_sessions": {},
             "target_roles": {},
         }
 
@@ -654,19 +631,22 @@ class AwsPreflightTests(unittest.TestCase):
             "account_key": "dev",
             "expected_account_id": "111111111111",
             "credential_source_key": "dev_entry",
-            "credential_provider_kind": "direct_profile",
-            "profile_name": "dev-profile",
+            "credential_provider_kind": "direct_source",
+            "credentials": {"AWS_ACCESS_KEY_ID": "ASIADEV"},
             "permission_set_name": "DevDeployAccess",
         }
         caller = {
             "Account": "111111111111",
             "Arn": "arn:aws:sts::111111111111:assumed-role/AWSReservedSSO_DevDeployAccess_hash/session",
         }
-        with mock.patch.object(
-            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(
-            aws_adapter.execution, "assert_caller", return_value=caller
-        ) as assertion:
+        with (
+            mock.patch.object(
+                aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
+            ),
+            mock.patch.object(
+                aws_adapter.execution, "assert_caller", return_value=caller
+            ) as assertion,
+        ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
                 {"execution_identity_key": "dev"},
@@ -687,7 +667,7 @@ class AwsPreflightTests(unittest.TestCase):
             "expected_account_id": "222222222222",
             "credential_source_key": "entry",
             "credential_provider_kind": "role_chain",
-            "entry_profile_name": "entry-profile",
+            "entry_credentials": {"AWS_ACCESS_KEY_ID": "ASIAENTRY"},
             "entry_account_id": "111111111111",
             "entry_permission_set_name": "CtlEntryAccess",
             "hop_role_arns": [
@@ -697,9 +677,12 @@ class AwsPreflightTests(unittest.TestCase):
             "target_role_key": "prod_deploy",
             "role_name": "prod-deploy",
         }
-        with mock.patch.object(
-            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(aws_adapter.execution, "assert_caller") as assertion:
+        with (
+            mock.patch.object(
+                aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
+            ),
+            mock.patch.object(aws_adapter.execution, "assert_caller") as assertion,
+        ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
                 {"execution_identity_key": "prod"},
@@ -710,9 +693,7 @@ class AwsPreflightTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "force_skipped")
         self.assertTrue(result["provider_path"])
-        self.assertTrue(
-            all(node["status"] == "force_skipped" for node in result["provider_path"])
-        )
+        self.assertTrue(all(node["status"] == "force_skipped" for node in result["provider_path"]))
         self.assertNotIn("observed_principal", str(result))
         assertion.assert_not_called()
 
@@ -724,7 +705,7 @@ class AwsPreflightTests(unittest.TestCase):
             "expected_account_id": "222222222222",
             "credential_source_key": "entry",
             "credential_provider_kind": "role_chain",
-            "entry_profile_name": "entry-profile",
+            "entry_credentials": {"AWS_ACCESS_KEY_ID": "ASIAENTRY"},
             "entry_account_id": "111111111111",
             "entry_role_name": "Entry",
             "hop_role_arns": [
@@ -746,14 +727,15 @@ class AwsPreflightTests(unittest.TestCase):
             ({"AWS_ACCESS_KEY_ID": "one"}, {"Arn": "runner"}),
             ({"AWS_ACCESS_KEY_ID": "two"}, {"Arn": "final"}),
         ]
-        with mock.patch.object(
-            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(
-            aws_adapter.execution, "assert_caller", return_value=entry
-        ), mock.patch.object(
-            aws_adapter.execution, "_assume_role_credentials", side_effect=assume_results
-        ) as assume, mock.patch.object(
-            aws_adapter.execution, "_run_aws_json", return_value=final
+        with (
+            mock.patch.object(
+                aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
+            ),
+            mock.patch.object(aws_adapter.execution, "assert_caller", return_value=entry),
+            mock.patch.object(
+                aws_adapter.execution, "_assume_role_credentials", side_effect=assume_results
+            ) as assume,
+            mock.patch.object(aws_adapter.execution, "_run_aws_json", return_value=final),
         ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
@@ -774,7 +756,7 @@ class AwsPreflightTests(unittest.TestCase):
             "expected_account_id": "222222222222",
             "credential_source_key": "entry",
             "credential_provider_kind": "role_chain",
-            "entry_profile_name": "entry-profile",
+            "entry_credentials": {"AWS_ACCESS_KEY_ID": "ASIAENTRY"},
             "entry_account_id": "111111111111",
             "entry_role_name": "Entry",
             "hop_role_arns": [
@@ -788,21 +770,24 @@ class AwsPreflightTests(unittest.TestCase):
             "Account": "222222222222",
             "Arn": "arn:aws:sts::222222222222:assumed-role/wrong-role/session",
         }
-        with mock.patch.object(
-            aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
-        ), mock.patch.object(
-            aws_adapter.execution,
-            "assert_caller",
-            return_value={
-                "Account": "111111111111",
-                "Arn": "arn:aws:sts::111111111111:assumed-role/Entry/session",
-            },
-        ), mock.patch.object(
-            aws_adapter.execution,
-            "_assume_role_credentials",
-            return_value=({"AWS_ACCESS_KEY_ID": "temporary"}, {}),
-        ), mock.patch.object(
-            aws_adapter.execution, "_run_aws_json", return_value=wrong_final
+        with (
+            mock.patch.object(
+                aws_adapter.execution, "resolve_target_aws_access", return_value=resolved
+            ),
+            mock.patch.object(
+                aws_adapter.execution,
+                "assert_caller",
+                return_value={
+                    "Account": "111111111111",
+                    "Arn": "arn:aws:sts::111111111111:assumed-role/Entry/session",
+                },
+            ),
+            mock.patch.object(
+                aws_adapter.execution,
+                "_assume_role_credentials",
+                return_value=({"AWS_ACCESS_KEY_ID": "temporary"}, {}),
+            ),
+            mock.patch.object(aws_adapter.execution, "_run_aws_json", return_value=wrong_final),
         ):
             result = aws_adapter.preflight_execution_identity(
                 "target_run",
@@ -844,7 +829,7 @@ class AwsPreflightTests(unittest.TestCase):
                 execution_context={},
                 implementation_key="sso",
                 execution_access_mode="force_bypass",
-                provider_options={"force_bypass_credential_profile": "do-not-render"},
+                provider_options={"force_bypass_profile": "do-not-render"},
                 live_check=False,
             )
         self.assertEqual(result["status"], "not_applicable")

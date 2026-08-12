@@ -4,7 +4,6 @@ These tests exercise the public selection assembly boundary so standalone target
 and workflow members cannot depend on state produced only by the other branch.
 """
 
-
 import os
 import sys
 import unittest
@@ -13,7 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.cfg import resources as cfg_resources
 from engine.commands import selection as commands_selection
 
@@ -41,8 +40,9 @@ class RealCfgSelectionTest(unittest.TestCase):
     order the branch assembles them.
     """
 
-    def _resolve(self, action: str, *, workflow: str | None = None,
-                 target: str | None = None) -> dict:
+    def _resolve(
+        self, action: str, *, workflow: str | None = None, target: str | None = None
+    ) -> dict:
         params = {**PARAMS, "operation": action}
         return commands_selection.resolve_pipeline_selection(
             DEV_CFG,
@@ -81,9 +81,7 @@ class RealCfgSelectionTest(unittest.TestCase):
 
     def test_a_workflow_member_carries_its_declared_action(self):
         selection = self._resolve("plan", workflow="env/baseline")
-        self.assertEqual(
-            "plan", selection["active_target_runs"]["env/infra"]["action"]
-        )
+        self.assertEqual("plan", selection["active_target_runs"]["env/infra"]["action"])
 
     def test_a_destroy_workflow_resolves_its_own_member_list(self):
         selection = self._resolve("destroy", workflow="env/baseline")
@@ -95,7 +93,7 @@ class RealCfgSelectionTest(unittest.TestCase):
         targets = cfg_resources.collect_resource(DEV_CFG, "targets", entry_depth=1)
         checked = 0
         for name, definition in sorted(targets.items()):
-            for action in catalog_targets.TargetActionPolicy(
+            for action in target_catalog.TargetActionPolicy(
                 definition, label=f"target {name!r}"
             ).actions():
                 try:

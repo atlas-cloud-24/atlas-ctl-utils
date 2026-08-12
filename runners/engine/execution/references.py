@@ -7,7 +7,6 @@ depend on the whole assembly."""
 
 import fnmatch
 import re
-
 from enum import StrEnum
 from pathlib import Path
 
@@ -28,23 +27,21 @@ def resolve_runtime_scalar(
         raise RuntimeError(f"❌ {label} must be a non-empty string")
 
     token_re = RUNTIME_SCALAR_TOKEN_RE
-    if tolerate_missing and any(
-        context.get(ref) in (None, "") for ref in token_re.findall(value)
-    ):
+    if tolerate_missing and any(context.get(ref) in (None, "") for ref in token_re.findall(value)):
         return None
 
     def replace(match: re.Match[str]) -> str:
         key = match.group(1)
         resolved = context.get(key)
         if resolved is None or str(resolved) == "":
-            raise RuntimeError(
-                f"❌ {label}: {execution_context_miss_message(context, key)}"
-            )
+            raise RuntimeError(f"❌ {label}: {execution_context_miss_message(context, key)}")
         return str(resolved)
 
     resolved = token_re.sub(replace, value.strip())
     if "${" in resolved:
-        raise RuntimeError(f"❌ {label} contains an unsupported or unresolved placeholder: {value!r}")
+        raise RuntimeError(
+            f"❌ {label} contains an unsupported or unresolved placeholder: {value!r}"
+        )
     if not resolved:
         raise RuntimeError(f"❌ {label} resolved to an empty string")
     return resolved
@@ -80,7 +77,9 @@ def resolve_cfg_key_entries(
             raise RuntimeError(f"❌ {label} cfg_key_sets must be a non-empty list ({cfg_path})")
         for name in cfg_key_set_keys:
             if not isinstance(name, str) or not name.strip():
-                raise RuntimeError(f"❌ {label} cfg_key_sets entries must be non-empty strings ({cfg_path})")
+                raise RuntimeError(
+                    f"❌ {label} cfg_key_sets entries must be non-empty strings ({cfg_path})"
+                )
             name = name.strip()
             if name not in cfg_key_sets:
                 available = ", ".join(sorted(cfg_key_sets)) or "none"
@@ -98,11 +97,17 @@ def resolve_cfg_key_entries(
                 )
             unknown = sorted(set(member) - {"cfg_key_sets", "cfg_keys"})
             if unknown:
-                raise RuntimeError(f"❌ cfg_key_set {name!r} has unsupported keys {unknown} ({cfg_path})")
+                raise RuntimeError(
+                    f"❌ cfg_key_set {name!r} has unsupported keys {unknown} ({cfg_path})"
+                )
             resolved.extend(
                 resolve_cfg_key_entries(
-                    member.get("cfg_keys"), member.get("cfg_key_sets"), cfg_key_sets,
-                    label=f"cfg_key_set {name!r}", cfg_path=cfg_path, _stack=(*_stack, name),
+                    member.get("cfg_keys"),
+                    member.get("cfg_key_sets"),
+                    cfg_key_sets,
+                    label=f"cfg_key_set {name!r}",
+                    cfg_path=cfg_path,
+                    _stack=(*_stack, name),
                 )
             )
     if cfg_keys is not None:
@@ -110,7 +115,9 @@ def resolve_cfg_key_entries(
             raise RuntimeError(f"❌ {label} cfg_keys must be a non-empty list ({cfg_path})")
         for entry in cfg_keys:
             if not isinstance(entry, str) or not entry.strip():
-                raise RuntimeError(f"❌ {label} cfg_keys entries must be non-empty strings ({cfg_path})")
+                raise RuntimeError(
+                    f"❌ {label} cfg_keys entries must be non-empty strings ({cfg_path})"
+                )
             entry = entry.strip()
             if not CFG_KEY_ENTRY_RE.fullmatch(entry):
                 raise RuntimeError(
@@ -274,13 +281,9 @@ def execution_context_nested(execution_context: dict[str, object]) -> dict[str, 
         for segment in segments[:-1]:
             child = node.setdefault(segment, {})
             if not isinstance(child, dict):
-                raise RuntimeError(
-                    f"❌ execution context key {ref!r} nests under a scalar fact"
-                )
+                raise RuntimeError(f"❌ execution context key {ref!r} nests under a scalar fact")
             node = child
         if isinstance(node.get(segments[-1]), dict):
-            raise RuntimeError(
-                f"❌ execution context key {ref!r} collides with a nested subtree"
-            )
+            raise RuntimeError(f"❌ execution context key {ref!r} collides with a nested subtree")
         node[segments[-1]] = value
     return {EXECUTION_CONTEXT_ROOT: nested}

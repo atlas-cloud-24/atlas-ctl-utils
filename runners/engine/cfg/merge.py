@@ -8,12 +8,12 @@ import logging
 import os
 import shutil
 import tempfile
-
 from pathlib import Path
 
 from engine.cfg import layout as cfg_layout
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
+
 
 def merge_cfg_values(base, overlay):
     if isinstance(base, dict) and isinstance(overlay, dict):
@@ -104,7 +104,10 @@ def merge_config_dirs(
                 dest_file = os.path.join(dest_root, file)
 
                 if os.path.exists(dest_file):
-                    merged_data = merge_cfg_values(kernel_yaml_io.load_cfg_yaml(dest_file), kernel_yaml_io.load_cfg_yaml(src_file))
+                    merged_data = merge_cfg_values(
+                        kernel_yaml_io.load_cfg_yaml(dest_file),
+                        kernel_yaml_io.load_cfg_yaml(src_file),
+                    )
                     source_list = merged_files.setdefault(dest_file, [])
                     source_list.append(src_file)
                     header_comment = None
@@ -115,14 +118,18 @@ def merge_config_dirs(
                             source_log_roots=source_log_roots,
                             dest_log_roots=dest_log_roots,
                         )
-                    kernel_yaml_io.write_cfg_yaml(dest_file, merged_data, header_comment=header_comment)
+                    kernel_yaml_io.write_cfg_yaml(
+                        dest_file, merged_data, header_comment=header_comment
+                    )
                 else:
                     shutil.copy2(src_file, dest_file)
                     merged_files[dest_file] = [src_file]
 
     for dest_path, sources in merged_files.items():
         if len(sources) > 1:
-            rendered_sources = [kernel_paths.format_path_for_log(src, source_log_roots) for src in sources]
+            rendered_sources = [
+                kernel_paths.format_path_for_log(src, source_log_roots) for src in sources
+            ]
             rendered_dest = kernel_paths.format_path_for_log(dest_path, dest_log_roots)
             logging.info("Merged:")
             logging.info("  %s", rendered_sources[0])
@@ -133,7 +140,9 @@ def merge_config_dirs(
     return merged_files
 
 
-def _flatten_yaml_leaf_values(value, path: tuple[object, ...] = ()) -> dict[tuple[object, ...], object]:
+def _flatten_yaml_leaf_values(
+    value, path: tuple[object, ...] = ()
+) -> dict[tuple[object, ...], object]:
     if isinstance(value, dict):
         leaves: dict[tuple[object, ...], object] = {}
         for key, child in value.items():
@@ -142,7 +151,9 @@ def _flatten_yaml_leaf_values(value, path: tuple[object, ...] = ()) -> dict[tupl
     return {path: value}
 
 
-def _scope_final_yaml_leaves(scope: dict, *, skip_filenames: set[str]) -> dict[tuple[str, tuple[object, ...]], object]:
+def _scope_final_yaml_leaves(
+    scope: dict, *, skip_filenames: set[str]
+) -> dict[tuple[str, tuple[object, ...]], object]:
     with tempfile.TemporaryDirectory(prefix="atlas-scope-leaves-") as tmp_dir:
         tmp_path = Path(tmp_dir)
         merge_config_dirs(

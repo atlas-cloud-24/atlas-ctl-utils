@@ -10,7 +10,6 @@ runnable before the dev cfg has been generated; discovering adapters by scanning
 what sits beside the engine is exactly what the declaration exists to replace.
 """
 
-
 import sys
 from pathlib import Path
 

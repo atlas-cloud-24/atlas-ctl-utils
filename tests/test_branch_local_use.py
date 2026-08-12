@@ -12,7 +12,6 @@ weak guard. This is the cheap one: the property is static, so it is checked
 statically, on every run, in milliseconds.
 """
 
-
 import ast
 import builtins
 import unittest
@@ -29,10 +28,8 @@ def _bound_by(node: ast.AST) -> set[str]:
     while stack:
         current = stack.pop()
         for child in ast.iter_child_nodes(current):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-                                  ast.ClassDef)):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                      ast.ClassDef)):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     bound.add(child.name)
                 continue
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
@@ -53,8 +50,7 @@ def _loads(node: ast.AST) -> set[str]:
     while stack:
         current = stack.pop()
         for child in ast.iter_child_nodes(current):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
-                                  ast.ClassDef)):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
                 continue
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 reads.add(child.id)
@@ -84,8 +80,7 @@ def _scan(body: list[ast.stmt], bound: set[str], report: list[str], where: str) 
                 if node.orelse:
                     branches.append(node.orelse)
                 break
-            per_branch = [set().union(*(_bound_by(s) for s in b)) if b else set()
-                          for b in branches]
+            per_branch = [set().union(*(_bound_by(s) for s in b)) if b else set() for b in branches]
             for index, branch in enumerate(branches):
                 siblings: set[str] = set()
                 for other in range(len(branches)):
@@ -135,8 +130,7 @@ class BranchesDoNotShareLocalsTest(unittest.TestCase):
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            params = {a.arg for a in node.args.args + node.args.kwonlyargs
-                      + node.args.posonlyargs}
+            params = {a.arg for a in node.args.args + node.args.kwonlyargs + node.args.posonlyargs}
             if node.args.vararg:
                 params.add(node.args.vararg.arg)
             if node.args.kwarg:
@@ -157,9 +151,7 @@ class BranchesDoNotShareLocalsTest(unittest.TestCase):
     )
 
     def test_selection_resolvers_have_no_cross_branch_reads(self):
-        violations = [
-            v for v in self._violations() if v.split(":", 1)[0] in self.WATCHED
-        ]
+        violations = [v for v in self._violations() if v.split(":", 1)[0] in self.WATCHED]
         self.assertEqual([], violations, "\n" + "\n".join(violations))
 
 

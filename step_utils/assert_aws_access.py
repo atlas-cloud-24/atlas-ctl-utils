@@ -4,7 +4,6 @@
 
 assert that active AWS credentials match the target account and principal."""
 
-
 import json
 import os
 import re
@@ -24,13 +23,10 @@ def validate_caller_identity(
     expected_role_name: str | None = None,
 ) -> tuple[str, str]:
     principal_expectation_count = sum(
-        bool(value)
-        for value in (expected_permission_set_name, expected_role_name)
+        bool(value) for value in (expected_permission_set_name, expected_role_name)
     )
     if principal_expectation_count != 1:
-        raise RuntimeError(
-            "exactly one expected permission-set name or role name is required"
-        )
+        raise RuntimeError("exactly one expected permission-set name or role name is required")
 
     actual_account_id = caller.get("Account")
     actual_arn = caller.get("Arn")
@@ -52,9 +48,7 @@ def validate_caller_identity(
 
     actual_role_name = match.group("role_name")
     if expected_permission_set_name:
-        pattern = re.compile(
-            rf"^AWSReservedSSO_{re.escape(expected_permission_set_name)}_[^/]+$"
-        )
+        pattern = re.compile(rf"^AWSReservedSSO_{re.escape(expected_permission_set_name)}_[^/]+$")
         if not pattern.fullmatch(actual_role_name):
             raise RuntimeError(
                 "AWS SSO permission-set mismatch: expected role "
@@ -94,9 +88,7 @@ def get_caller_identity(
     """
 
     if profile_name and credentials:
-        raise RuntimeError(
-            "get_caller_identity takes a profile OR credentials, never both"
-        )
+        raise RuntimeError("get_caller_identity takes a profile OR credentials, never both")
     cmd = ["aws", "sts", "get-caller-identity", "--output", "json"]
     if profile_name:
         cmd += ["--profile", profile_name]
@@ -113,8 +105,10 @@ def get_caller_identity(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         source = (
-            f"profile {profile_name!r}" if profile_name
-            else "supplied credentials" if credentials
+            f"profile {profile_name!r}"
+            if profile_name
+            else "supplied credentials"
+            if credentials
             else "ambient env credentials"
         )
         raise RuntimeError(f"AWS access assertion failed for {source}: {detail}")
@@ -129,9 +123,7 @@ def get_caller_identity(
 def main() -> int:
     caller = get_caller_identity()
 
-    profile_only = (
-        os.getenv("ATLAS_AWS_PROFILE_ONLY_ACCESS", "").strip().lower() == "true"
-    )
+    profile_only = os.getenv("ATLAS_AWS_SUBSTITUTE_ACCESS", "").strip().lower() == "true"
     if profile_only:
         actual_account_id = caller.get("Account")
         actual_arn = caller.get("Arn")
@@ -141,9 +133,7 @@ def main() -> int:
         return 0
 
     expected_account_id = require_env("ATLAS_AWS_EXPECT_ACCOUNT_ID")
-    permission_set_name = (
-        os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
-    )
+    permission_set_name = os.getenv("ATLAS_AWS_EXPECT_PERMISSION_SET_NAME", "").strip() or None
     role_name = os.getenv("ATLAS_AWS_EXPECT_ROLE_NAME", "").strip() or None
 
     validate_caller_identity(

@@ -1,59 +1,15 @@
-"""Provider adapters for the Atlas ctl engine.
+"""Provider adapters, reached by package name.
 
-The engine core owns only `execution_identity_key`, provider selection,
-lifecycle, and error propagation. Each adapter owns its identity schema,
-catalogs, credential acquisition, target resolution, runtime binding, access
-assertion, and derived provider facts.
-
-Adapter contract (module-level callables):
-
-    validate_catalog(ctl_cfg_root)
-    validate_target_execution_identity(execution, ctl_cfg_root, *, label)
-    describe() -> {execution_access_modes, identity_preflight,
-        modes_resolving_execution_identity, provider_options}
-    supported_execution_access_modes() -> set[str]      (CSI-style advertisement)
-    supports_identity_preflight() -> bool
-    normal_execution_access_mode() -> str          (its own non-escalated mode)
-    resolves_execution_identity(execution_access_mode) -> bool
-    target_consent(execution_access_mode) -> {opt_in_field, execution_field} | None
-    execution_access_mode_from_options(provider_options) -> mode | None
-    validate_provider_options(options) -> options       (unknown key -> hard error)
-    required_profile_grants(options) -> [ctl-profile permission keys]
-    load_runtime_catalogs(ctl_cfg_root, *, execution_context) ->
-        structurally valid opaque catalogs bundle; concrete bindings may remain unresolved
-    validate_active_target_access(active_target_runs, catalogs, *, execution_context,
-        implementation_key, execution_access_mode, provider_options)
-    preflight_execution_identity(target_run_id, target_run, catalogs, *, execution_context,
-        implementation_key, execution_access_mode, provider_options, live_check) -> result
-    materialize_target_binding(target_run_id, target_run, target_env, catalogs, *,
-        execution_context, implementation_key, execution_access_mode, provider_options)
-        -> binds credentials via ephemeral private temp state only; NEVER writes
-           credential material into the run's ctl-state dir
-    target_assertion_argv(step_utils_dir) -> argv | None
-    validate_state_backend_entry(namespace_key, entry, path)
-    resolve_ctl_state_credential(operation_execution, ctl_cfg_root, *,
-        execution_context, implementation_key, execution_access_mode, provider_options)
-    create_state_syncer(results_root, bucket_name, bucket_region, credential, *,
-        required)
-
-The engine narrows both provider-specific inputs at this boundary: it passes ONE
-provider's `execution_access_mode` (a name only that adapter defines) and ONE
-provider's `provider_options` (its own keys, prefix stripped). No adapter ever
-sees another provider's mode or options.
+The engine owns provider selection and lifecycle; an adapter owns its identity
+schema, catalogs, credentials and access assertion. The contract is the set of
+module-level callables this module looks up.
 """
 
 
-# An adapter lives in its OWN repository — the engine depends on it, never the
-# other way round — so it is imported by PACKAGE NAME rather than by reaching into
-# a subdirectory of this one. Where that package comes from is DECLARED, not
-# discovered: `execution-provider-{provider}` is a tooling ref in `refs.global`,
-# materialized by the same path as the rest of the engine's tooling. The engine
-# never globs the filesystem for adapters — that would make whatever happens to
-# sit beside the checkout into the registry.
+# An adapter is imported by package name, from a DECLARED tooling ref
+# (`execution-provider-{provider}`) — never found by globbing the filesystem.
 
-# The cfg root of the run in progress, so a provider lookup can reach the
-# declaration without every call site threading it through. Set once, by the same
-# code that puts the declared adapter repositories on the import path.
+# The cfg root of the run in progress, so a lookup need not thread it through.
 from pathlib import Path
 
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -121,9 +77,7 @@ def registered_providers(ctl_cfg_root=None) -> tuple[str, ...]:
 
     root = ctl_cfg_root or _ACTIVE_CTL_CFG_ROOT
     if root is None:
-        raise RuntimeError(
-            "❌ no ctl cfg root is active, so the declared providers cannot be read"
-        )
+        raise RuntimeError("❌ no ctl cfg root is active, so the declared providers cannot be read")
     declared = load_execution_providers(root)
     if not declared:
         raise RuntimeError(f"❌ {root} declares no providers in execution_providers.yaml")

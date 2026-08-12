@@ -6,7 +6,6 @@ construction, which is why the checks here are static rather than per-run."""
 
 import collections
 import logging
-
 from pathlib import Path
 
 from engine.cfg import layout as cfg_layout

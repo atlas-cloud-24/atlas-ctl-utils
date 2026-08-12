@@ -6,7 +6,6 @@ writes to the local ctl-state tree. `remote` hydrates into a throwaway root
 destroys a force-skipped, local-only pointer); `local` never calls the bucket.
 """
 
-
 import argparse
 import sys
 import tempfile
@@ -111,22 +110,26 @@ class StatusScopeTests(unittest.TestCase):
         # and breadth (--all/--target/--workflow/--fan-out) is a required choice.
         status_parser = argparse.ArgumentParser()
         cli_args.add_status_args(status_parser)
-        scope = next(
-            item for item in status_parser._actions if "--scope" in item.option_strings
-        )
+        scope = next(item for item in status_parser._actions if "--scope" in item.option_strings)
         self.assertEqual(tuple(scope.choices), ("local", "remote"))
         self.assertIsNone(scope.default)
         with self.assertRaises(SystemExit):  # no breadth, no scope
-            status_parser.parse_args(
-                ["--ctl-cfg", "x", "--ctl-profile", "dev"]
-            )
+            status_parser.parse_args(["--ctl-cfg", "x", "--ctl-profile", "dev"])
         with self.assertRaises(SystemExit):  # two breadths are mutually exclusive
             status_parser.parse_args(
                 [
-                    "--ctl-cfg", "x", "--ctl-profile", "dev",
-                    "--all", "--target", "env/core", "--scope", "local",
+                    "--ctl-cfg",
+                    "x",
+                    "--ctl-profile",
+                    "dev",
+                    "--all",
+                    "--target",
+                    "env/core",
+                    "--scope",
+                    "local",
                 ]
             )
+
 
 class Phase42SweepScopeTests(unittest.TestCase):
     def test_status_sweep_hydrates_into_a_throwaway_root(self):
@@ -148,14 +151,14 @@ class Phase42SweepScopeTests(unittest.TestCase):
                 return NAMESPACE, namespace_root, _RecordingSyncer(namespace_root)
 
             args = _status_args(local_root, None)
-            with patch.object(
-                execution_run_context, "build_execution_context", return_value={}
-            ), patch.object(
-                state_sync.CtlStateAccess, "arm_operation", side_effect=fake_arm
-            ), patch.object(
-                state_run_store, "hydrate_ctl_state_index", return_value=[]
+            with (
+                patch.object(execution_run_context, "build_execution_context", return_value={}),
+                patch.object(state_sync.CtlStateAccess, "arm_operation", side_effect=fake_arm),
+                patch.object(state_run_store, "hydrate_ctl_state_index", return_value=[]),
             ):
-                commands_maintenance.run_ctl_state_status_sweep(Path("/nonexistent-cfg"), args)
+                commands_maintenance.CtlStateMaintenance.status_sweep(
+                    Path("/nonexistent-cfg"), args
+                )
 
             for root in armed_roots:
                 self.assertNotEqual(root, local_root)

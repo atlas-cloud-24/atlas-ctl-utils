@@ -14,6 +14,7 @@ ctl cannot derive the grouping. A target names a procedure, a procedure names
 steps, and only a step's tooling knows what it operates on — so the group is
 declared in cfg and nothing else could supply it.
 """
+
 import sys
 import unittest
 from pathlib import Path
@@ -112,9 +113,7 @@ class TargetStandingResolutionTest(unittest.TestCase):
             TECH_JOBS,
             {
                 BASELINE: _event("2026-08-05T00:00:00Z"),
-                TECH_JOBS: _event(
-                    "2026-08-05T00:01:00Z", run_actions.Action.DESTROY
-                ),
+                TECH_JOBS: _event("2026-08-05T00:01:00Z", run_actions.Action.DESTROY),
             },
         )
         self.assertIsNone(standing)
@@ -184,6 +183,7 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
 
     def _namespace(self, tmp: Path, addresses: list[str]) -> Path:
         import sys as _sys
+
         _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
         from engine.kernel import yaml_io as kernel_yaml_io
         from engine.run import addressing as run_addressing
@@ -195,26 +195,37 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
             (instance / "committed").mkdir(parents=True, exist_ok=True)
             kernel_yaml_io.write_yaml_file(
                 instance / "committed" / "mutative.yaml",
-                {"run_id": f"r{index}", "status": "ok", "action": "provision",
-                 "committed_at": f"2026-08-05T00:00:{index:02d}Z",
-                 "ref_policy": "commit_required"},
+                {
+                    "run_id": f"r{index}",
+                    "status": "ok",
+                    "action": "provision",
+                    "committed_at": f"2026-08-05T00:00:{index:02d}Z",
+                    "ref_policy": "commit_required",
+                },
             )
             slot = instance / "ok" / f"r{index}"
             slot.mkdir(parents=True, exist_ok=True)
             kernel_yaml_io.write_yaml_file(
                 slot / "STATUS.yaml",
-                {"run_id": f"r{index}", "status": "ok", "action": "provision",
-                 "updated_at": "2026-08-05T00:00:00Z"},
+                {
+                    "run_id": f"r{index}",
+                    "status": "ok",
+                    "action": "provision",
+                    "updated_at": "2026-08-05T00:00:00Z",
+                },
             )
         return namespace
 
     def test_the_replaced_member_reports_its_standing_and_by_whom(self):
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             namespace = self._namespace(Path(tmp), [BASELINE, TECH_JOBS])
             rows = state_status.compute_namespace_status_map(namespace, RELATIONS)
             baseline = rows["target"]["env/core/baseline"]["instances"]["env.type=dev"]["mutative"]
-            tech_jobs = rows["target"]["env/core/tech_jobs"]["instances"]["env.type=dev"]["mutative"]
+            tech_jobs = rows["target"]["env/core/tech_jobs"]["instances"]["env.type=dev"][
+                "mutative"
+            ]
             self.assertEqual("superseded", baseline["standing"])
             self.assertEqual(
                 "target/env/core/tech_jobs/instances/env.type=dev",
@@ -231,9 +242,7 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             namespace = self._namespace(Path(tmp), [BASELINE, TECH_JOBS])
             key, segments = run_addressing.split_target_instance_address(TECH_JOBS)
-            instance = namespace / run_addressing.compose_state_relpath(
-                "target", key, segments
-            )
+            instance = namespace / run_addressing.compose_state_relpath("target", key, segments)
             kernel_yaml_io.write_yaml_file(
                 instance / "committed" / "plan.yaml",
                 {
@@ -245,15 +254,14 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
             )
 
             rows = state_status.compute_namespace_status_map(namespace, RELATIONS)
-            plan = rows["target"]["env/core/tech_jobs"]["instances"][
-                "env.type=dev"
-            ]["plan"]
+            plan = rows["target"]["env/core/tech_jobs"]["instances"]["env.type=dev"]["plan"]
             self.assertEqual("active", plan["standing"])
 
     def test_without_a_declared_group_neither_is_superseded(self):
         """Guards the default: `exclusive_target_relations: {}` must leave every row alone."""
 
         import tempfile
+
         with tempfile.TemporaryDirectory() as tmp:
             namespace = self._namespace(Path(tmp), [BASELINE, TECH_JOBS])
             rows = state_status.compute_namespace_status_map(namespace, {})

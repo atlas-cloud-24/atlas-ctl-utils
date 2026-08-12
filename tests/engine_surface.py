@@ -35,7 +35,8 @@ def engine_modules() -> dict[str, object]:
 def engine_source_files() -> list[Path]:
     """Every engine source file. Package markers carry no code and are skipped."""
     files = sorted(
-        p for p in PACKAGE_ROOT.rglob("*.py")
+        p
+        for p in PACKAGE_ROOT.rglob("*.py")
         if p.name != "__init__.py" and "__pycache__" not in p.parts
     )
     if not files:

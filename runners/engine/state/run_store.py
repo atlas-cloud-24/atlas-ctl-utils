@@ -6,6 +6,7 @@ on this module without depending on each other."""
 
 import argparse
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -219,7 +220,7 @@ def move_state_slots_to_group(run_dir: Path, group: str) -> None:
             if not status.is_file():
                 continue
             if (kernel_yaml_io.load_yaml(status) or {}).get("run_path") != run_path:
-                continue                # another run's slot in the same instance
+                continue  # another run's slot in the same instance
             destination = state_slot_dir(instance_dir, state, group)
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
@@ -245,8 +246,7 @@ def run_workspace_dir(run_dir: Path) -> Path | None:
     if not local_root:
         return None
     return (
-        Path(local_root)
-        .joinpath(*LOCAL_ONLY_LOCATOR)
+        Path(local_root).joinpath(*LOCAL_ONLY_LOCATOR)
         / LOCAL_WORKSPACES_DIRNAME
         / Path(run_dir).name
     )
@@ -295,9 +295,14 @@ _COMMITTED_FACT_KEYS = (
     # published it. Without it, reuse eligibility could not compare the action and
     # A workflow holding one target under two actions skipped both members.
     "action",
-    "child_revisions", "source_commit", "cfg_source_commit",
-    "source_state", "ref_policy", "workflow_definition_sha256",
-    "target_definition_sha256", "target_cfg_view_sha256",
+    "child_revisions",
+    "source_commit",
+    "cfg_source_commit",
+    "source_state",
+    "ref_policy",
+    "workflow_definition_sha256",
+    "target_definition_sha256",
+    "target_cfg_view_sha256",
     # What this run APPLIED. A mode group's members share one deployment, so the
     # member in effect is the one whose overlays the deployment carries — without
     # this the others cannot know they were replaced.
@@ -321,7 +326,9 @@ def committed_pointer_path(instance_dir: Path, group: str) -> Path:
     group: a deployment run writes one file and touches nothing else."""
 
     if group not in run_actions.RESULT_GROUPS:
-        raise RuntimeError(f"❌ unknown state group {group!r} (expected {run_actions.RESULT_GROUPS})")
+        raise RuntimeError(
+            f"❌ unknown state group {group!r} (expected {run_actions.RESULT_GROUPS})"
+        )
     return Path(instance_dir) / "committed" / f"{group}.yaml"
 
 
@@ -339,10 +346,10 @@ def write_run_snapshot(run_dir: Path, payload: dict) -> str:
 
 def publish_committed_pointer(run_dir: Path, payload: dict) -> Path | None:
     """Publish the instance's committed.yaml pointer to this run's snapshot
-. Writes the snapshot first (manifest-last), then the pointer
-    with the denormalized facts + status readers need. The physical
-    conditional write to the backend is the syncer's job; locally this is the
-    authoritative record."""
+    . Writes the snapshot first (manifest-last), then the pointer
+        with the denormalized facts + status readers need. The physical
+        conditional write to the backend is the syncer's job; locally this is the
+        authoritative record."""
     # Only a state owner publishes. A workflow owns execution, so its
     # RUN.yaml IS the record — persistent composition status would be a claim
     # nobody re-checks, because ctl never observes the cloud.
@@ -409,7 +416,16 @@ def record_run_target_keys(run_dir: Path, target_keys: list[str]) -> None:
     status = load_current_status(run_dir)
     if status:
         status.update({"target_keys": normalized, "updated_at": kernel_ids.utc_timestamp()})
-        for key in ("action", "run_type", "result_name", "result_key", "ctl_state_local_root", "ctl_state_dir", "run_dir", "log_path"):
+        for key in (
+            "action",
+            "run_type",
+            "result_name",
+            "result_key",
+            "ctl_state_local_root",
+            "ctl_state_dir",
+            "run_dir",
+            "log_path",
+        ):
             if key in metadata:
                 status[key] = metadata[key]
         write_current_status(run_dir, status)
@@ -431,18 +447,6 @@ def load_status_mapping(path: Path) -> dict:
     if not isinstance(data, dict):
         raise RuntimeError(f"❌ STATUS.yaml must contain a mapping: {path}")
     return data
-
-
-def update_committed_manifest(status_path: Path, payload: dict) -> None:
-    manifest_path = status_path.parent / "MANIFEST.yaml"
-    manifest = {
-        "run_id": payload.get("run_id"),
-        "run_path": payload.get("run_path") or (f"runs/{payload.get('run_id')}" if payload.get("run_id") else None),
-        "status_path": payload.get("status_path") or (f"runs/{payload.get('run_id')}/RUN.yaml" if payload.get("run_id") else None),
-        "artifacts_path": payload.get("artifacts_path") or (f"runs/{payload.get('run_id')}/artifacts" if payload.get("run_id") else None),
-        "updated_at": payload.get("updated_at"),
-    }
-    kernel_yaml_io.write_yaml_file(manifest_path, {k: v for k, v in manifest.items() if v is not None})
 
 
 def ctl_state_lock_path(ctl_state_local_root: Path) -> Path:
@@ -472,9 +476,7 @@ CHILD_LOCK_GRANT_ENV = "ATLAS_CHILD_LOCK_GRANT"
 _REDEEMED_CHILD_GRANT: str | None = None
 
 
-def mint_child_lock_grant(
-    ctl_state_local_root: Path, *, child_kind: str, child_key: str
-) -> str:
+def mint_child_lock_grant(ctl_state_local_root: Path, *, child_kind: str, child_key: str) -> str:
     """Mint a SINGLE-USE grant letting one child run under the lock
     this process holds.
 
@@ -518,7 +520,7 @@ def consume_child_lock_grant(
         claim.get("key") is not None and claim.get("key") != child_key
     ):
         return False
-    del grants[grant]                       # single use
+    del grants[grant]  # single use
     metadata["child_lock_grants"] = grants
     kernel_yaml_io.write_yaml_file(ctl_state_lock_metadata_path(ctl_state_local_root), metadata)
     _REDEEMED_CHILD_GRANT = grant
@@ -543,7 +545,10 @@ def format_ctl_state_lock_error(ctl_state_local_root: Path, metadata: dict, *, r
         value = metadata.get(key)
         if value not in (None, ""):
             details.append(f"{key}: {value}")
-    details.append("If the owning ctl process is gone, run maintenance unlock-ctl-state with --lock-id " + str(lock_id))
+    details.append(
+        "If the owning ctl process is gone, run maintenance unlock-ctl-state with --lock-id "
+        + str(lock_id)
+    )
     return "\n".join(details)
 
 
@@ -652,11 +657,10 @@ def should_bypass_ctl_state_lock(args: argparse.Namespace, run_type: str) -> boo
     """
 
     if run_type == "maintenance":
-        return (
-            getattr(args, "maintenance_action", None) == "unlock-ctl-state"
-            and ctl_state_lock_matches(
-                args.ctl_state_local_root, getattr(args, "lock_id", None)
-            )
+        return getattr(
+            args, "maintenance_action", None
+        ) == "unlock-ctl-state" and ctl_state_lock_matches(
+            args.ctl_state_local_root, getattr(args, "lock_id", None)
         )
     # A child runs under its parent's lock only by redeeming a
     # SINGLE-USE grant the parent minted for it, passed by environment so it is
@@ -693,9 +697,7 @@ def write_ctl_state_lock_metadata(
     )
 
 
-def hydrate_ctl_state_index(
-    syncer, *, include_maintenance_manifests: bool = False
-) -> list[str]:
+def hydrate_ctl_state_index(syncer, *, include_maintenance_manifests: bool = False) -> list[str]:
     """Hydrate the immutable runs and mutable pointers needed by state readers.
 
     Maintenance manifests are opt-in so ordinary namespace status does not pay
@@ -710,11 +712,7 @@ def hydrate_ctl_state_index(
             and key.startswith("_maintenance/")
             and key.endswith("/manifest.yaml")
         )
-        if (
-            grouped_pointer
-            or key.endswith("/RUN.yaml")
-            or maintenance_manifest
-        ):
+        if grouped_pointer or key.endswith("/RUN.yaml") or maintenance_manifest:
             syncer.pull_object(key)
     return keys
 
@@ -723,7 +721,11 @@ _MUTATION_LOCK_HELD: dict | None = None
 
 
 def enforce_mutation_lock(
-    syncer, *, action: str, run_id: str, parent_run_id: str | None = None,
+    syncer,
+    *,
+    action: str,
+    run_id: str,
+    parent_run_id: str | None = None,
     ttl_seconds: int | None = None,
 ) -> None:
     """The interim global mutation lock, enforced at the
@@ -737,10 +739,13 @@ def enforce_mutation_lock(
         logging.info("mutation lock skipped: no armed ctl-state syncer")
         return
     if action not in run_actions.MUTATING_ACTIONS:
-        return                          # never acquires, never blocks: no read needed
+        return  # never acquires, never blocks: no read needed
     existing = syncer.read_mutation_lock()
     outcome = evaluate_mutation_lock(
-        existing, action=action, run_id=run_id, parent_run_id=parent_run_id,
+        existing,
+        action=action,
+        run_id=run_id,
+        parent_run_id=parent_run_id,
         ttl_seconds=ttl_seconds,
     )
     decision = outcome["decision"]
@@ -808,8 +813,7 @@ def target_instance_dir_for_run(
         *(metadata.get("ctl_state_locator") or [])
     )
     return (
-        namespace_root
-        / run_addressing.compose_state_relpath("target", target_key, segments),
+        namespace_root / run_addressing.compose_state_relpath("target", target_key, segments),
         run_addressing.target_instance_address(target_key, segments),
     )
 
@@ -826,7 +830,10 @@ MUTATION_LOCK_TTL_SECONDS = 21600
 
 
 def build_mutation_lock_doc(
-    run_id: str, action: str, *, broke_lock_of: str | None = None,
+    run_id: str,
+    action: str,
+    *,
+    broke_lock_of: str | None = None,
     ttl_seconds: int | None = None,
 ) -> dict:
     now = datetime.now(UTC)
@@ -858,7 +865,11 @@ def mutation_lock_is_stale(lock_doc: dict, *, now: datetime | None = None) -> bo
 
 
 def evaluate_mutation_lock(
-    existing_lock: dict | None, *, action: str, run_id: str, parent_run_id: str | None = None,
+    existing_lock: dict | None,
+    *,
+    action: str,
+    run_id: str,
+    parent_run_id: str | None = None,
     ttl_seconds: int | None = None,
 ) -> dict:
     """Pure decision logic for the interim global mutation lock.
@@ -879,12 +890,17 @@ def evaluate_mutation_lock(
     if not mutating:
         return {"decision": "proceed"}
     if existing_lock is None:
-        return {"decision": "acquire", "lock_doc": build_mutation_lock_doc(run_id, action, ttl_seconds=ttl_seconds)}
+        return {
+            "decision": "acquire",
+            "lock_doc": build_mutation_lock_doc(run_id, action, ttl_seconds=ttl_seconds),
+        }
     if mutation_lock_is_stale(existing_lock):
         return {
             "decision": "break_and_acquire",
             "lock_doc": build_mutation_lock_doc(
-                run_id, action, broke_lock_of=str(existing_lock.get("run_id")),
+                run_id,
+                action,
+                broke_lock_of=str(existing_lock.get("run_id")),
                 ttl_seconds=ttl_seconds,
             ),
         }
@@ -898,3 +914,50 @@ def evaluate_mutation_lock(
         logging.info("mutation lock held by parent run %s; proceeding as its child", holder)
         return {"decision": "proceed"}
     return {"decision": "blocked", "holder": holder}
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Run:
+    """One execution of a target, workflow, fan-out or procedure."""
+
+    run_id: str
+    run_type: str
+    action: str
+    status: str = ""
+    label: str = ""
+    instance_address: str = ""
+
+    @classmethod
+    def from_record(cls, record: dict) -> "Run":
+        """Build from a stored run record."""
+
+        return cls(
+            run_id=str(record.get("run_id") or ""),
+            run_type=str(record.get("run_type") or ""),
+            action=str(record.get("action") or ""),
+            status=str(record.get("status") or ""),
+            label=str(record.get("label") or ""),
+            instance_address=str(record.get("instance_address") or ""),
+        )
+
+    @property
+    def is_finished(self) -> bool:
+        """Whether this run reached a terminal status."""
+
+        return self.status in ("passed", "failed")
+
+    def to_document(self) -> dict:
+        """Render for the run record."""
+
+        return {
+            key: value
+            for key, value in (
+                ("run_id", self.run_id),
+                ("run_type", self.run_type),
+                ("action", self.action),
+                ("status", self.status),
+                ("label", self.label),
+                ("instance_address", self.instance_address),
+            )
+            if value
+        }

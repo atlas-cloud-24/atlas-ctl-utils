@@ -13,7 +13,6 @@ import tempfile
 from pathlib import Path
 
 import yaml
-
 from engine.execution import adapters
 
 
@@ -22,7 +21,9 @@ def declare_providers(root: Path, *names: str) -> Path:
     if not names:
         raise AssertionError("declare at least one provider, or the fixture proves nothing")
     (Path(root) / "execution_providers.yaml").write_text(
-        yaml.safe_dump({"execution_providers": {name: {"implements": ["execution"]} for name in names}}),
+        yaml.safe_dump(
+            {"execution_providers": {name: {"implements": ["execution"]} for name in names}}
+        ),
         encoding="utf-8",
     )
     return Path(root)

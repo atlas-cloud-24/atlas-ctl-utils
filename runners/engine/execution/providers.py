@@ -7,13 +7,13 @@ module."""
 
 import argparse
 import sys
-
 from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
 from engine.cfg import tooling as cfg_tooling
 from engine.execution import adapters
 from engine.execution import references as execution_references
+
 
 def validate_target_providers(declared: object, identities: dict, *, label: str) -> list[str]:
     """A target DECLARES the providers it runs against, and the declaration must
@@ -25,8 +25,10 @@ def validate_target_providers(declared: object, identities: dict, *, label: str)
     rather than quietly widen it.
     """
 
-    if not isinstance(declared, list) or not declared or not all(
-        isinstance(item, str) and item.strip() for item in declared
+    if (
+        not isinstance(declared, list)
+        or not declared
+        or not all(isinstance(item, str) and item.strip() for item in declared)
     ):
         raise RuntimeError(f"❌ {label} providers must be a non-empty list of provider names")
     if sorted(set(declared)) != sorted(identities):
@@ -56,7 +58,7 @@ def activate_provider_adapters(ctl_cfg_root) -> list[str]:
     try:
         tooling = cfg_tooling.load_local_tooling_cfg(Path(ctl_cfg_root))
     except Exception:
-        return []                       # strict runs materialize refs elsewhere
+        return []  # strict runs materialize refs elsewhere
     added = []
     for name, entry in (tooling or {}).items():
         if not name.startswith("execution-provider-"):
@@ -73,7 +75,7 @@ def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str)
 
     one provider's mode from the per-provider map."""
 
-    if isinstance(modes, str):          # already narrowed by a caller
+    if isinstance(modes, str):  # already narrowed by a caller
         return modes
     try:
         return (modes or {})[provider]
@@ -89,7 +91,9 @@ def run_providers(execution_context: dict[str, object]) -> list[str]:
 
     the providers this run DECLARED (--providers), in order."""
 
-    declared = execution_context.get(f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.providers") or []
+    declared = (
+        execution_context.get(f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.providers") or []
+    )
     if isinstance(declared, str):
         declared = [declared]
     providers = [str(p).strip() for p in declared if str(p).strip()]
@@ -131,19 +135,6 @@ def run_provider(execution_context: dict[str, object]) -> str:
             "separate invocations until per-target adapter dispatch lands"
         )
     return providers[0]
-
-
-def target_run_providers(target_run: dict) -> list[str]:
-    """Every provider a target_run executes against, from its execution_identities.
-
-    A target may declare more than one: a root touching two clouds needs
-    credentials for both before a single plan.
-    """
-
-    identities = (target_run or {}).get("execution_identities") or {}
-    if not identities:
-        raise RuntimeError("❌ target_run execution_identities declares no provider")
-    return sorted(identities)
 
 
 def provider_inputs(
@@ -240,14 +231,17 @@ def provider_options_for(options: dict[str, str] | None, provider: str) -> dict[
 
     prefix = f"{provider}."
     return {
-        key[len(prefix):]: value
+        key[len(prefix) :]: value
         for key, value in (options or {}).items()
         if key.startswith(prefix)
     }
 
 
 def validate_provider_options(
-    options: dict[str, str] | None, providers: list[str] | tuple[str, ...]
+    options: dict[str, str] | None,
+    providers: list[str] | tuple[str, ...],
+    *,
+    execution_access_modes: dict[str, str] | None = None,
 ) -> None:
     """Validate provider options: addressed to a declared provider, and a key
     that provider actually offers. The engine checks the ADDRESS; each adapter
@@ -255,7 +249,8 @@ def validate_provider_options(
     validate_provider_options_addressing(options, providers)
     for provider in providers:
         adapters.get_adapter(provider).validate_provider_options(
-            provider_options_for(options, provider)
+            provider_options_for(options, provider),
+            execution_access_mode=(execution_access_modes or {}).get(provider),
         )
 
 
@@ -276,7 +271,10 @@ def validate_provider_options_addressing(
 
 
 def resolve_provider_implementation_key(
-    provider_options: dict[str, str] | None, provider: str
+    provider_options: dict[str, str] | None,
+    provider: str,
+    *,
+    execution_access_mode: str | None = None,
 ) -> str:
     """The credential implementation this run wants from one provider.
 
@@ -288,13 +286,19 @@ def resolve_provider_implementation_key(
 
     options = provider_options_for(provider_options, provider)
     implementation_key = options.get("credential_acquisition")
-    if not implementation_key:
-        raise RuntimeError(
-            f"❌ no credential implementation declared for provider {provider!r}; "
-            f"pass --provider-options {provider}.credential_acquisition=... "
-            f"(see `ctl.py providers`)"
-        )
-    return implementation_key
+    if implementation_key:
+        return implementation_key
+    # A mode that resolves no identity acquires nothing, so there is no
+    # acquisition to declare and nothing downstream reads this.
+    if execution_access_mode is not None and not adapters.get_adapter(
+        provider
+    ).resolves_execution_identity(execution_access_mode):
+        return ""
+    raise RuntimeError(
+        f"❌ no credential implementation declared for provider {provider!r}; "
+        f"pass --provider-options {provider}.credential_acquisition=... "
+        f"(see `ctl.py providers`)"
+    )
 
 
 def run_provider_implementation_key(args: argparse.Namespace) -> str:
@@ -310,7 +314,11 @@ def run_provider_implementation_key(args: argparse.Namespace) -> str:
             "separate invocations until per-target adapter dispatch lands"
         )
     return resolve_provider_implementation_key(
-        getattr(args, "provider_options", None), providers[0]
+        getattr(args, "provider_options", None),
+        providers[0],
+        execution_access_mode=(getattr(args, "execution_access_modes", None) or {}).get(
+            providers[0]
+        ),
     )
 
 
@@ -330,9 +338,7 @@ def validate_target_provider_coverage(
     declared = set(providers or ())
     offenders = []
     for target_run_id, target_run in active_target_runs.items():
-        undeclared = sorted(
-            set(target_run.get("execution_identities") or {}) - declared
-        )
+        undeclared = sorted(set(target_run.get("execution_identities") or {}) - declared)
         if undeclared:
             offenders.append(f"{target_run_id} (providers {undeclared})")
     offenders = sorted(offenders)
@@ -341,6 +347,7 @@ def validate_target_provider_coverage(
             "❌ selected target_runs use providers not declared in --providers "
             f"{sorted(declared)}: " + ", ".join(offenders)
         )
+
 
 # What a declared contract OBLIGES an adapter to expose. `implements:` was
 # accepted and read by nobody, so a provider could claim a contract its package
@@ -365,9 +372,7 @@ CONTRACT_CALLABLES: dict[str, tuple[str, ...]] = {
         "create_state_syncer",
         "validate_state_backend_entry",
     ),
-    "secrets": (
-        "resolve_secret",
-    ),
+    "secrets": ("resolve_secret",),
 }
 
 
@@ -395,7 +400,8 @@ def validate_declared_contracts(ctl_cfg_root) -> None:
         adapter = adapters.get_adapter(provider, ctl_cfg_root)
         for contract in contracts:
             missing = [
-                name for name in CONTRACT_CALLABLES[contract]
+                name
+                for name in CONTRACT_CALLABLES[contract]
                 if not callable(getattr(adapter, name, None))
             ]
             if missing:

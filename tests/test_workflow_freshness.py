@@ -12,6 +12,7 @@ one, and a composition cannot be fresher than its least fresh member. Each membe
 retains the target status row that supplied its freshness, so every presentation
 reads facts from the report rather than reconstructing them.
 """
+
 import sys
 import tempfile
 import unittest
@@ -35,9 +36,11 @@ def _with_member_freshness(values: list[str | None]):
 
     def fake(namespace_root, action, spec):
         value = next(answers)
-        return {"address": spec["address"]} if value is None else {
-            "address": spec["address"], "freshness": value
-        }
+        return (
+            {"address": spec["address"]}
+            if value is None
+            else {"address": spec["address"], "freshness": value}
+        )
 
     return mock.patch.object(state_status, "compute_target_instance_status", fake)
 
@@ -70,17 +73,17 @@ class WorkflowFreshnessTest(unittest.TestCase):
 
         freshness, _, reasons = self._resolve(["up_to_date", "undetermined"])
         self.assertEqual(state_status.Freshness.UNDETERMINED, freshness)
-        self.assertEqual(
-            reasons, ["target/env/ops/dbs/instances/env.type=dev: undetermined"]
-        )
+        self.assertEqual(reasons, ["target/env/ops/dbs/instances/env.type=dev: undetermined"])
 
     def test_a_member_carries_its_own_verdict(self):
         """A rolled-up value is unreadable without the member that caused it."""
 
         _, members, _ = self._resolve(["up_to_date", "outdated"])
         self.assertEqual(
-            [("target/env/core/baseline/instances/env.type=dev", "up_to_date"),
-             ("target/env/ops/dbs/instances/env.type=dev", "outdated")],
+            [
+                ("target/env/core/baseline/instances/env.type=dev", "up_to_date"),
+                ("target/env/ops/dbs/instances/env.type=dev", "outdated"),
+            ],
             [(m["address"], m["freshness"]) for m in members],
         )
 
@@ -94,11 +97,18 @@ class WorkflowFreshnessTest(unittest.TestCase):
             "time": "2026-08-09T01:00:00Z",
             "label": "release",
         }
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
-            state_status, "compute_target_instance_status", return_value=answer,
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(
+                state_status,
+                "compute_target_instance_status",
+                return_value=answer,
+            ),
         ):
             _, members, _ = state_status.workflow_member_freshness(
-                Path(tmp), "provision", [MEMBERS[0]],
+                Path(tmp),
+                "provision",
+                [MEMBERS[0]],
             )
         self.assertEqual({**answer, "address": MEMBERS[0]}, members[0])
 

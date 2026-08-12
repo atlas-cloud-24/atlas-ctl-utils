@@ -6,17 +6,7 @@ where that text stops being text."""
 
 import argparse
 import collections
-
 from pathlib import Path
-
-def bool2str(v: bool) -> str:
-    """
-
-    convert boolean to 'true'/'false' string."""
-
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    raise argparse.ArgumentTypeError(f"Expected bool, got: {type(v).__name__} ({v!r})")
 
 
 def str2bool(v: str) -> bool:
@@ -31,9 +21,7 @@ def str2bool(v: str) -> bool:
         if value == "false":
             return False
 
-    raise argparse.ArgumentTypeError(
-        f"Expected 'true' or 'false', got: {type(v).__name__} ({v!r})"
-    )
+    raise argparse.ArgumentTypeError(f"Expected 'true' or 'false', got: {type(v).__name__} ({v!r})")
 
 
 def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str) -> list[str]:
@@ -57,9 +45,7 @@ def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str)
                 f"{item_label} path must be relative to {root_dir_name}/: {item}"
             )
         if ".." in path.parts:
-            raise argparse.ArgumentTypeError(
-                f"{item_label} path must not contain '..': {item}"
-            )
+            raise argparse.ArgumentTypeError(f"{item_label} path must not contain '..': {item}")
 
     duplicates = [item for item, count in collections.Counter(raw).items() if count > 1]
     if duplicates:

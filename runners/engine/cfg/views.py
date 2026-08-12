@@ -10,9 +10,7 @@ from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
 
 
-def attach_target_cfg_view_facts(
-    active_target_runs: dict, plt_targets_dir: Path
-) -> None:
+def attach_target_cfg_view_facts(active_target_runs: dict, plt_targets_dir: Path) -> None:
     for target_run_id, target_run in active_target_runs.items():
         target_view = (
             Path(plt_targets_dir)
@@ -21,9 +19,7 @@ def attach_target_cfg_view_facts(
             else Path(plt_targets_dir) / target_run_id
         )
         hashed_view = target_view / "input"
-        target_run["target_cfg_view_sha256"] = kernel_paths.directory_content_sha256(
-            hashed_view
-        )
+        target_run["target_cfg_view_sha256"] = kernel_paths.directory_content_sha256(hashed_view)
 
 
 def finalize_target_cfg_view_facts(

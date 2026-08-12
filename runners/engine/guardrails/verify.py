@@ -26,22 +26,6 @@ def verify_ctl_guardrails(
     )
 
 
-def verify_plt_guardrails(
-    plt_cfg_root: Path,
-    guardrails_cfg_root: Path,
-    plt_rendered_dir: Path,
-    execution_context: dict[str, object],
-    scope_params: dict[str, str],
-) -> None:
-    guardrails_policies.Verifier(guardrails_cfg_root).check_plt(
-        plt_cfg_root,
-        plt_cfg_root,
-        plt_rendered_dir,
-        execution_context,
-        scope_params,
-    )
-
-
 def verify_guardrails(
     ctl_cfg_root: Path,
     plt_cfg_root: Path,

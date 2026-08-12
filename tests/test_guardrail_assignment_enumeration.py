@@ -10,7 +10,6 @@ exists without a declaration behind it would never be regenerated and would go
 stale without anything noticing.
 """
 
-
 import sys
 import tempfile
 import unittest
@@ -81,7 +80,8 @@ class LoadCoverageTest(unittest.TestCase):
 
     def test_duplicate_assignment_is_rejected(self):
         (self.root / "coverage.yaml").write_text(
-            COVERAGE + """
+            COVERAGE
+            + """
       - landing_zone: live
 """
         )
@@ -94,7 +94,6 @@ class LoadCoverageTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "must be a non-empty list"):
             rg.load_coverage_assignments(self.root, "plt")
-
 
 
 @unittest.skipUnless(GUARDRAILS_REPO.is_dir(), "oxygen guardrail repo not present")
@@ -124,21 +123,14 @@ class CommittedBaselinesAreDeclaredTest(unittest.TestCase):
             declared = self._declared_identities(mode)
             doc = yaml.safe_load(path.read_text()) or {}
             for baseline in doc.get("guardrail_baselines") or []:
-                params = (
-                    (baseline.get("subject") or {}).get("instance") or {}
-                ).get("params") or {}
+                params = ((baseline.get("subject") or {}).get("instance") or {}).get("params") or {}
                 identity = {
-                    k.replace("execution_context.params.", ""): str(v)
-                    for k, v in params.items()
+                    k.replace("execution_context.params.", ""): str(v) for k, v in params.items()
                 }
                 if not identity:
                     continue  # a policy with no instance_params owns one global baseline
-                if not any(
-                    set(identity.items()) <= assignment for assignment in declared
-                ):
-                    orphans.append(
-                        f"{path.relative_to(GUARDRAILS_REPO)} :: {identity}"
-                    )
+                if not any(set(identity.items()) <= assignment for assignment in declared):
+                    orphans.append(f"{path.relative_to(GUARDRAILS_REPO)} :: {identity}")
         self.assertEqual(
             [],
             orphans,

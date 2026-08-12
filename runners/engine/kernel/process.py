@@ -5,14 +5,13 @@ ANSI stripping and the error extraction all exist because a child process
 writes for a human terminal and the engine has to store it."""
 
 import logging
+import logging.handlers
 import re
 import subprocess
-import logging.handlers
-
 from pathlib import Path
 
 # ANSI escape code pattern
-ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def strip_ansi(text: str) -> str:
@@ -20,7 +19,7 @@ def strip_ansi(text: str) -> str:
 
     remove ANSI color codes from text."""
 
-    return ANSI_ESCAPE.sub('', text)
+    return ANSI_ESCAPE.sub("", text)
 
 
 def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
@@ -38,7 +37,7 @@ def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
         text=True,
         encoding="utf-8",
         errors="replace",
-        bufsize=1  # Line buffered
+        bufsize=1,  # Line buffered
     )
 
     # Stream output in real-time
@@ -51,15 +50,17 @@ def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
         # Only log to file handlers, not console
         for handler in logging.getLogger().handlers:
             if isinstance(handler, logging.FileHandler):
-                handler.emit(logging.LogRecord(
-                    name=logging.getLogger().name,
-                    level=logging.INFO,
-                    pathname="",
-                    lineno=0,
-                    msg=f"  {clean_line}",
-                    args=(),
-                    exc_info=None
-                ))
+                handler.emit(
+                    logging.LogRecord(
+                        name=logging.getLogger().name,
+                        level=logging.INFO,
+                        pathname="",
+                        lineno=0,
+                        msg=f"  {clean_line}",
+                        args=(),
+                        exc_info=None,
+                    )
+                )
 
     # Wait for process to complete
     returncode = process.wait()

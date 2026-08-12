@@ -14,6 +14,7 @@ Every other provider is delegated, and the engine names none of them.
 """
 
 import os
+from enum import StrEnum
 from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
@@ -22,9 +23,17 @@ from engine.plt import providers as plt_providers
 
 RESOURCE_KEY = "ctl_secrets"
 
+
 # Resolvable without a credential, and therefore the only sources that can
 # produce the secret an adapter is fetched with.
-PRIMITIVE_PROVIDERS = ("env", "file")
+class PrimitiveSecretProvider(StrEnum):
+    """A secret source needing no provider adapter."""
+
+    ENV = "env"
+    FILE = "file"
+
+
+PRIMITIVE_PROVIDERS = tuple(PrimitiveSecretProvider)
 
 
 class SecretStore:
@@ -54,9 +63,7 @@ class SecretStore:
     @property
     def declared(self) -> dict:
         if self._declared is None:
-            self._declared = cfg_resources.collect_resource(
-                self.ctl_cfg_root, RESOURCE_KEY
-            ) or {}
+            self._declared = cfg_resources.collect_resource(self.ctl_cfg_root, RESOURCE_KEY) or {}
         return self._declared
 
     def entry(self, secret_key: str, *, label: str) -> dict:
@@ -84,9 +91,7 @@ class SecretStore:
         entry = self.entry(secret_key, label=label)
         provider = entry.get("provider")
         if not isinstance(provider, str) or not provider.strip():
-            raise RuntimeError(
-                f"❌ {RESOURCE_KEY}.{secret_key} must declare a provider"
-            )
+            raise RuntimeError(f"❌ {RESOURCE_KEY}.{secret_key} must declare a provider")
         provider = provider.strip()
         where = f"{RESOURCE_KEY}.{secret_key}"
 
@@ -102,9 +107,7 @@ class SecretStore:
             raise RuntimeError(f"❌ {where}: provider 'env' requires a `name`")
         value = os.getenv(name.strip())
         if value is None:
-            raise RuntimeError(
-                f"❌ {where}: environment variable {name.strip()!r} is not set"
-            )
+            raise RuntimeError(f"❌ {where}: environment variable {name.strip()!r} is not set")
         return value
 
     def _from_file(self, entry: dict, *, where: str) -> str:
@@ -122,8 +125,7 @@ class SecretStore:
         resolve = getattr(adapter, "resolve_secret", None)
         if resolve is None:
             raise RuntimeError(
-                f"❌ {where}: provider {provider!r} does not implement the "
-                f"'secrets' contract"
+                f"❌ {where}: provider {provider!r} does not implement the 'secrets' contract"
             )
         value = resolve(
             {key: value for key, value in entry.items() if key != "provider"},

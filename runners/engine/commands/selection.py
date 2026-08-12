@@ -4,18 +4,19 @@ Shared by every run type: what to run, under which identity, in which
 directories, having passed which gates. The command modules above it decide what
 to DO with a selection; none of them re-derive one."""
 
+import abc
 import argparse
 import logging
+import logging.handlers
 import os
 import shutil
 import uuid
-import logging.handlers
-
 from datetime import UTC, datetime
 from pathlib import Path
+
 import yaml
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import overlays as cfg_overlays
@@ -32,141 +33,225 @@ from engine.run import addressing as run_addressing
 from engine.run import policy as run_policy
 from engine.state import run_store as state_run_store
 from engine.state import sync as state_sync
+from engine.units import procedure as units_procedure
+from engine.units import workflow as units_workflow
 
-def validate_workflow_args(args: argparse.Namespace) -> None:
+SYNTHETIC_TARGET_FIELDS = (
+    "source",
+    "ref",
+    "domain",
+    "procedure",
+    "execution_provider",
+    "execution_account",
+    "execution_role",
+    "affected_target_keys",
+)
+
+
+class RunArguments(abc.ABC):
+    """The argument rules of ONE run type.
+
+    Each run type is reached by exactly one runner and states which arguments it
+    requires and which belong elsewhere. A new run type is a new subclass: no
+    existing rule is edited to admit it.
     """
 
-    validate args for a declared workflow run."""
+    run_type: str
 
-    if not getattr(args, "workflow", None):
-        raise RuntimeError("❌ workflow runner requires --workflow")
-    if getattr(args, "target", None):
-        raise RuntimeError("❌ workflow runner does not accept --target")
-    if any(getattr(args, field, None) for field in ("source", "ref", "domain", "procedure", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
-        raise RuntimeError("❌ workflow runner does not accept procedure synthetic target args")
+    @abc.abstractmethod
+    def validate(self, args: argparse.Namespace) -> None:
+        """Refuse arguments this run type cannot act on."""
 
+    def _refuse_synthetic_target_args(self, args: argparse.Namespace) -> None:
+        """Procedure-only arguments, which describe a target no cfg declares."""
 
-def validate_target_args(args: argparse.Namespace) -> None:
-    """
-
-    validate args for a declared single-target run."""
-
-    if not getattr(args, "target", None):
-        raise RuntimeError("❌ target runner requires --target")
-    if getattr(args, "workflow", None):
-        raise RuntimeError("❌ target runner does not accept --workflow")
-    if any(getattr(args, field, None) for field in ("source", "ref", "domain", "procedure", "execution_provider", "execution_account", "execution_role", "affected_target_keys")):
-        raise RuntimeError("❌ target runner does not accept procedure synthetic target args")
-
-
-def validate_maintenance_args(args: argparse.Namespace) -> None:
-    """
-
-    validate args for one explicit maintenance operation."""
-
-    if any(
-        getattr(args, field, None)
-        for field in (
-            "source", "ref", "domain", "procedure",
-            "execution_provider", "execution_account", "execution_role",
-            "affected_target_keys",
-        )
-    ):
-        raise RuntimeError(
-            "❌ maintenance runner does not accept synthetic target args"
-        )
-    action = getattr(args, "maintenance_action", None)
-    if not action:
-        raise RuntimeError("❌ --maintenance-action is required for maintenance")
-    if action == "unlock-ctl-state":
-        # Which of the two ctl-state locks. `both` is the default because a run
-        # that dies holds both, and clearing one alone only moves where the next
-        # run is refused. It means the remote lock and THIS machine's local one:
-        # Remote is namespace-wide, local is one directory, so `both` is not a
-        # claim to have cleared every local lock everywhere.
-        scope = getattr(args, "unlock_scope", None) or "both"
-        args.unlock_scope = scope
-        if scope in ("local", "both") and not getattr(args, "ctl_state_local_root", None):
+        if any(getattr(args, field, None) for field in SYNTHETIC_TARGET_FIELDS):
             raise RuntimeError(
-                f"❌ --scope {scope} releases the local lock and requires "
-                "--ctl-state-local-root"
+                f"❌ {self.run_type} runner does not accept procedure synthetic target args"
             )
-        if not getattr(args, "lock_id", None):
-            raise RuntimeError(
-                "❌ --lock-id is required for --maintenance-action=unlock-ctl-state"
+
+
+class WorkflowArguments(RunArguments):
+    run_type = "workflow"
+
+    def validate(self, args: argparse.Namespace) -> None:
+
+        if not getattr(args, "workflow", None):
+            raise RuntimeError(f"❌ {self.run_type} runner requires --workflow")
+        if getattr(args, "target", None):
+            raise RuntimeError(f"❌ {self.run_type} runner does not accept --target")
+        if any(
+            getattr(args, field, None)
+            for field in (
+                "source",
+                "ref",
+                "domain",
+                "procedure",
+                "execution_provider",
+                "execution_account",
+                "execution_role",
+                "affected_target_keys",
             )
-        return
-        if not state_run_store.ctl_state_lock_matches(args.ctl_state_local_root, args.lock_id):
-            raise RuntimeError(
-                f"❌ --lock-id {args.lock_id!r} does not hold the ctl-state lock"
+        ):
+            raise RuntimeError("❌ workflow runner does not accept procedure synthetic target args")
+
+
+class TargetArguments(RunArguments):
+    run_type = "target"
+
+    def validate(self, args: argparse.Namespace) -> None:
+
+        if not getattr(args, "target", None):
+            raise RuntimeError(f"❌ {self.run_type} runner requires --target")
+        if getattr(args, "workflow", None):
+            raise RuntimeError(f"❌ {self.run_type} runner does not accept --workflow")
+        if any(
+            getattr(args, field, None)
+            for field in (
+                "source",
+                "ref",
+                "domain",
+                "procedure",
+                "execution_provider",
+                "execution_account",
+                "execution_role",
+                "affected_target_keys",
             )
-        return
-    if getattr(args, "target", None):
-        raise RuntimeError(f"❌ --target is not valid for {action}")
-    if action == "forget":
+        ):
+            raise RuntimeError("❌ target runner does not accept procedure synthetic target args")
+
+
+class MaintenanceArguments(RunArguments):
+    run_type = "maintenance"
+
+    def validate(self, args: argparse.Namespace) -> None:
+
+        if any(
+            getattr(args, field, None)
+            for field in (
+                "source",
+                "ref",
+                "domain",
+                "procedure",
+                "execution_provider",
+                "execution_account",
+                "execution_role",
+                "affected_target_keys",
+            )
+        ):
+            raise RuntimeError("❌ maintenance runner does not accept synthetic target args")
+        action = getattr(args, "maintenance_action", None)
+        if not action:
+            raise RuntimeError("❌ --maintenance-action is required for maintenance")
+        if action == "unlock-ctl-state":
+            # Which of the two ctl-state locks. `both` is the default because a run
+            # that dies holds both, and clearing one alone only moves where the next
+            # run is refused. It means the remote lock and THIS machine's local one:
+            # Remote is namespace-wide, local is one directory, so `both` is not a
+            # claim to have cleared every local lock everywhere.
+            scope = getattr(args, "unlock_scope", None) or "both"
+            args.unlock_scope = scope
+            if scope in ("local", "both") and not getattr(args, "ctl_state_local_root", None):
+                raise RuntimeError(
+                    f"❌ --scope {scope} releases the local lock and requires "
+                    "--ctl-state-local-root"
+                )
+            if not getattr(args, "lock_id", None):
+                raise RuntimeError(
+                    "❌ --lock-id is required for --maintenance-action=unlock-ctl-state"
+                )
+            return
+        if getattr(args, "target", None):
+            raise RuntimeError(f"❌ --target is not valid for {action}")
+        if action == "forget":
+            missing = [
+                flag
+                for flag, value in (
+                    ("--older-than", getattr(args, "older_than", None)),
+                    ("--address", getattr(args, "forget_address", None)),
+                )
+                if not value
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"❌ forget requires {' and '.join(missing)}: both filters are "
+                    "always stated, so nothing is removed on one the caller did not write"
+                )
+            args.forget_scope = getattr(args, "unlock_scope", None) or "both"
+            if args.forget_scope in ("local", "both") and not getattr(
+                args, "ctl_state_local_root", None
+            ):
+                raise RuntimeError(
+                    f"❌ --scope {args.forget_scope} forgets local records and requires "
+                    "--ctl-state-local-root"
+                )
+            return
+        if action == "status-sweep":
+            return
+        if action == "history-prune":
+            if not args.prune_run_id and not args.prune_before:
+                raise RuntimeError("❌ history-prune requires --prune-run-id or --prune-before")
+            if args.apply_history_prune != args.agree_history_prune:
+                raise RuntimeError(
+                    "❌ applying history prune requires both --apply-history-prune "
+                    "and --agree-history-prune"
+                )
+            return
+        raise RuntimeError(f"❌ unsupported maintenance action: {action}")
+
+
+class ProcedureArguments(RunArguments):
+    run_type = "procedure"
+
+    def validate(self, args: argparse.Namespace) -> None:
+
+        if getattr(args, "workflow", None) or getattr(args, "target", None):
+            raise RuntimeError("❌ procedure runner does not accept --workflow or --target")
         missing = [
-            flag
-            for flag, value in (
-                ("--older-than", getattr(args, "older_than", None)),
-                ("--address", getattr(args, "forget_address", None)),
-            )
-            if not value
+            f for f in ("source", "ref", "domain", "procedure") if not getattr(args, f, None)
         ]
         if missing:
             raise RuntimeError(
-                f"❌ forget requires {' and '.join(missing)}: both filters are "
-                "always stated, so nothing is removed on one the caller did not write"
+                "❌ procedure needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
             )
-        args.forget_scope = getattr(args, "unlock_scope", None) or "both"
-        if args.forget_scope in ("local", "both") and not getattr(
-            args, "ctl_state_local_root", None
-        ):
+        execution_fields = ("execution_provider", "execution_account", "execution_role")
+        supplied = [f for f in execution_fields if getattr(args, f, None)]
+        if supplied and len(supplied) != len(execution_fields):
+            missing_execution = [f for f in execution_fields if f not in supplied]
             raise RuntimeError(
-                f"❌ --scope {args.forget_scope} forgets local records and requires "
-                "--ctl-state-local-root"
+                "❌ a synthetic target's execution is declared in full or not at all; missing "
+                + ", ".join(f"--{m.replace('_', '-')}" for m in missing_execution)
             )
-        return
-    if action == "status-sweep":
-        return
-    if action == "history-prune":
-        if not args.prune_run_id and not args.prune_before:
+        procedure = units_procedure.Procedure.from_args(args)
+        affected_target_keys = list(procedure.affected_target_keys)
+        if affected_target_keys:
+            args.affected_target_keys = run_addressing.normalize_target_keys(
+                affected_target_keys, label="--affected-target-key"
+            )
+        if args.action in run_actions.MUTATING_ACTIONS and not procedure.affects_targets:
             raise RuntimeError(
-                "❌ history-prune requires --prune-run-id or --prune-before"
+                "❌ mutating procedure runs require at least one --affected-target-key"
             )
-        if args.apply_history_prune != args.agree_history_prune:
-            raise RuntimeError(
-                "❌ applying history prune requires both --apply-history-prune "
-                "and --agree-history-prune"
-            )
-        return
-    raise RuntimeError(f"❌ unsupported maintenance action: {action}")
 
 
-def validate_procedure_args(args: argparse.Namespace) -> None:
-    """
+RUN_ARGUMENTS: dict[str, RunArguments] = {
+    rules.run_type: rules
+    for rules in (
+        WorkflowArguments(),
+        TargetArguments(),
+        MaintenanceArguments(),
+        ProcedureArguments(),
+    )
+}
 
-    validate args for a synthetic repo-local procedure run."""
 
-    if getattr(args, "workflow", None) or getattr(args, "target", None):
-        raise RuntimeError("❌ procedure runner does not accept --workflow or --target")
-    missing = [f for f in ("source", "ref", "domain", "procedure") if not getattr(args, f, None)]
-    if missing:
-        raise RuntimeError(
-            "❌ procedure needs " + ", ".join(f"--{m.replace('_', '-')}" for m in missing)
-        )
-    execution_fields = ("execution_provider", "execution_account", "execution_role")
-    supplied = [f for f in execution_fields if getattr(args, f, None)]
-    if supplied and len(supplied) != len(execution_fields):
-        missing_execution = [f for f in execution_fields if f not in supplied]
-        raise RuntimeError(
-            "❌ a synthetic target's execution is declared in full or not at all; missing "
-            + ", ".join(f"--{m.replace('_', '-')}" for m in missing_execution)
-        )
-    affected_target_keys = getattr(args, "affected_target_keys", None) or []
-    if affected_target_keys:
-        args.affected_target_keys = run_addressing.normalize_target_keys(affected_target_keys, label="--affected-target-key")
-    if args.action in run_actions.MUTATING_ACTIONS and not getattr(args, "affected_target_keys", None):
-        raise RuntimeError("❌ mutating procedure runs require at least one --affected-target-key")
+def validate_run_args(run_type: str, args: argparse.Namespace) -> None:
+    """Apply one run type's argument rules, by name."""
+
+    rules = RUN_ARGUMENTS.get(run_type)
+    if rules is None:
+        raise RuntimeError(f"❌ unknown run type {run_type!r}; known: {sorted(RUN_ARGUMENTS)}")
+    rules.validate(args)
 
 
 def setup_run_dirs(
@@ -234,7 +319,7 @@ def setup_run_dirs(
     os.makedirs(logs_dir, exist_ok=True)
     logs_run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
     log_file = logs_dir / f"{kernel_ids.SERVICE_ID}_{logs_run_id}.log"
-    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logging.getLogger().addHandler(file_handler)
@@ -249,8 +334,11 @@ def setup_run_dirs(
             "run_id": run_id,
             "run_type": run_type,
             "result_name": result_name,
-            **({"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
-               if action is not None else {}),
+            **(
+                {"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
+                if action is not None
+                else {}
+            ),
             "ctl_state_local_root": str(Path(ctl_state_local_root)),
             "ctl_state_locator": list(locator_segments),
             "ctl_state_dir": str(ctl_state_dir),
@@ -261,11 +349,15 @@ def setup_run_dirs(
             # Degraded-mode audit: each provider's access mode is persisted
             # structurally (not only in the logged command) so an audit of
             # committed run records can tell which runs escalated, and where.
-            **({"execution_access_modes": execution_access_modes}
-               if execution_access_modes else {}),
+            **(
+                {"execution_access_modes": execution_access_modes} if execution_access_modes else {}
+            ),
             # Instance identity + namespace facts of this run.
-            **({"ctl_state_namespace": locator_segments[0]}
-               if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0] else {}),
+            **(
+                {"ctl_state_namespace": locator_segments[0]}
+                if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0]
+                else {}
+            ),
             **({"instance": list(instance_segments)} if instance_segments else {}),
             **({"instance_address": instance_address} if instance_address else {}),
             **({"target_addresses": list(target_addresses)} if target_addresses else {}),
@@ -279,10 +371,14 @@ def setup_run_dirs(
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
             # A child spawned by a workflow records its parent, so the
             # namespace mutation lock can tell "my parent holds it" from contention.
-            **({"parent_workflow_run_id": parent_workflow_run_id}
-               if parent_workflow_run_id else {}),
-            **({"parent_workflow_instance_address": parent_workflow_instance_address}
-               if parent_workflow_instance_address else {}),
+            **(
+                {"parent_workflow_run_id": parent_workflow_run_id} if parent_workflow_run_id else {}
+            ),
+            **(
+                {"parent_workflow_instance_address": parent_workflow_instance_address}
+                if parent_workflow_instance_address
+                else {}
+            ),
         },
     )
 
@@ -344,17 +440,11 @@ def setup_preflight_run_dirs(
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    logs_run_id = (
-        datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-        + "_"
-        + uuid.uuid4().hex[:6]
-    )
+    logs_run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
     log_file = logs_dir / f"{kernel_ids.SERVICE_ID}_{logs_run_id}.log"
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logging.getLogger().addHandler(file_handler)
     memory_handler.setTarget(file_handler)
     memory_handler.flush()
@@ -366,8 +456,11 @@ def setup_preflight_run_dirs(
             "run_id": run_id,
             "run_type": run_type,
             "result_name": result_name,
-            **({"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
-               if action is not None else {}),
+            **(
+                {"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
+                if action is not None
+                else {}
+            ),
             "ctl_state_local_root": str(Path(ctl_state_local_root)),
             "ctl_state_locator": list(locator_segments),
             "ctl_state_dir": str(ctl_state_dir),
@@ -377,11 +470,15 @@ def setup_preflight_run_dirs(
             "mutation_started": False,
             "execution_identity_preflight_check_only": bool(check_only),
             # Degraded-mode audit (see setup_run_dirs).
-            **({"execution_access_modes": execution_access_modes}
-               if execution_access_modes else {}),
+            **(
+                {"execution_access_modes": execution_access_modes} if execution_access_modes else {}
+            ),
             # Instance identity + namespace facts of this run.
-            **({"ctl_state_namespace": locator_segments[0]}
-               if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0] else {}),
+            **(
+                {"ctl_state_namespace": locator_segments[0]}
+                if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0]
+                else {}
+            ),
             **({"instance": list(instance_segments)} if instance_segments else {}),
             **({"instance_address": instance_address} if instance_address else {}),
             **({"target_addresses": list(target_addresses)} if target_addresses else {}),
@@ -390,10 +487,14 @@ def setup_preflight_run_dirs(
             **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
             # A child spawned by a workflow records its parent, so the
             # namespace mutation lock can tell "my parent holds it" from contention.
-            **({"parent_workflow_run_id": parent_workflow_run_id}
-               if parent_workflow_run_id else {}),
-            **({"parent_workflow_instance_address": parent_workflow_instance_address}
-               if parent_workflow_instance_address else {}),
+            **(
+                {"parent_workflow_run_id": parent_workflow_run_id} if parent_workflow_run_id else {}
+            ),
+            **(
+                {"parent_workflow_instance_address": parent_workflow_instance_address}
+                if parent_workflow_instance_address
+                else {}
+            ),
         },
     )
     logging.info("Using preflight run_dir: %s", run_dir)
@@ -425,7 +526,7 @@ def prepare_pipeline_cfg(
     """
 
     if active_target_runs is None:
-        active_target_runs = catalog_targets.build_active_target_runs(
+        active_target_runs = target_catalog.ActiveTargetRuns.build(
             workflow_cfg,
             action_cfg,
             repo_key=target_repo_key,
@@ -451,19 +552,16 @@ def prepare_pipeline_cfg(
             target_run,
             execution_context=execution_context or {},
         )
-    catalog_targets.attach_target_definition_facts(active_target_runs)
+    target_catalog.ActiveTargetRuns.attach_definition_facts(active_target_runs)
 
-    catalog_workflow.write_target_run_flow_artifact(
+    catalog_workflow.WorkflowArtifacts.write_target_run_flow(
         artifacts_dir / "resolved_target_runs_flow.yaml",
         workflow_cfg.get("meta"),
         active_target_runs,
     )
 
     # Create and write pipeline_run_cfg
-    pipeline_run_cfg = {
-        "meta": workflow_cfg.get("meta"),
-        "target_runs": active_target_runs
-    }
+    pipeline_run_cfg = {"meta": workflow_cfg.get("meta"), "target_runs": active_target_runs}
     pipeline_run_cfg_path = artifacts_dir / "pipeline_run_cfg.yaml"
     with pipeline_run_cfg_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(pipeline_run_cfg, f, sort_keys=False)
@@ -481,7 +579,7 @@ def require_unique_fan_out_namespace(
     execution_runtime_mode: str,
     providers: list[str] | tuple[str, ...] = (),
 ) -> str:
-    """ 3: a fan-out first expands, then resolves the namespace
+    """3: a fan-out first expands, then resolves the namespace
     for EVERY child execution context and requires the unique set to contain
     exactly one member. Cross-namespace expansions are hard errors and must be
     partitioned into separate invocations. The fan-out runner never names or
@@ -498,7 +596,9 @@ def require_unique_fan_out_namespace(
             providers=providers,
             execution_runtime_mode=execution_runtime_mode,
         )
-        namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(ctl_cfg_root, child_context)
+        namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
+            ctl_cfg_root, child_context
+        )
         namespace_by_child[child["label"]] = namespace_key
     unique = sorted(set(namespace_by_child.values()))
     if len(unique) != 1:
@@ -549,7 +649,9 @@ def resolve_run_locator_segments(
         providers=providers,
         execution_runtime_mode=execution_runtime_mode,
     )
-    namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(ctl_cfg_root, execution_context)
+    namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
+        ctl_cfg_root, execution_context
+    )
     return [namespace_key]
 
 
@@ -584,16 +686,22 @@ def resolve_run_instance_identity(
         execution_runtime_mode=execution_runtime_mode,
     )
     if run_type == "workflow":
-        workflow_cfg = catalog_workflow.load_workflow_cfg(
+        workflow_cfg = catalog_workflow.WorkflowCatalog.workflow_cfg(
             ctl_cfg_root, ctl_profile, action, workflow_name, execution_context
         )
-        action_cfg = catalog_targets.load_action_cfg(
-            ctl_cfg_root, action, execution_context,
-            member_actions=catalog_workflow.workflow_member_actions(workflow_cfg),
+        action_cfg = target_catalog.TargetCatalog.action_cfg(
+            ctl_cfg_root,
+            action,
+            execution_context,
+            member_actions=units_workflow.Workflow.from_cfg(
+                workflow_name or "", workflow_cfg, action=action
+            ).member_actions,
         )
     else:
         workflow_cfg = None
-        action_cfg = catalog_targets.load_action_cfg(ctl_cfg_root, action, execution_context)
+        action_cfg = target_catalog.TargetCatalog.action_cfg(
+            ctl_cfg_root, action, execution_context
+        )
     targets = action_cfg.get("targets", {})
 
     def target_segments(name: str) -> list[str]:
@@ -644,7 +752,7 @@ def resolve_run_instance_identity(
     # Params, not a hash: params ADDRESS (readable, predictable from cfg, stable
     # across cfg edits) where a hash IDENTIFIES, and identity is the question
     # phase 73 decided ctl must not answer.
-    instance_params = catalog_workflow.validate_workflow_instance_params(
+    instance_params = catalog_workflow.WorkflowInstanceParams.validate(
         workflow_cfg.get("workflow_instance_params"),
         workflow_cfg,
         targets,
@@ -718,11 +826,13 @@ def resolve_pipeline_selection(
         ),
     )
     if enforce_ctl_policy:
-        execution_run_context.validate_execution_context_constraints(ctl_cfg_root, execution_context)
+        execution_run_context.validate_execution_context_constraints(
+            ctl_cfg_root, execution_context
+        )
     require_commit_refs = run_policy.ref_policy_requires_commits(ctl_ref_policy)
 
     if procedure_run:
-        workflow_cfg, action_cfg = catalog_workflow.build_procedure_cfg(
+        workflow_cfg, action_cfg = catalog_workflow.WorkflowCatalog.procedure_cfg(
             ctl_cfg_root,
             action,
             source=procedure_run["source"],
@@ -738,7 +848,7 @@ def resolve_pipeline_selection(
     elif target_name:
         # A standalone target run has no members, so the action is filtered by
         # the invoked action alone.
-        action_cfg = catalog_targets.load_action_cfg(
+        action_cfg = target_catalog.TargetCatalog.action_cfg(
             ctl_cfg_root, action, execution_context
         )
         workflow_cfg = {
@@ -751,24 +861,26 @@ def resolve_pipeline_selection(
         selection_kind = "target"
         selection_key = target_name
     else:
-        workflow_cfg = catalog_workflow.load_workflow_cfg(
+        workflow_cfg = catalog_workflow.WorkflowCatalog.workflow_cfg(
             ctl_cfg_root,
             ctl_profile,
             action,
             workflow_name,
             execution_context,
         )
-        action_cfg = catalog_targets.load_action_cfg(
-            ctl_cfg_root, action, execution_context,
-            member_actions=catalog_workflow.workflow_member_actions(workflow_cfg),
+        action_cfg = target_catalog.TargetCatalog.action_cfg(
+            ctl_cfg_root,
+            action,
+            execution_context,
+            member_actions=units_workflow.Workflow.from_cfg(
+                workflow_name or "", workflow_cfg, action=action
+            ).member_actions,
         )
         selection_kind = "workflow"
         selection_key = workflow_name
 
     if not procedure_run:
-        catalog_targets.validate_workflow_target_selectors(
-            workflow_cfg, action_cfg, execution_context
-        )
+        target_catalog.TargetEntries.validate_selectors(workflow_cfg, action_cfg, execution_context)
     if enforce_ctl_policy:
         run_policy.validate_target_policy_constraints(
             ctl_cfg_root, ctl_profile, workflow_cfg, action_cfg
@@ -787,10 +899,12 @@ def resolve_pipeline_selection(
                 force_skip_execution_identity_preflight_check
             ),
         )
-        run_policy.validate_execution_runtime_mode(ctl_cfg_root, ctl_profile, execution_runtime_mode)
+        run_policy.validate_execution_runtime_mode(
+            ctl_cfg_root, ctl_profile, execution_runtime_mode
+        )
 
     refs = cfg_tooling.load_refs_cfg(ctl_cfg_root)
-    active_target_runs = catalog_targets.build_active_target_runs(
+    active_target_runs = target_catalog.ActiveTargetRuns.build(
         workflow_cfg,
         action_cfg,
         repo_key=target_repo_key,
@@ -879,7 +993,9 @@ def resolve_and_preflight_execution_identities(
         providers=providers,
     )
     cfg_report = preflight_checks.CFG_VALIDATION.build(
-        preflight_reports.collect_provider_cfg_findings(ctl_cfg_root, selection["execution_context"])
+        preflight_reports.collect_provider_cfg_findings(
+            ctl_cfg_root, selection["execution_context"]
+        )
     )
     preflight_checks.CFG_VALIDATION.apply_gate(
         cfg_report, force_skip=force_skip_full_cfg_validation_gate

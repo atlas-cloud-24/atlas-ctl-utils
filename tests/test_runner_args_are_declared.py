@@ -14,6 +14,7 @@ check is static and exhaustive — parse the runner FILE, collect every
 author saying the attribute may be absent, which is a different contract from a
 bare read.
 """
+
 import ast
 import re
 import sys
@@ -52,6 +53,7 @@ PARENT_ARGS_BY_SENDER = {
     "parent_workflow_run_id": {"target"},
     "parent_workflow_instance_address": {"target"},
 }
+
 
 def _reads_itself(assignment: ast.Assign, attribute: str) -> bool:
     """Whether `args.x = ...` computes its new value FROM `args.x`.
@@ -123,7 +125,11 @@ def _attribute_reads(path: Path) -> set[str]:
     names: set[str] = set()
     assigned: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "args":
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+        ):
             if isinstance(node.ctx, ast.Store):
                 assigned.add(node.attr)
             else:
@@ -132,7 +138,6 @@ def _attribute_reads(path: Path) -> set[str]:
     # it never enters `names` — the author's default already says the attribute
     # may be absent, which is a different contract from a bare read.
     return names - assigned
-
 
 
 def _consumer_sources() -> list[Path]:
@@ -173,11 +178,7 @@ def _is_consumed(dest: str, sources: dict[Path, str]) -> bool:
         rf'hasattr\( args , "{dest}"',
         rf'"{dest}"',
     )
-    return any(
-        re.search(pattern, text)
-        for text in sources.values()
-        for pattern in patterns
-    )
+    return any(re.search(pattern, text) for text in sources.values() for pattern in patterns)
 
 
 def _declared(run_type: str) -> set[str]:
@@ -214,7 +215,8 @@ class RunnerArgsAreDeclaredTest(unittest.TestCase):
                 if attribute not in declared:
                     offenders.append(f"{name}: args.{attribute}")
         self.assertEqual(
-            [], offenders,
+            [],
+            offenders,
             "a runner reads an argument its parser does not declare, which fails "
             "at runtime with AttributeError after the run has already started:\n"
             + "\n".join(offenders),
@@ -238,8 +240,11 @@ class RunnerArgsAreDeclaredTest(unittest.TestCase):
         offered by three runners nothing could ever send it to.
         """
 
-        sources = {path: re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
-                   for path in _consumer_sources() if path.is_file()}
+        sources = {
+            path: re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+            for path in _consumer_sources()
+            if path.is_file()
+        }
         offenders: list[str] = []
         for run_type in sorted(set(RUNNERS.values())):
             for dest in sorted(_declared(run_type)):
@@ -248,7 +253,8 @@ class RunnerArgsAreDeclaredTest(unittest.TestCase):
                 if not _is_consumed(dest, sources):
                     offenders.append(f"{run_type}: {dest}")
         self.assertEqual(
-            [], offenders,
+            [],
+            offenders,
             "an argument is declared but nothing reads it, so a run accepts it "
             "and ignores it:\n" + "\n".join(offenders),
         )
@@ -262,8 +268,11 @@ class RunnerArgsAreDeclaredTest(unittest.TestCase):
         line-wise scan reports it dead.
         """
 
-        sources = {path: re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
-                   for path in _consumer_sources() if path.is_file()}
+        sources = {
+            path: re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+            for path in _consumer_sources()
+            if path.is_file()
+        }
         self.assertTrue(_is_consumed("ctl_profile", sources))
         self.assertTrue(_is_consumed("parent_workflow_instance_address", sources))
         self.assertTrue(_is_consumed("label", sources))

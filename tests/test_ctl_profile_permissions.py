@@ -23,7 +23,11 @@ def profile_root(tmp: str, **grants: bool) -> Path:
     root = Path(tmp)
     (root / "ctl_profiles.yaml").write_text(
         yaml.safe_dump(
-            {"ctl_profiles": {"p": {"description": "d", "ref_policy": "local_dirty_allowed", **grants}}}
+            {
+                "ctl_profiles": {
+                    "p": {"description": "d", "ref_policy": "local_dirty_allowed", **grants}
+                }
+            }
         ),
         encoding="utf-8",
     )

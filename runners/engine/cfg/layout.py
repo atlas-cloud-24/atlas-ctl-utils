@@ -5,10 +5,7 @@ filenames. This module is the exception list, and keeping it one small file is
 what makes the rule checkable: anything the engine knows by name is here, and
 everything else it discovers."""
 
-from pathlib import Path
 from engine.cfg import presets as cfg_presets
-
-from engine.kernel import yaml_io as kernel_yaml_io
 
 PLT_GUARDRAILS_FILENAME = "__guardrails__.yaml"
 
@@ -20,16 +17,6 @@ CFG_SOURCE_KEYS = ("plt", "guardrails")
 
 
 CFG_ROOT_META_FILENAME = "__cfg__.yaml"
-
-
-def load_cfg_root_meta(cfg_root: Path) -> dict:
-    path = cfg_root / CFG_ROOT_META_FILENAME
-    if not path.is_file():
-        return {}
-    data = kernel_yaml_io.load_yaml(path) or {}
-    if not isinstance(data, dict):
-        raise RuntimeError(f"❌ {CFG_ROOT_META_FILENAME} must contain a mapping: {path}")
-    return data
 
 
 SCOPE_META_FILENAME = "__meta__.yaml"

@@ -31,8 +31,12 @@ SEGMENTS = "env_type=dev/account=dev"
 
 def _seed_target_pointer(root: Path, action: str, *, status: str, run_id: str, when: str):
     d = (
-        root / "live" / action / "target/env/seed/baseline/instances"
-        / "env_type=dev" / "account=dev"
+        root
+        / "live"
+        / action
+        / "target/env/seed/baseline/instances"
+        / "env_type=dev"
+        / "account=dev"
     )
     d.mkdir(parents=True, exist_ok=True)
     kernel_yaml_io.write_yaml_file(
@@ -47,7 +51,16 @@ def _seed_target_pointer(root: Path, action: str, *, status: str, run_id: str, w
     return d / "committed.yaml"
 
 
-def _seed_workflow_pointer(root: Path, action: str, key: str, seg: str, *, when: str, status: str = "ok", child_revisions=None):
+def _seed_workflow_pointer(
+    root: Path,
+    action: str,
+    key: str,
+    seg: str,
+    *,
+    when: str,
+    status: str = "ok",
+    child_revisions=None,
+):
     d = root / "live" / action / "workflow" / key / "instances" / seg
     d.mkdir(parents=True, exist_ok=True)
     payload = {"run_id": f"{action}-wf", "status": status, "committed_at": when}
@@ -65,8 +78,11 @@ class Phase50SelfOutdateFixTests(unittest.TestCase):
     """§50.9: the workflow's outdate sweep excludes its own fresh same-action
     commit, but still supersedes the cross-action sibling."""
 
+
 class Phase50NamespaceMapTests(unittest.TestCase):
     pass
+
+
 class FinalizeStatusArgsTests(unittest.TestCase):
     def setUp(self):
         # a remote scope resolves its access mode from the provider's adapter,
@@ -76,11 +92,22 @@ class FinalizeStatusArgsTests(unittest.TestCase):
     def _ns(self, **kw):
         base = dict(
             execution_param=[("provider", "aws"), ("landing_zone", "live")],
-            all=False, maintenance=False, target=None, workflow=None, fan_out=None,
-            action=None, scope="local", ctl_state_local_root="/tmp/x",
-            provider_options={}, write_cache=False,
-            structure="nested", output_format=None, hide_members=False,
-            sort="address", kinds=None, groups=None,
+            all=False,
+            maintenance=False,
+            target=None,
+            workflow=None,
+            fan_out=None,
+            action=None,
+            scope="local",
+            ctl_state_local_root="/tmp/x",
+            provider_options={},
+            write_cache=False,
+            structure="nested",
+            output_format=None,
+            hide_members=False,
+            sort="address",
+            kinds=None,
+            groups=None,
         )
         base.update(kw)
         return argparse.Namespace(**base)
@@ -94,7 +121,7 @@ class FinalizeStatusArgsTests(unittest.TestCase):
             cli_args.finalize_status_args(
                 self._ns(
                     all=True,
-                    provider_options={"aws.force_bypass_credential_profile": "prof"},
+                    provider_options={"aws.force_bypass_profile": "prof"},
                 )
             )
 
@@ -106,7 +133,9 @@ class FinalizeStatusArgsTests(unittest.TestCase):
 
     def test_remote_default_is_the_providers_normal_mode(self):
         args = self._ns(
-            all=True, scope="remote", ctl_state_local_root=None,
+            all=True,
+            scope="remote",
+            ctl_state_local_root=None,
             provider_options={"aws.credential_acquisition": "sso"},
         )
         cli_args.finalize_status_args(args)
@@ -115,16 +144,17 @@ class FinalizeStatusArgsTests(unittest.TestCase):
 
     def test_remote_substitute_credential_option_implies_its_mode(self):
         args = self._ns(
-            all=True, scope="remote", ctl_state_local_root=None,
+            all=True,
+            scope="remote",
+            ctl_state_local_root=None,
             provider_options={
-                "aws.credential_acquisition": "sso",
-                "aws.force_bypass_credential_profile": "dev-profile",
+                "aws.force_bypass_profile": "dev-profile",
             },
         )
         cli_args.finalize_status_args(args)
         self.assertEqual(args.execution_access_modes, {"aws": "force_bypass"})
         self.assertEqual(
-            args.provider_options["aws.force_bypass_credential_profile"],
+            args.provider_options["aws.force_bypass_profile"],
             "dev-profile",
         )
 
@@ -145,13 +175,14 @@ class FinalizeStatusArgsTests(unittest.TestCase):
 
     def test_maintenance_rejects_all_only_shaping(self):
         with self.assertRaisesRegex(RuntimeError, "--structure shapes --all"):
-            cli_args.finalize_status_args(
-                self._ns(maintenance=True, structure="nested")
-            )
+            cli_args.finalize_status_args(self._ns(maintenance=True, structure="nested"))
 
     def test_hide_members_accepts_only_a_nested_table(self):
         args = self._ns(
-            all=True, structure="nested", output_format="table", hide_members=True,
+            all=True,
+            structure="nested",
+            output_format="table",
+            hide_members=True,
         )
         cli_args.finalize_status_args(args)
         self.assertTrue(args.hide_members)
@@ -160,22 +191,27 @@ class FinalizeStatusArgsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "--structure nested"):
             cli_args.finalize_status_args(
                 self._ns(
-                    all=True, structure="flat", output_format="table",
+                    all=True,
+                    structure="flat",
+                    output_format="table",
                     hide_members=True,
                 )
             )
 
     def test_hide_members_rejects_machine_readable_output(self):
         for output_format in (None, "yaml"):
-            with self.subTest(output_format=output_format), self.assertRaisesRegex(
-                RuntimeError, "--format table"
+            with (
+                self.subTest(output_format=output_format),
+                self.assertRaisesRegex(RuntimeError, "--format table"),
             ):
                 cli_args.finalize_status_args(
-                        self._ns(
-                            all=True, structure="nested",
-                            output_format=output_format, hide_members=True,
-                        )
+                    self._ns(
+                        all=True,
+                        structure="nested",
+                        output_format=output_format,
+                        hide_members=True,
                     )
+                )
 
     def test_write_cache_requires_all(self):
         with self.assertRaises(RuntimeError):
@@ -195,7 +231,10 @@ class Phase50WriteCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state:
             root = Path(state)
             _seed_target_pointer(
-                root, "provision", status="ok", run_id="p1",
+                root,
+                "provision",
+                status="ok",
+                run_id="p1",
                 when="2026-07-21T16:00:00Z",
             )
             args = argparse.Namespace(
@@ -204,17 +243,27 @@ class Phase50WriteCacheTests(unittest.TestCase):
                 kinds=None,
                 groups=None,
                 execution_param=[("provider", "aws"), ("landing_zone", "live")],
-                all=True, target=None, workflow=None, fan_out=None,
-                action=None, scope="local", ctl_state_local_root=str(root),
-                provider_options={}, write_cache=False, ctl_profile="local_dev",
+                all=True,
+                target=None,
+                workflow=None,
+                fan_out=None,
+                action=None,
+                scope="local",
+                ctl_state_local_root=str(root),
+                provider_options={},
+                write_cache=False,
+                ctl_profile="local_dev",
             )
             cli_args.finalize_status_args(args)
-            with unittest.mock.patch.object(
-                execution_run_context, "build_execution_context", return_value={}
-            ), unittest.mock.patch.object(
-                state_sync.CtlStateBackends, "resolve_namespace", return_value=("live", {})
+            with (
+                unittest.mock.patch.object(
+                    execution_run_context, "build_execution_context", return_value={}
+                ),
+                unittest.mock.patch.object(
+                    state_sync.CtlStateBackends, "resolve_namespace", return_value=("live", {})
+                ),
             ):
-                commands_status.run_status_all_command(Path("/nonexistent-cfg"), args)
+                commands_status.StatusCommand.all_run_types(Path("/nonexistent-cfg"), args)
             self.assertFalse((root / "live" / "status_cache.yaml").exists())
 
 
@@ -225,11 +274,11 @@ if __name__ == "__main__":
 class DestroyedIsNotIndistinguishableTest(unittest.TestCase):
     """
 
-    Regression: a destroyed composition must not look like an absent one.
+       Regression: a destroyed composition must not look like an absent one.
 
- keyed "owns no state" on the ABSENCE of a provision pointer, which
-    also matches a deployable composition destroyed under a hash whose provision
-    record is not present. The result: `env/seed` at one instance reported
-    `status: passed` with no `state`, so `--all` could not tell "torn down" from
-    "never deployed".
+    keyed "owns no state" on the ABSENCE of a provision pointer, which
+       also matches a deployable composition destroyed under a hash whose provision
+       record is not present. The result: `env/seed` at one instance reported
+       `status: passed` with no `state`, so `--all` could not tell "torn down" from
+       "never deployed".
     """

@@ -48,7 +48,9 @@ class AwsSsoProfileRendererTests(unittest.TestCase):
         self.assertEqual(rendered.count("sso_start_url"), 1)
         self.assertIn('"${SSO_START_URL}"', rendered)
         self.assertIn("profile.oxygen-live-dev-deploy.sso_account_id 111111111111", rendered)
-        self.assertIn("profile.oxygen-live-test-readonly.sso_role_name NonProdReadOnlyAccess", rendered)
+        self.assertIn(
+            "profile.oxygen-live-test-readonly.sso_role_name NonProdReadOnlyAccess", rendered
+        )
 
     def test_a_profile_carries_no_region(self):
         """The session declares `sso_region`, where Identity Center lives. A
@@ -93,7 +95,9 @@ class AwsSsoProfileRendererTests(unittest.TestCase):
             ):
                 self.assertEqual(renderer.main(), 0)
 
-            self.assertTrue(output_path.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash"))
+            self.assertTrue(
+                output_path.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
+            )
             self.assertNotEqual(os.stat(output_path).st_mode & 0o111, 0)
 
 

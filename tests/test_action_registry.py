@@ -10,7 +10,6 @@ group->actions inverse, a group->representative inverse, and three argparse list
 in a repository that cannot import any of them.
 """
 
-
 import dataclasses
 import re
 import sys
@@ -57,7 +56,8 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
             with self.subTest(action=action):
                 others = {
                     run_actions.GROUP_BY_ACTION[name]
-                    for name in run_actions.ACTIONS if name != action
+                    for name in run_actions.ACTIONS
+                    if name != action
                 }
                 self.assertNotIn(run_actions.GROUP_BY_ACTION[action], others)
 
@@ -74,12 +74,8 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
         )
 
     def test_maintenance_has_state_ownership_but_not_ordinary_status_ownership(self):
-        self.assertEqual(
-            {"target", "workflow", "maintenance"}, set(run_actions.RESULT_KINDS)
-        )
-        self.assertEqual(
-            {"target", "workflow"}, set(run_actions.STATUS_RESULT_KINDS)
-        )
+        self.assertEqual({"target", "workflow", "maintenance"}, set(run_actions.RESULT_KINDS))
+        self.assertEqual({"target", "workflow"}, set(run_actions.STATUS_RESULT_KINDS))
         self.assertNotIn("maintenance", run_actions.STATUS_RESULT_GROUPS)
 
     def test_the_group_inverse_is_derived_not_written(self):
@@ -180,7 +176,8 @@ class BootstrapParserMirrorsTheRegistryTest(unittest.TestCase):
         expected = list(run_actions.ACTIONS)
         for found in self._literal_action_lists():
             self.assertEqual(
-                expected, found,
+                expected,
+                found,
                 "the bootstrap parser accepts a different action set than the "
                 "engine, so --help and the run disagree about what is valid",
             )

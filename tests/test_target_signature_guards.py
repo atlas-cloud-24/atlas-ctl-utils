@@ -17,7 +17,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.cfg import materialize as cfg_materialize
 
 BASE = {
@@ -33,19 +33,19 @@ BASE = {
 class DistinctTargetSignatureTest(unittest.TestCase):
     def test_an_identical_signature_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "same input signature"):
-            catalog_targets.validate_distinct_target_signatures(
+            target_catalog.TargetCatalog.validate_distinct_signatures(
                 {"env/a": BASE, "env/b": dict(BASE)}
             )
 
     def test_a_different_procedure_is_accepted(self):
-        catalog_targets.validate_distinct_target_signatures(
+        target_catalog.TargetCatalog.validate_distinct_signatures(
             {"env/a": BASE, "env/b": {**BASE, "procedure_key": "other"}}
         )
 
     def test_different_cfg_keys_are_accepted(self):
         """The signature must be COMPLETE or this is a false positive: same
         source, procedure and params, but different cfg, so different resources."""
-        catalog_targets.validate_distinct_target_signatures(
+        target_catalog.TargetCatalog.validate_distinct_signatures(
             {
                 "env/a": {**BASE, "cfg_keys": {"env": {"a": "a"}}},
                 "env/b": {**BASE, "cfg_keys": {"env": {"b": "b"}}},
@@ -53,7 +53,7 @@ class DistinctTargetSignatureTest(unittest.TestCase):
         )
 
     def test_an_incomplete_declaration_is_left_to_its_own_validator(self):
-        catalog_targets.validate_distinct_target_signatures(
+        target_catalog.TargetCatalog.validate_distinct_signatures(
             {
                 "env/a": {"source_key": "target_sources.seed"},
                 "env/b": {"source_key": "target_sources.seed"},
@@ -72,7 +72,7 @@ class DistinctTargetSignatureTest(unittest.TestCase):
         for path in glob.glob(str(root / "*.yaml")):
             definitions.update((yaml.safe_load(open(path)) or {}).get("targets") or {})
         self.assertGreater(len(definitions), 0)
-        catalog_targets.validate_distinct_target_signatures(definitions)
+        target_catalog.TargetCatalog.validate_distinct_signatures(definitions)
 
 
 class StepPathMatchesActionTest(unittest.TestCase):
@@ -116,7 +116,7 @@ class StepPathMatchesActionTest(unittest.TestCase):
             ids, steps = cfg_materialize.get_repo_local_steps(repo, "provision", "baseline")
             self.assertEqual(["provision/infra"], ids)
             self.assertEqual(1, len(steps))
-            self.assertNotIn("plt", steps[0])
+            self.assertNotIn("plt", steps[0].to_document())
 
 
 if __name__ == "__main__":

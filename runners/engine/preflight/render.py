@@ -4,8 +4,7 @@ Presentation only, and separate from the reports it draws so that adding a
 check never means touching the renderer — the tree shape comes from the report,
 not from a branch per check."""
 
-
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 
 PREFLIGHT_RESULT_STATUSES = {
     "passed",
@@ -48,9 +47,7 @@ def _tree_child_lines(children: list, prefix: str) -> list[str]:
     for index, child in enumerate(children):
         last = index == len(children) - 1
         lines.append(prefix + ("└── " if last else "├── ") + child["label"])
-        lines.extend(
-            _tree_child_lines(child["children"], prefix + ("    " if last else "│   "))
-        )
+        lines.extend(_tree_child_lines(child["children"], prefix + ("    " if last else "│   ")))
     return lines
 
 
@@ -86,11 +83,11 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         tag = _preflight_status_tag
         if "ctl_state_backend" in result:
             children: list[dict] = []
-            backend_execution = catalog_targets.describe_target_execution_identity(result.get("execution_identities"))
+            backend_execution = target_catalog.TargetExecutionIdentity.describe(
+                result.get("execution_identities")
+            )
             if backend_execution:
-                children.append(
-                    _node(f"execution_identity: {backend_execution} {tag(status)}")
-                )
+                children.append(_node(f"execution_identity: {backend_execution} {tag(status)}"))
             if result.get("reason"):
                 children.append(_node(f"reason: {result['reason']}"))
             nodes.append(
@@ -103,7 +100,10 @@ def _identity_result_nodes(report: dict) -> list[dict]:
         # Container row carries only passed/failed/not_evaluated; the identity
         # row keeps the raw status (bypassed/skipped/not-applicable count as passed)
         row_status = status if status in ("failed", "not_evaluated") else "passed"
-        identity_key = catalog_targets.describe_target_execution_identity(result.get("execution_identities")) or "<unresolved>"
+        identity_key = (
+            target_catalog.TargetExecutionIdentity.describe(result.get("execution_identities"))
+            or "<unresolved>"
+        )
         identity_children: list[dict] = []
         for path_node in result.get("provider_path") or []:
             display = (
@@ -137,9 +137,7 @@ def _identity_result_nodes(report: dict) -> list[dict]:
             target_children = [_node(f"instance: {result['instance']}", [identity_node])]
         else:
             target_children = [identity_node]
-        nodes.append(
-            _node(f"target: {result['target_key']} {tag(row_status)}", target_children)
-        )
+        nodes.append(_node(f"target: {result['target_key']} {tag(row_status)}", target_children))
     return nodes
 
 
@@ -159,9 +157,7 @@ def _policy_check_nodes(report: dict) -> list[dict]:
         detail = check.get("detail")
         if isinstance(detail, dict):
             for name in sorted(detail):
-                children.append(
-                    _node(f"provider: {name}", [_node(line) for line in detail[name]])
-                )
+                children.append(_node(f"provider: {name}", [_node(line) for line in detail[name]]))
         elif detail:
             children.extend(_node(line) for line in detail)
         return _node(f"check: {check['name']} {tag(check['status'])}", children)
@@ -185,9 +181,7 @@ def _cfg_validation_text_lines(report: dict) -> list[str]:
     root = _node(f"cfg validation {_preflight_status_tag(report['status'])}")
     gate = report.get("gate") or {}
     if gate:
-        gate_children = (
-            [_node(f"reason: {gate['reason']}")] if gate.get("reason") else []
-        )
+        gate_children = [_node(f"reason: {gate['reason']}")] if gate.get("reason") else []
         root["children"].append(
             _node(
                 f"full cfg validation gate {_preflight_status_tag(gate['status'])}",
@@ -195,9 +189,7 @@ def _cfg_validation_text_lines(report: dict) -> list[str]:
             )
         )
     for finding in report.get("findings", []):
-        children = (
-            [_node(f"error: {finding['error']}")] if finding.get("error") else []
-        )
+        children = [_node(f"error: {finding['error']}")] if finding.get("error") else []
         root["children"].append(
             _node(
                 f"{finding['cfg_path']} {_preflight_status_tag(finding['status'])}",
@@ -218,9 +210,7 @@ def _target_cfg_result_nodes(report: dict) -> list[dict]:
             children.append(_node(f"{row['name']} {tag(row['status'])}"))
         if result.get("failure_reason"):
             children.append(_node(f"error: {result['failure_reason']}"))
-        nodes.append(
-            _node(f"target: {result['target_key']} {tag(result['status'])}", children)
-        )
+        nodes.append(_node(f"target: {result['target_key']} {tag(result['status'])}", children))
     return nodes
 
 

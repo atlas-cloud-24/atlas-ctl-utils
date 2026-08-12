@@ -5,11 +5,13 @@ may be used to select or resolve anything; the moment a permission is read as a
 choice, a guard has become a router and stops guarding."""
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from engine.execution import adapters as execution_adapters
 from engine.execution import references as execution_references
 from engine.kernel import yaml_io as kernel_yaml_io
+
 
 def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
     """Load the ctl profile catalog (content key: ctl_profiles) — named policy
@@ -30,7 +32,9 @@ def load_ctl_profiles(ctl_cfg_root: Path) -> dict[str, dict]:
             if not isinstance(profile_name, str) or not profile_name.strip():
                 raise RuntimeError(f"❌ ctl profile names must be non-empty strings: {path}")
             if policy is not None and not isinstance(policy, dict):
-                raise RuntimeError(f"❌ ctl profile {profile_name!r} policy must be a mapping: {path}")
+                raise RuntimeError(
+                    f"❌ ctl profile {profile_name!r} policy must be a mapping: {path}"
+                )
             profiles[profile_name] = policy or {}
     return profiles
 
@@ -120,9 +124,7 @@ class Permissions:
         "allow_force_skip_ctl_state_backend_sync",
         "--force-skip-ctl-state-backend-sync",
     )
-    FORCE_SKIP_GUARDRAILS = Permission(
-        "allow_force_skip_guardrails", "--force-skip-guardrails"
-    )
+    FORCE_SKIP_GUARDRAILS = Permission("allow_force_skip_guardrails", "--force-skip-guardrails")
     FORCE_SKIP_FULL_CFG_VALIDATION_GATE = Permission(
         "allow_force_skip_full_cfg_validation_gate",
         "--force-skip-full-cfg-validation-gate",
@@ -131,9 +133,7 @@ class Permissions:
         "allow_force_skip_execution_identity_preflight_check",
         "--force-skip-execution-identity-preflight-check",
     )
-    SKIP_CHILDREN_PRECHECK = Permission(
-        "allow_skip_children_precheck", "--skip-children-precheck"
-    )
+    SKIP_CHILDREN_PRECHECK = Permission("allow_skip_children_precheck", "--skip-children-precheck")
     # Erasing the only evidence that something is provisioned is a different
     # power from aging out history, so it is a different grant.
     CTL_STATE_FORGET = Permission("allow_ctl_state_forget", "--forget")
@@ -145,7 +145,14 @@ class Permissions:
 # execution runtime (WHERE a target_run's box is produced). CTL selects one
 # runtime for the whole run (always explicit, no default); the target_run declares
 # which it can run in (a constraint).
-EXECUTION_RUNTIME_MODES = ("local", "ci")
+class ExecutionRuntimeMode(StrEnum):
+    """Where a step runs: this machine, or the CI image."""
+
+    LOCAL = "local"
+    CI = "ci"
+
+
+EXECUTION_RUNTIME_MODES = tuple(ExecutionRuntimeMode)
 
 
 def step_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> set[str]:
@@ -157,13 +164,19 @@ def step_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> 
     if raw is None:
         return set(EXECUTION_RUNTIME_MODES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes must be a list of strings: {label}")
+        raise RuntimeError(
+            f"❌ target_run runtime.supported_execution_runtime_modes must be a list of strings: {label}"
+        )
     runtimes = set(raw)
     unknown = runtimes - set(EXECUTION_RUNTIME_MODES)
     if unknown:
-        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes has unknown runtimes {sorted(unknown)}: {label}")
+        raise RuntimeError(
+            f"❌ target_run runtime.supported_execution_runtime_modes has unknown runtimes {sorted(unknown)}: {label}"
+        )
     if not runtimes:
-        raise RuntimeError(f"❌ target_run runtime.supported_execution_runtime_modes must not be empty: {label}")
+        raise RuntimeError(
+            f"❌ target_run runtime.supported_execution_runtime_modes must not be empty: {label}"
+        )
     return runtimes
 
 
@@ -177,17 +190,25 @@ def ctl_allowed_execution_runtime_modes(ctl_cfg_root: Path, ctl_profile: str) ->
     if raw is None:
         return set(EXECUTION_RUNTIME_MODES)
     if not isinstance(raw, list) or not all(isinstance(r, str) for r in raw):
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must be a list of strings")
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must be a list of strings"
+        )
     runtimes = set(raw)
     unknown = runtimes - set(EXECUTION_RUNTIME_MODES)
     if unknown:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes has unknown runtimes {sorted(unknown)}")
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes has unknown runtimes {sorted(unknown)}"
+        )
     if not runtimes:
-        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must not be empty")
+        raise RuntimeError(
+            f"❌ ctl profile {ctl_profile!r} allowed_execution_runtime_modes must not be empty"
+        )
     return runtimes
 
 
-def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execution_runtime_mode: str) -> None:
+def validate_execution_runtime_mode(
+    ctl_cfg_root: Path, ctl_profile: str, execution_runtime_mode: str
+) -> None:
     """
 
     reconcile the selected runtime against the ctl profile: a known
@@ -195,7 +216,9 @@ def validate_execution_runtime_mode(ctl_cfg_root: Path, ctl_profile: str, execut
     run_targets, where the repo-local target_run manifest is loaded."""
 
     if execution_runtime_mode not in EXECUTION_RUNTIME_MODES:
-        raise RuntimeError(f"❌ unknown execution runtime {execution_runtime_mode!r} (known: {sorted(EXECUTION_RUNTIME_MODES)})")
+        raise RuntimeError(
+            f"❌ unknown execution runtime {execution_runtime_mode!r} (known: {sorted(EXECUTION_RUNTIME_MODES)})"
+        )
     allowed = ctl_allowed_execution_runtime_modes(ctl_cfg_root, ctl_profile)
     if execution_runtime_mode not in allowed:
         raise RuntimeError(
@@ -210,7 +233,6 @@ def ctl_allowed_providers(ctl_cfg_root: Path, ctl_profile: str) -> list[str]:
     and each one must carry its own policy block. Provider IDENTITY is engine
     vocabulary; everything inside a provider's block is not.
     """
-
 
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     raw = policy.get("allowed_providers")
@@ -242,21 +264,16 @@ def validate_ctl_allowed_providers(
     stray = sorted(set(providers) - set(allowed))
     if stray:
         raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} does not allow providers {stray} "
-            f"(allowed: {allowed})"
+            f"❌ ctl profile {ctl_profile!r} does not allow providers {stray} (allowed: {allowed})"
         )
 
 
-def ctl_profile_provider_policy(
-    ctl_cfg_root: Path, ctl_profile: str, provider: str
-) -> dict:
+def ctl_profile_provider_policy(ctl_cfg_root: Path, ctl_profile: str, provider: str) -> dict:
     """One provider's policy block, opaque to the engine — the adapter reads it."""
     ctl_allowed_providers(ctl_cfg_root, ctl_profile)
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile).get(provider)
     if not isinstance(policy, dict):
-        raise RuntimeError(
-            f"❌ ctl profile {ctl_profile!r} declares no {provider!r} policy block"
-        )
+        raise RuntimeError(f"❌ ctl profile {ctl_profile!r} declares no {provider!r} policy block")
     return policy
 
 
@@ -307,12 +324,13 @@ def validate_credential_refresh_modes(
         )
     for provider, mode in sorted(selected.items()):
         validate_cadence_supported(provider, mode)
-        validate_cadence_against_access_mode(
-            {provider: mode}, execution_access_modes
+        validate_cadence_against_access_mode({provider: mode}, execution_access_modes)
+        allowed = (
+            ctl_profile_provider_policy(ctl_cfg_root, ctl_profile, provider).get(
+                "allowed_credential_refresh_modes"
+            )
+            or []
         )
-        allowed = ctl_profile_provider_policy(
-            ctl_cfg_root, ctl_profile, provider
-        ).get("allowed_credential_refresh_modes") or []
         if mode not in allowed:
             raise RuntimeError(
                 f"❌ ctl profile {ctl_profile!r} does not allow credential refresh "
@@ -322,12 +340,8 @@ def validate_credential_refresh_modes(
     return selected
 
 
-def validate_skip_children_precheck(
-    ctl_cfg_root: Path, ctl_profile: str, requested: bool
-) -> None:
-    Permissions.SKIP_CHILDREN_PRECHECK.require(
-        ctl_cfg_root, ctl_profile, requested=requested
-    )
+def validate_skip_children_precheck(ctl_cfg_root: Path, ctl_profile: str, requested: bool) -> None:
+    Permissions.SKIP_CHILDREN_PRECHECK.require(ctl_cfg_root, ctl_profile, requested=requested)
 
 
 def validate_force_skip_full_cfg_validation_gate_policy(
@@ -381,9 +395,7 @@ def validate_cadence_against_access_mode(
         access = (access_modes or {}).get(provider)
         if not access:
             continue
-        usable = execution_adapters.get_adapter(provider).credential_refresh_mode_access_modes(
-            mode
-        )
+        usable = execution_adapters.get_adapter(provider).credential_refresh_mode_access_modes(mode)
         if usable and access not in usable:
             raise RuntimeError(
                 f"❌ --credential-refresh-mode {provider}={mode} has no effect "
@@ -439,7 +451,7 @@ def validate_execution_access(
     names no provider vocabulary."""
     # consent: a mode may require each active target of that provider to have
     # declared, up front, that it accepts being run this way and with what
-    #. The ADAPTER says which of its modes need consent and which
+    # . The ADAPTER says which of its modes need consent and which
     # target fields carry it; declaring the sources is not the same as opting in.
     targets = action_cfg.get("targets", {})
     for target_name in active_target_names(workflow_cfg):
@@ -487,9 +499,7 @@ def validate_execution_access(
     Permissions.FORCE_SKIP_FULL_CFG_VALIDATION_GATE.require(
         ctl_cfg_root,
         ctl_profile,
-        requested=bool(
-            execution_context.get(f"{ctl_flags}.force_skip_full_cfg_validation_gate")
-        ),
+        requested=bool(execution_context.get(f"{ctl_flags}.force_skip_full_cfg_validation_gate")),
     )
     Permissions.FORCE_SKIP_EXECUTION_IDENTITY_PREFLIGHT_CHECK.require(
         ctl_cfg_root,
@@ -497,32 +507,45 @@ def validate_execution_access(
         requested=bool(force_skip_execution_identity_preflight_check),
     )
     if agreed_defer_ctl_state_backend_sync:
-        missing = active_targets_missing_key(workflow_cfg, action_cfg, "allow_agreed_defer_ctl_state_backend_sync")
+        missing = active_targets_missing_key(
+            workflow_cfg, action_cfg, "allow_agreed_defer_ctl_state_backend_sync"
+        )
         if missing:
             raise RuntimeError(
                 "❌ --agreed-defer-ctl-state-backend-sync was requested, but active targets do not "
-                "declare allow_agreed_defer_ctl_state_backend_sync: true: " + ", ".join(sorted(missing))
+                "declare allow_agreed_defer_ctl_state_backend_sync: true: "
+                + ", ".join(sorted(missing))
             )
 
 
 def load_target_policy_constraints(ctl_cfg_root: Path) -> list[dict]:
     constraints: list[dict] = []
-    for path, section in kernel_yaml_io.collect_top_level_sections(ctl_cfg_root, "target_policy_constraints"):
+    for path, section in kernel_yaml_io.collect_top_level_sections(
+        ctl_cfg_root, "target_policy_constraints"
+    ):
         if not isinstance(section, list):
             raise RuntimeError(f"❌ target_policy_constraints must be a list: {path}")
         for idx, raw in enumerate(section, start=1):
             if not isinstance(raw, dict):
-                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} must be a mapping: {path}")
+                raise RuntimeError(
+                    f"❌ target_policy_constraints entry #{idx} must be a mapping: {path}"
+                )
             target_prefix = raw.get("target_prefix")
             required_ref_policy = raw.get("required_ref_policy")
             if not isinstance(target_prefix, str) or not target_prefix.strip():
-                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} target_prefix must be a non-empty string: {path}")
+                raise RuntimeError(
+                    f"❌ target_policy_constraints entry #{idx} target_prefix must be a non-empty string: {path}"
+                )
             if not isinstance(required_ref_policy, str) or not required_ref_policy.strip():
-                raise RuntimeError(f"❌ target_policy_constraints entry #{idx} required_ref_policy must be a non-empty string: {path}")
-            constraints.append({
-                "target_prefix": target_prefix.strip(),
-                "required_ref_policy": required_ref_policy.strip(),
-            })
+                raise RuntimeError(
+                    f"❌ target_policy_constraints entry #{idx} required_ref_policy must be a non-empty string: {path}"
+                )
+            constraints.append(
+                {
+                    "target_prefix": target_prefix.strip(),
+                    "required_ref_policy": required_ref_policy.strip(),
+                }
+            )
     return constraints
 
 

@@ -8,7 +8,6 @@ checked against something other than what ran."""
 import argparse
 import re
 import shutil
-
 from pathlib import Path
 
 from engine.cfg import resources as cfg_resources
@@ -29,7 +28,9 @@ EXECUTION_CONTEXT_CONSTRAINT_FIELDS = frozenset(
 
 def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
     constraint_entries: list[tuple[dict, Path]] = []
-    for path, section in kernel_yaml_io.collect_top_level_sections(ctl_cfg_root, "execution_context_constraints"):
+    for path, section in kernel_yaml_io.collect_top_level_sections(
+        ctl_cfg_root, "execution_context_constraints"
+    ):
         if not isinstance(section, list):
             raise RuntimeError(f"❌ execution_context_constraints must be a list: {path}")
         constraint_entries.extend((constraint, path) for constraint in section)
@@ -66,10 +67,16 @@ def load_execution_context_constraints(ctl_cfg_root: Path) -> list[dict]:
                 )
         require_present = constraint.get("require_present") or []
         allowed_values = constraint.get("allowed_values") or {}
-        if not isinstance(require_present, list) or not all(isinstance(item, str) and item for item in require_present):
-            raise RuntimeError(f"❌ execution context constraint #{idx} require_present must be a list of non-empty strings: {path}")
+        if not isinstance(require_present, list) or not all(
+            isinstance(item, str) and item for item in require_present
+        ):
+            raise RuntimeError(
+                f"❌ execution context constraint #{idx} require_present must be a list of non-empty strings: {path}"
+            )
         if not isinstance(allowed_values, dict):
-            raise RuntimeError(f"❌ execution context constraint #{idx} allowed_values must be a mapping: {path}")
+            raise RuntimeError(
+                f"❌ execution context constraint #{idx} allowed_values must be a mapping: {path}"
+            )
         constraints.append(constraint)
     return constraints
 
@@ -86,33 +93,39 @@ def execution_context_constraint_applies(
     """
     entries_all = constraint.get("when_all") or []
     if entries_all and not all(
-        run_selectors.selector_matches(entry, execution_context, label=f"execution_context_constraints[{idx}].when_all[{n}]")
+        run_selectors.selector_matches(
+            entry, execution_context, label=f"execution_context_constraints[{idx}].when_all[{n}]"
+        )
         for n, entry in enumerate(entries_all)
     ):
         return False
 
     entries_any = constraint.get("when_any") or []
-    if entries_any and not any(
-        run_selectors.selector_matches(entry, execution_context, label=f"execution_context_constraints[{idx}].when_any[{n}]")
-        for n, entry in enumerate(entries_any)
-    ):
-        return False
+    return not (
+        entries_any
+        and not any(
+            run_selectors.selector_matches(
+                entry,
+                execution_context,
+                label=f"execution_context_constraints[{idx}].when_any[{n}]",
+            )
+            for n, entry in enumerate(entries_any)
+        )
+    )
 
-    return True
 
-
-def validate_execution_context_constraints(ctl_cfg_root: Path, execution_context: dict[str, object]) -> None:
+def validate_execution_context_constraints(
+    ctl_cfg_root: Path, execution_context: dict[str, object]
+) -> None:
     for idx, constraint in enumerate(load_execution_context_constraints(ctl_cfg_root), start=1):
         if not execution_context_constraint_applies(constraint, execution_context, idx=idx):
             continue
-        when = {
-            key: constraint[key]
-            for key in ("when_all", "when_any")
-            if key in constraint
-        }
+        when = {key: constraint[key] for key in ("when_all", "when_any") if key in constraint}
 
         for ref in constraint.get("require_present") or []:
-            execution_references.validate_execution_context_ref(ref, label=f"execution_context_constraints[{idx}].require_present")
+            execution_references.validate_execution_context_ref(
+                ref, label=f"execution_context_constraints[{idx}].require_present"
+            )
             if ref not in execution_context:
                 raise RuntimeError(
                     f"❌ execution context constraint #{idx} requires {ref!r} when {when} matches; "
@@ -120,8 +133,12 @@ def validate_execution_context_constraints(ctl_cfg_root: Path, execution_context
                 )
 
         for ref, expected in (constraint.get("allowed_values") or {}).items():
-            execution_references.validate_execution_context_ref(ref, label=f"execution_context_constraints[{idx}].allowed_values")
-            allowed = run_selectors.selector_expected_values(expected, label=f"execution_context_constraints[{idx}].allowed_values.{ref}")
+            execution_references.validate_execution_context_ref(
+                ref, label=f"execution_context_constraints[{idx}].allowed_values"
+            )
+            allowed = run_selectors.selector_expected_values(
+                expected, label=f"execution_context_constraints[{idx}].allowed_values.{ref}"
+            )
             if ref in execution_context and str(execution_context[ref]) not in allowed:
                 raise RuntimeError(
                     f"❌ execution context constraint #{idx} allows {ref} only in {allowed}, got {execution_context[ref]!r}"
@@ -149,15 +166,18 @@ def load_ctl_sources(ctl_cfg_root: Path) -> dict:
         if unknown:
             raise RuntimeError(f"❌ {label} has unknown fields {unknown}: {ctl_cfg_root}")
         for field, why in (
-            ("type", "the combine operation follows from it: a map is merged by key, "
-                     "a list is concatenated"),
-            ("conflict_resolution", "left implicit, source order would silently decide "
-                                    "which value wins"),
+            (
+                "type",
+                "the combine operation follows from it: a map is merged by key, "
+                "a list is concatenated",
+            ),
+            (
+                "conflict_resolution",
+                "left implicit, source order would silently decide which value wins",
+            ),
         ):
             if not isinstance(entry.get(field), str) or not entry[field].strip():
-                raise RuntimeError(
-                    f"❌ {label}.{field} must be declared — {why}: {ctl_cfg_root}"
-                )
+                raise RuntimeError(f"❌ {label}.{field} must be declared — {why}: {ctl_cfg_root}")
         prefix = entry.get("publish_under")
         if prefix is not None and (not isinstance(prefix, str) or not prefix.strip()):
             raise RuntimeError(
@@ -222,24 +242,34 @@ def resolve_input_params(
                     f"❌ {label}: undefined param_set {name!r}; declared: {available} ({cfg_path})"
                 )
             if name in _stack:
-                raise RuntimeError(f"❌ param_set cycle: {' -> '.join([*_stack, name])} ({cfg_path})")
+                raise RuntimeError(
+                    f"❌ param_set cycle: {' -> '.join([*_stack, name])} ({cfg_path})"
+                )
             member = param_sets[name]
             if not isinstance(member, dict):
                 raise RuntimeError(f"❌ param_set {name!r} must be a mapping ({cfg_path})")
             unknown = sorted(set(member) - {"input_param_sets", "input_params"})
             if unknown:
-                raise RuntimeError(f"❌ param_set {name!r} has unsupported keys {unknown} ({cfg_path})")
+                raise RuntimeError(
+                    f"❌ param_set {name!r} has unsupported keys {unknown} ({cfg_path})"
+                )
             resolved.extend(
                 resolve_input_params(
-                    member.get("input_params"), member.get("input_param_sets"), param_sets,
-                    label=f"param_set {name!r}", cfg_path=cfg_path, _stack=(*_stack, name),
+                    member.get("input_params"),
+                    member.get("input_param_sets"),
+                    param_sets,
+                    label=f"param_set {name!r}",
+                    cfg_path=cfg_path,
+                    _stack=(*_stack, name),
                 )
             )
     if input_params is not None:
         if not isinstance(input_params, list) or not input_params:
             raise RuntimeError(f"❌ {label} input_params must be a non-empty list ({cfg_path})")
         for entry in input_params:
-            if not isinstance(entry, str) or not execution_references.CONTEXT_KEY_RE.fullmatch(entry.strip()):
+            if not isinstance(entry, str) or not execution_references.CONTEXT_KEY_RE.fullmatch(
+                entry.strip()
+            ):
                 raise RuntimeError(f"❌ {label} input_params entry {entry!r} must be a param name")
             resolved.append(entry.strip())
     seen: set[str] = set()
@@ -270,8 +300,12 @@ def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
         ref_context = resolve_ref_context(ref, args.execution_params) if ref else "procedure"
         raw_name = f"{ref_context_to_result_path(ref_context)}/{getattr(args, 'source', None) or 'unknown'}/{getattr(args, 'procedure', None) or 'unknown'}"
     elif run_type == "maintenance":
-        maintenance_target = getattr(args, "target", None) or getattr(args, "lock_id", None) or "unknown"
-        raw_name = f"{getattr(args, 'maintenance_action', None) or 'maintenance'}/{maintenance_target}"
+        maintenance_target = (
+            getattr(args, "target", None) or getattr(args, "lock_id", None) or "unknown"
+        )
+        raw_name = (
+            f"{getattr(args, 'maintenance_action', None) or 'maintenance'}/{maintenance_target}"
+        )
     elif run_type == "fan_out":
         raw_name = getattr(args, "fan_out", None)
     else:
@@ -289,9 +323,12 @@ def load_execution_params(ctl_cfg_root: Path) -> dict[str, object]:
     reference into ctl/params (resolved against CLI params + promoted args)."""
     entries: dict[str, object] = {}
     origins: dict[str, Path] = {}
-    for path, section in kernel_yaml_io.collect_top_level_sections(ctl_cfg_root, EXECUTION_PARAMS_KEY):
+    for path, section in kernel_yaml_io.collect_top_level_sections(
+        ctl_cfg_root, EXECUTION_PARAMS_KEY
+    ):
         if not isinstance(section, dict):
             raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY} must be a mapping: {path}")
+
         # A namespaced family may be authored as a NESTED mapping and is flattened
         # to the dotted param keys the context uses — `ns: {key: x}` and
         # `ns.key: x` declare the same param. Params stay scalar-only; nesting is
@@ -299,14 +336,18 @@ def load_execution_params(ctl_cfg_root: Path) -> dict[str, object]:
         # The engine names no namespace: the consumer chooses them.
         def walk(node, prefix="", path=path):
             for key, raw in node.items():
-                if not isinstance(key, str) or not execution_references.CONTEXT_KEY_RE.fullmatch(key):
+                if not isinstance(key, str) or not execution_references.CONTEXT_KEY_RE.fullmatch(
+                    key
+                ):
                     raise RuntimeError(
                         f"❌ {EXECUTION_PARAMS_KEY} key must be a valid identifier: {key!r}"
                     )
                 dotted = f"{prefix}{key}"
                 if isinstance(raw, dict):
                     if not raw:
-                        raise RuntimeError(f"❌ {EXECUTION_PARAMS_KEY}.{dotted} must not be an empty map: {path}")
+                        raise RuntimeError(
+                            f"❌ {EXECUTION_PARAMS_KEY}.{dotted} must not be an empty map: {path}"
+                        )
                     walk(raw, f"{dotted}.")
                     continue
                 if dotted in entries:
@@ -360,13 +401,17 @@ def build_execution_context(
 
         if not execution_references.CONTEXT_KEY_RE.fullmatch(key):
             raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
-        cleaned = [str(execution_references._context_scalar(v, label=label)) for v in (values or [])]
+        cleaned = [
+            str(execution_references._context_scalar(v, label=label)) for v in (values or [])
+        ]
         context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = cleaned
 
     def put(namespace: str, key: str, value, *, label: str) -> None:
         if not execution_references.CONTEXT_KEY_RE.fullmatch(key):
             raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
-        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = execution_references._context_scalar(value, label=label)
+        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.{namespace}.{key}"] = (
+            execution_references._context_scalar(value, label=label)
+        )
 
     if action is not None:
         put("ctl", "action", action, label="promoted --action")
@@ -382,9 +427,24 @@ def build_execution_context(
             _mode,
             label="promoted --execution-access-mode",
         )
-    put("ctl", "agreed_defer_ctl_state_backend_sync", bool(agreed_defer_ctl_state_backend_sync), label="promoted --agreed-defer-ctl-state-backend-sync")
-    put("ctl", "force_skip_ctl_state_backend_sync", bool(force_skip_ctl_state_backend_sync), label="promoted --force-skip-ctl-state-backend-sync")
-    put("ctl", "force_skip_guardrails", bool(force_skip_guardrails), label="promoted --force-skip-guardrails")
+    put(
+        "ctl",
+        "agreed_defer_ctl_state_backend_sync",
+        bool(agreed_defer_ctl_state_backend_sync),
+        label="promoted --agreed-defer-ctl-state-backend-sync",
+    )
+    put(
+        "ctl",
+        "force_skip_ctl_state_backend_sync",
+        bool(force_skip_ctl_state_backend_sync),
+        label="promoted --force-skip-ctl-state-backend-sync",
+    )
+    put(
+        "ctl",
+        "force_skip_guardrails",
+        bool(force_skip_guardrails),
+        label="promoted --force-skip-guardrails",
+    )
     put(
         "ctl",
         "force_skip_full_cfg_validation_gate",
@@ -412,7 +472,12 @@ def build_execution_context(
             raise RuntimeError(f"❌ {label}: key {key!r} must be a valid identifier")
         staged_cli[key] = execution_references._context_scalar(value, label=label)
     lookup = dict(context)
-    lookup.update({f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}": value for key, value in staged_cli.items()})
+    lookup.update(
+        {
+            f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}": value
+            for key, value in staged_cli.items()
+        }
+    )
 
     for key, raw in load_execution_params(ctl_cfg_root).items():
         label = f"{EXECUTION_PARAMS_KEY}.{key}"
@@ -435,7 +500,9 @@ def build_execution_context(
                     f"${{{execution_references.EXECUTION_CONTEXT_ROOT}.<ctl|params>.<key>}} reference is allowed, got {raw!r}"
                 )
         put("params", key, raw, label=label)
-        lookup[f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}"] = context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}"]
+        lookup[f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}"] = context[
+            f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{key}"
+        ]
 
     for key, value in staged_cli.items():
         put("params", key, value, label=f"--execution-params {key}")
@@ -446,7 +513,7 @@ def build_execution_context(
     # hands each participating adapter the declared params and namespaces
     # whatever it returns. Derived facts never override a declared one.
     declared = {
-        ref[len(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params."):]: value
+        ref[len(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.") :]: value
         for ref, value in context.items()
         if ref.startswith(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.")
     }
@@ -502,18 +569,27 @@ def scope_params_from_context(execution_context: dict[str, object]) -> dict[str,
     bare param map used for scope-identity activation (scope mechanism)."""
 
     prefix = f"{execution_references.EXECUTION_CONTEXT_ROOT}.params."
-    return {ref[len(prefix):]: str(value) for ref, value in execution_context.items() if ref.startswith(prefix)}
+    return {
+        ref[len(prefix) :]: str(value)
+        for ref, value in execution_context.items()
+        if ref.startswith(prefix)
+    }
 
 
 def write_execution_context_artifact(run_dir: Path, execution_context: dict[str, object]) -> Path:
     path = run_dir / "execution" / EXECUTION_CONTEXT_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    kernel_yaml_io.write_yaml_file(path, execution_references.execution_context_nested(execution_context))
+    kernel_yaml_io.write_yaml_file(
+        path, execution_references.execution_context_nested(execution_context)
+    )
     return path
 
 
 def execution_context_from_scope_params(scope_params: dict[str, str]) -> dict[str, object]:
-    return {f"{execution_references.EXECUTION_CONTEXT_PARAMS_PREFIX}{key}": value for key, value in (scope_params or {}).items()}
+    return {
+        f"{execution_references.EXECUTION_CONTEXT_PARAMS_PREFIX}{key}": value
+        for key, value in (scope_params or {}).items()
+    }
 
 
 def whole_tree_execution_context(
@@ -551,7 +627,10 @@ def build_target_execution_context(
 
     declared = target_run.get("input_params")
     derived = set(
-        run_execution_context.get(f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.derived_params") or []
+        run_execution_context.get(
+            f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.derived_params"
+        )
+        or []
     )
     context: dict[str, object] = {}
     for ref, value in run_execution_context.items():
@@ -564,7 +643,8 @@ def build_target_execution_context(
 
     if declared:
         missing = sorted(
-            k for k in declared
+            k
+            for k in declared
             if f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.{k}" not in context
         )
         if missing:
@@ -575,10 +655,14 @@ def build_target_execution_context(
 
     domains = target_run.get("domains")
     if domains:
-        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.target.domains"] = [str(d) for d in domains]
+        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.target.domains"] = [
+            str(d) for d in domains
+        ]
     for name, value in (target_run.get("static_vars") or {}).items():
-        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.target.static_vars.{name}"] = execution_references._context_scalar(
-            value, label=f"target_run {target_run_id!r} static_vars.{name}"
+        context[f"{execution_references.EXECUTION_CONTEXT_ROOT}.target.static_vars.{name}"] = (
+            execution_references._context_scalar(
+                value, label=f"target_run {target_run_id!r} static_vars.{name}"
+            )
         )
     return context
 
@@ -592,9 +676,15 @@ def resolve_ctl_structure(value, execution_context: dict[str, object], *, label:
     env/dev)."""
 
     if isinstance(value, dict):
-        return {k: resolve_ctl_structure(v, execution_context, label=f"{label}.{k}") for k, v in value.items()}
+        return {
+            k: resolve_ctl_structure(v, execution_context, label=f"{label}.{k}")
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [resolve_ctl_structure(v, execution_context, label=f"{label}[{i}]") for i, v in enumerate(value)]
+        return [
+            resolve_ctl_structure(v, execution_context, label=f"{label}[{i}]")
+            for i, v in enumerate(value)
+        ]
     if isinstance(value, str) and "${" in value:
         return execution_references.resolve_runtime_scalar(value, execution_context, label=label)
     return value

@@ -9,6 +9,7 @@ The value is not decoration: `--skip-up-to-date` already refuses to reuse a
 member whose `ref_policy` is not `commit_required`, so the fact was known and
 simply had no name in the row a reader sees.
 """
+
 import sys
 import unittest
 from pathlib import Path

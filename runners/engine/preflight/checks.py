@@ -72,9 +72,7 @@ class PreflightCheck(abc.ABC):
     def write_artifacts(self, gates_dir: Path, report: dict) -> None:
         text_path = Path(gates_dir) / self.artifact_name
         text_path.parent.mkdir(parents=True, exist_ok=True)
-        text_path.write_text(
-            "\n".join(self.render_lines(report)) + "\n", encoding="utf-8"
-        )
+        text_path.write_text("\n".join(self.render_lines(report)) + "\n", encoding="utf-8")
 
     def assert_accepted(self, report: dict) -> None:
         if self.gate_status(report) != "failed":
@@ -142,9 +140,7 @@ class CfgValidationCheck(PreflightCheck):
     def build(self, findings: list[dict]) -> dict:
         """A flat list of cfg-path-keyed findings. Failed if any finding failed."""
         status = (
-            "failed"
-            if any(finding.get("status") == "failed" for finding in findings)
-            else "passed"
+            "failed" if any(finding.get("status") == "failed" for finding in findings) else "passed"
         )
         return {"kind": "cfg_validation", "status": status, "findings": list(findings)}
 
@@ -164,9 +160,7 @@ class CfgValidationCheck(PreflightCheck):
         return report
 
     def gate_status(self, report: dict) -> str:
-        return (report.get("gate") or {}).get(
-            "status", report.get("status", "failed")
-        )
+        return (report.get("gate") or {}).get("status", report.get("status", "failed"))
 
     def render_lines(self, report: dict) -> list[str]:
         return preflight_render._cfg_validation_text_lines(report)
@@ -222,12 +216,8 @@ class CtlPolicyPreflightCheck(SelectionPreflightCheck):
             execution_runtime_mode=inputs.execution_runtime_mode,
             execution_access_modes=inputs.execution_access_modes,
             provider_options=inputs.provider_options,
-            agreed_defer_ctl_state_backend_sync=(
-                inputs.agreed_defer_ctl_state_backend_sync
-            ),
-            force_skip_ctl_state_backend_sync=(
-                inputs.force_skip_ctl_state_backend_sync
-            ),
+            agreed_defer_ctl_state_backend_sync=(inputs.agreed_defer_ctl_state_backend_sync),
+            force_skip_ctl_state_backend_sync=(inputs.force_skip_ctl_state_backend_sync),
             force_skip_execution_identity_preflight_check=(
                 inputs.force_skip_execution_identity_preflight_check
             ),
@@ -252,16 +242,10 @@ class ExecutionIdentityPreflightCheck(SelectionPreflightCheck):
             implementation_key=inputs.implementation_key,
             execution_access_modes=inputs.execution_access_modes,
             provider_options=inputs.provider_options,
-            force_skip_providers=(
-                inputs.force_skip_execution_identity_preflight_check
-            ),
+            force_skip_providers=(inputs.force_skip_execution_identity_preflight_check),
             ctl_cfg_root=inputs.ctl_cfg_root,
-            agreed_defer_ctl_state_backend_sync=(
-                inputs.agreed_defer_ctl_state_backend_sync
-            ),
-            force_skip_ctl_state_backend_sync=(
-                inputs.force_skip_ctl_state_backend_sync
-            ),
+            agreed_defer_ctl_state_backend_sync=(inputs.agreed_defer_ctl_state_backend_sync),
+            force_skip_ctl_state_backend_sync=(inputs.force_skip_ctl_state_backend_sync),
         )
 
     def render_lines(self, report: dict) -> list[str]:
@@ -288,9 +272,7 @@ SELECTION_PREFLIGHT_CHECKS: tuple[SelectionPreflightCheck, ...] = tuple(
 )
 
 
-def build_selection_validation_reports(
-    selection: dict, inputs: PreflightInputs
-) -> dict:
+def build_selection_validation_reports(selection: dict, inputs: PreflightInputs) -> dict:
     """Build every selection-scoped report for a selection resolved with
     `load_provider_catalogs=False`, keyed by check name.
 
@@ -316,14 +298,11 @@ def build_selection_validation_reports(
         )
         # One try for all of them: a catalog load that fails leaves NONE of these
         # checked, so none may report a result it did not actually reach.
-        catalog_reports = {
-            check.name: check.build(selection, inputs) for check in catalog_checks
-        }
+        catalog_reports = {check.name: check.build(selection, inputs) for check in catalog_checks}
     except Exception as error:
         reason = execution_run_context.credential_free_preflight_failure_reason(error)
         catalog_reports = {
-            check.name: check.unresolved_report(selection_ref, reason)
-            for check in catalog_checks
+            check.name: check.unresolved_report(selection_ref, reason) for check in catalog_checks
         }
     reports.update(catalog_reports)
     return {"selection": selection, "reports": reports}

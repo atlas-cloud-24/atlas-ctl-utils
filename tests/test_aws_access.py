@@ -11,7 +11,7 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import atlas_ctl_adapter_aws as aws_adapter
 import ctl_cfg_fixture
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.execution import references as execution_references
 from engine.kernel import errors as kernel_errors
 
@@ -28,6 +28,15 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # these resolve against the adapter, which the engine reaches only via
         # the providers a cfg root declares
         ctl_cfg_fixture.cfg_root(self, "aws")
+        # Acquisition has its own tests; these are about WHICH source is chosen
+        # and what the chain derives from it.
+        acquire = mock.patch.object(
+            aws_adapter.credentials,
+            "acquire_credential_source",
+            return_value={"AWS_ACCESS_KEY_ID": "AKIAENTRY"},
+        )
+        self.acquire = acquire.start()
+        self.addCleanup(acquire.stop)
         # A source declares HOW it is acquired: `sso` is a root (session +
         # account + permission set); `assume_role` continues from a source it
         # names. Nothing names a host profile.
@@ -143,12 +152,12 @@ class AwsAccessResolutionTests(unittest.TestCase):
     # --- direct mode (--agreed-skip-ctl-role-chain) ---
 
     @mock.patch.dict(os.environ, {}, clear=True)
-    def test_direct_mode_resolves_profile_account_and_principal(self):
+    def test_direct_mode_acquires_the_declared_source(self):
         with mock.patch.object(
             aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            return_value="111111111111",
-        ):
+            "acquire_credential_source",
+            return_value={"AWS_ACCESS_KEY_ID": "AKIADIRECT"},
+        ) as acquire:
             resolved = aws_adapter.resolve_target_aws_access(
                 {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
@@ -157,21 +166,22 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
+                sso_sessions=self.sso_sessions,
             )
         self.assertEqual(resolved["account_key"], "dev")
-        self.assertEqual(resolved["profile_name"], "oxygen-dev-deploy")
+        self.assertEqual(resolved["credential_source_key"], "non_prod_deploy")
+        self.assertEqual(resolved["credential_provider_kind"], "direct_source")
+        self.assertEqual(resolved["credentials"], {"AWS_ACCESS_KEY_ID": "AKIADIRECT"})
         self.assertEqual(resolved["expected_account_id"], "111111111111")
-        self.assertEqual(resolved["credential_provider_kind"], "direct_profile")
-        # direct mode carries the source's declared principal
-        self.assertEqual(resolved["permission_set_name"], "NonProdDeployAccess")
-        self.assertNotIn("role_name", resolved)
+        # the source it acquired is the one the identity allows, by name
+        self.assertEqual(acquire.call_args.args[0], "non_prod_deploy")
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_interpolates_identity_account_key(self):
         with mock.patch.object(
             aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            return_value="111111111111",
+            "acquire_credential_source",
+            return_value={"AWS_ACCESS_KEY_ID": "AKIADIRECT"},
         ):
             resolved = aws_adapter.resolve_target_aws_access(
                 {"execution_identities": {"aws": self.executions["ctl_state_dev_synchronizer"]}},
@@ -181,8 +191,9 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 implementation_key="sso",
                 account_registry=self.account_registry,
                 execution_access_mode="agreed_direct",
+                sso_sessions=self.sso_sessions,
             )
-        self.assertEqual(resolved["profile_name"], "oxygen-dev-ctl-state-synchronizer")
+        self.assertEqual(resolved["credential_source_key"], "ctl_state_synchronizer")
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_requires_direct_credential_source_key(self):
@@ -201,12 +212,15 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # the identity bundle is dissolved; a target still carrying the
         # old key must fail loud naming its replacement (hard cutover, no alias).
         with self.assertRaisesRegex(RuntimeError, r"execution must be a non-empty mapping"):
-            catalog_targets.validate_target_execution_identity({}, label="target 'env/static/x'")
+            target_catalog.TargetExecutionIdentity.validate({}, label="target 'env/static/x'")
         with self.assertRaisesRegex(RuntimeError, "unknown fields"):
-            catalog_targets.validate_target_execution_identity(
-                {"provider": "aws", "account": "dev",
-                 "roles": {"readwrite": "ctl_target"},
-                 "execution_identity_key": "env_deploy"},
+            target_catalog.TargetExecutionIdentity.validate(
+                {
+                    "provider": "aws",
+                    "account": "dev",
+                    "roles": {"readwrite": "ctl_target"},
+                    "execution_identity_key": "env_deploy",
+                },
                 label="target 'env/static/x'",
             )
 
@@ -215,26 +229,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
         {"ATLAS_AWS_PROFILE_NON_PROD_DEPLOY": "custom-dev-deploy"},
         clear=True,
     )
-    def test_profile_override_cannot_change_account(self):
-        account_ids = {
-            "oxygen-dev-deploy": "111111111111",
-            "custom-dev-deploy": "222222222222",
-        }
-        with mock.patch.object(
-            aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            side_effect=account_ids.__getitem__,
-        ), self.assertRaisesRegex(RuntimeError, "profile override"):
-            aws_adapter.resolve_target_aws_access(
-                {"execution_identities": {"aws": self.executions["env_deploy"]}},
-                self.identities,
-                self.credential_sources,
-                execution_context=self.context,
-                implementation_key="sso",
-                account_registry=self.account_registry,
-                execution_access_mode="agreed_direct",
-            )
-
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_execution_less_target_run_resolves_to_none(self):
         # Coverage is validated separately; a lone resolve has nothing to resolve.
@@ -251,19 +245,24 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_unimplemented_credential_acquisition_fails(self):
-        # Only 'local' (profile-based) acquisition is built; 'ci'
-        # (AssumeRoleWithWebIdentity — planned rename: web_identity) is declared and
-        # validated in cfg but not implemented, so it must fail explicitly.
-        with self.assertRaisesRegex(RuntimeError, "is not implemented"):
-            aws_adapter.resolve_target_aws_access(
-                {"execution_identities": {"aws": self.executions["env_deploy"]}},
-                self.identities,
-                self.credential_sources,
-                execution_context=self.context,
-                implementation_key="ci",
-                account_registry=self.account_registry,
-                execution_access_mode="agreed_direct",
-            )
+        # Declared acquisitions whose mechanics are not built must refuse at use,
+        # naming themselves — never fail later on a missing field.
+        for acquisition in aws_adapter.UNIMPLEMENTED_CREDENTIAL_ACQUISITIONS:
+            with (
+                self.subTest(acquisition=acquisition),
+                self.assertRaisesRegex(
+                    RuntimeError, f"{acquisition!r} is declared and not implemented"
+                ),
+            ):
+                aws_adapter.resolve_target_aws_access(
+                    {"execution_identities": {"aws": self.executions["env_deploy"]}},
+                    self.identities,
+                    self.credential_sources,
+                    execution_context=self.context,
+                    implementation_key=acquisition,
+                    account_registry=self.account_registry,
+                    execution_access_mode="agreed_direct",
+                )
 
     def test_unknown_runtime_placeholder_fails(self):
         with self.assertRaisesRegex(RuntimeError, "not found in execution context"):
@@ -272,33 +271,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 self.context,
                 label="test",
             )
-
-    @mock.patch.dict(os.environ, {}, clear=True)
-    def test_account_registry_rejects_conflicting_profile_ids(self):
-        account_ids = {
-            "oxygen-dev-deploy": "111111111111",
-            "oxygen-dev-readonly": "222222222222",
-        }
-        target_runs = {
-            "deploy": {"execution_identities": {"aws": self.executions["env_deploy"]}},
-            "readonly": {"execution_identities": {"aws": self.executions["env_readonly"]}},
-        }
-        with mock.patch.object(
-            aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            side_effect=account_ids.__getitem__,
-        ), self.assertRaisesRegex(RuntimeError, "AWS account registry maps"):
-            aws_adapter.validate_active_target_run_aws_access(
-                target_runs,
-                self.identities,
-                self.credential_sources,
-                execution_context=self.context,
-                implementation_key="sso",
-                account_registry=self.account_registry,
-                execution_access_mode="agreed_direct",
-            )
-
-    # --- chain mode (default) ---
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_chain_mode_derives_runner_and_target_role_arns(self):
@@ -311,9 +283,10 @@ class AwsAccessResolutionTests(unittest.TestCase):
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
             target_roles=self.target_roles,
+            sso_sessions=self.sso_sessions,
         )
         self.assertEqual(resolved["credential_provider_kind"], "role_chain")
-        self.assertEqual(resolved["entry_profile_name"], "oxygen-ctl-entry")
+        self.assertEqual(resolved["entry_credentials"], {"AWS_ACCESS_KEY_ID": "AKIAENTRY"})
         self.assertEqual(resolved["entry_permission_set_name"], "CtlEntryAccess")
         self.assertEqual(
             resolved["hop_role_arns"],
@@ -343,6 +316,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
             account_registry=self.account_registry,
             ctl_role_chain=self.ctl_role_chain,
             target_roles=self.target_roles,
+            sso_sessions=self.sso_sessions,
         )
         self.assertEqual(
             resolved["hop_role_arns"][-1],
@@ -362,6 +336,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
                 target_roles=self.target_roles,
+                sso_sessions=self.sso_sessions,
             )
 
     @mock.patch.dict(os.environ, {}, clear=True)
@@ -380,18 +355,38 @@ class AwsAccessResolutionTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_identity_bypass_uses_substitute_credential_even_with_identity(self):
-        resolved = aws_adapter.resolve_target_aws_access(
-            {"execution_identities": {"aws": self.executions["env_deploy"]}},
-            self.identities,
-            self.credential_sources,
-            execution_context=self.context,
-            implementation_key="sso",
-            execution_access_mode="force_bypass",
-            provider_options={"force_bypass_credential_profile": "my-sandbox-admin"},
-        )
-        self.assertEqual(resolved["profile_name"], "my-sandbox-admin")
+        substitute = {
+            "AWS_ACCESS_KEY_ID": "AKIASUB",
+            "AWS_SECRET_ACCESS_KEY": "s",
+            "AWS_SESSION_TOKEN": "t",
+        }
+        with mock.patch.object(
+            aws_adapter.credentials, "_profile_credentials", return_value=substitute
+        ):
+            resolved = aws_adapter.resolve_target_aws_access(
+                {"execution_identities": {"aws": self.executions["env_deploy"]}},
+                self.identities,
+                self.credential_sources,
+                execution_context=self.context,
+                implementation_key="sso",
+                execution_access_mode="force_bypass",
+                provider_options={"force_bypass_profile": "my-sandbox-admin"},
+            )
+        # a declared identity is ignored, and what the run carries is a credential
+        self.assertEqual(resolved["credentials"], substitute)
         self.assertEqual(resolved["credential_provider_kind"], "substitute_credential")
         self.assertEqual(resolved["identity_bypass"], "true")
+
+    @mock.patch.dict(os.environ, {}, clear=True)
+    def test_identity_bypass_inputs_are_exclusive_and_neither_defaults(self):
+        cases = {
+            "requires the substitute credential": {},
+            "mutually exclusive": {"force_bypass_profile": "p", "force_bypass_env": "true"},
+        }
+        for expected, options in cases.items():
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    aws_adapter.credentials.force_bypass_credentials(options)
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_identity_bypass_requires_substitute_credential(self):
@@ -411,8 +406,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
         # substitute profile's host-resolved env credentials
         target_env = {"AWS_ACCESS_KEY_ID": "inherited-ambient"}
         with mock.patch.object(
-            aws_adapter.execution,
-            "export_profile_credentials",
+            aws_adapter.credentials,
+            "_profile_credentials",
             return_value={"AWS_ACCESS_KEY_ID": "AKIASUB", "AWS_SECRET_ACCESS_KEY": "s"},
         ) as export:
             aws_adapter.configure_target_aws_env(
@@ -425,47 +420,22 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 implementation_key="sso",
                 account_registry={},
                 execution_access_mode="force_bypass",
-                provider_options={"force_bypass_credential_profile": "my-sandbox-admin"},
+                provider_options={"force_bypass_profile": "my-sandbox-admin"},
             )
         export.assert_called_once_with("my-sandbox-admin")
         self.assertEqual(target_env["AWS_ACCESS_KEY_ID"], "AKIASUB")
-        self.assertEqual(target_env["ATLAS_AWS_PROFILE_ONLY_ACCESS"], "true")
+        self.assertEqual(target_env["ATLAS_AWS_SUBSTITUTE_ACCESS"], "true")
         self.assertNotIn("ATLAS_AWS_EXPECT_ACCOUNT_ID", target_env)
         self.assertNotIn("AWS_PROFILE", target_env)
 
     # ---: expect everywhere ---
-
-    def test_local_source_without_expect_is_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, r"must declare\s+expect"):
-            aws_adapter._validate_aws_credential_source_implementation(
-                "bare", "local", {"profile_name": "some-profile"}, Path("/cfg")
-            )
-
-    def test_local_source_with_multiple_principals_is_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "exactly one"):
-            aws_adapter._validate_aws_credential_source_implementation(
-                "ambiguous",
-                "local",
-                {
-                    "profile_name": "some-profile",
-                    "expect": {
-                        "permission_set_name": "ReadOnlyAccess",
-                        "role_name": "SomeRole",
-                    },
-                },
-                Path("/cfg"),
-            )
 
     @mock.patch.dict(os.environ, {}, clear=True)
     def test_direct_mode_binding_exports_principal_expectation(self):
         target_env: dict[str, str] = {}
         with mock.patch.object(
             aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            return_value="111111111111",
-        ), mock.patch.object(
-            aws_adapter.execution,
-            "export_profile_credentials",
+            "acquire_credential_source",
             return_value={"AWS_ACCESS_KEY_ID": "AKIADIR", "AWS_SECRET_ACCESS_KEY": "s"},
         ):
             aws_adapter.configure_target_aws_env(
@@ -483,29 +453,6 @@ class AwsAccessResolutionTests(unittest.TestCase):
         self.assertNotIn("AWS_PROFILE", target_env)
         self.assertEqual(target_env["ATLAS_AWS_EXPECT_ACCOUNT_ID"], "111111111111")
         self.assertEqual(target_env["ATLAS_AWS_EXPECT_PERMISSION_SET_NAME"], "NonProdDeployAccess")
-
-    def test_direct_expect_account_key_conflict_is_rejected(self):
-        sources = dict(self.credential_sources)
-        sources["org_admin"] = {
-            "profile": {
-                "profile_name": "oxygen-org-admin",
-                "expect": {"account_key": "dev", "permission_set_name": "AdministratorAccess"},
-            }
-        }
-        with mock.patch.object(
-            aws_adapter.credentials,
-            "resolve_configured_profile_account_id",
-            return_value="333333333333",
-        ), self.assertRaisesRegex(RuntimeError, "expect.account_key resolves to"):
-            aws_adapter.resolve_target_aws_access(
-                {"execution_identities": {"aws": self.executions["org_admin"]}},
-                self.identities,
-                sources,
-                execution_context=self.context,
-                implementation_key="sso",
-                account_registry=self.account_registry,
-                execution_access_mode="agreed_direct",
-            )
 
     def test_chain_blocks_placeholder_entry_account(self):
         account_registry = dict(self.account_registry)
@@ -529,12 +476,12 @@ class AwsAccessResolutionTests(unittest.TestCase):
     def test_chain_resolution_requires_entry_account_key(self):
         sources = dict(self.credential_sources)
         sources["ctl_entry"] = {
-            "profile": {
-                "profile_name": "oxygen-ctl-entry",
-                "expect": {"permission_set_name": "CtlEntryAccess"},
+            "sso": {
+                "session_key": "providers.aws.sso_sessions.main",
+                "permission_set_name": "CtlEntryAccess",
             }
         }
-        with self.assertRaisesRegex(RuntimeError, r"must declare\s+expect.account_key"):
+        with self.assertRaisesRegex(RuntimeError, "must declare account_key"):
             aws_adapter.resolve_target_aws_access(
                 {"execution_identities": {"aws": self.executions["env_deploy"]}},
                 self.identities,
@@ -544,6 +491,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 account_registry=self.account_registry,
                 ctl_role_chain=self.ctl_role_chain,
                 target_roles=self.target_roles,
+                sso_sessions=self.sso_sessions,
             )
 
     def test_entry_validation_is_exact_not_substring(self):
@@ -551,7 +499,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         caller = {
             "Account": "444444444444",
             "Arn": "arn:aws:sts::444444444444:assumed-role/"
-                   "AWSReservedSSO_CtlEntryAccess-evil_abc123/session",
+            "AWSReservedSSO_CtlEntryAccess-evil_abc123/session",
         }
         with self.assertRaisesRegex(RuntimeError, "permission-set mismatch"):
             assert_aws_access.validate_caller_identity(
@@ -563,15 +511,21 @@ class AwsAccessResolutionTests(unittest.TestCase):
     # --- identity coverage ---
 
     def test_identity_coverage_rejects_missing_identity_without_bypass(self):
-        target_runs = {"declared": {"execution_identities": {"aws": self.executions["env_deploy"]}}, "bare": {}}
+        target_runs = {
+            "declared": {"execution_identities": {"aws": self.executions["env_deploy"]}},
+            "bare": {},
+        }
         with self.assertRaisesRegex(RuntimeError, "have no execution_identity block"):
-            catalog_targets.validate_target_execution_identity_coverage(
+            target_catalog.TargetExecutionIdentity.validate_coverage(
                 target_runs, execution_access_modes={"aws": "standard"}
             )
 
     def test_identity_coverage_allows_anything_under_bypass(self):
-        target_runs = {"declared": {"execution_identities": {"aws": self.executions["env_deploy"]}}, "bare": {}}
-        catalog_targets.validate_target_execution_identity_coverage(
+        target_runs = {
+            "declared": {"execution_identities": {"aws": self.executions["env_deploy"]}},
+            "bare": {},
+        }
+        target_catalog.TargetExecutionIdentity.validate_coverage(
             target_runs, execution_access_modes={"aws": "force_bypass"}
         )
 
@@ -600,7 +554,7 @@ class AwsAccessResolutionTests(unittest.TestCase):
         self.assertNotIn("AWS_SHARED_CREDENTIALS_FILE", target_env)
         self.assertNotIn("AWS_ACCESS_KEY_ID", target_env)
 
-    def test_synchronizer_asserts_selected_profile_principal(self):
+    def test_synchronizer_asserts_the_sources_declared_principal(self):
         with (
             mock.patch.object(
                 aws_adapter.ctl_state,
@@ -614,8 +568,8 @@ class AwsAccessResolutionTests(unittest.TestCase):
             ),
             mock.patch.object(
                 aws_adapter.credentials,
-                "resolve_configured_profile_account_id",
-                return_value="111111111111",
+                "acquire_credential_source",
+                return_value={"AWS_ACCESS_KEY_ID": "AKIASYNC"},
             ),
             mock.patch.object(aws_adapter.ctl_state, "assert_caller") as assertion,
         ):
@@ -629,14 +583,13 @@ class AwsAccessResolutionTests(unittest.TestCase):
                 execution_access_mode="agreed_direct",
             )
 
-        self.assertEqual(credential, "oxygen-dev-ctl-state-synchronizer")
+        self.assertEqual(credential, {"AWS_ACCESS_KEY_ID": "AKIASYNC"})
         assertion.assert_called_once_with(
-            "oxygen-dev-ctl-state-synchronizer",
+            {"AWS_ACCESS_KEY_ID": "AKIASYNC"},
             expected_account_id="111111111111",
             expect_principal={"role_name": "oxygen-ctl-state-synchronizer"},
             label="ctl-state sync execution",
         )
-
 
 
 class CallerAssertionTakesACredentialBindingTests(unittest.TestCase):
@@ -650,8 +603,8 @@ class CallerAssertionTakesACredentialBindingTests(unittest.TestCase):
 
     def _module(self):
         import importlib.util
-        script = (Path(__file__).resolve().parents[1]
-                  / "step_utils" / "assert_aws_access.py")
+
+        script = Path(__file__).resolve().parents[1] / "step_utils" / "assert_aws_access.py"
         spec = importlib.util.spec_from_file_location("aaa_under_test", script)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -701,12 +654,13 @@ class CallerAssertionTakesACredentialBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "OR credentials"):
             module.get_caller_identity("p", credentials={"AWS_ACCESS_KEY_ID": "x"})
 
+
 class CallerIdentityAssertionTests(unittest.TestCase):
     @mock.patch.dict(
         os.environ,
         {
             "AWS_PROFILE": "private-profile",
-            "ATLAS_AWS_PROFILE_ONLY_ACCESS": "true",
+            "ATLAS_AWS_SUBSTITUTE_ACCESS": "true",
         },
         clear=True,
     )
@@ -716,9 +670,7 @@ class CallerIdentityAssertionTests(unittest.TestCase):
             "Arn": "arn:aws:iam::111111111111:user/private-user",
         }
         with (
-            mock.patch.object(
-                assert_aws_access, "get_caller_identity", return_value=caller
-            ),
+            mock.patch.object(assert_aws_access, "get_caller_identity", return_value=caller),
             mock.patch("builtins.print") as output,
         ):
             self.assertEqual(assert_aws_access.main(), 0)
@@ -735,9 +687,7 @@ class CallerIdentityAssertionTests(unittest.TestCase):
             "Arn": "arn:aws:sts::111111111111:assumed-role/SomeRole/session",
         }
         with self.assertRaisesRegex(RuntimeError, "exactly one expected"):
-            assert_aws_access.validate_caller_identity(
-                caller, expected_account_id="111111111111"
-            )
+            assert_aws_access.validate_caller_identity(caller, expected_account_id="111111111111")
         with self.assertRaisesRegex(RuntimeError, "exactly one expected"):
             assert_aws_access.validate_caller_identity(
                 caller,
@@ -791,10 +741,7 @@ class CallerIdentityAssertionTests(unittest.TestCase):
     def test_assume_role_name_must_match_exactly(self):
         caller = {
             "Account": "222222222222",
-            "Arn": (
-                "arn:aws:sts::222222222222:assumed-role/"
-                "OrganizationAccountAccessRole/session"
-            ),
+            "Arn": ("arn:aws:sts::222222222222:assumed-role/OrganizationAccountAccessRole/session"),
         }
         assert_aws_access.validate_caller_identity(
             caller,
@@ -818,14 +765,15 @@ class AccountExpectationCheckTests(unittest.TestCase):
 
     def _check(self, caller_account, *, execution=None, registry=None, options=None):
         with mock.patch.object(
-            aws_adapter.credentials, "cached_caller_identity",
+            aws_adapter.credentials,
+            "cached_caller_identity",
             return_value={"Account": caller_account, "Arn": "arn:aws:iam::x:user/y"},
         ):
             return aws_adapter.check_account_expectation(
                 self.EXECUTION if execution is None else execution,
                 execution_context=self.CTX,
                 account_registry=self.REGISTRY if registry is None else registry,
-                profile_name="substitute",
+                credentials={"AWS_ACCESS_KEY_ID": "ASIASUB"},
                 provider_options=options,
                 label="target",
             )
@@ -840,8 +788,7 @@ class AccountExpectationCheckTests(unittest.TestCase):
         self.assertIn("111111111111", result["failure_reason"])
 
     def test_placeholder_registry_id_declares_no_expectation(self):
-        result = self._check("999999999999",
-                             execution={"provider": "aws", "account": "seam"})
+        result = self._check("999999999999", execution={"provider": "aws", "account": "seam"})
         self.assertEqual(result["status"], "not_applicable")
 
     def test_unknown_account_key_declares_no_expectation(self):
@@ -849,8 +796,9 @@ class AccountExpectationCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_applicable")
 
     def test_execution_less_target_declares_no_expectation(self):
-        self.assertEqual(self._check("999999999999", execution=None if False else {})["status"],
-                         "not_applicable")
+        self.assertEqual(
+            self._check("999999999999", execution=None if False else {})["status"], "not_applicable"
+        )
 
     def test_force_skip_option_bypasses_it(self):
         result = self._check(
@@ -862,15 +810,23 @@ class AccountExpectationCheckTests(unittest.TestCase):
     def test_caller_identity_is_cached_per_credential(self):
         aws_adapter._CALLER_IDENTITY_CACHE.clear()
         with mock.patch.object(
-            aws_adapter.credentials, "_assertion",
-            return_value=mock.Mock(get_caller_identity=mock.Mock(
-                return_value={"Account": "111111111111"})),
+            aws_adapter.credentials,
+            "_assertion",
+            return_value=mock.Mock(
+                get_caller_identity=mock.Mock(return_value={"Account": "111111111111"})
+            ),
         ) as assertion:
-            aws_adapter.cached_caller_identity("substitute")
-            aws_adapter.cached_caller_identity("substitute")
-            calls = assertion.return_value.get_caller_identity.call_count
+            substitute = {"AWS_ACCESS_KEY_ID": "ASIASUB", "AWS_SECRET_ACCESS_KEY": "s"}
+            aws_adapter.cached_caller_identity(substitute)
+            # same credential, different mapping order: one call, not two
+            aws_adapter.cached_caller_identity(dict(reversed(list(substitute.items()))))
+            cached = assertion.return_value.get_caller_identity.call_count
+            aws_adapter.cached_caller_identity({"AWS_ACCESS_KEY_ID": "ASIAOTHER"})
+            distinct = assertion.return_value.get_caller_identity.call_count
         aws_adapter._CALLER_IDENTITY_CACHE.clear()
-        self.assertEqual(calls, 1)
+        self.assertEqual(cached, 1)
+        # a DIFFERENT credential is a different principal and must be asked again
+        self.assertEqual(distinct, 2)
 
 
 if __name__ == "__main__":

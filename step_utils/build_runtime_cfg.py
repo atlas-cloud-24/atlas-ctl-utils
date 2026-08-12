@@ -53,7 +53,6 @@ def load_yaml_mapping(path: Path) -> dict:
     return data
 
 
-
 EXECUTION_CONTEXT_ROOT = "execution_context"
 
 
@@ -65,7 +64,9 @@ def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
     data = load_yaml_mapping(path)
     nested = data.get(EXECUTION_CONTEXT_ROOT)
     if not isinstance(nested, dict):
-        raise RuntimeError(f"execution context file must contain a top-level {EXECUTION_CONTEXT_ROOT} mapping: {path}")
+        raise RuntimeError(
+            f"execution context file must contain a top-level {EXECUTION_CONTEXT_ROOT} mapping: {path}"
+        )
     flat: dict[str, object] = {}
 
     def walk(prefix: str, entries: dict) -> None:
@@ -80,14 +81,14 @@ def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
                 walk(ref, value)
             elif isinstance(value, list):
                 if not all(isinstance(item, (str, int, float, bool)) for item in value):
-                    raise RuntimeError(
-                        f"execution context key {ref!r} must be a list of scalars"
-                    )
+                    raise RuntimeError(f"execution context key {ref!r} must be a list of scalars")
                 flat[ref] = value
             elif isinstance(value, (str, int, float, bool)):
                 flat[ref] = value
             else:
-                raise RuntimeError(f"execution context key {ref!r} must be scalar, got {type(value).__name__}")
+                raise RuntimeError(
+                    f"execution context key {ref!r} must be scalar, got {type(value).__name__}"
+                )
 
     for namespace, entries in nested.items():
         if not isinstance(entries, dict):
@@ -108,13 +109,12 @@ def merge_values(base, overlay):
     return deepcopy(overlay)
 
 
-
 def format_cfg_path(path: tuple[str, ...]) -> str:
     return ".".join(path) if path else "<root>"
 
 
 def parse_cfg_entry_ref(value: str, path: tuple[str, ...]) -> tuple[str, str]:
-    body = value[len(CFG_ENTRY_REF_PREFIX):]
+    body = value[len(CFG_ENTRY_REF_PREFIX) :]
     if ":" not in body:
         raise RuntimeError(
             f"cfg entry reference at {format_cfg_path(path)} must use "
@@ -122,9 +122,13 @@ def parse_cfg_entry_ref(value: str, path: tuple[str, ...]) -> tuple[str, str]:
         )
     collection, key = body.rsplit(":", 1)
     if not collection:
-        raise RuntimeError(f"cfg entry reference at {format_cfg_path(path)} has an empty collection path")
+        raise RuntimeError(
+            f"cfg entry reference at {format_cfg_path(path)} has an empty collection path"
+        )
     if not key or key != key.strip():
-        raise RuntimeError(f"cfg entry reference at {format_cfg_path(path)} has an empty or padded item key")
+        raise RuntimeError(
+            f"cfg entry reference at {format_cfg_path(path)} has an empty or padded item key"
+        )
     if not CFG_ENTRY_REF_COLLECTION_RE.fullmatch(collection):
         raise RuntimeError(
             f"cfg entry reference at {format_cfg_path(path)} has invalid collection path {collection!r}"
@@ -374,7 +378,9 @@ class Resolver:
         return value
 
 
-def build_step_values(origin_cfg_dir: Path, cfg_keys: dict, env_ctx: dict[str, str]) -> tuple[dict, list[str]]:
+def build_step_values(
+    origin_cfg_dir: Path, cfg_keys: dict, env_ctx: dict[str, str]
+) -> tuple[dict, list[str]]:
     docs = load_domain_docs(origin_cfg_dir)
     merged: dict = {}
     merged_domains: list[str] = []
@@ -461,8 +467,7 @@ def parse_cfg_keys(raw: str) -> dict:
         for domain, bindings in parsed.items()
     ):
         raise argparse.ArgumentTypeError(
-            "--cfg-keys must be a JSON map of domain -> non-empty map of "
-            "local name -> cfg key"
+            "--cfg-keys must be a JSON map of domain -> non-empty map of local name -> cfg key"
         )
     return parsed
 
@@ -512,7 +517,8 @@ def main() -> int:
                 },
                 indent=2,
                 sort_keys=True,
-            ) + "\n",
+            )
+            + "\n",
             encoding="utf-8",
         )
 

@@ -13,7 +13,6 @@ the listed names, and the suite would stay green while covering a fraction of th
 engine. The walk below covers a module the moment it exists.
 """
 
-
 import functools
 import os
 import re
@@ -27,8 +26,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 import atlas_ctl_adapter_aws as aws_adapter
 import ctl_cfg_fixture
-from engine.run import policy as run_policy
 from engine.execution.adapters import get_adapter
+from engine.run import policy as run_policy
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -141,9 +140,7 @@ class EngineCoreDiscoveryTests(unittest.TestCase):
 
         package = REPO_ROOT / "runners" / "engine"
         covered = [path for path in engine_core_files() if package in path.parents]
-        self.assertTrue(
-            covered, f"the walk reached no module under {package}"
-        )
+        self.assertTrue(covered, f"the walk reached no module under {package}")
         self.assertIn(package / "commands" / "pipeline.py", set(covered))
 
     def test_the_walk_still_covers_what_the_old_list_named(self):
@@ -181,7 +178,9 @@ class ProviderBoundaryTests(unittest.TestCase):
                 for number, line in enumerate(text.splitlines(), start=1)
                 if FORBIDDEN_PUBLIC.search(line) and "removed" not in line
             ]
-            self.assertEqual(public_hits, [], "engine-core role-chain leakage:\n" + "\n".join(public_hits))
+            self.assertEqual(
+                public_hits, [], "engine-core role-chain leakage:\n" + "\n".join(public_hits)
+            )
 
     def test_unknown_provider_is_a_hard_error(self):
         """Unknown means UNDECLARED. The engine holds no adapter list to be absent
@@ -222,6 +221,10 @@ class ProviderBoundaryTests(unittest.TestCase):
 
 class ContractWrapperTests(unittest.TestCase):
     @unittest.mock.patch.dict(os.environ, {}, clear=True)
+    @unittest.mock.patch.dict(
+        os.environ,
+        {"AWS_ACCESS_KEY_ID": "ASIABYPASS", "AWS_SECRET_ACCESS_KEY": "s", "AWS_SESSION_TOKEN": "t"},
+    )
     def test_validate_and_bind_wrappers_run_in_bypass_mode(self):
         # the wrappers dispatch back through the engine's provider lookup
         ctl_cfg_fixture.cfg_root(self, "aws")
@@ -240,12 +243,12 @@ class ContractWrapperTests(unittest.TestCase):
             execution_context={},
             implementation_key="sso",
             execution_access_mode="force_bypass",
-            provider_options={"force_bypass_credential_profile": "substitute"},
+            provider_options={"force_bypass_env": "true"},
         )
         target_env: dict[str, str] = {}
         with unittest.mock.patch.object(
-            aws_adapter.execution,
-            "export_profile_credentials",
+            aws_adapter.credentials,
+            "force_bypass_credentials",
             return_value={"AWS_ACCESS_KEY_ID": "AKIA", "AWS_SECRET_ACCESS_KEY": "s"},
         ) as export:
             aws_adapter.materialize_target_binding(
@@ -256,9 +259,9 @@ class ContractWrapperTests(unittest.TestCase):
                 execution_context={},
                 implementation_key="sso",
                 execution_access_mode="force_bypass",
-                provider_options={"force_bypass_credential_profile": "substitute"},
+                provider_options={"force_bypass_env": "true"},
             )
-        export.assert_called_once_with("substitute")
+        export.assert_called_once()
         self.assertEqual(target_env.get("AWS_ACCESS_KEY_ID"), "AKIA")
         self.assertNotIn("AWS_PROFILE", target_env)
 
@@ -286,18 +289,27 @@ class SsoCredentialAcquisitionTests(unittest.TestCase):
     """
 
     def test_sso_acquisition_returns_env_credentials_only(self):
-        response = {"roleCredentials": {
-            "accessKeyId": "AKIA", "secretAccessKey": "SECRET",
-            "sessionToken": "TOKEN", "expiration": 123,
-        }}
-        with unittest.mock.patch.object(
-            aws_adapter.credentials, "_run_aws_json", return_value=response
-        ), unittest.mock.patch.object(
-            aws_adapter.credentials, "_sso_access_token", return_value="t"
+        response = {
+            "roleCredentials": {
+                "accessKeyId": "AKIA",
+                "secretAccessKey": "SECRET",
+                "sessionToken": "TOKEN",
+                "expiration": 123,
+            }
+        }
+        with (
+            unittest.mock.patch.object(
+                aws_adapter.credentials, "_run_aws_json", return_value=response
+            ),
+            unittest.mock.patch.object(
+                aws_adapter.credentials, "_sso_access_token", return_value="t"
+            ),
         ):
             creds = aws_adapter.acquire_aws_sso_credentials(
                 {"start_url": "https://x", "sso_region": "eu-west-2", "session_name": "s"},
-                "111111111111", "CtlEntryAccess", label="test",
+                "111111111111",
+                "CtlEntryAccess",
+                label="test",
             )
         self.assertEqual(
             sorted(creds),
@@ -306,15 +318,22 @@ class SsoCredentialAcquisitionTests(unittest.TestCase):
 
     def test_incomplete_sso_response_fails_loud(self):
         response = {"roleCredentials": {"accessKeyId": "AKIA", "sessionToken": "T"}}
-        with unittest.mock.patch.object(
-            aws_adapter.credentials, "_run_aws_json", return_value=response
-        ), unittest.mock.patch.object(
-            aws_adapter.credentials, "_sso_access_token", return_value="t"
-        ), self.assertRaisesRegex(RuntimeError, "secretAccessKey"):
+        with (
+            unittest.mock.patch.object(
+                aws_adapter.credentials, "_run_aws_json", return_value=response
+            ),
+            unittest.mock.patch.object(
+                aws_adapter.credentials, "_sso_access_token", return_value="t"
+            ),
+            self.assertRaisesRegex(RuntimeError, "secretAccessKey"),
+        ):
             aws_adapter.acquire_aws_sso_credentials(
                 {"start_url": "https://x", "sso_region": "eu-west-2", "session_name": "s"},
-                "111111111111", "CtlEntryAccess", label="test",
+                "111111111111",
+                "CtlEntryAccess",
+                label="test",
             )
+
 
 class CredentialPathIteratorTests(unittest.TestCase):
     """§12.3: the AWS credential-path executor makes no assumption about the
@@ -325,16 +344,19 @@ class CredentialPathIteratorTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no role hops"):
             aws_adapter.validate_credential_path([])
         with self.assertRaisesRegex(RuntimeError, "repeats a role ARN"):
-            aws_adapter.validate_credential_path([
-                "arn:aws:iam::111111111111:role/a",
-                "arn:aws:iam::111111111111:role/a",
-            ])
+            aws_adapter.validate_credential_path(
+                [
+                    "arn:aws:iam::111111111111:role/a",
+                    "arn:aws:iam::111111111111:role/a",
+                ]
+            )
 
     def test_iterator_supports_one_two_three_hops(self):
         seen = []
 
         def fake_run(cmd, capture_output, text, env):
             import types
+
             if "get-caller-identity" in cmd:
                 out = '{"Account": "111111111111", "Arn": "arn:aws:sts::111111111111:assumed-role/Entry/s"}'
             else:
@@ -351,10 +373,14 @@ class CredentialPathIteratorTests(unittest.TestCase):
             seen.clear()
             with unittest.mock.patch("subprocess.run", side_effect=fake_run):
                 creds = aws_adapter.assume_ctl_role_chain(
-                    {"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "SK",
-                     "AWS_SESSION_TOKEN": "ST"},
+                    {
+                        "AWS_ACCESS_KEY_ID": "AK",
+                        "AWS_SECRET_ACCESS_KEY": "SK",
+                        "AWS_SESSION_TOKEN": "ST",
+                    },
                     hops,
-                    session_name="s", entry_expected_account_id="111111111111",
+                    session_name="s",
+                    entry_expected_account_id="111111111111",
                     entry_role_name="Entry",
                 )
             self.assertEqual(seen, hops)  # every hop assumed, in order
@@ -383,13 +409,17 @@ class ExecutionAccessModeTests(unittest.TestCase):
                 policy["allowed_execution_access_modes"], ["standard", "agreed_direct"]
             )
             aws_adapter.authorize_run(
-                policy, execution_access_mode="standard",
-                provider_options={"credential_acquisition": "sso"}, label="p",
+                policy,
+                execution_access_mode="standard",
+                provider_options={"credential_acquisition": "sso"},
+                label="p",
             )
             with self.assertRaisesRegex(RuntimeError, "is not allowed by"):
                 aws_adapter.authorize_run(
-                    policy, execution_access_mode="force_bypass",
-                    provider_options={}, label="p",
+                    policy,
+                    execution_access_mode="force_bypass",
+                    provider_options={},
+                    label="p",
                 )
 
     def test_mode_consent_is_the_adapters_answer(self):
@@ -440,14 +470,18 @@ class ExecutionAccessModeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "allow_agreed_direct_execution_access"):
                 check({"execution_identities": {"aws": execution}})
             with self.assertRaisesRegex(RuntimeError, "allowed_agreed_direct_credential_sources"):
-                check({
+                check(
+                    {
+                        "allow_agreed_direct_execution_access": True,
+                        "execution_identities": {"aws": {}},
+                    }
+                )
+            check(
+                {
                     "allow_agreed_direct_execution_access": True,
-                    "execution_identities": {"aws": {}},
-                })
-            check({
-                "allow_agreed_direct_execution_access": True,
-                "execution_identities": {"aws": execution},
-            })
+                    "execution_identities": {"aws": execution},
+                }
+            )
 
     def test_modes_that_resolve_no_identity_are_declared(self):
         self.assertFalse(aws_adapter.resolves_execution_identity("force_bypass"))
@@ -466,27 +500,32 @@ class ExecutionAccessModeTests(unittest.TestCase):
         }
         opts = {"force_skip_account_expectation_check": "true"}
         with self.assertRaisesRegex(RuntimeError, "allow_force_skip_account_expectation_check"):
-            aws_adapter.authorize_run(policy, execution_access_mode="force_bypass",
-                                      provider_options=opts, label="p")
+            aws_adapter.authorize_run(
+                policy, execution_access_mode="force_bypass", provider_options=opts, label="p"
+            )
         granted = dict(policy, allow_force_skip_account_expectation_check=True)
-        aws_adapter.authorize_run(granted, execution_access_mode="force_bypass",
-                                  provider_options=opts, label="p")
+        aws_adapter.authorize_run(
+            granted, execution_access_mode="force_bypass", provider_options=opts, label="p"
+        )
         # a credential implementation the profile does not allow is refused
         with self.assertRaisesRegex(RuntimeError, "credential implementation"):
             aws_adapter.authorize_run(
-                granted, execution_access_mode="force_bypass",
-                provider_options={"credential_acquisition": "web_identity"}, label="p")
+                granted,
+                execution_access_mode="force_bypass",
+                provider_options={"credential_acquisition": "web_identity"},
+                label="p",
+            )
         with self.assertRaisesRegex(RuntimeError, "must be 'true' or 'false'"):
-            aws_adapter.validate_provider_options({
-                "credential_acquisition": "sso",
-                "force_skip_account_expectation_check": "yes",
-            })
+            aws_adapter.validate_provider_options(
+                {
+                    "credential_acquisition": "sso",
+                    "force_skip_account_expectation_check": "yes",
+                }
+            )
 
     def test_options_may_imply_a_mode(self):
         self.assertEqual(
-            aws_adapter.execution_access_mode_from_options(
-                {"force_bypass_credential_profile": "dev"}
-            ),
+            aws_adapter.execution_access_mode_from_options({"force_bypass_profile": "dev"}),
             "force_bypass",
         )
         self.assertIsNone(aws_adapter.execution_access_mode_from_options({}))
@@ -518,6 +557,7 @@ class AdapterInternalLayeringTest(unittest.TestCase):
 
     def _package(self) -> Path:
         import atlas_ctl_adapter_aws as pkg
+
         return Path(pkg.__file__).parent
 
     def test_the_three_parts_exist(self):
@@ -540,10 +580,10 @@ class AdapterInternalLayeringTest(unittest.TestCase):
                     if dep not in allowed:
                         offenders.append(f"{part} -> {dep}")
         self.assertEqual(
-            [], offenders,
+            [],
+            offenders,
             "an edge against the direction puts the two CONTRACTS back in a cycle, "
-            "which is the thing credentials/ was extracted to prevent:\n"
-            + "\n".join(offenders),
+            "which is the thing credentials/ was extracted to prevent:\n" + "\n".join(offenders),
         )
 
     def test_no_part_uses_a_star_import(self):
@@ -565,10 +605,18 @@ class AdapterInternalLayeringTest(unittest.TestCase):
 
         import atlas_ctl_adapter_aws as pkg
 
-        for name in ("validate_catalog", "describe", "materialize_target_binding",
-                     "resolve_ctl_state_credential", "create_state_syncer",
-                     "preflight_execution_identity", "target_assertion_argv",
-                     "_run_aws_json", "_assume_role_credentials", "subprocess"):
+        for name in (
+            "validate_catalog",
+            "describe",
+            "materialize_target_binding",
+            "resolve_ctl_state_credential",
+            "create_state_syncer",
+            "preflight_execution_identity",
+            "target_assertion_argv",
+            "_run_aws_json",
+            "_assume_role_credentials",
+            "subprocess",
+        ):
             with self.subTest(name=name):
                 self.assertTrue(hasattr(pkg, name), f"{name} left the adapter surface")
 
@@ -619,7 +667,9 @@ class AdapterActivationTest(unittest.TestCase):
         ) + body
         return subprocess.run(
             [sys.executable, "-c", script],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
             # An inherited PYTHONPATH could supply the adapter and hide the point.
             env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
         )

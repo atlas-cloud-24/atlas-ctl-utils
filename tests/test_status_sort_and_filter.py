@@ -107,15 +107,11 @@ class OneVocabularyTest(unittest.TestCase):
         as the first segment of the address, so printing it would repeat what a
         reader can already see — but "only the workflows" is a real question."""
 
-        self.assertEqual(
-            state_status.FILTER_FIELDS, ("kind", *state_status.SORT_FIELDS)
-        )
+        self.assertEqual(state_status.FILTER_FIELDS, ("kind", *state_status.SORT_FIELDS))
 
     def test_yaml_only_relation_detail_survives_report_structuring(self):
         row = next(item for item in _flat(MAP) if item.get("standing") == "superseded")
-        self.assertEqual(
-            "workflow/env/core/instances/env.type=dev", row["superseded_by"]
-        )
+        self.assertEqual("workflow/env/core/instances/env.type=dev", row["superseded_by"])
         self.assertNotIn("superseded_by", state_status.SORT_FIELDS)
 
     def test_the_time_axis_and_the_time_sort_field_are_one_word(self):
@@ -238,7 +234,9 @@ class FilterNarrowsTest(unittest.TestCase):
         narrowed = _flat(_filtered("kind=workflow"))
         narrower = _flat(_filtered("kind=workflow", "status=failed"))
         self.assertLess(len(narrower), len(narrowed))
-        self.assertTrue({row["address"] for row in narrower} <= {row["address"] for row in narrowed})
+        self.assertTrue(
+            {row["address"] for row in narrower} <= {row["address"] for row in narrowed}
+        )
 
     def test_every_row_field_can_be_filtered_on(self):
         for pair, expected in (
@@ -300,9 +298,7 @@ class FilterNarrowsTest(unittest.TestCase):
         kept = _filtered("kind=workflow", "group=mutative")
         body = kept["workflow"]["env/seed"]
         self.assertIn(run_addressing.INSTANCES_MARKER, body)
-        self.assertEqual(
-            list(body[run_addressing.INSTANCES_MARKER]["env.type=dev"]), ["mutative"]
-        )
+        self.assertEqual(list(body[run_addressing.INSTANCES_MARKER]["env.type=dev"]), ["mutative"])
 
 
 class FilterRefusalsTest(unittest.TestCase):
@@ -323,9 +319,7 @@ class FilterRefusalsTest(unittest.TestCase):
 
     def test_a_wildcard_is_only_a_single_trailing_prefix_marker(self):
         for value in ("*", "*failed", "fail*ed", "fail**"):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                RuntimeError, "one trailing"
-            ):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "one trailing"):
                 state_status.parse_filters([f"status={value}"])
 
     def test_the_echoed_filters_parse_back(self):
@@ -356,9 +350,7 @@ class SortAndFilterComposeTest(unittest.TestCase):
         """Only SORTING is narrowed by the nested shape — a filter tests one row
         at a time, so it works the same in both."""
 
-        kept = state_status.filter_status_map(
-            MAP, state_status.parse_filters(["status=failed"])
-        )
+        kept = state_status.filter_status_map(MAP, state_status.parse_filters(["status=failed"]))
         nested = state_status.structure_status_map(kept, "nested", "time:desc")
         self.assertEqual(list(nested), ["workflow"])
         self.assertEqual(list(nested["workflow"]), ["env/seed", "env/core"])

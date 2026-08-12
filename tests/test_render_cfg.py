@@ -55,11 +55,18 @@ class RenderScopeTreeTests(unittest.TestCase):
             },
             CTX,
         )
-        app = yaml.safe_load((rendered / "env/computing/asg.yaml").read_text())["foundation"]["computing"]["asg_cfg"]["app"]
+        app = yaml.safe_load((rendered / "env/computing/asg.yaml").read_text())["foundation"][
+            "computing"
+        ]["asg_cfg"]["app"]
         self.assertEqual(app["name"], "oxygen-asg")
         self.assertEqual(
             app["launch_template_key"],
-            {"cfg_entry_ref": {"collection": "foundation.computing.launch_templates_cfg", "key": "app"}},
+            {
+                "cfg_entry_ref": {
+                    "collection": "foundation.computing.launch_templates_cfg",
+                    "key": "app",
+                }
+            },
         )
         self.assertEqual((rendered / "env/notes.md").read_text(), "not yaml\n")
 
@@ -79,8 +86,12 @@ class RenderScopeTreeTests(unittest.TestCase):
             },
             CTX,
         )
-        self.assertEqual(yaml.safe_load((rendered / "env/a.yaml").read_text())["uses"]["ref"], "env-value")
-        self.assertEqual(yaml.safe_load((rendered / "org/b.yaml").read_text())["uses"]["ref"], "org-value")
+        self.assertEqual(
+            yaml.safe_load((rendered / "env/a.yaml").read_text())["uses"]["ref"], "env-value"
+        )
+        self.assertEqual(
+            yaml.safe_load((rendered / "org/b.yaml").read_text())["uses"]["ref"], "org-value"
+        )
 
 
 if __name__ == "__main__":

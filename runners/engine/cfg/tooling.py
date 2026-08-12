@@ -6,7 +6,6 @@ disk. The filesystem is not a registry."""
 
 import functools
 import logging
-
 from pathlib import Path
 
 from engine.cfg import merge as cfg_merge
@@ -64,7 +63,7 @@ def load_local_tooling_cfg(ctl_cfg_root: Path) -> dict:
     return dict(_local_tooling_cfg(str(Path(ctl_cfg_root).resolve())))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _local_tooling_cfg(resolved_root: str) -> dict:
     ctl_cfg_root = Path(resolved_root)
     raw_tooling_cfg = cfg_resources.collect_resource(ctl_cfg_root, "tooling")

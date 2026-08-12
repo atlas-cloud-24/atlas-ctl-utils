@@ -20,17 +20,11 @@ def make_cfg(root: Path) -> Path:
     cfg = root / "ctl-cfg"
     write(
         cfg / "arbitrary" / "fan.yaml",
-        "fan_outs:\n"
-        "  deploy-all:\n"
-        "    runs:\n"
-        "    - workflow_key: deploy\n",
+        "fan_outs:\n  deploy-all:\n    runs:\n    - workflow_key: deploy\n",
     )
     write(
         cfg / "not-workflows.yaml",
-        "workflows:\n"
-        "  deploy:\n"
-        "    actions: [provision]\n"
-        "    target_keys: [app]\n",
+        "workflows:\n  deploy:\n    actions: [provision]\n    target_keys: [app]\n",
     )
     write(
         cfg / "anything.yaml",
@@ -38,13 +32,11 @@ def make_cfg(root: Path) -> Path:
         "  app:\n"
         "    actions: [provision]\n"
         "    source_key: target_sources.app-source\n"
-        "    execution_identity_key: deploy-group\n"
+        "    execution_identity_key: deploy-group\n",
     )
     write(
         cfg / "catalog-a.yaml",
-        "target_sources:\n"
-        "  app-source:\n"
-        "    repo_url: https://example.test/app.git\n",
+        "target_sources:\n  app-source:\n    repo_url: https://example.test/app.git\n",
     )
     write(
         cfg / "catalog-b.yaml",
@@ -80,11 +72,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
             def edge(source_kind, source_key, target_kind, target_key, label=""):
                 source = diagram.node_id(source_kind, source_key)
                 target = diagram.node_id(target_kind, target_key)
-                return (
-                    f'{source} -->|"{label}"| {target}'
-                    if label
-                    else f"{source} --> {target}"
-                )
+                return f'{source} -->|"{label}"| {target}' if label else f"{source} --> {target}"
 
             general = diagram.build_diagram(
                 cfg,
@@ -182,8 +170,8 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 "  app:\n"
                 "    actions: [provision]\n"
                 "    source_key: target_sources.app-source\n"
-                "    execution_identity_key: runtime-${execution_context.params.account}\n"
-                    )
+                "    execution_identity_key: runtime-${execution_context.params.account}\n",
+            )
             write(
                 cfg / "extra.yaml",
                 "execution_identities:\n"
@@ -251,9 +239,7 @@ class CtlCfgDiagramTests(unittest.TestCase):
 """,
             )
 
-            provision = diagram.build_diagram(
-                cfg, action="provision", view="general"
-            )
+            provision = diagram.build_diagram(cfg, action="provision", view="general")
             plan = diagram.build_diagram(cfg, action="plan", view="general")
 
             self.assertIn("provision<br/>app", provision)
@@ -287,8 +273,8 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 cfg / "destroy.yaml",
                 "workflows:\n  remove:\n    actions: [destroy]\n    target_keys: [remove-app]\n"
                 "targets:\n  remove-app:\n    actions: [destroy]\n    source_key: target_sources.app-source\n"
-                "    execution_identity_key: deploy-group\n"
-                    )
+                "    execution_identity_key: deploy-group\n",
+            )
 
             rendered = diagram.build_diagram(
                 cfg,
@@ -313,18 +299,8 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 self.assertEqual(diagram.main(), 0)
 
             for view in diagram.DIAGRAM_VIEWS:
-                self.assertTrue(
-                    (
-                        cfg
-                        / "diagrams"
-                        / "provision"
-                        / view
-                        / "diagram.mmd"
-                    ).is_file()
-                )
-            self.assertFalse(
-                (cfg / "diagrams" / "ctl-cfg-architecture-provision.mmd").exists()
-            )
+                self.assertTrue((cfg / "diagrams" / "provision" / view / "diagram.mmd").is_file())
+            self.assertFalse((cfg / "diagrams" / "ctl-cfg-architecture-provision.mmd").exists())
             self.assertFalse((cfg / "ctl-cfg-architecture.mmd").exists())
 
     def test_render_svg_invokes_mmdc_and_requires_output(self):
@@ -341,8 +317,9 @@ class CtlCfgDiagramTests(unittest.TestCase):
                 write(output_path, "<svg></svg>\n")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            with mock.patch.object(diagram.shutil, "which", return_value="/usr/bin/mmdc"), mock.patch.object(
-                diagram.subprocess, "run", side_effect=fake_run
+            with (
+                mock.patch.object(diagram.shutil, "which", return_value="/usr/bin/mmdc"),
+                mock.patch.object(diagram.subprocess, "run", side_effect=fake_run),
             ):
                 diagram.render_svg(mmd_path, svg_path)
 

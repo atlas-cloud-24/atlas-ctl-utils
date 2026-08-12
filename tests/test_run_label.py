@@ -51,11 +51,7 @@ class LabelIsOfferedWhereItGroupsSomethingTest(unittest.TestCase):
             with self.subTest(run_type=run_type):
                 parser = argparse.ArgumentParser()
                 cli_args.add_common_args(parser, run_type=run_type)
-                flags = {
-                    option
-                    for action in parser._actions
-                    for option in action.option_strings
-                }
+                flags = {option for action in parser._actions for option in action.option_strings}
                 self.assertIn("--label", flags)
 
     def test_maintenance_is_offered_no_label(self):
@@ -63,9 +59,7 @@ class LabelIsOfferedWhereItGroupsSomethingTest(unittest.TestCase):
 
         parser = argparse.ArgumentParser()
         cli_args.add_common_args(parser, run_type="maintenance")
-        flags = {
-            option for action in parser._actions for option in action.option_strings
-        }
+        flags = {option for action in parser._actions for option in action.option_strings}
         self.assertNotIn("--label", flags)
 
 
@@ -83,15 +77,13 @@ class LabelNormalizationTest(unittest.TestCase):
         """An empty string would be a label every unlabelled run shares."""
 
         for value in ("", "   "):
-            with self.subTest(value=value):
-                with self.assertRaises(RuntimeError):
-                    cli_args.normalize_run_label(value)
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                cli_args.normalize_run_label(value)
 
     def test_a_label_that_breaks_a_line_or_a_column_is_refused(self):
         for value in ("two\nlines", "a" * (cli_args.RUN_LABEL_MAX_LENGTH + 1)):
-            with self.subTest(value=value):
-                with self.assertRaises(RuntimeError):
-                    cli_args.normalize_run_label(value)
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                cli_args.normalize_run_label(value)
 
     def test_a_label_argparse_would_read_as_a_flag_is_refused(self):
         """`--label=-x` parses fine HERE and dies in the child, which receives
@@ -117,14 +109,16 @@ class LabelReachesTheRunRecordTest(unittest.TestCase):
                 self.assertIn("label", inspect.signature(builder).parameters)
                 with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
                     run_dir, *_ = builder(
-                        "labelled-run", "provision", "target", "env/seed/baseline",
-                        Path(tmp), _memory_handler(),
+                        "labelled-run",
+                        "provision",
+                        "target",
+                        "env/seed/baseline",
+                        Path(tmp),
+                        _memory_handler(),
                         locator_segments=["live"],
                         label=LABEL,
                     )
-                    self.assertEqual(
-                        state_run_store.load_run_metadata(run_dir).get("label"), LABEL
-                    )
+                    self.assertEqual(state_run_store.load_run_metadata(run_dir).get("label"), LABEL)
 
     def test_an_unlabelled_run_leaves_no_key(self):
         """Absence stays absence: an empty label would read as a release name
@@ -132,8 +126,12 @@ class LabelReachesTheRunRecordTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "plain-run", "provision", "target", "env/seed/baseline",
-                Path(tmp), _memory_handler(),
+                "plain-run",
+                "provision",
+                "target",
+                "env/seed/baseline",
+                Path(tmp),
+                _memory_handler(),
                 locator_segments=["live"],
             )
             self.assertNotIn("label", state_run_store.load_run_metadata(run_dir))
@@ -147,12 +145,16 @@ class LabelPropagatesToChildrenTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             parent_run_dir, *_ = commands_selection.setup_run_dirs(
-                "parent-run", "provision", "workflow", "env/seed",
-                Path(tmp), _memory_handler(),
+                "parent-run",
+                "provision",
+                "workflow",
+                "env/seed",
+                Path(tmp),
+                _memory_handler(),
                 locator_segments=["live"],
                 label=LABEL,
             )
-            argv = catalog_workflow.build_child_target_command(
+            argv = catalog_workflow.WorkflowChildren.build_command(
                 {
                     "ctl_entrypoint": "ctl.py",
                     "ctl_cfg_root": tmp,
@@ -171,11 +173,15 @@ class LabelPropagatesToChildrenTest(unittest.TestCase):
     def test_an_unlabelled_parent_passes_no_label_flag(self):
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             parent_run_dir, *_ = commands_selection.setup_run_dirs(
-                "parent-run", "provision", "workflow", "env/seed",
-                Path(tmp), _memory_handler(),
+                "parent-run",
+                "provision",
+                "workflow",
+                "env/seed",
+                Path(tmp),
+                _memory_handler(),
                 locator_segments=["live"],
             )
-            argv = catalog_workflow.build_child_target_command(
+            argv = catalog_workflow.WorkflowChildren.build_command(
                 {
                     "ctl_entrypoint": "ctl.py",
                     "ctl_cfg_root": tmp,
@@ -199,14 +205,16 @@ class LabelIsDenormalizedOntoThePointerTest(unittest.TestCase):
         self.assertIn("label", state_run_store._COMMITTED_FACT_KEYS)
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "published-run", "provision", "target", "env/seed/baseline",
-                Path(tmp), _memory_handler(),
+                "published-run",
+                "provision",
+                "target",
+                "env/seed/baseline",
+                Path(tmp),
+                _memory_handler(),
                 locator_segments=["live"],
                 label=LABEL,
             )
-            payload = state_status.build_status_payload(
-                run_dir, state_run_store.RunStatus.OK
-            )
+            payload = state_status.build_status_payload(run_dir, state_run_store.RunStatus.OK)
             state_run_store.publish_committed_pointer(run_dir, payload)
             pointer = state_run_store.read_committed_pointer(
                 state_run_store.ctl_state_dir_from_run_dir(run_dir), "mutative"
@@ -231,9 +239,7 @@ class LabelIsMetadataNeverIdentityTest(unittest.TestCase):
         reaches the source repository, so it is absent from the context a target
         runs under."""
 
-        parameters = inspect.signature(
-            execution_run_context.build_execution_context
-        ).parameters
+        parameters = inspect.signature(execution_run_context.build_execution_context).parameters
         self.assertNotIn("label", parameters)
 
     def test_no_address_is_built_from_it(self):
@@ -252,7 +258,7 @@ class LabelIsMetadataNeverIdentityTest(unittest.TestCase):
         """A workflow instance is addressed by the composition it names. A label
         inside the manifest would change the digest and therefore the instance."""
 
-        doc = catalog_workflow.build_workflow_identity_doc(
+        doc = catalog_workflow.WorkflowArtifacts.identity_doc(
             "env/seed",
             ["target/env/seed/baseline/instances/env.type=dev"],
             {"env_type": "dev"},
@@ -270,16 +276,18 @@ class LabelIsReadableFromStatusTest(unittest.TestCase):
     def test_a_row_reports_the_label_of_the_run_that_produced_its_status(self):
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "published-run", "provision", "target", "env/seed/baseline",
-                Path(tmp), _memory_handler(),
+                "published-run",
+                "provision",
+                "target",
+                "env/seed/baseline",
+                Path(tmp),
+                _memory_handler(),
                 locator_segments=["live"],
                 label=LABEL,
             )
             state_run_store.publish_committed_pointer(
                 run_dir,
-                state_status.build_status_payload(
-                    run_dir, state_run_store.RunStatus.OK
-                ),
+                state_status.build_status_payload(run_dir, state_run_store.RunStatus.OK),
             )
             namespace_root = Path(tmp) / "live"
             computed = state_status.compute_target_instance_status(
@@ -289,9 +297,7 @@ class LabelIsReadableFromStatusTest(unittest.TestCase):
                     "kind": "target",
                     "key": "env/seed/baseline",
                     "segments": [],
-                    "address": run_addressing.target_instance_address(
-                        "env/seed/baseline", []
-                    ),
+                    "address": run_addressing.target_instance_address("env/seed/baseline", []),
                 },
             )
             self.assertEqual(computed.get("label"), LABEL)

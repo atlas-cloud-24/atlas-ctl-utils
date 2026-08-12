@@ -69,23 +69,31 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
         # domains are consumer vocabulary; the engine accepts any snake_case key
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write(root / "ctl_state.yaml", "ctl_state_backends:\n  org:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n")
+            write(
+                root / "ctl_state.yaml",
+                "ctl_state_backends:\n  org:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n",
+            )
             cfg = state_sync.CtlStateBackends.load(root)
             self.assertEqual(set(cfg), {"org"})
-
 
     def test_legacy_bucket_schema_is_ignored(self):
         # legacy ctl_state_buckets alias removed (hard cutover): the section is
         # simply not read as a backend registry any more
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write(root / "ctl_state.yaml", "ctl_state_buckets:\n  env:\n    bucket_name: x\n    bucket_region: y\n")
+            write(
+                root / "ctl_state.yaml",
+                "ctl_state_buckets:\n  env:\n    bucket_name: x\n    bucket_region: y\n",
+            )
             self.assertIsNone(state_sync.CtlStateBackends.load(root))
 
     def test_rejects_non_snake_domain(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write(root / "ctl_state.yaml", "ctl_state_backends:\n  Org-State:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n")
+            write(
+                root / "ctl_state.yaml",
+                "ctl_state_backends:\n  Org-State:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n    bucket_region: y\n",
+            )
 
             with self.assertRaisesRegex(RuntimeError, "must be a snake_case key"):
                 state_sync.CtlStateBackends.load(root)
@@ -93,7 +101,10 @@ class CtlStateBucketsCfgTests(unittest.TestCase):
     def test_rejects_missing_region(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write(root / "ctl_state.yaml", "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n")
+            write(
+                root / "ctl_state.yaml",
+                "ctl_state_backends:\n  env:\n    provider: aws\n    backend_type: s3\n    bucket_name: x\n",
+            )
 
             with self.assertRaisesRegex(RuntimeError, "bucket_region must be a non-empty string"):
                 state_sync.CtlStateBackends.load(root)
@@ -150,9 +161,7 @@ class RunRecordPublicationTests(unittest.TestCase):
                 {"run_id": "rid", "ctl_state_local_root": str(root)},
             )
             workspace = state_run_store.run_workspace_dir(run_dir)
-            self.assertEqual(
-                workspace, root / "_local" / "workspaces" / "rid"
-            )
+            self.assertEqual(workspace, root / "_local" / "workspaces" / "rid")
             # no sync of any run prefix can ever reach it
             self.assertNotIn(str(run_dir), str(workspace))
 
@@ -176,8 +185,12 @@ class CtlStateSkipPolicyTests(unittest.TestCase):
     def test_defaults_to_strict(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "")
-            self.assertFalse(run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
-            self.assertFalse(run_policy.Permissions.FORCE_SKIP_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
+            self.assertFalse(
+                run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx")
+            )
+            self.assertFalse(
+                run_policy.Permissions.FORCE_SKIP_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx")
+            )
             # provider policy has no engine-granted default: it is declared
             with self.assertRaisesRegex(RuntimeError, "must declare allowed_providers"):
                 run_policy.ctl_allowed_providers(root, "test_ctx")
@@ -185,7 +198,9 @@ class CtlStateSkipPolicyTests(unittest.TestCase):
     def test_reads_profile_bool(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._ctl_root(tmp, "    allow_agreed_defer_ctl_state_backend_sync: true\n")
-            self.assertTrue(run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx"))
+            self.assertTrue(
+                run_policy.Permissions.AGREED_DEFER_CTL_STATE_BACKEND_SYNC.granted(root, "test_ctx")
+            )
 
     def test_rejects_non_bool(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -120,9 +120,7 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertTrue(step_yamls, "no step.yaml files discovered")
         for sy in step_yamls:
             meta = kernel_yaml_io.load_yaml(sy) or {}
-            self.assertNotIn(
-                "plt", meta, f"{sy} must remain PLT-provider-independent"
-            )
+            self.assertNotIn("plt", meta, f"{sy} must remain PLT-provider-independent")
             runtime_cfg = meta.get("runtime") or {}
             self.assertIn(
                 runtime_cfg.get("image"),

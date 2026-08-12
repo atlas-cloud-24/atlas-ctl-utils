@@ -19,7 +19,9 @@ import yaml
 from engine.kernel import process as kernel_process
 
 
-def git_clone(repo_url: str, branch: str | None, commit: str | None, dest: Path, token: str | None = None):
+def git_clone(
+    repo_url: str, branch: str | None, commit: str | None, dest: Path, token: str | None = None
+):
     env = os.environ.copy()
     askpass_path: str | None = None
     if token:
@@ -28,7 +30,7 @@ def git_clone(repo_url: str, branch: str | None, commit: str | None, dest: Path,
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(
                     "#!/bin/sh\n"
-                    "case \"$1\" in\n"
+                    'case "$1" in\n'
                     "  *Username*) printf '%s\\n' \"${GIT_HTTP_USERNAME:-x-access-token}\" ;;\n"
                     "  *Password*) printf '%s\\n' \"${GIT_HTTP_PASSWORD:-}\" ;;\n"
                     "  *) printf '\\n' ;;\n"
@@ -79,15 +81,15 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
         tuple: (repo_url, branch, commit) where one of branch/commit is None
     """
 
-    if '@' not in value:
+    if "@" not in value:
         raise argparse.ArgumentTypeError(
             f"Invalid format: '{value}'. Expected URL@branch=name or URL@commit=sha"
         )
 
     # Split on last @ to handle URLs that might contain @
-    idx = value.rfind('@')
+    idx = value.rfind("@")
     repo_url = value[:idx]
-    ref_part = value[idx + 1:]
+    ref_part = value[idx + 1 :]
 
     if not repo_url or not ref_part:
         raise argparse.ArgumentTypeError(
@@ -103,12 +105,16 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
     if ref_part.startswith("branch="):
         branch = ref_part[7:]  # len("branch=") = 7
         if not branch:
-            raise argparse.ArgumentTypeError(f"Invalid format: '{value}'. Branch name cannot be empty.")
+            raise argparse.ArgumentTypeError(
+                f"Invalid format: '{value}'. Branch name cannot be empty."
+            )
         return repo_url, branch, None
     elif ref_part.startswith("commit="):
         commit = ref_part[7:]  # len("commit=") = 7
         if not commit:
-            raise argparse.ArgumentTypeError(f"Invalid format: '{value}'. Commit sha cannot be empty.")
+            raise argparse.ArgumentTypeError(
+                f"Invalid format: '{value}'. Commit sha cannot be empty."
+            )
         return repo_url, None, commit
     else:
         raise argparse.ArgumentTypeError(
@@ -151,7 +157,7 @@ def _run_git(git_dir: Path, *args: str) -> str | None:
         return out.strip()
     except Exception:
         return None
-    
+
 
 def get_repo_url_safe(git_dir: str | Path) -> str | None:
     git_dir = Path(git_dir)

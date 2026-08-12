@@ -10,7 +10,6 @@ the importer asked for.
 Read-only. Writes a `.mmd` file (and an SVG when Mermaid CLI is available).
 """
 
-
 from __future__ import annotations
 
 import argparse
@@ -34,10 +33,18 @@ EXECUTION_CONTEXT_PREFIX = "execution_context."
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plt-cfg-root", required=True, help="Platform cfg directory to read.")
-    parser.add_argument("--out", help="Output .mmd path (default: <plt-cfg-root>/diagrams/composition.mmd).")
-    parser.add_argument("--audit-only", action="store_true", help="Report findings without writing a diagram.")
-    parser.add_argument("--mmdc", help="Path or command name for Mermaid CLI (default: mmdc from PATH).")
-    parser.add_argument("--mmd-only", action="store_true", help="Write Mermaid source without rendering SVG.")
+    parser.add_argument(
+        "--out", help="Output .mmd path (default: <plt-cfg-root>/diagrams/composition.mmd)."
+    )
+    parser.add_argument(
+        "--audit-only", action="store_true", help="Report findings without writing a diagram."
+    )
+    parser.add_argument(
+        "--mmdc", help="Path or command name for Mermaid CLI (default: mmdc from PATH)."
+    )
+    parser.add_argument(
+        "--mmd-only", action="store_true", help="Write Mermaid source without rendering SVG."
+    )
     return parser.parse_args()
 
 
@@ -92,7 +99,9 @@ class Graph:
         return "/" + rel if rel != "." else "/"
 
     def _load(self) -> None:
-        for meta_path in sorted(self.root.rglob(cfg_presets.IMPORTS_FILENAME.replace("imports", "meta"))):
+        for meta_path in sorted(
+            self.root.rglob(cfg_presets.IMPORTS_FILENAME.replace("imports", "meta"))
+        ):
             doc = yaml.safe_load(meta_path.read_text()) or {}
             if doc.get("type") == "overlay":
                 continue
@@ -140,10 +149,14 @@ class Graph:
 
     @staticmethod
     def _touches(references: set[str], provided: set[str]) -> bool:
-        return any(ref == key or ref.startswith(key + ".") for key in provided for ref in references)
+        return any(
+            ref == key or ref.startswith(key + ".") for key in provided for ref in references
+        )
 
     def importers_of(self, unit: str) -> list[str]:
-        return sorted(u for u, entries in self.imports.items() if any(e["from"] == unit for e in entries))
+        return sorted(
+            u for u, entries in self.imports.items() if any(e["from"] == unit for e in entries)
+        )
 
     def audit(self) -> list[tuple[str, str]]:
         """Findings the per-unit assertions structurally cannot see."""
@@ -161,7 +174,8 @@ class Graph:
                 provided = self.defines.get(source, set())
                 if entry["import"] != "*":
                     provided = {
-                        key for key in provided
+                        key
+                        for key in provided
                         if any(key == sel or key.startswith(sel + ".") for sel in entry["import"])
                     }
                 if entry["as"]:
@@ -170,24 +184,29 @@ class Graph:
                 if not top_level:
                     continue
                 touched = {
-                    key for key in top_level
+                    key
+                    for key in top_level
                     if any(ref == key or ref.startswith(key + ".") for ref in own_refs)
                 }
                 # A scope may import a preset purely to PUBLISH what it provides
                 republished = bool(top_level & own_defined) or unit in self.scopes
                 if not touched and not republished:
-                    findings.append((
-                        "unused-import",
-                        f"{unit} imports {source} but references none of {sorted(top_level)}",
-                    ))
+                    findings.append(
+                        (
+                            "unused-import",
+                            f"{unit} imports {source} but references none of {sorted(top_level)}",
+                        )
+                    )
                 elif touched and len(top_level - touched) > 0 and entry["import"] == "*":
                     extra = sorted(top_level - touched)
                     if not republished:
-                        findings.append((
-                            "wide-import",
-                            f"{unit} imports {source} with \"*\" but uses only {sorted(touched)}; "
-                            f"also receives {extra}",
-                        ))
+                        findings.append(
+                            (
+                                "wide-import",
+                                f'{unit} imports {source} with "*" but uses only {sorted(touched)}; '
+                                f"also receives {extra}",
+                            )
+                        )
 
         # An import declared where it is not used, while a preset BELOW it does use
         # it, is the dynamic-scoping shape: the importer carries a dependency on its
@@ -217,11 +236,13 @@ class Graph:
                     }
                 )
                 if consumers:
-                    findings.append((
-                        "import-belongs-lower",
-                        f"{unit} imports {source} but does not use it; "
-                        f"{', '.join(consumers)} does — declare it there",
-                    ))
+                    findings.append(
+                        (
+                            "import-belongs-lower",
+                            f"{unit} imports {source} but does not use it; "
+                            f"{', '.join(consumers)} does — declare it there",
+                        )
+                    )
 
         # An import whose content the unit neither references nor would lose —
         # because another of its imports already brings it — states nothing. It
@@ -232,7 +253,8 @@ class Graph:
             for entry in entries:
                 source = entry["from"]
                 reached_via = [
-                    other for other in direct
+                    other
+                    for other in direct
                     if other != source and source in self.reachable_from(other)
                 ]
                 if not reached_via:
@@ -241,11 +263,13 @@ class Graph:
                 provided = provided or self.defines.get(source, set())
                 if self._touches(self.uses[unit], provided):
                     continue
-                findings.append((
-                    "redundant-import",
-                    f"{unit} imports {source} without using it, and already receives it "
-                    f"via {reached_via[0]}",
-                ))
+                findings.append(
+                    (
+                        "redundant-import",
+                        f"{unit} imports {source} without using it, and already receives it "
+                        f"via {reached_via[0]}",
+                    )
+                )
 
         for unit in sorted(self.units):
             for name in self.aliases[unit]:
@@ -261,7 +285,9 @@ class Graph:
                     ref == f"{cfg_presets.PARAM_NAMESPACE}.{name}" for ref in self.uses[unit]
                 )
                 if not used_here and not bound_onward:
-                    findings.append(("unused-param", f"{unit} declares param {name!r} it never uses"))
+                    findings.append(
+                        ("unused-param", f"{unit} declares param {name!r} it never uses")
+                    )
 
         return findings
 
@@ -333,7 +359,11 @@ class Graph:
             lines.append(f'  subgraph L{level}["{title}"]')
             lines.append("    direction LR")
             for unit in sorted(by_level[level]):
-                shape = f'["{self._label(unit)}"]' if unit in self.scopes else f'("{self._label(unit)}")'
+                shape = (
+                    f'["{self._label(unit)}"]'
+                    if unit in self.scopes
+                    else f'("{self._label(unit)}")'
+                )
                 lines.append(f"    {node_id(unit)}{shape}")
             lines.append("  end")
 
@@ -344,7 +374,11 @@ class Graph:
                 lines.append(f"  {node_id(entry['from'])} --> {node_id(unit)}")
 
         for unit in units:
-            cls = "scope" if unit in self.scopes else ("parametrised" if self.params[unit] else "preset")
+            cls = (
+                "scope"
+                if unit in self.scopes
+                else ("parametrised" if self.params[unit] else "preset")
+            )
             lines.append(f"  class {node_id(unit)} {cls};")
         return "\n".join(lines) + "\n"
 
@@ -394,7 +428,11 @@ class Graph:
             lines.append(f'  subgraph G{title.split()[0]}["{title}"]')
             lines.append("    direction LR")
             for unit in group:
-                shape = f'["{self._label(unit)}"]' if unit in self.scopes else f'("{self._label(unit)}")'
+                shape = (
+                    f'["{self._label(unit)}"]'
+                    if unit in self.scopes
+                    else f'("{self._label(unit)}")'
+                )
                 lines.append(f"    {node_id(unit)}{shape}")
             lines.append("  end")
 
@@ -419,7 +457,11 @@ class Graph:
             lines.append("  (no consumer — this preset is unreachable)")
             return "\n".join(lines) + "\n"
         for unit in consumers:
-            how = "direct" if any(e["from"] == preset for e in self.imports.get(unit, [])) else "indirect"
+            how = (
+                "direct"
+                if any(e["from"] == preset for e in self.imports.get(unit, []))
+                else "indirect"
+            )
             kind = "scope" if unit in self.scopes else "preset"
             lines.append(f"  {unit:58} {kind:6} {how}")
         return "\n".join(lines) + "\n"
@@ -470,8 +512,10 @@ def main() -> int:
     graph = Graph(Path(args.plt_cfg_root))
 
     print(f"units: {len(graph.units)}  scopes: {len(graph.scopes)}  presets: {len(graph.presets)}")
-    print(f"imports: {sum(len(v) for v in graph.imports.values())}  "
-          f"parametrised presets: {sum(1 for u in graph.units if graph.params[u])}")
+    print(
+        f"imports: {sum(len(v) for v in graph.imports.values())}  "
+        f"parametrised presets: {sum(1 for u in graph.units if graph.params[u])}"
+    )
 
     findings = graph.audit()
     if findings:
@@ -512,7 +556,9 @@ def main() -> int:
         preset_dir.mkdir(parents=True, exist_ok=True)
         mmd_path = preset_dir / "consumers.mmd"
         mmd_path.write_text(graph.preset_mermaid(preset), encoding="utf-8")
-        (preset_dir / "consumers.txt").write_text(graph.preset_consumers_text(preset), encoding="utf-8")
+        (preset_dir / "consumers.txt").write_text(
+            graph.preset_consumers_text(preset), encoding="utf-8"
+        )
         count = len(graph.consumers_of(preset))
         print(f"  {preset:58} {count:2d} consumers")
         if not args.mmd_only:

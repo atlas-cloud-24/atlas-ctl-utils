@@ -68,9 +68,7 @@ class ToolingCfgIsCachedPerRootTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = tooling_root(tmp, **{"ctl-utils": {"repo_path": tmp}})
             cfg_tooling.load_local_tooling_cfg(root)["ctl-utils"] = "corrupted"
-            self.assertNotEqual(
-                "corrupted", cfg_tooling.load_local_tooling_cfg(root)["ctl-utils"]
-            )
+            self.assertNotEqual("corrupted", cfg_tooling.load_local_tooling_cfg(root)["ctl-utils"])
 
     def test_two_cfg_roots_are_cached_apart(self):
         """Keyed by root, not global: a fan-out child may run against another."""

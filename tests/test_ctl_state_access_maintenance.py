@@ -10,10 +10,9 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import atlas_ctl_adapter_aws as aws
 import ctl_cfg_fixture
-from engine_surface import engine_defines
-from engine_surface import engine_source
 from engine.commands import maintenance as commands_maintenance
 from engine.kernel import errors as kernel_errors
+from engine_surface import engine_defines, engine_source
 
 
 def write(path: Path, text: str) -> None:
@@ -22,11 +21,7 @@ def write(path: Path, text: str) -> None:
 
 
 from engine.execution import run_context as execution_run_context
-
-
 from engine.run import policy as run_policy
-
-
 from engine.state import sync as state_sync
 
 
@@ -66,7 +61,9 @@ class AccountRegistryTests(unittest.TestCase):
     def test_zone_file_is_selected_by_landing_zone(self):
         """A landing zone is a separate AWS organization, so the zone selects the
         FILE and each file holds one flat action — no selectors, no merging."""
-        temporary, root = self._root("  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n")
+        temporary, root = self._root(
+            "  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n"
+        )
         root_path = Path(temporary.name)
         write(
             root_path / "_inputs" / "aws" / "account_registries" / "canary.yaml",
@@ -83,7 +80,9 @@ class AccountRegistryTests(unittest.TestCase):
                 )
 
     def test_unknown_landing_zone_is_rejected(self):
-        temporary, root = self._root("  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n")
+        temporary, root = self._root(
+            "  ctl_plane:\n    slug: ctl-plane\n    account_id: '111111111111'\n"
+        )
         with temporary, self.assertRaisesRegex(RuntimeError, "must resolve exactly one member"):
             aws.load_aws_account_registry_cfg(
                 root, execution_context={"execution_context.params.landing_zone": "qa"}
@@ -91,9 +90,7 @@ class AccountRegistryTests(unittest.TestCase):
 
     def test_selected_placeholder_is_rejected(self):
         temporary, root = self._root(
-            "  ctl_plane:\n"
-            "    slug: ctl-plane\n"
-            "    account_id: <live-ctl-plane-account-id>\n"
+            "  ctl_plane:\n    slug: ctl-plane\n    account_id: <live-ctl-plane-account-id>\n"
         )
         with temporary, self.assertRaisesRegex(RuntimeError, "12-digit account id"):
             aws.load_aws_account_registry_cfg(
@@ -103,9 +100,7 @@ class AccountRegistryTests(unittest.TestCase):
 
     def test_catalog_reports_placeholder_as_concrete_binding_failure(self):
         temporary, root = self._root(
-            "  management:\n"
-            "    slug: management\n"
-            "    account_id: <live-management-account-id>\n"
+            "  management:\n    slug: management\n    account_id: <live-management-account-id>\n"
         )
         with temporary:
             aws.validate_catalog(root)
@@ -153,11 +148,19 @@ class AccountRegistryTests(unittest.TestCase):
                     "allowed_agreed_direct_credential_sources": ["management"],
                 },
             }
+            catalogs["sso_sessions"] = {
+                "main": {
+                    "session_name": "main",
+                    "start_url": "https://example.awsapps.com/start",
+                    "sso_region": "eu-west-2",
+                }
+            }
             catalogs["credential_sources"] = {
                 key: {
                     "sso": {
-                        "profile_name": key,
-                        "expect": {"account_key": account_key, "role_name": "Admin"},
+                        "session_key": "providers.aws.sso_sessions.main",
+                        "account_key": f"providers.aws.accounts_registry.{account_key}",
+                        "permission_set_name": "AdministratorAccess",
                     }
                 }
                 for key, account_key in (
@@ -192,8 +195,8 @@ class AccountRegistryTests(unittest.TestCase):
 
             with mock.patch.object(
                 aws.credentials,
-                "resolve_configured_profile_account_id",
-                return_value="111111111111",
+                "acquire_credential_source",
+                return_value={"AWS_ACCESS_KEY_ID": "ASIADEV"},
             ):
                 aws.validate_active_target_access(
                     {"dev": {"execution_identities": {"aws": executions["dev_direct"]}}},
@@ -260,11 +263,7 @@ class AccountSlugTests(unittest.TestCase):
         )
         return temporary, root
 
-    ENTRY = (
-        "  non_prod_email_svc:\n"
-        "    slug: non-prod-email-svc\n"
-        "    account_id: '111111111111'\n"
-    )
+    ENTRY = "  non_prod_email_svc:\n    slug: non-prod-email-svc\n    account_id: '111111111111'\n"
 
     def test_derived_params_publishes_the_slug_for_the_declared_account(self):
         temporary, root = self._root(self.ENTRY)
@@ -338,7 +337,8 @@ class SessionPolicyTests(unittest.TestCase):
         serialized = str(policy)
         self.assertNotIn("DeleteObjectVersion", serialized)
         put_statements = [
-            statement for statement in policy["Statement"]
+            statement
+            for statement in policy["Statement"]
             if "s3:PutObject" in statement.get("Action", [])
         ]
         self.assertEqual(len(put_statements), 1)
@@ -398,9 +398,7 @@ class ToolLockIsNotTheEngineTest(unittest.TestCase):
             "resolve_force_unlock_tfstate_binding",
             "force_unlock_resource_kind",
         ):
-            self.assertFalse(
-                engine_defines(name), f"{name} still exists in engine core"
-            )
+            self.assertFalse(engine_defines(name), f"{name} still exists in engine core")
 
     def test_maintenance_against_a_target_points_at_the_procedure(self):
         """
@@ -463,9 +461,11 @@ class HistoryPruneTests(unittest.TestCase):
                 ),
             ),
             mock.patch.object(execution_run_context, "build_execution_context", return_value={}),
-            mock.patch.object(state_sync.CtlStateAccess, "arm_operation", side_effect=returns) as arm,
+            mock.patch.object(
+                state_sync.CtlStateAccess, "arm_operation", side_effect=returns
+            ) as arm,
         ):
-            result = commands_maintenance.run_ctl_state_history_prune(Path("/cfg"), args)
+            result = commands_maintenance.CtlStateMaintenance.history_prune(Path("/cfg"), args)
         return result, arm
 
     def test_retained_workflow_reference_requires_explicit_cascade(self):
@@ -478,9 +478,7 @@ class HistoryPruneTests(unittest.TestCase):
             workflow_key = f"workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
-                "run_id: old-workflow-run\n"
-                "child_revisions:\n"
-                "- run_id: old-target-run\n",
+                "run_id: old-workflow-run\nchild_revisions:\n- run_id: old-target-run\n",
             )
             with self.assertRaisesRegex(RuntimeError, "referenced by retained workflow"):
                 self._run(
@@ -499,9 +497,7 @@ class HistoryPruneTests(unittest.TestCase):
             workflow_key = f"workflow/deploy/runs/{workflow_run}/RUN.yaml"
             write(
                 namespace / workflow_key,
-                "run_id: old-workflow-run\n"
-                "child_revisions:\n"
-                "- run_id: old-target-run\n",
+                "run_id: old-workflow-run\nchild_revisions:\n- run_id: old-target-run\n",
             )
             maintainer = _MemorySyncer()
             result, arm = self._run(
@@ -515,7 +511,9 @@ class HistoryPruneTests(unittest.TestCase):
             maintenance_scope = arm.call_args_list[1].kwargs["object_keys"]
             self.assertIn(target_key, maintenance_scope)
             self.assertIn(workflow_key, maintenance_scope)
-            self.assertTrue(any(key.startswith("_maintenance/history-prune/") for key in maintenance_scope))
+            self.assertTrue(
+                any(key.startswith("_maintenance/history-prune/") for key in maintenance_scope)
+            )
 
     def test_dry_run_writes_manifest_without_deleting_history(self):
         with tempfile.TemporaryDirectory() as tmp:

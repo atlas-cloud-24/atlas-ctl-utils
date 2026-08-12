@@ -5,10 +5,11 @@ decision made once at start-up, and burying it in a module with other
 responsibilities makes it look like something a caller may do repeatedly."""
 
 import logging
-import sys
 import logging.handlers
+import sys
 
 from engine.kernel import process as kernel_process
+
 
 def setup_logging() -> logging.handlers.MemoryHandler:
     """Setup logging with memory handler to capture early logs."""

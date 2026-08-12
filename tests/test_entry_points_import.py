@@ -31,13 +31,11 @@ def engine_entry_points() -> list[Path]:
     found = sorted(
         path
         for path in (REPO_ROOT / "cfg").glob("*.py")
-        if "__pycache__" not in path.parts
-        and "if __name__" in path.read_text(encoding="utf-8")
+        if "__pycache__" not in path.parts and "if __name__" in path.read_text(encoding="utf-8")
     )
     if not found:
         raise RuntimeError(
-            f"no entry points found under {REPO_ROOT / 'cfg'} — this check would "
-            f"pass vacuously"
+            f"no entry points found under {REPO_ROOT / 'cfg'} — this check would pass vacuously"
         )
     return found
 
@@ -80,9 +78,7 @@ class EntryPointsImportTest(unittest.TestCase):
     def test_every_engine_tool_imports(self):
         for path in engine_entry_points():
             with self.subTest(entry_point=path.name):
-                result = import_in_subprocess(
-                    path, extra_paths=[REPO_ROOT / "runners", ADAPTER]
-                )
+                result = import_in_subprocess(path, extra_paths=[REPO_ROOT / "runners", ADAPTER])
                 self.assertEqual(
                     0,
                     result.returncode,

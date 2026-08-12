@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import materialize as cfg_materialize
 from engine.cfg import overlays as cfg_overlays
@@ -114,7 +114,7 @@ def _validate_variation(
         provider_dispatch = plt_dispatch.ProviderDispatch(ctl_cfg_root, plt_cfg_root)
         rendered_views: list[tuple[Path, dict[str, object]]] = []
         if provider_dispatch.enabled and provider_dispatch.provider is None:
-            declared_targets = catalog_targets.load_target_catalog(ctl_cfg_root)
+            declared_targets = target_catalog.TargetCatalog.load(ctl_cfg_root)
             actions = sorted(
                 {
                     action
@@ -125,7 +125,7 @@ def _validate_variation(
             )
             validation_targets: dict[str, dict] = {}
             for action in actions:
-                action_cfg = catalog_targets.load_action_cfg(
+                action_cfg = target_catalog.TargetCatalog.action_cfg(
                     ctl_cfg_root, action, execution_context
                 )
                 validation_targets.update(action_cfg["targets"])
@@ -138,9 +138,7 @@ def _validate_variation(
                     {**target_run, "plt_overlays": plt_overlays},
                     execution_context=target_context,
                     target_cfg_dir=temp_root / "provider-views" / target_name,
-                    scope_params=execution_run_context.scope_params_from_context(
-                        target_context
-                    ),
+                    scope_params=execution_run_context.scope_params_from_context(target_context),
                 )
                 rendered_views.append((rendered_dir, target_context))
         elif provider_dispatch.enabled:
@@ -248,8 +246,8 @@ def main() -> int:
     # raw cfg here made every member look up as missing, so the union of member
     # instance params was always empty — the `missing` half of the guard could
     # never fire, and the `extra` half fired on any declaration at all.
-    catalog_workflow.validate_all_workflow_instance_params(
-        catalog_workflow.load_workflow_catalog(ctl_cfg_root),
+    catalog_workflow.WorkflowInstanceParams.validate_all(
+        catalog_workflow.WorkflowCatalog.load(ctl_cfg_root),
         cfg_resources.collect_resource(ctl_cfg_root, "targets"),
     )
     # whole-tree tooling activates every declared domain (see helper)

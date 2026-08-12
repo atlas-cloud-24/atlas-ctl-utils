@@ -4,7 +4,6 @@
 
 generate Mermaid and SVG dependency diagrams from Atlas ctl cfg."""
 
-
 from __future__ import annotations
 
 import argparse
@@ -22,7 +21,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine.catalog import targets as catalog_targets
+from engine.catalog import target_catalog
 from engine.cfg import resources as cfg_resources
 from engine.run import selectors as run_selectors
 
@@ -59,7 +58,9 @@ class Edge:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ctl-cfg-root", required=True, help="Ctl cfg directory to read and write into.")
+    parser.add_argument(
+        "--ctl-cfg-root", required=True, help="Ctl cfg directory to read and write into."
+    )
     parser.add_argument(
         "--action",
         action="append",
@@ -79,8 +80,12 @@ def parse_args() -> argparse.Namespace:
         default=28,
         help="Diagram font size in pixels (default: 28).",
     )
-    parser.add_argument("--mmdc", help="Path or command name for Mermaid CLI (default: mmdc from PATH).")
-    parser.add_argument("--mmd-only", action="store_true", help="Write Mermaid source without rendering SVG.")
+    parser.add_argument(
+        "--mmdc", help="Path or command name for Mermaid CLI (default: mmdc from PATH)."
+    )
+    parser.add_argument(
+        "--mmd-only", action="store_true", help="Write Mermaid source without rendering SVG."
+    )
     return parser.parse_args()
 
 
@@ -209,12 +214,10 @@ def build_diagram(
                 per_action.setdefault(entry_action, {})[name] = entry
         return per_action
 
-    workflows = _by_action(
-        cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1)
-    )
+    workflows = _by_action(cfg_resources.collect_resource(ctl_cfg_root, "workflows", entry_depth=1))
     # Through the catalog loader, so the diagram reads the same resolved keys the
     # engine runs on rather than the qualified paths cfg declares.
-    targets = _by_action(catalog_targets.load_target_catalog(ctl_cfg_root))
+    targets = _by_action(target_catalog.TargetCatalog.load(ctl_cfg_root))
     sources = cfg_resources.collect_resource(ctl_cfg_root, "target_sources")
     identities = cfg_resources.collect_resource(ctl_cfg_root, "execution_identities")
     backends = cfg_resources.collect_resource(ctl_cfg_root, "ctl_state_backends")
@@ -236,9 +239,7 @@ def build_diagram(
     for action in actions:
         for key in sorted(workflows.get(action) or {}):
             qualified = f"{action}:{key}"
-            nodes["workflow"].append(
-                (node_id("workflow", qualified), mermaid_label(action, key))
-            )
+            nodes["workflow"].append((node_id("workflow", qualified), mermaid_label(action, key)))
         for key in sorted(targets.get(action) or {}):
             qualified = f"{action}:{key}"
             nodes["target"].append((node_id("target", qualified), mermaid_label(action, key)))
@@ -269,9 +270,7 @@ def build_diagram(
             )
         )
 
-    workflow_keys_by_action = {
-        action: set(workflows.get(action) or {}) for action in actions
-    }
+    workflow_keys_by_action = {action: set(workflows.get(action) or {}) for action in actions}
     target_keys_by_action = {action: set(targets.get(action) or {}) for action in actions}
 
     for fan_out_key, fan_out_cfg in sorted(fan_outs.items()):
@@ -295,7 +294,9 @@ def build_diagram(
             if not matches:
                 if focused:
                     continue
-                raise RuntimeError(f"fan_outs.{fan_out_key}.runs[{index}].{ref_field} references missing key {ref!r}")
+                raise RuntimeError(
+                    f"fan_outs.{fan_out_key}.runs[{index}].{ref_field} references missing key {ref!r}"
+                )
             for action, key in matches:
                 edges.add(Edge(source_id, node_id(kind, f"{action}:{key}"), kind))
 
@@ -311,9 +312,7 @@ def build_diagram(
                     raise RuntimeError(
                         f"workflows.{action}.{workflow_key}.import_workflow_keys references missing key {imported!r}"
                     )
-                edges.add(
-                    Edge(source_id, node_id("workflow", f"{action}:{imported}"), "imports")
-                )
+                edges.add(Edge(source_id, node_id("workflow", f"{action}:{imported}"), "imports"))
             for target_key in workflow_target_keys(
                 workflow_cfg, action=action, workflow_key=workflow_key
             ):
@@ -357,9 +356,7 @@ def build_diagram(
 
     connected_node_ids = {identifier for edge in edges for identifier in (edge.source, edge.target)}
     backend_keys = {
-        key
-        for key in backends
-        if not focused or node_id("backend", key) in connected_node_ids
+        key for key in backends if not focused or node_id("backend", key) in connected_node_ids
     }
     for backend_key in sorted(backend_keys):
         backend_cfg = backends[backend_key]
@@ -372,9 +369,7 @@ def build_diagram(
             for match in reference_candidates(
                 identity_key,
                 set(identities),
-                label=(
-                    f"ctl_state_backends.{backend_key}.execution_identity_keys.{operation}"
-                ),
+                label=(f"ctl_state_backends.{backend_key}.execution_identity_keys.{operation}"),
             ):
                 edges.add(
                     Edge(
@@ -386,9 +381,7 @@ def build_diagram(
 
     connected_node_ids = {identifier for edge in edges for identifier in (edge.source, edge.target)}
     pending_identity_keys = {
-        key
-        for key in identities
-        if not focused or node_id("identity", key) in connected_node_ids
+        key for key in identities if not focused or node_id("identity", key) in connected_node_ids
     }
     processed_identity_keys: set[str] = set()
     while pending_identity_keys:
@@ -433,14 +426,10 @@ def build_diagram(
             for key in catalog
         )
         for kind in nodes:
-            nodes[kind] = [
-                node for node in nodes[kind] if node[0] in retained_node_ids
-            ]
+            nodes[kind] = [node for node in nodes[kind] if node[0] in retained_node_ids]
 
     node_kind_by_id = {
-        identifier: kind
-        for kind, kind_nodes in nodes.items()
-        for identifier, _ in kind_nodes
+        identifier: kind for kind, kind_nodes in nodes.items() for identifier, _ in kind_nodes
     }
     view_group_kinds = VIEW_GROUP_KINDS[view]
     if view == "execution_identities":
@@ -461,8 +450,7 @@ def build_diagram(
             member_edges = {
                 edge
                 for edge in edges
-                if edge.source == identity_id
-                and node_kind_by_id.get(edge.target) == "identity"
+                if edge.source == identity_id and node_kind_by_id.get(edge.target) == "identity"
             }
             view_edges.update(member_edges)
             pending_identity_ids.update(edge.target for edge in member_edges)
@@ -476,23 +464,17 @@ def build_diagram(
         }
 
     retained_view_node_ids = {
-        identifier
-        for edge in view_edges
-        for identifier in (edge.source, edge.target)
+        identifier for edge in view_edges for identifier in (edge.source, edge.target)
     }
     if view == "general":
         retained_view_node_ids.update(
-            identifier
-            for kind in view_group_kinds
-            for identifier, _ in nodes[kind]
+            identifier for kind in view_group_kinds for identifier, _ in nodes[kind]
         )
     else:
         retained_view_node_ids.update(identifier for identifier, _ in nodes["target"])
 
     view_nodes = {
-        kind: [
-            node for node in nodes[kind] if node[0] in retained_view_node_ids
-        ]
+        kind: [node for node in nodes[kind] if node[0] in retained_view_node_ids]
         for kind in view_group_kinds
     }
     lines = [
@@ -528,9 +510,7 @@ def build_diagram(
         lines.append("  end")
     for edge in sorted(view_edges):
         if edge.label:
-            lines.append(
-                f'  {edge.source} -->|"{mermaid_edge_label(edge.label)}"| {edge.target}'
-            )
+            lines.append(f'  {edge.source} -->|"{mermaid_edge_label(edge.label)}"| {edge.target}')
         else:
             lines.append(f"  {edge.source} --> {edge.target}")
     return "\n".join(lines) + "\n"
@@ -587,16 +567,11 @@ def main() -> int:
         for entry in cfg_resources.collect_resource(ctl_cfg_root, kind, entry_depth=1).values():
             if isinstance(entry, dict):
                 available_actions.update(entry.get("actions") or [])
-    actions = selected_actions(
-        {action: {} for action in available_actions}, {}, args.actions
-    )
-    unsafe_actions = [
-        action for action in actions if not ACTION_KEY_RE.fullmatch(action)
-    ]
+    actions = selected_actions({action: {} for action in available_actions}, {}, args.actions)
+    unsafe_actions = [action for action in actions if not ACTION_KEY_RE.fullmatch(action)]
     if unsafe_actions:
         raise RuntimeError(
-            "diagram generation requires filename-safe action keys; "
-            f"invalid: {unsafe_actions}"
+            f"diagram generation requires filename-safe action keys; invalid: {unsafe_actions}"
         )
     views = args.views or list(DIAGRAM_VIEWS)
     duplicate_views = sorted({view for view in views if views.count(view) > 1})

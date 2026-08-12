@@ -29,15 +29,9 @@ CFG = {
         "        maintenance:\n          role: maintainer\n"
     ),
     "target_sources.yaml": (
-        "target_sources:\n"
-        "  bootstrap:\n"
-        "    repo_url: https://example.invalid/bootstrap.git\n"
+        "target_sources:\n  bootstrap:\n    repo_url: https://example.invalid/bootstrap.git\n"
     ),
-    "domains.yaml": (
-        "domains:\n"
-        "  env:\n"
-        "    description: workload environment platform\n"
-    ),
+    "domains.yaml": ("domains:\n  env:\n    description: workload environment platform\n"),
     "workflow.yaml": (
         "workflows:\n"
         "  env/bootstrap:\n"
@@ -84,14 +78,18 @@ PARAMS = {"landing_zone": "live", "account": "dev", "env_type": "dev"}
 
 
 class LifecycleWiringTests(unittest.TestCase):
-    """ 6b/6c — namespace locator, instance identity, run dirs, outdate."""
+    """6b/6c — namespace locator, instance identity, run dirs, outdate."""
 
     def test_locator_is_namespace_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(self, tmp)
             loc = commands_selection.resolve_run_locator_segments(
-                root, run_type="target", action="provision", ctl_profile=None,
-                execution_params=PARAMS, execution_runtime_mode="local",
+                root,
+                run_type="target",
+                action="provision",
+                ctl_profile=None,
+                execution_params=PARAMS,
+                execution_runtime_mode="local",
                 target_name="env/tfstate_backend",
             )
             self.assertEqual(loc, ["live"])
@@ -101,8 +99,12 @@ class LifecycleWiringTests(unittest.TestCase):
             root = make_cfg(self, tmp)
             for run_type in ("fan_out", "procedure"):
                 loc = commands_selection.resolve_run_locator_segments(
-                    root, run_type=run_type, action="provision", ctl_profile=None,
-                    execution_params=PARAMS, execution_runtime_mode="local",
+                    root,
+                    run_type=run_type,
+                    action="provision",
+                    ctl_profile=None,
+                    execution_params=PARAMS,
+                    execution_runtime_mode="local",
                 )
                 self.assertEqual(loc, ["_local"], run_type)
 
@@ -110,8 +112,12 @@ class LifecycleWiringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(self, tmp)
             ident = commands_selection.resolve_run_instance_identity(
-                root, run_type="target", action="provision", ctl_profile=None,
-                execution_params=PARAMS, execution_runtime_mode="local",
+                root,
+                run_type="target",
+                action="provision",
+                ctl_profile=None,
+                execution_params=PARAMS,
+                execution_runtime_mode="local",
                 target_name="env/tfstate_backend",
             )
             self.assertEqual(ident["instance_segments"], ["account=dev", "env_type=dev"])
@@ -130,15 +136,17 @@ class LifecycleWiringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(self, tmp)
             ident = commands_selection.resolve_run_instance_identity(
-                root, run_type="workflow", action="provision", ctl_profile=None,
-                execution_params=PARAMS, execution_runtime_mode="local",
+                root,
+                run_type="workflow",
+                action="provision",
+                ctl_profile=None,
+                execution_params=PARAMS,
+                execution_runtime_mode="local",
                 workflow_name="env/bootstrap",
             )
             self.assertIsNone(ident["identity_doc"])
             self.assertEqual(["account=dev", "env_type=dev"], ident["instance_segments"])
-            self.assertEqual(
-                "env/bootstrap/instances/account=dev/env_type=dev", ident["address"]
-            )
+            self.assertEqual("env/bootstrap/instances/account=dev/env_type=dev", ident["address"])
             self.assertEqual(
                 ident["target_addresses"],
                 ["env/tfstate_backend/instances/account=dev/env_type=dev"],
@@ -155,22 +163,33 @@ class LifecycleWiringTests(unittest.TestCase):
             workflows = root / "workflow.yaml"
             body = workflows.read_text()
 
-            workflows.write_text(body.replace(
-                "    workflow_instance_params: [account, env_type]\n", ""))
+            workflows.write_text(
+                body.replace("    workflow_instance_params: [account, env_type]\n", "")
+            )
             with self.assertRaisesRegex(RuntimeError, "missing"):
                 commands_selection.resolve_run_instance_identity(
-                    root, run_type="workflow", action="provision", ctl_profile=None,
-                    execution_params=PARAMS, execution_runtime_mode="local",
-                    workflow_name="env/bootstrap")
+                    root,
+                    run_type="workflow",
+                    action="provision",
+                    ctl_profile=None,
+                    execution_params=PARAMS,
+                    execution_runtime_mode="local",
+                    workflow_name="env/bootstrap",
+                )
 
-            workflows.write_text(body.replace(
-                "[account, env_type]", "[account, env_type, landing_zone]"))
+            workflows.write_text(
+                body.replace("[account, env_type]", "[account, env_type, landing_zone]")
+            )
             with self.assertRaisesRegex(RuntimeError, "declares"):
                 commands_selection.resolve_run_instance_identity(
-                    root, run_type="workflow", action="provision", ctl_profile=None,
-                    execution_params=PARAMS, execution_runtime_mode="local",
-                    workflow_name="env/bootstrap")
-
+                    root,
+                    run_type="workflow",
+                    action="provision",
+                    ctl_profile=None,
+                    execution_params=PARAMS,
+                    execution_runtime_mode="local",
+                    workflow_name="env/bootstrap",
+                )
 
     def test_an_incomplete_union_does_not_flag_a_spare_axis(self):
         """A member absent from THIS action's action contributes unknown axes.
@@ -184,7 +203,7 @@ class LifecycleWiringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             make_cfg(self, tmp)
             # the target declares provision only, so a destroy action omits it
-            union, complete = catalog_workflow.workflow_member_instance_params(
+            union, complete = catalog_workflow.WorkflowInstanceParams.member_params(
                 {"target_runs": ["env/absent_here"]}, {}, label="workflow 'w'"
             )
             self.assertEqual([], union)
@@ -192,8 +211,10 @@ class LifecycleWiringTests(unittest.TestCase):
             # over-declaration is NOT raised while the union is incomplete
             self.assertEqual(
                 ["account"],
-                catalog_workflow.validate_workflow_instance_params(
-                    ["account"], {"target_runs": ["env/absent_here"]}, {},
+                catalog_workflow.WorkflowInstanceParams.validate(
+                    ["account"],
+                    {"target_runs": ["env/absent_here"]},
+                    {},
                     label="workflow 'w'",
                 ),
             )
@@ -203,7 +224,7 @@ class LifecycleWiringTests(unittest.TestCase):
             make_cfg(self, tmp)
             targets = {"a": {"target_instance_params": ["account"]}}
             with self.assertRaisesRegex(RuntimeError, "missing"):
-                catalog_workflow.validate_workflow_instance_params(
+                catalog_workflow.WorkflowInstanceParams.validate(
                     [], {"target_runs": ["a", "gone"]}, targets, label="workflow 'w'"
                 )
 
@@ -227,44 +248,71 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
         "dispatching": {
             "target_instance_params": {
                 "members": [
-                    {"params": ["domain", "env_type"],
-                     "selectors": {"match": {"execution_context.params.domain": "env"}}},
-                    {"params": ["domain"],
-                     "selectors": {"match": {"execution_context.params.domain": "org"}}},
+                    {
+                        "params": ["domain", "env_type"],
+                        "selectors": {"match": {"execution_context.params.domain": "env"}},
+                    },
+                    {
+                        "params": ["domain"],
+                        "selectors": {"match": {"execution_context.params.domain": "org"}},
+                    },
                 ]
             }
         },
     }
 
     def _check(self, workflows):
-        catalog_workflow.validate_all_workflow_instance_params(workflows, self.TARGETS)
+        catalog_workflow.WorkflowInstanceParams.validate_all(workflows, self.TARGETS)
 
     def test_a_correct_declaration_passes(self):
-        self._check({"w": {"workflow_instance_params": ["account", "env_type"],
-                           "targets": {"keys": ["wide", "narrow"]}}})
+        self._check(
+            {
+                "w": {
+                    "workflow_instance_params": ["account", "env_type"],
+                    "targets": {"keys": ["wide", "narrow"]},
+                }
+            }
+        )
 
     def test_a_missing_axis_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            self._check({"w": {"workflow_instance_params": ["account"],
-                               "targets": {"keys": ["wide"]}}})
+            self._check(
+                {"w": {"workflow_instance_params": ["account"], "targets": {"keys": ["wide"]}}}
+            )
 
     def test_a_spare_axis_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "declares"):
-            self._check({"w": {"workflow_instance_params": ["account", "env_type"],
-                               "targets": {"keys": ["narrow"]}}})
+            self._check(
+                {
+                    "w": {
+                        "workflow_instance_params": ["account", "env_type"],
+                        "targets": {"keys": ["narrow"]},
+                    }
+                }
+            )
 
     def test_a_branch_is_checked_against_the_target_branch_it_can_hold_with(self):
         """A members-shaped target contributes only the branches whose selectors
         could be satisfied together with the workflow branch's."""
-        self._check({"w": {
-            "workflow_instance_params": {"members": [
-                {"params": ["domain", "env_type"],
-                 "selectors": {"match": {"execution_context.params.domain": "env"}}},
-                {"params": ["domain"],
-                 "selectors": {"match": {"execution_context.params.domain": "org"}}},
-            ]},
-            "targets": {"keys": ["dispatching"]},
-        }})
+        self._check(
+            {
+                "w": {
+                    "workflow_instance_params": {
+                        "members": [
+                            {
+                                "params": ["domain", "env_type"],
+                                "selectors": {"match": {"execution_context.params.domain": "env"}},
+                            },
+                            {
+                                "params": ["domain"],
+                                "selectors": {"match": {"execution_context.params.domain": "org"}},
+                            },
+                        ]
+                    },
+                    "targets": {"keys": ["dispatching"]},
+                }
+            }
+        )
 
     def test_an_unpinned_dispatch_axis_is_refused_rather_than_guessed(self):
         """
@@ -273,25 +321,46 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
         single correct declaration."""
 
         with self.assertRaisesRegex(RuntimeError, "does not pin"):
-            self._check({"w": {"workflow_instance_params": ["domain"],
-                               "targets": {"keys": ["dispatching"]}}})
+            self._check(
+                {
+                    "w": {
+                        "workflow_instance_params": ["domain"],
+                        "targets": {"keys": ["dispatching"]},
+                    }
+                }
+            )
 
     def test_a_target_without_selectors_applies_to_every_branch(self):
         """A plain list means 'always', so it counts under any condition."""
 
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            self._check({"w": {
-                "workflow_instance_params": {"members": [
-                    {"params": ["account"],
-                     "selectors": {"match": {"execution_context.params.domain": "env"}}},
-                ]},
-                "targets": {"keys": ["wide"]},
-            }})
+            self._check(
+                {
+                    "w": {
+                        "workflow_instance_params": {
+                            "members": [
+                                {
+                                    "params": ["account"],
+                                    "selectors": {
+                                        "match": {"execution_context.params.domain": "env"}
+                                    },
+                                },
+                            ]
+                        },
+                        "targets": {"keys": ["wide"]},
+                    }
+                }
+            )
 
     def test_imported_workflows_contribute_their_members(self):
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            self._check({
-                "base": {"targets": {"keys": ["wide"]}},
-                "w": {"workflow_instance_params": ["account"],
-                      "import_workflows": ["base"], "targets": {"keys": []}},
-            })
+            self._check(
+                {
+                    "base": {"targets": {"keys": ["wide"]}},
+                    "w": {
+                        "workflow_instance_params": ["account"],
+                        "import_workflows": ["base"],
+                        "targets": {"keys": []},
+                    },
+                }
+            )

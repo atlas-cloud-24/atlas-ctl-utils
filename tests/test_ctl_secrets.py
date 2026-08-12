@@ -111,13 +111,15 @@ class ProviderBackedSecretsTest(unittest.TestCase):
     def test_a_provider_that_does_not_implement_secrets_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = cfg_root(tmp, secrets={"k": {"provider": "somecloud", "id": "x"}})
-            with mock.patch.object(
-                cfg_secrets.execution_adapters,
-                "get_adapter",
-                return_value=object(),
+            with (
+                mock.patch.object(
+                    cfg_secrets.execution_adapters,
+                    "get_adapter",
+                    return_value=object(),
+                ),
+                self.assertRaisesRegex(RuntimeError, "does not implement"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "does not implement"):
-                    cfg_secrets.SecretStore(root).resolve("k", label="a source")
+                cfg_secrets.SecretStore(root).resolve("k", label="a source")
 
     def test_the_adapter_receives_the_entry_without_the_provider_key(self):
         """The adapter validates its OWN vocabulary, so `provider` — the only
@@ -276,13 +278,15 @@ class DeclaredContractsAreBackedTest(unittest.TestCase):
                 secrets={"k": {"provider": "env", "name": "X"}},
                 providers={"somecloud": {"implements": ["secrets"]}},
             )
-            with mock.patch.object(
-                cfg_secrets.execution_adapters,
-                "get_adapter",
-                return_value=Adapter,
+            with (
+                mock.patch.object(
+                    cfg_secrets.execution_adapters,
+                    "get_adapter",
+                    return_value=Adapter,
+                ),
+                self.assertRaisesRegex(RuntimeError, "resolve_secret"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "resolve_secret"):
-                    execution_providers.validate_declared_contracts(root)
+                execution_providers.validate_declared_contracts(root)
 
     def test_an_unknown_contract_name_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -38,7 +38,7 @@ WILDCARD = "*"
 
 def _prefix_matches(expected: list[str], actual: list[str]) -> bool:
     return len(expected) == len(actual) and all(
-        want in (WILDCARD, got) for want, got in zip(expected, actual)
+        want in (WILDCARD, got) for want, got in zip(expected, actual, strict=False)
     )
 
 
@@ -55,10 +55,9 @@ def resolve(value, collection: str, *, label: str) -> str:
     parts = value.split(".")
     if len(parts) <= len(expected) or not _prefix_matches(expected, parts[: len(expected)]):
         raise RuntimeError(
-            f"❌ {label}: {value!r} does not name its collection — expected "
-            f"{collection}.<key>"
+            f"❌ {label}: {value!r} does not name its collection — expected {collection}.<key>"
         )
-    return ".".join(parts[len(expected):])
+    return ".".join(parts[len(expected) :])
 
 
 def resolve_each(values, collection: str, *, label: str):
@@ -86,7 +85,5 @@ def resolve_fields(entry: dict, fields: dict, *, label: str) -> dict:
     resolved = dict(entry)
     for field, collection in fields.items():
         if field in resolved and resolved[field] is not None:
-            resolved[field] = resolve_each(
-                resolved[field], collection, label=f"{label}.{field}"
-            )
+            resolved[field] = resolve_each(resolved[field], collection, label=f"{label}.{field}")
     return resolved

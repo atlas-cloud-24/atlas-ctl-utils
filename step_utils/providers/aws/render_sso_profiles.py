@@ -4,7 +4,6 @@
 
 render AWS CLI SSO profile configuration commands from a normalized model."""
 
-
 import argparse
 import json
 import os
@@ -166,9 +165,7 @@ def build_commands(model: dict) -> list[str]:
         profile_name = profile["profile_name"]
         session_name = normalized_sessions[profile["session_key"]]["session_name"]
         lines.append(configure_set(f"profile.{profile_name}.sso_session", session_name))
-        lines.append(
-            configure_set(f"profile.{profile_name}.sso_account_id", profile["account_id"])
-        )
+        lines.append(configure_set(f"profile.{profile_name}.sso_account_id", profile["account_id"]))
         lines.append(configure_set(f"profile.{profile_name}.sso_role_name", profile["role_name"]))
         lines.append("")
 
@@ -188,7 +185,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Render an executable AWS CLI SSO profile configuration script.",
     )
-    parser.add_argument("--input-json", required=True, help="Normalized sessions/profiles JSON model")
+    parser.add_argument(
+        "--input-json", required=True, help="Normalized sessions/profiles JSON model"
+    )
     parser.add_argument("--output", help="Output script path; stdout when omitted")
     args = parser.parse_args()
 

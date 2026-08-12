@@ -4,10 +4,8 @@ UUIDv7 rather than v4 because a run id is sorted by time constantly — in
 listings, in status, in the state tree — and a v4 would force every one of
 those to read a timestamp field it would rather not need."""
 
-import argparse
 import time
 import uuid
-
 from datetime import UTC, datetime
 
 SERVICE_ID = "atlas-ctl-orchestrator-local"
@@ -17,17 +15,6 @@ _UUID7_LAST_TIMESTAMP_MS = -1
 
 
 _UUID7_COUNTER = 0
-
-
-def validate_uuid7(v: str) -> str:
-    """Validate that a string is a valid UUID version 7."""
-    try:
-        parsed = uuid.UUID(v)
-        if parsed.version != 7:
-            raise argparse.ArgumentTypeError(f"UUID must be version 7, got version {parsed.version}: {v}")
-        return v
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"Invalid UUID format: {v}")
 
 
 def _uuid7_timestamp_ms() -> int:

@@ -51,6 +51,7 @@ _IMPORT_FIELDS = {"from", "import", "as", "with"}
 class PresetError(RuntimeError):
     """A preset declaration is malformed, incomplete, or unsatisfiable."""
 
+
 def _load_yaml_mapping(path: Path) -> dict:
     import yaml
 
@@ -89,13 +90,13 @@ def declared_params(preset_dir: Path) -> list[str]:
     doc = _load_yaml_mapping(params_path)
     unknown = set(doc) - {"params"}
     if unknown:
-        raise PresetError(f"❌ unknown key(s) {sorted(unknown)} in {params_path}; only `params` is allowed")
+        raise PresetError(
+            f"❌ unknown key(s) {sorted(unknown)} in {params_path}; only `params` is allowed"
+        )
     raw = doc.get("params") or []
     if not isinstance(raw, list):
         # A mapping is the rejected form that carried per-param defaults.
-        raise PresetError(
-            f"❌ params must be a plain list of names (no defaults): {params_path}"
-        )
+        raise PresetError(f"❌ params must be a plain list of names (no defaults): {params_path}")
     names: list[str] = []
     for entry in raw:
         # A bare list of names. A mapping here is the rejected
@@ -135,7 +136,9 @@ def declared_imports(preset_dir: Path) -> list[dict]:
     doc = _load_yaml_mapping(imports_path)
     unknown = set(doc) - {"imports"}
     if unknown:
-        raise PresetError(f"❌ unknown key(s) {sorted(unknown)} in {imports_path}; only `imports` is allowed")
+        raise PresetError(
+            f"❌ unknown key(s) {sorted(unknown)} in {imports_path}; only `imports` is allowed"
+        )
     raw = doc.get("imports") or []
     if not isinstance(raw, list):
         raise PresetError(f"❌ imports must be a list: {imports_path}")
@@ -153,7 +156,9 @@ def declared_imports(preset_dir: Path) -> list[dict]:
             )
         source = item.get("from")
         if not isinstance(source, str) or not source.startswith("/"):
-            raise PresetError(f"❌ import `from` must be an absolute cfg path: {imports_path}; got {source!r}")
+            raise PresetError(
+                f"❌ import `from` must be an absolute cfg path: {imports_path}; got {source!r}"
+            )
         # A6/A9: one import per source. Materializing the same preset twice is
         # module-style instantiation, which belongs to the infrastructure layer.
         if source in seen_sources:
@@ -168,11 +173,15 @@ def declared_imports(preset_dir: Path) -> list[dict]:
             raise PresetError(f"❌ import from {source!r} must declare `import`: {imports_path}")
         if selection == "*":
             selected = "*"
-        elif isinstance(selection, list) and selection and all(isinstance(k, str) and k for k in selection):
+        elif (
+            isinstance(selection, list)
+            and selection
+            and all(isinstance(k, str) and k for k in selection)
+        ):
             selected = list(selection)
         else:
             raise PresetError(
-                f"❌ import `import` must be \"*\" or a non-empty list of cfg keys: {imports_path} ({source})"
+                f'❌ import `import` must be "*" or a non-empty list of cfg keys: {imports_path} ({source})'
             )
 
         alias = item.get("as")
@@ -184,7 +193,9 @@ def declared_imports(preset_dir: Path) -> list[dict]:
             raise PresetError(f"❌ import `with` must be a mapping: {imports_path} ({source})")
         for name in bindings:
             if not isinstance(name, str) or not _PARAM_NAME_RE.match(name):
-                raise PresetError(f"❌ `with` key must be a param name: {imports_path} ({source}); got {name!r}")
+                raise PresetError(
+                    f"❌ `with` key must be a param name: {imports_path} ({source}); got {name!r}"
+                )
 
         entries.append(
             {
@@ -254,7 +265,9 @@ def _bind_params(text: str, bindings: dict, *, label: str, params: list[str]) ->
     def replace(match: re.Match[str]) -> str:
         name = match.group(1)
         if name not in params:
-            raise PresetError(f"❌ ${{{PARAM_NAMESPACE}.{name}}} is not declared in params: {label}")
+            raise PresetError(
+                f"❌ ${{{PARAM_NAMESPACE}.{name}}} is not declared in params: {label}"
+            )
         value = bindings[name]
         if isinstance(value, bool):
             return "true" if value else "false"
@@ -444,7 +457,9 @@ def materialize(
             stack=(*stack, preset_path),
             composition=composition,
         )
-        _absorb(nested, nested_dest, selection=entry["import"], alias=entry["as"], label=entry["from"])
+        _absorb(
+            nested, nested_dest, selection=entry["import"], alias=entry["as"], label=entry["from"]
+        )
         shutil.rmtree(nested)
 
     for path in sorted(dest.rglob("*.yaml")):
@@ -476,7 +491,6 @@ def materialize(
         target.write_text(
             yaml.safe_dump(doc, sort_keys=False, default_flow_style=False), encoding="utf-8"
         )
-
 
 
 _REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?::-.*?)?\}")
@@ -526,10 +540,7 @@ def _owns(name: str, defined: set[str]) -> bool:
     if name in defined:
         return True
     segments = name.split(".")
-    for size in range(len(segments) - 1, 0, -1):
-        if ".".join(segments[:size]) in defined:
-            return True
-    return False
+    return any(".".join(segments[:size]) in defined for size in range(len(segments) - 1, 0, -1))
 
 
 def _assert_self_contained(

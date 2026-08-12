@@ -16,6 +16,7 @@ from engine.run import policy as run_policy
 from engine.run import selectors as run_selectors
 from engine.state import sync as state_sync
 
+
 def collect_provider_cfg_findings(
     ctl_cfg_root: Path, execution_context: dict[str, object]
 ) -> list[dict]:
@@ -23,9 +24,7 @@ def collect_provider_cfg_findings(
     findings: list[dict] = []
     for _name, adapter in execution_providers.run_provider_adapters(execution_context):
         findings.extend(
-            adapter.collect_provider_cfg_findings(
-                ctl_cfg_root, execution_context=execution_context
-            )
+            adapter.collect_provider_cfg_findings(ctl_cfg_root, execution_context=execution_context)
         )
     return findings
 
@@ -109,7 +108,9 @@ def build_ctl_policy_preflight_report(
                 {
                     "name": name,
                     "status": "failed",
-                    "failure_reason": execution_run_context.credential_free_preflight_failure_reason(error),
+                    "failure_reason": execution_run_context.credential_free_preflight_failure_reason(
+                        error
+                    ),
                 }
             )
 
@@ -138,7 +139,9 @@ def build_ctl_policy_preflight_report(
             rows[provider] = execution_adapters.get_adapter(provider).authorize_run(
                 run_policy.ctl_profile_provider_policy(ctl_cfg_root, ctl_profile, provider),
                 execution_access_mode=mode,
-                provider_options=execution_providers.provider_options_for(provider_options, provider),
+                provider_options=execution_providers.provider_options_for(
+                    provider_options, provider
+                ),
                 label=f"ctl profile {ctl_profile!r} policy for {provider!r}",
             )
         return rows
@@ -170,8 +173,9 @@ def build_ctl_policy_preflight_report(
     )
     check(
         "ref_policy",
-        lambda: cfg_validate.CommitPinning(ctl_ref_policy
-        ).check_target_runs(selection["active_target_runs"]),
+        lambda: cfg_validate.CommitPinning(ctl_ref_policy).check_target_runs(
+            selection["active_target_runs"]
+        ),
     )
     # Per-target policy checks (hybrid: selection-scoped checks above, target-
     # scoped checks here).
@@ -188,7 +192,9 @@ def build_ctl_policy_preflight_report(
                     {
                         "name": name,
                         "status": "failed",
-                        "failure_reason": execution_run_context.credential_free_preflight_failure_reason(error),
+                        "failure_reason": execution_run_context.credential_free_preflight_failure_reason(
+                            error
+                        ),
                     }
                 )
 
@@ -202,9 +208,7 @@ def build_ctl_policy_preflight_report(
             {
                 "target_key": target_key,
                 "status": (
-                    "failed"
-                    if any(c["status"] == "failed" for c in target_checks)
-                    else "passed"
+                    "failed" if any(c["status"] == "failed" for c in target_checks) else "passed"
                 ),
                 "checks": target_checks,
             }
@@ -262,7 +266,9 @@ def build_ctl_state_backend_preflight_result(
         )
     except Exception as error:
         result["status"] = "failed"
-        result["failure_reason"] = execution_run_context.credential_free_preflight_failure_reason(error)
+        result["failure_reason"] = execution_run_context.credential_free_preflight_failure_reason(
+            error
+        )
         return result
     result["ctl_state_backend"] = namespace_key
     if force_skip_ctl_state_backend_sync:
@@ -310,12 +316,17 @@ def build_ctl_state_backend_preflight_result(
             provider_options=namespace_adapter_options,
             live_check=namespace_provider not in force_skip_providers,
         )
-        if not isinstance(checked, dict) or checked.get("status") not in preflight_render.PREFLIGHT_RESULT_STATUSES:
+        if (
+            not isinstance(checked, dict)
+            or checked.get("status") not in preflight_render.PREFLIGHT_RESULT_STATUSES
+        ):
             raise RuntimeError("provider preflight returned an invalid result")
     except Exception as error:
         result["status"] = "failed"
         result["execution_identities"] = operation_execution
-        result["failure_reason"] = execution_run_context.credential_free_preflight_failure_reason(error)
+        result["failure_reason"] = execution_run_context.credential_free_preflight_failure_reason(
+            error
+        )
         return result
     checked = dict(checked)
     checked["ctl_state_backend"] = namespace_key
@@ -374,10 +385,14 @@ def build_execution_identity_preflight_report(
                 "provider": provider_adapter.PROVIDER_NAME,
                 "access_mode": execution_providers.execution_access_mode_for(
                     execution_access_modes, provider_adapter.PROVIDER_NAME
-                ) if (target_run.get("execution_identities") or {}) else None,
+                )
+                if (target_run.get("execution_identities") or {})
+                else None,
                 "status": "failed",
                 "provider_path": [],
-                "failure_reason": execution_run_context.credential_free_preflight_failure_reason(error),
+                "failure_reason": execution_run_context.credential_free_preflight_failure_reason(
+                    error
+                ),
             }
         status = result.get("status")
         if status not in preflight_render.PREFLIGHT_RESULT_STATUSES:
@@ -481,15 +496,15 @@ def build_target_cfg_validation_report(
             result = {
                 "status": "failed",
                 "rows": [],
-                "failure_reason": execution_run_context.credential_free_preflight_failure_reason(error),
+                "failure_reason": execution_run_context.credential_free_preflight_failure_reason(
+                    error
+                ),
             }
         result = dict(result)
         result["target_key"] = target_key
         result["instance"] = run_addressing.target_instance_display(target_run, execution_context)
         # Axes guard
-        action_target = (selection["action_cfg"].get("targets") or {}).get(
-            target_key
-        )
+        action_target = (selection["action_cfg"].get("targets") or {}).get(target_key)
         if isinstance(action_target, dict):
             consumed = run_selectors.collect_target_consumed_axes(
                 target_key,

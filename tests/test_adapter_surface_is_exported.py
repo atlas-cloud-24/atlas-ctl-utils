@@ -11,6 +11,7 @@ static and derived: parse the ENGINE for `adapter.<name>` and require the adapte
 package to expose each one. Deriving beats listing — a hardcoded list rots into a
 false pass the day someone adds a call.
 """
+
 import ast
 import importlib
 import sys
@@ -64,12 +65,10 @@ class AdapterSurfaceTest(unittest.TestCase):
         self.assertIn("target_consent", found)
 
     def test_every_attribute_the_engine_uses_is_exported(self):
-        missing = sorted(
-            name for name in _adapter_attributes()
-            if not hasattr(self.adapter, name)
-        )
+        missing = sorted(name for name in _adapter_attributes() if not hasattr(self.adapter, name))
         self.assertEqual(
-            [], missing,
+            [],
+            missing,
             "the engine reaches for these on the adapter PACKAGE, and a function "
             "that exists in a submodule but is not re-exported fails only at run "
             "time, after a run has already started:\n" + "\n".join(missing),

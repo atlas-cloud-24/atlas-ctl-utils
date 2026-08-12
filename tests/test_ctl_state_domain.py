@@ -6,9 +6,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
-from engine_surface import engine_defines
 from engine.run import selectors as run_selectors
 from engine.state import sync as state_sync
+from engine_surface import engine_defines
 
 
 class OperationIdentityTests(unittest.TestCase):
@@ -41,7 +41,10 @@ class OperationIdentityTests(unittest.TestCase):
 class ResultsBootstrapDetectionTests(unittest.TestCase):
     INVENTORY = {
         "targets": {
-            "env/ctl-state-backend": {"procedure": "env_ctl_state_backend", "provisions_ctl_state_backend": True},
+            "env/ctl-state-backend": {
+                "procedure": "env_ctl_state_backend",
+                "provisions_ctl_state_backend": True,
+            },
             "env/core/baseline": {"procedure": "baseline"},
         }
     }
@@ -59,8 +62,14 @@ class ResultsBootstrapDetectionTests(unittest.TestCase):
         self.assertFalse(state_sync.run_provisions_ctl_state_backend(wf, self.INVENTORY))
 
     def test_false_when_target_missing_or_no_flag(self):
-        self.assertFalse(state_sync.run_provisions_ctl_state_backend({"target_runs": ["unknown"]}, self.INVENTORY))
-        self.assertFalse(state_sync.run_provisions_ctl_state_backend({"target_runs": []}, self.INVENTORY))
+        self.assertFalse(
+            state_sync.run_provisions_ctl_state_backend(
+                {"target_runs": ["unknown"]}, self.INVENTORY
+            )
+        )
+        self.assertFalse(
+            state_sync.run_provisions_ctl_state_backend({"target_runs": []}, self.INVENTORY)
+        )
 
 
 class ScopeConditionTests(unittest.TestCase):
@@ -72,12 +81,18 @@ class ScopeConditionTests(unittest.TestCase):
     SCOPE = {"contains": {"execution_context.target.domains": "env"}}
 
     def test_scope_activates_when_the_run_reads_its_domain(self):
-        self.assertTrue(run_selectors.selector_matches(
-            self.SCOPE, {"execution_context.target.domains": ["env", "org"]}, label="t"))
+        self.assertTrue(
+            run_selectors.selector_matches(
+                self.SCOPE, {"execution_context.target.domains": ["env", "org"]}, label="t"
+            )
+        )
 
     def test_scope_is_dropped_when_it_does_not(self):
-        self.assertFalse(run_selectors.selector_matches(
-            self.SCOPE, {"execution_context.target.domains": ["org"]}, label="t"))
+        self.assertFalse(
+            run_selectors.selector_matches(
+                self.SCOPE, {"execution_context.target.domains": ["org"]}, label="t"
+            )
+        )
 
     def test_scope_is_dropped_when_no_domains_are_declared(self):
         self.assertFalse(run_selectors.selector_matches(self.SCOPE, {}, label="t"))

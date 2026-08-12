@@ -93,7 +93,7 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
 
     def setUp(self):
         self.root = _cfg_root(self)
-        self.workflows = catalog_workflow.load_workflow_catalog(self.root)
+        self.workflows = catalog_workflow.WorkflowCatalog.load(self.root)
         self.targets = cfg_resources.collect_resource(self.root, "targets")
 
     def test_cfg_declares_qualified_keys(self):
@@ -103,16 +103,17 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
         self.assertIn("targets.env/wide", CFG)
 
     def test_the_loader_resolves_them_to_the_key_targets_are_indexed_by(self):
-        keys = catalog_workflow.workflow_target_key_entries(
+        keys = catalog_workflow.WorkflowCatalog.target_key_entries(
             {**self.workflows["env/correct"], "__name__": "env/correct"},
-            self.workflows, label="env/correct",
+            self.workflows,
+            label="env/correct",
         )
         self.assertEqual(keys, ["env/wide", "env/narrow"])
         for key in keys:
             self.assertIn(key, self.targets)
 
     def test_a_correct_declaration_passes(self):
-        catalog_workflow.validate_all_workflow_instance_params(
+        catalog_workflow.WorkflowInstanceParams.validate_all(
             {"env/correct": self.workflows["env/correct"]}, self.targets
         )
 
@@ -120,7 +121,7 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
         """Every member axis belongs in the workflow instance address."""
 
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            catalog_workflow.validate_all_workflow_instance_params(
+            catalog_workflow.WorkflowInstanceParams.validate_all(
                 {"env/missing_an_axis": self.workflows["env/missing_an_axis"]},
                 self.targets,
             )
@@ -130,13 +131,13 @@ class MemberKeysResolveBeforeTheyAreLookedUpTest(unittest.TestCase):
 
         raw = cfg_resources.collect_resource(self.root, "workflows", entry_depth=1)
         with self.assertRaisesRegex(RuntimeError, "declares"):
-            catalog_workflow.validate_all_workflow_instance_params(
+            catalog_workflow.WorkflowInstanceParams.validate_all(
                 {"env/missing_an_axis": raw["env/missing_an_axis"]}, self.targets
             )
         # Validation consumes the loaded catalog; the raw collection is outside
         # that contract for every workflow shape.
         with self.assertRaisesRegex(RuntimeError, "declares"):
-            catalog_workflow.validate_all_workflow_instance_params(
+            catalog_workflow.WorkflowInstanceParams.validate_all(
                 {"env/correct": raw["env/correct"]}, self.targets
             )
 
@@ -146,22 +147,27 @@ class OnlyTheSelectedWorkflowMustApplyToTheOperationTest(unittest.TestCase):
 
     def setUp(self):
         self.root = _cfg_root(self)
-        self.workflows = catalog_workflow.load_workflow_catalog(self.root)
+        self.workflows = catalog_workflow.WorkflowCatalog.load(self.root)
 
     def _load(self, name, operation):
-        return catalog_workflow.load_workflow_cfg(
-            self.root, "local_dev", None, name,
+        return catalog_workflow.WorkflowCatalog.workflow_cfg(
+            self.root,
+            "local_dev",
+            None,
+            name,
             {"execution_context.params.operation": operation},
         )
 
     def test_the_closure_is_the_workflow_and_what_it_imports(self):
-        workflows = {"a": {"import_workflows": ["b"]}, "b": {"import_workflows": ["c"]},
-                     "c": {}, "unrelated": {}}
+        workflows = {
+            "a": {"import_workflows": ["b"]},
+            "b": {"import_workflows": ["c"]},
+            "c": {},
+            "unrelated": {},
+        }
+        self.assertEqual(catalog_workflow.WorkflowImports.closure(workflows, "a"), {"a", "b", "c"})
         self.assertEqual(
-            catalog_workflow.workflow_import_closure(workflows, "a"), {"a", "b", "c"}
-        )
-        self.assertEqual(
-            catalog_workflow.workflow_import_closure(workflows, "unrelated"), {"unrelated"}
+            catalog_workflow.WorkflowImports.closure(workflows, "unrelated"), {"unrelated"}
         )
 
     def test_a_run_is_not_blocked_by_a_workflow_it_never_touches(self):

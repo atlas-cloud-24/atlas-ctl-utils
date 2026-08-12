@@ -39,7 +39,9 @@ foundation:
                 encoding="utf-8",
             )
 
-            values, _ = build_runtime_cfg.build_step_values(root, {"cfg": {"foundation": "foundation"}}, {})
+            values, _ = build_runtime_cfg.build_step_values(
+                root, {"cfg": {"foundation": "foundation"}}, {}
+            )
 
         self.assertEqual(
             values["foundation"]["computing"]["asg_cfg"]["app"]["launch_template"],

@@ -10,8 +10,7 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import atlas_ctl_adapter_aws as aws
 import ctl_cfg_fixture
-from engine.catalog import targets as catalog_targets
-from engine.catalog import workflow as catalog_workflow
+from engine.catalog import target_catalog
 from engine.cfg import overlays as cfg_overlays
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
@@ -19,6 +18,7 @@ from engine.run import actions as run_actions
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
+from engine.units import fan_out as units_fan_out
 
 
 class CtlStateAddressAndCommitTests(unittest.TestCase):
@@ -106,7 +106,7 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(RuntimeError, "duplicate state owners"):
-            catalog_workflow.validate_unique_fan_out_materializations([selection, dict(selection)])
+            units_fan_out.FanOut.validate_unique_materializations([selection, dict(selection)])
 
     def test_committed_rerun_requires_matching_clean_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +268,7 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
         ]
 
     def test_active_target_keeps_cfg_overlay_and_backend_facts(self):
-        active = catalog_targets.build_active_target_runs(
+        active = target_catalog.ActiveTargetRuns.build(
             {
                 "meta": {"action": "provision"},
                 "target_runs": [{"id": "run", "target": "target"}],
@@ -425,19 +425,23 @@ class OverlayAndDefinitionHashTests(unittest.TestCase):
             "repo_path": "/machine/one",
             "secret_key": "IGNORED_SECRET",
         }
-        first = kernel_paths.canonical_sha256(catalog_targets.target_definition_document(target))
+        first = kernel_paths.canonical_sha256(
+            target_catalog.ActiveTargetRuns.definition_document(target)
+        )
         same_definition = dict(target, repo_path="/machine/two")
         same_definition["plt_overlays"] = ["unrelated"]
         self.assertEqual(
             first,
             kernel_paths.canonical_sha256(
-                catalog_targets.target_definition_document(same_definition)
+                target_catalog.ActiveTargetRuns.definition_document(same_definition)
             ),
         )
         changed = dict(target, procedure="other")
         self.assertNotEqual(
             first,
-            kernel_paths.canonical_sha256(catalog_targets.target_definition_document(changed)),
+            kernel_paths.canonical_sha256(
+                target_catalog.ActiveTargetRuns.definition_document(changed)
+            ),
         )
 
     def test_cfg_view_hash_is_path_and_content_sensitive(self):

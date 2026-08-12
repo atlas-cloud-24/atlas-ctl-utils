@@ -21,7 +21,7 @@ def log_target_run_banner(target_run_id: str, *, ch: str = "#", min_width: int =
     title = f" {target_run_id} "
     width = max(min_width, len(title) + 2)  # ensure it always fits
     line = ch * width
-    mid  = title.center(width, ch)
+    mid = title.center(width, ch)
     logging.info(line)
     logging.info(mid)
     logging.info(line)
@@ -57,9 +57,7 @@ def record_maintenance_request(
     )
 
 
-def record_workflow_members(
-    run_dir: Path, active_target_runs: dict, workflow_cfg: dict
-) -> None:
+def record_workflow_members(run_dir: Path, active_target_runs: dict, workflow_cfg: dict) -> None:
     """A workflow run records the composition it ran, as history.
 
     it records target INSTANCES, not keys. A workflow's own instance
@@ -170,7 +168,9 @@ def print_failure_summary(payload: dict) -> None:
 
 
 def mark_run_succeeded(run_dir: Path) -> None:
-    payload = state_status.build_status_payload(run_dir, state_run_store.RunStatus.OK, {"ctl_state_sync": state_sync.PUBLICATION.summary()})
+    payload = state_status.build_status_payload(
+        run_dir, state_run_store.RunStatus.OK, {"ctl_state_sync": state_sync.PUBLICATION.summary()}
+    )
     state_run_store.write_current_status(run_dir, payload)
     pointer_path = state_run_store.publish_committed_pointer(run_dir, payload)
     state_run_store.remove_state_slot(run_dir, state_run_store.StateSlot.IN_PROGRESS)
@@ -247,7 +247,9 @@ def mark_run_force_unlocked(run_dir: Path, metadata: dict, maintenance_run_dir: 
     state_status.mark_outdated_for_run(run_dir, include_current_result=True, force=force_outdated)
 
 
-def force_unlock_ctl_state_lock(ctl_state_local_root: Path, lock_id: str, maintenance_run_dir: Path) -> bool:
+def force_unlock_ctl_state_lock(
+    ctl_state_local_root: Path, lock_id: str, maintenance_run_dir: Path
+) -> bool:
     metadata = state_run_store.load_ctl_state_lock_metadata(ctl_state_local_root)
     if not metadata:
         return False
@@ -274,7 +276,9 @@ def force_unlock_ctl_state_lock(ctl_state_local_root: Path, lock_id: str, mainte
         try:
             run_dir.relative_to(root)
         except ValueError as exc:
-            raise RuntimeError(f"❌ ctl-state lock run_dir is outside ctl_state_local_root: {run_dir}") from exc
+            raise RuntimeError(
+                f"❌ ctl-state lock run_dir is outside ctl_state_local_root: {run_dir}"
+            ) from exc
 
         mark_run_force_unlocked(run_dir, metadata, maintenance_run_dir)
         logging.warning("Ctl-state lock released for run_id=%s", lock_id)
@@ -335,7 +339,7 @@ def begin_workflow_target_run(
             "instance": segments,
             "instance_address": address,
             "parent_workflow_run_id": parent_metadata.get("run_id"),
-            #(b4): name the parent by INSTANCE too, so a target record
+            # (b4): name the parent by INSTANCE too, so a target record
             # says which workflow instance it belongs to without loading the parent.
             "parent_workflow_instance_address": parent_metadata.get("instance_address"),
             "fan_out_run_id": parent_metadata.get("fan_out_run_id"),
@@ -343,8 +347,13 @@ def begin_workflow_target_run(
             **{
                 key: target_run[key]
                 for key in (
-                    "source_commit", "cfg_source_commit", "source_state", "ref_policy",
-                    "plt_overlays", "target_definition_sha256", "target_cfg_view_sha256",
+                    "source_commit",
+                    "cfg_source_commit",
+                    "source_state",
+                    "ref_policy",
+                    "plt_overlays",
+                    "target_definition_sha256",
+                    "target_cfg_view_sha256",
                 )
                 if target_run.get(key) is not None
             },
@@ -363,7 +372,8 @@ def finish_workflow_target_run(
 
     if error is not None:
         payload = state_status.build_status_payload(
-            child_run_dir, state_run_store.RunStatus.FAILED,
+            child_run_dir,
+            state_run_store.RunStatus.FAILED,
             {"error": {"type": type(error).__name__, "summary": str(error)}},
         )
         state_run_store.write_current_status(child_run_dir, payload)
@@ -375,7 +385,9 @@ def finish_workflow_target_run(
         return None
 
     payload = state_status.build_status_payload(
-        child_run_dir, state_run_store.RunStatus.OK, {"ctl_state_sync": state_sync.PUBLICATION.summary()}
+        child_run_dir,
+        state_run_store.RunStatus.OK,
+        {"ctl_state_sync": state_sync.PUBLICATION.summary()},
     )
     state_run_store.write_current_status(child_run_dir, payload)
     pointer_path = state_run_store.publish_committed_pointer(child_run_dir, payload)
@@ -386,7 +398,12 @@ def finish_workflow_target_run(
         pointer_path,
         reason="workflow child succeeded",
     )
-    pointer = state_run_store.read_committed_pointer(state_run_store.ctl_state_dir_from_run_dir(child_run_dir)) or {}
+    pointer = (
+        state_run_store.read_committed_pointer(
+            state_run_store.ctl_state_dir_from_run_dir(child_run_dir)
+        )
+        or {}
+    )
     return {
         "address": payload.get("instance_address") or payload.get("result_name"),
         "run_id": pointer.get("run_id"),
