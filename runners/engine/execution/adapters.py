@@ -23,9 +23,7 @@ PROVIDER_ADAPTER_TOOLING_TEMPLATE = "execution-provider-{provider}"
 
 
 def provider_adapter_tooling_name(provider: str) -> str:
-    """
-
-    the tooling ref name a provider's adapter is pinned under."""
+    """The tooling ref name a provider's adapter is pinned under."""
 
     return PROVIDER_ADAPTER_TOOLING_TEMPLATE.format(provider=provider)
 

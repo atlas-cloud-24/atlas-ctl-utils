@@ -156,9 +156,7 @@ EXECUTION_RUNTIME_MODES = tuple(ExecutionRuntimeMode)
 
 
 def step_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> set[str]:
-    """
-
-    runtimes a target_run can run in; absent = all EXECUTION_RUNTIME_MODES."""
+    """Runtimes a target_run can run in; absent = all EXECUTION_RUNTIME_MODES."""
 
     raw = runtime_cfg.get("supported_execution_runtime_modes")
     if raw is None:
@@ -181,9 +179,7 @@ def step_supported_execution_runtime_modes(runtime_cfg: dict, *, label: str) -> 
 
 
 def ctl_allowed_execution_runtime_modes(ctl_cfg_root: Path, ctl_profile: str) -> set[str]:
-    """
-
-    runtimes the ctl profile authorizes. Absent = all EXECUTION_RUNTIME_MODES."""
+    """Runtimes the ctl profile authorizes. Absent = all EXECUTION_RUNTIME_MODES."""
 
     policy = ctl_profile_policy(ctl_cfg_root, ctl_profile)
     raw = policy.get("allowed_execution_runtime_modes")
@@ -209,11 +205,11 @@ def ctl_allowed_execution_runtime_modes(ctl_cfg_root: Path, ctl_profile: str) ->
 def validate_execution_runtime_mode(
     ctl_cfg_root: Path, ctl_profile: str, execution_runtime_mode: str
 ) -> None:
-    """
+    """Reconcile the selected runtime against the ctl profile: a known
 
-    reconcile the selected runtime against the ctl profile: a known
     runtime, allowed by the profile. Per-target_run `supported_execution_runtime_modes` is enforced in
-    run_targets, where the repo-local target_run manifest is loaded."""
+    run_targets, where the repo-local target_run manifest is loaded.
+    """
 
     if execution_runtime_mode not in EXECUTION_RUNTIME_MODES:
         raise RuntimeError(
@@ -416,9 +412,7 @@ def active_target_names(workflow_cfg: dict) -> list[str]:
 
 
 def active_targets_missing_key(workflow_cfg: dict, action_cfg: dict, skip_key: str) -> list[str]:
-    """
-
-    targets that do NOT declare the given skip_* key (presence = capability)."""
+    """Targets that do NOT declare the given skip_* key (presence = capability)."""
 
     targets = action_cfg.get("targets", {})
     missing: list[str] = []

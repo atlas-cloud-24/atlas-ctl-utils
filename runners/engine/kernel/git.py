@@ -123,9 +123,7 @@ def parse_repo_url_ref(value: str) -> tuple[str, str | None, str | None]:
 
 
 def git_source_facts(path: Path) -> tuple[str | None, str]:
-    """
-
-    return the checked-out commit and reproducibility state of one cfg source."""
+    """Return the checked-out commit and reproducibility state of one cfg source."""
 
     root = Path(path)
     commit = subprocess.run(

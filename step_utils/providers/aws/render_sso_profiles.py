@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-
-
-render AWS CLI SSO profile configuration commands from a normalized model."""
+"""Render AWS CLI SSO profile configuration commands from a normalized model."""
 
 import argparse
 import json

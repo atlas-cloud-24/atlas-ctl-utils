@@ -49,13 +49,13 @@ class SecretStore:
         ctl_cfg_root: Path,
         *,
         execution_context: dict[str, object] | None = None,
-        implementation_key: str | None = None,
+        credential_acquisition: str | None = None,
         execution_access_modes: dict[str, str] | None = None,
         provider_options: dict[str, str] | None = None,
     ):
         self.ctl_cfg_root = Path(ctl_cfg_root)
         self.execution_context = execution_context or {}
-        self.implementation_key = implementation_key
+        self.credential_acquisition = credential_acquisition
         self.execution_access_modes = execution_access_modes or {}
         self.provider_options = provider_options or {}
         self._declared: dict | None = None
@@ -131,7 +131,7 @@ class SecretStore:
             {key: value for key, value in entry.items() if key != "provider"},
             ctl_cfg_root=self.ctl_cfg_root,
             execution_context=self.execution_context,
-            implementation_key=self.implementation_key,
+            credential_acquisition=self.credential_acquisition,
             execution_access_mode=self.execution_access_modes.get(provider, "standard"),
             provider_options=self.provider_options,
         )

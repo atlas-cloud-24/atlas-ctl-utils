@@ -43,9 +43,7 @@ _MATERIALIZED_IMPORT_LABELS: dict[Path, str] = {}
 
 
 def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = False) -> str:
-    """
-
-    normalize a cfg-root absolute path used by plt metadata."""
+    """Normalize a cfg-root absolute path used by plt metadata."""
 
     if not isinstance(raw_value, str) or not raw_value.strip():
         raise RuntimeError(f"{label} must be a non-empty string")
@@ -65,9 +63,7 @@ def normalize_cfg_absolute_path(raw_value, *, label: str, allow_root: bool = Fal
 
 
 def cfg_abs_path_to_dir(cfg_root: Path, abs_path: str, *, label: str) -> Path:
-    """
-
-    resolve a normalized cfg-root absolute path to a directory under cfg_root."""
+    """Resolve a normalized cfg-root absolute path to a directory under cfg_root."""
 
     normalized = normalize_cfg_absolute_path(abs_path, label=label, allow_root=True)
     rel = normalized.lstrip("/")
@@ -80,18 +76,14 @@ def cfg_abs_path_to_dir(cfg_root: Path, abs_path: str, *, label: str) -> Path:
 
 
 def canonical_sha256(value: object) -> str:
-    """
-
-    hash a JSON-compatible value with stable mapping-key ordering."""
+    """Hash a JSON-compatible value with stable mapping-key ordering."""
 
     canonical = json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def directory_content_sha256(path: Path) -> str:
-    """
-
-    hash a directory view from sorted relative paths and exact file bytes."""
+    """Hash a directory view from sorted relative paths and exact file bytes."""
 
     digest = hashlib.sha256()
     files = (
@@ -118,17 +110,13 @@ def _sha256_file(path: Path) -> str:
 
 
 def _newest(groups: dict) -> str:
-    """
-
-    the latest `time` across a row's groups; '' when none carries one."""
+    """The latest `time` across a row's groups; '' when none carries one."""
 
     return max((g.get("time") or "" for g in groups.values()), default="")
 
 
 def _remove_path(path: Path) -> None:
-    """
-
-    remove an existing file, directory, or symlink."""
+    """Remove an existing file, directory, or symlink."""
 
     if path.is_symlink() or path.is_file():
         path.unlink()

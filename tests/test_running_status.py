@@ -20,8 +20,13 @@ from engine.kernel import ids as kernel_ids
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
+from engine.run import request as run_request
+from engine.run import selection as run_selection
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_outdating as state_status_outdating
+from engine.state import status_query as state_status_query
+from engine.state import status_rows as state_status_rows
 from engine_surface import patch_engine
 
 TARGET_SPEC = {
@@ -215,16 +220,16 @@ class OutdateAtMutationStartTest(unittest.TestCase):
         return sibling
 
     def test_a_run_that_never_mutated_outdates_nothing(self):
-        """
+        """The mutation_started guard still holds: preparation failures touch
 
-        the mutation_started guard still holds: preparation failures touch
-        no resources, so they must not invalidate anyone's result."""
+        no resources, so they must not invalidate anyone's result.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = self._run_dir(root)
             sibling = self._sibling(root)
-            state_status.mark_outdated_for_run(run_dir, include_current_result=False)
+            state_status_outdating.mark_outdated_for_run(run_dir, include_current_result=False)
             self.assertEqual(kernel_yaml_io.load_yaml(sibling / "committed.yaml")["status"], "ok")
 
 
@@ -241,7 +246,7 @@ class StatusGroupTest(unittest.TestCase):
     """
 
     def _map(self, namespace: Path):
-        return state_status.compute_namespace_status_map(namespace)
+        return state_status_rows.compute_namespace_status_map(namespace)
 
     def test_nothing_ran_means_no_row_at_all(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,30 +286,32 @@ class StatusFilterTest(unittest.TestCase):
     }
 
     def test_kind_keeps_only_matching_rows(self):
-        got = state_status.filter_status_map(self.MAP, {"kind": ["workflow"]})
+        got = state_status_query.filter_status_map(self.MAP, {"kind": ["workflow"]})
         self.assertEqual({"workflow"}, set(got))
         self.assertEqual({"env/baseline"}, set(got["workflow"]))
 
     def test_group_keeps_only_matching_groups(self):
-        got = state_status.filter_status_map(self.MAP, {"group": ["mutative"]})
+        got = state_status_query.filter_status_map(self.MAP, {"group": ["mutative"]})
         self.assertEqual({"mutative"}, set(got["target"]["env/core"]["instances"]["account=dev"]))
 
     def test_a_row_left_with_no_group_is_dropped(self):
+        """Not shown empty: an empty row reads as "nothing happened here", a
+
+        different claim from "you asked not to see it".
         """
 
-        not shown empty: an empty row reads as "nothing happened here", a
-        different claim from "you asked not to see it"."""
-
-        got = state_status.filter_status_map(self.MAP, {"group": ["mutative"]})
+        got = state_status_query.filter_status_map(self.MAP, {"group": ["mutative"]})
         self.assertNotIn("env/acm", got["target"])
 
     def test_both_filters_compose(self):
-        got = state_status.filter_status_map(self.MAP, {"kind": ["target"], "group": ["plan"]})
+        got = state_status_query.filter_status_map(
+            self.MAP, {"kind": ["target"], "group": ["plan"]}
+        )
         self.assertEqual({"target"}, set(got))
         self.assertEqual({"env/core", "env/acm"}, set(got["target"]))
 
     def test_no_filter_is_the_whole_map(self):
-        self.assertEqual(self.MAP, state_status.filter_status_map(self.MAP, {}))
+        self.assertEqual(self.MAP, state_status_query.filter_status_map(self.MAP, {}))
 
 
 class TemplateNestingTest(unittest.TestCase):
@@ -324,12 +331,14 @@ class TemplateNestingTest(unittest.TestCase):
                     namespace,
                     f"target/env/core/instances/account={account}",
                 )
-            block = state_status.compute_namespace_status_map(namespace)["target"]["env/core"]
+            block = state_status_rows.compute_namespace_status_map(namespace)["target"]["env/core"]
             self.assertEqual({"account=dev", "account=stg"}, set(block["instances"]))
 
     def test_filtering_a_singleton_template_drops_it_whole(self):
         singleton = {"target": {"env/core": {"plan": {"status": "passed"}}}}
-        self.assertEqual({}, state_status.filter_status_map(singleton, {"group": ["mutative"]}))
+        self.assertEqual(
+            {}, state_status_query.filter_status_map(singleton, {"group": ["mutative"]})
+        )
 
 
 class StructureAndSortTest(unittest.TestCase):
@@ -358,19 +367,17 @@ class StructureAndSortTest(unittest.TestCase):
     }
 
     def test_nested_sorts_templates_by_their_newest_instance(self):
-        got = state_status.structure_status_map(self.MAP, "nested", "time:desc")
+        got = state_status_query.structure_status_map(self.MAP, "nested", "time:desc")
         self.assertEqual(["B", "A"], list(got["target"]))
 
     def test_nested_sorts_instances_within_a_template(self):
-        got = state_status.structure_status_map(self.MAP, "nested", "time:desc")
+        got = state_status_query.structure_status_map(self.MAP, "nested", "time:desc")
         self.assertEqual(["i2", "i1"], list(got["target"]["B"]["instances"]))
 
     def test_flat_gives_a_strictly_chronological_sequence(self):
-        """
+        """The order a tree cannot express: B/i2, A/i2, B/i1, A/i1."""
 
-        the order a tree cannot express: B/i2, A/i2, B/i1, A/i1."""
-
-        got = state_status.structure_status_map(self.MAP, "flat", "time:desc")
+        got = state_status_query.structure_status_map(self.MAP, "flat", "time:desc")
         self.assertEqual(
             [
                 "target/B/instances/i2",
@@ -382,9 +389,7 @@ class StructureAndSortTest(unittest.TestCase):
         )
 
     def test_flat_is_one_list_across_kinds(self):
-        """
-
-        splitting by kind would break global order exactly as nesting does."""
+        """Splitting by kind would break global order exactly as nesting does."""
 
         mixed = {
             **self.MAP,
@@ -396,27 +401,27 @@ class StructureAndSortTest(unittest.TestCase):
                 }
             },
         }
-        got = state_status.structure_status_map(mixed, "flat", "time:desc")
+        got = state_status_query.structure_status_map(mixed, "flat", "time:desc")
         self.assertEqual(["instances"], list(got))
         self.assertEqual("workflow/W/instances/i1", got["instances"][0]["address"])
 
     def test_flat_rows_carry_their_own_address_and_group(self):
-        row = state_status.structure_status_map(self.MAP, "flat", "time:asc")["instances"][0]
+        row = state_status_query.structure_status_map(self.MAP, "flat", "time:asc")["instances"][0]
         self.assertEqual("target/A/instances/i1", row["address"])
         self.assertEqual("mutative", row["group"])
         self.assertEqual("passed", row["status"])
 
     def test_address_sort_is_the_default_direction_ascending(self):
-        got = state_status.structure_status_map(self.MAP, "nested", "address")
+        got = state_status_query.structure_status_map(self.MAP, "nested", "address")
         self.assertEqual(["A", "B"], list(got["target"]))
 
     def test_unknown_sort_field_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "unknown"):
-            state_status.parse_sort("size:desc")
+            state_status_query.parse_sort("size:desc")
 
     def test_unknown_sort_direction_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "asc or desc"):
-            state_status.parse_sort("time:sideways")
+            state_status_query.parse_sort("time:sideways")
 
 
 class CrossDirectionRunStatusTest(unittest.TestCase):
@@ -511,20 +516,26 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
                 patched["latest_child_revision"].return_value = None
                 patched["run_and_log"].side_effect = spawn
                 commands_pipeline.run_targets(
-                    {"tr1": {"target": "env/seed/baseline"}},
-                    run_dir,
-                    Path(tmp),
-                    Path(tmp) / "ctx.yaml",
-                    action,
-                    {},
-                    "r1",
-                    {},
-                    False,
-                    None,
-                    {},
-                    "aws",
-                    "local",
+                    run_request.RunRequest(
+                        ctl_cfg_root=Path(tmp),
+                        ctl_profile="local_dev",
+                        action=action,
+                        run_id="r1",
+                        run_dir=run_dir,
+                        credential_acquisition="aws",
+                        execution_runtime_mode="local",
+                    ),
+                    run_selection.RunSelection(
+                        kind="workflow", key="w", execution_context={}, provider_catalogs={}
+                    ),
+                    active_target_runs={"tr1": {"target": "env/seed/baseline"}},
+                    plt_targets_dir_path=Path(tmp),
+                    execution_context_path=Path(tmp) / "ctx.yaml",
+                    tooling_refs={},
+                    credential_refresh_modes=None,
                     child_command_spec={"ctl_state_local_root": str(tmp)},
+                    secret_store=None,
+                    plt_provider_dispatch=None,
                 )
         finally:
             os.chdir(cwd)
@@ -539,9 +550,7 @@ class WorkflowSpawnMutationMarkTest(unittest.TestCase):
             self.assertIs(True, self._run(tmp, "destroy").get("mutation_started"))
 
     def test_the_mark_lands_before_the_child_runs(self):
-        """
-
-        marking after the spawn would leave the whole child run unrecorded."""
+        """Marking after the spawn would leave the whole child run unrecorded."""
 
         seen = {}
 
@@ -616,20 +625,26 @@ class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
                 patched["mint_child_lock_grant"].return_value = "grant"
                 patched["latest_child_revision"].return_value = None
                 commands_pipeline.run_targets(
-                    {"tr1": target_run},
-                    run_dir,
-                    Path(tmp),
-                    Path(tmp) / "ctx.yaml",
-                    run_action,
-                    {},
-                    "r1",
-                    {},
-                    False,
-                    None,
-                    {},
-                    "aws",
-                    "local",
+                    run_request.RunRequest(
+                        ctl_cfg_root=Path(tmp),
+                        ctl_profile="local_dev",
+                        action=run_action,
+                        run_id="r1",
+                        run_dir=run_dir,
+                        credential_acquisition="aws",
+                        execution_runtime_mode="local",
+                    ),
+                    run_selection.RunSelection(
+                        kind="workflow", key="w", execution_context={}, provider_catalogs={}
+                    ),
+                    active_target_runs={"tr1": target_run},
+                    plt_targets_dir_path=Path(tmp),
+                    execution_context_path=Path(tmp) / "ctx.yaml",
+                    tooling_refs={},
+                    credential_refresh_modes=None,
                     child_command_spec={"ctl_state_local_root": str(tmp)},
+                    secret_store=None,
+                    plt_provider_dispatch=None,
                 )
                 revision_action = patched["latest_child_revision"].call_args[0][3]
         finally:
@@ -640,31 +655,30 @@ class MemberActionDrivesWhatTheParentReadsTest(unittest.TestCase):
         return slot, revision_action
 
     def test_a_provisioning_member_in_a_plan_run_marks_the_mutation(self):
-        """
+        """The member decides: a `plan` workflow holding a provisioning member DOES
 
-        the member decides: a `plan` workflow holding a provisioning member DOES
-        mutate, and a run that does not mark it reports no damage after damage."""
+        mutate, and a run that does not mark it reports no damage after damage.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             slot, _ = self._run(tmp, "plan", "provision")
             self.assertIs(True, slot.get("mutation_started"))
 
     def test_a_plan_member_in_a_provision_run_does_not_mark(self):
-        """
+        """The other direction, which a run-level check gets wrong too: planning
 
-        the other direction, which a run-level check gets wrong too: planning
-        changes nothing, whatever the run as a whole is for."""
+        changes nothing, whatever the run as a whole is for.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             slot, _ = self._run(tmp, "provision", "plan")
             self.assertIs(False, slot.get("mutation_started"))
 
     def test_the_revision_reader_is_given_the_members_action(self):
+        """Spawned with the member's action, so read back with the member's action
+
+        — otherwise the parent looks in a group the child never wrote to.
         """
-
-        spawned with the member's action, so read back with the member's action
-        — otherwise the parent looks in a group the child never wrote to."""
-
         with tempfile.TemporaryDirectory() as tmp:
             _, revision_action = self._run(tmp, "provision", "plan")
             self.assertEqual("plan", revision_action)

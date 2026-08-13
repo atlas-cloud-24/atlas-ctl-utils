@@ -19,6 +19,8 @@ from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.commands import pipeline as commands_pipeline
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import request as run_request
+from engine.run import selection as run_selection
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine_surface import patch_engine
@@ -188,26 +190,32 @@ class WorkflowReuseGateTest(unittest.TestCase):
                         )
                     )
                     commands_pipeline.run_targets(
-                        {
+                        run_request.RunRequest(
+                            ctl_cfg_root=Path(tmp),
+                            ctl_profile="local_dev",
+                            action="plan",
+                            run_id="w1",
+                            run_dir=run_dir,
+                            credential_acquisition="provider",
+                            execution_runtime_mode="local",
+                            skip_up_to_date=True,
+                        ),
+                        run_selection.RunSelection(
+                            kind="workflow", key="w", execution_context={}, provider_catalogs={}
+                        ),
+                        active_target_runs={
                             "member": {
                                 "target": "target",
                                 "reuse_committed_result": reuse_committed_result,
                             }
                         },
-                        run_dir,
-                        Path(tmp),
-                        Path(tmp) / "context.yaml",
-                        "plan",
-                        {},
-                        "w1",
-                        {},
-                        False,
-                        None,
-                        {},
-                        "provider",
-                        "local",
-                        skip_up_to_date=True,
+                        plt_targets_dir_path=Path(tmp),
+                        execution_context_path=Path(tmp) / "context.yaml",
+                        tooling_refs={},
+                        credential_refresh_modes=None,
                         child_command_spec={"ctl_state_local_root": tmp},
+                        secret_store=None,
+                        plt_provider_dispatch=None,
                     )
                     return {
                         "reuse_checks": patched["up_to_date_child_revision"].call_count,

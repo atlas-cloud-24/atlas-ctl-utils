@@ -22,9 +22,7 @@ def _uuid7_timestamp_ms() -> int:
 
 
 def generate_uuid7() -> str:
-    """
-
-    generate a monotonic UUIDv7 string for one ctl run execution."""
+    """Generate a monotonic UUIDv7 string for one ctl run execution."""
 
     global _UUID7_LAST_TIMESTAMP_MS, _UUID7_COUNTER
 

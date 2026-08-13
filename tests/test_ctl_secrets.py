@@ -150,7 +150,7 @@ class ProviderBackedSecretsTest(unittest.TestCase):
             {
                 "ctl_cfg_root",
                 "execution_context",
-                "implementation_key",
+                "credential_acquisition",
                 "execution_access_mode",
                 "provider_options",
             },

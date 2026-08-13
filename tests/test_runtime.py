@@ -93,9 +93,9 @@ class RuntimePrimitivesTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "non-empty ref_policy"):
                 run_policy.ctl_ref_policy(root, "empty")
 
-    def test_step_box_name_valid_and_unique(self):
-        a = kernel_process._step_box_name("landing_zone/org/baseline", "provision/infra")
-        b = kernel_process._step_box_name("env/ops/app", "provision/ecr")
+    def teststep_box_name_valid_and_unique(self):
+        a = kernel_process.step_box_name("landing_zone/org/baseline", "provision/infra")
+        b = kernel_process.step_box_name("env/ops/app", "provision/ecr")
         for name in (a, b):
             self.assertRegex(name, r"^[a-z0-9._-]+$")
             self.assertFalse(name.startswith("-") or name.endswith("-"))
@@ -103,9 +103,7 @@ class RuntimePrimitivesTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
-    """
-
-    the target_run/CTL boundary is enforced, not conventional."""
+    """The target_run/CTL boundary is enforced, not conventional."""
 
     def _step_yamls(self):
         return sorted(ATLAS_STACK.glob("*/atlas_ctl_adapter/steps/*/*/step.yaml"))

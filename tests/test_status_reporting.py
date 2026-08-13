@@ -28,6 +28,8 @@ from engine.run import addressing as run_addressing
 from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_query as state_status_query
+from engine.state import status_rows as state_status_rows
 
 TARGET_KEY = "env/workload_identity/baseline"
 TARGET_SEGMENTS = ["env.type=dev", "aws.account=dev"]
@@ -86,29 +88,25 @@ def _slot(
 
 
 class TimelineTest(unittest.TestCase):
-    """
-
-    nothing -> running -> committed, read at each moment."""
+    """Nothing -> running -> committed, read at each moment."""
 
     def test_an_empty_namespace_reports_nothing_and_does_not_fail(self):
-        """
-
-        the case that looked broken: a read before anything is published."""
+        """The case that looked broken: a read before anything is published."""
 
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual({}, state_status.compute_namespace_status_map(Path(tmp)))
+            self.assertEqual({}, state_status_rows.compute_namespace_status_map(Path(tmp)))
 
     def test_a_missing_namespace_reports_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
-                {}, state_status.compute_namespace_status_map(Path(tmp) / "never-created")
+                {}, state_status_rows.compute_namespace_status_map(Path(tmp) / "never-created")
             )
 
     def test_a_run_in_flight_reports_running_before_it_commits(self):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "in_progress")
-            rows = state_status.compute_namespace_status_map(ns)
+            rows = state_status_rows.compute_namespace_status_map(ns)
             row = rows["target"][TARGET_KEY]["instances"]["/".join(TARGET_SEGMENTS)]
             self.assertEqual("running", row["mutative"]["status"])
             self.assertNotIn("freshness", row["mutative"])
@@ -117,23 +115,21 @@ class TimelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("passed", row["status"])
             self.assertEqual("up_to_date", row["freshness"])
             self.assertEqual("2026-07-30T15:05:34Z", row["time"])
 
     def test_a_target_and_its_workflow_both_appear(self):
-        """
-
-        the target reports state; the workflow reports its last run."""
+        """The target reports state; the workflow reports its last run."""
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
             _workflow_run(ns, WORKFLOW_KEY, run_id="w1")
-            rows = state_status.compute_namespace_status_map(ns)
+            rows = state_status_rows.compute_namespace_status_map(ns)
             self.assertEqual({"target", "workflow"}, set(rows))
             self.assertIn(
                 "mutative", rows["target"][TARGET_KEY]["instances"]["/".join(TARGET_SEGMENTS)]
@@ -145,9 +141,9 @@ class TimelineTest(unittest.TestCase):
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
             _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "failed", error={"summary": "boom"})
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("failed", row["status"])
 
 
@@ -158,7 +154,7 @@ class GroupIndependenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, at="2026-07-30T10:00:00Z")
-            before = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            before = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
             ]["/".join(TARGET_SEGMENTS)]["mutative"]
             _publish(
@@ -170,7 +166,7 @@ class GroupIndependenceTest(unittest.TestCase):
                 action="plan",
                 at="2026-07-30T11:00:00Z",
             )
-            after = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            after = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
                 "instances"
             ]["/".join(TARGET_SEGMENTS)]
             self.assertEqual(before, after["mutative"])
@@ -180,17 +176,15 @@ class GroupIndependenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action="destroy")
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("passed", row["status"])
             self.assertNotIn("freshness", row)
 
 
 class ShapingTest(unittest.TestCase):
-    """
-
-    filtering and structuring the map a reader actually sees."""
+    """Filtering and structuring the map a reader actually sees."""
 
     def _map(self, ns: Path) -> dict:
         _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, at="2026-07-30T15:05:34Z")
@@ -204,33 +198,37 @@ class ShapingTest(unittest.TestCase):
             at="2026-07-30T15:00:00Z",
         )
         _workflow_run(ns, WORKFLOW_KEY, run_id="w1")
-        return state_status.compute_namespace_status_map(ns)
+        return state_status_rows.compute_namespace_status_map(ns)
 
     def test_kind_filter_keeps_only_that_kind(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), {"kind": ["workflow"]})
+            rows = state_status_query.filter_status_map(
+                self._map(Path(tmp)), {"kind": ["workflow"]}
+            )
             self.assertEqual(["workflow"], list(rows))
 
     def test_group_filter_keeps_only_that_group(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), {"group": ["plan"]})
+            rows = state_status_query.filter_status_map(self._map(Path(tmp)), {"group": ["plan"]})
             instance = rows["target"][TARGET_KEY]["instances"]["/".join(TARGET_SEGMENTS)]
             self.assertEqual(["plan"], list(instance))
 
     def test_a_row_left_with_no_group_is_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = state_status.filter_status_map(self._map(Path(tmp)), {"group": ["readonly"]})
+            rows = state_status_query.filter_status_map(
+                self._map(Path(tmp)), {"group": ["readonly"]}
+            )
             self.assertEqual({}, rows)
 
     def test_flat_structure_sorts_chronologically(self):
         with tempfile.TemporaryDirectory() as tmp:
-            flat = state_status.structure_status_map(self._map(Path(tmp)), "flat", "time:asc")
+            flat = state_status_query.structure_status_map(self._map(Path(tmp)), "flat", "time:asc")
             times = [row["time"] for row in flat["instances"]]
             self.assertEqual(sorted(times), times)
 
     def test_an_unknown_sort_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, "unknown"):
-            state_status.parse_sort("size:desc")
+            state_status_query.parse_sort("size:desc")
 
 
 if __name__ == "__main__":
@@ -238,9 +236,7 @@ if __name__ == "__main__":
 
 
 class StatusArgumentsTest(unittest.TestCase):
-    """
-
-    every status argument still means something under the history model."""
+    """Every status argument still means something under the history model."""
 
     def _tree(self, ns: Path) -> None:
         _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
@@ -262,7 +258,7 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _workflow_run(ns, WORKFLOW_KEY, run_id="w1")
-            result = state_status._targeted_workflow_status(
+            result = state_status_rows._targeted_workflow_status(
                 ns,
                 "provision",
                 {"kind": "workflow", "key": WORKFLOW_KEY, "segments": [], "address": WORKFLOW_KEY},
@@ -271,7 +267,7 @@ class StatusArgumentsTest(unittest.TestCase):
 
     def test_a_targeted_workflow_that_never_ran_reports_no_run(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result = state_status._targeted_workflow_status(
+            result = state_status_rows._targeted_workflow_status(
                 Path(tmp),
                 "provision",
                 {"kind": "workflow", "key": WORKFLOW_KEY, "segments": [], "address": WORKFLOW_KEY},
@@ -283,8 +279,8 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._tree(ns)
-            rows = state_status.filter_status_map(
-                state_status.compute_namespace_status_map(ns), {"kind": ["workflow"]}
+            rows = state_status_query.filter_status_map(
+                state_status_rows.compute_namespace_status_map(ns), {"kind": ["workflow"]}
             )
             self.assertEqual(["workflow"], list(rows))
 
@@ -295,8 +291,8 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._tree(ns)
-            rows = state_status.filter_status_map(
-                state_status.compute_namespace_status_map(ns), {"group": ["mutative"]}
+            rows = state_status_query.filter_status_map(
+                state_status_rows.compute_namespace_status_map(ns), {"group": ["mutative"]}
             )
             self.assertEqual(["target", "workflow"], sorted(rows))
 
@@ -304,8 +300,8 @@ class StatusArgumentsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._tree(ns)
-            flat = state_status.structure_status_map(
-                state_status.compute_namespace_status_map(ns), "flat", "time:asc"
+            flat = state_status_query.structure_status_map(
+                state_status_rows.compute_namespace_status_map(ns), "flat", "time:asc"
             )
             addresses = [row["address"] for row in flat["instances"]]
             self.assertIn("workflow/env/workload_identity", addresses)
@@ -326,7 +322,7 @@ class StatusArgumentsTest(unittest.TestCase):
                 "env/readonly": {"readonly": {"status": "succeeded"}},
             }
         }
-        kept = state_status.filter_status_map(
+        kept = state_status_query.filter_status_map(
             instances, {"kind": ["workflow"], "group": ["mutative"]}
         )
         self.assertEqual(["env/baseline"], list(kept["workflow"]))
@@ -336,21 +332,26 @@ class StatusArgumentsTest(unittest.TestCase):
         is dropped when none remain."""
 
         instances = {"workflow": {"env/baseline": {"mutative": {"status": "succeeded"}}}}
-        kept = state_status.filter_status_map(
+        kept = state_status_query.filter_status_map(
             instances, {"kind": ["workflow"], "group": ["mutative"]}
         )
         self.assertEqual({"mutative": {"status": "succeeded"}}, kept["workflow"]["env/baseline"])
         self.assertEqual(
-            {}, state_status.filter_status_map(instances, {"kind": ["workflow"], "group": ["plan"]})
+            {},
+            state_status_query.filter_status_map(
+                instances, {"kind": ["workflow"], "group": ["plan"]}
+            ),
         )
 
     def test_workflows_alone_are_fine(self):
-        state_status.filter_status_map({}, {"kind": ["workflow"]})
+        state_status_query.filter_status_map({}, {"kind": ["workflow"]})
 
     def test_a_group_with_targets_included_is_fine(self):
         """The group narrows the target rows; the workflow rows are unaffected."""
-        state_status.filter_status_map({}, {"kind": ["target", "workflow"], "group": ["mutative"]})
-        state_status.filter_status_map({}, {"group": ["mutative"]})
+        state_status_query.filter_status_map(
+            {}, {"kind": ["target", "workflow"], "group": ["mutative"]}
+        )
+        state_status_query.filter_status_map({}, {"group": ["mutative"]})
 
 
 class RunIdentityTest(unittest.TestCase):
@@ -385,9 +386,9 @@ class RunIdentityTest(unittest.TestCase):
                 "mutation_started": True,
             },
         )
-        return state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-            "/".join(TARGET_SEGMENTS)
-        ]["mutative"]
+        return state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_at_is_the_failed_runs_time_not_the_last_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,10 +397,10 @@ class RunIdentityTest(unittest.TestCase):
             self.assertEqual("2026-08-03T11:22:26Z", row["time"])
 
     def test_run_id_is_the_failed_run(self):
-        """
+        """The worse half: the detailed row carried the SUCCESSFUL run's id, so
 
-        the worse half: the detailed row carried the SUCCESSFUL run's id, so
-        anyone opening it landed in the wrong run directory."""
+        anyone opening it landed in the wrong run directory.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
@@ -427,16 +428,14 @@ class RunIdentityTest(unittest.TestCase):
             self.assertEqual(["status", "last_action", "time"], list(row))
 
     def test_a_clean_row_does_not_repeat_itself(self):
-        """
-
-        when one run is both newest and committed, there is nothing to add."""
+        """When one run is both newest and committed, there is nothing to add."""
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS)
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertNotIn("committed_at", row)
             self.assertNotIn("committed_run_id", row)
 
@@ -452,9 +451,9 @@ class LastActionTest(unittest.TestCase):
 
     def _row(self, ns: Path, action: str) -> dict:
         _publish(ns, "target", TARGET_KEY, TARGET_SEGMENTS, action=action)
-        return state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-            "/".join(TARGET_SEGMENTS)
-        ]["mutative"]
+        return state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_a_provisioned_instance_says_so(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -475,18 +474,18 @@ class LastActionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             _slot(ns, "target", TARGET_KEY, TARGET_SEGMENTS, "in_progress")
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("running", row["status"])
             self.assertEqual("provision", row["last_action"])
 
     def test_a_failed_destroy_after_a_good_provision_reports_destroy(self):
-        """
+        """The confusing case from a real namespace: `status: failed` beside
 
-        the confusing case from a real namespace: `status: failed` beside
         `last_action: provision` reads as "the provision failed", when the
-        provision succeeded and the DESTROY failed."""
+        provision succeeded and the DESTROY failed.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
@@ -504,16 +503,14 @@ class LastActionTest(unittest.TestCase):
                     "mutation_started": True,
                 },
             )
-            row = state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-                "/".join(TARGET_SEGMENTS)
-            ]["mutative"]
+            row = state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+                "instances"
+            ]["/".join(TARGET_SEGMENTS)]["mutative"]
             self.assertEqual("failed", row["status"])
             self.assertEqual("destroy", row["last_action"])
 
     def test_last_action_reads_before_freshness(self):
-        """
-
-        it qualifies `status`, so it sits next to it."""
+        """It qualifies `status`, so it sits next to it."""
 
         with tempfile.TemporaryDirectory() as tmp:
             row = self._row(Path(tmp), "provision")
@@ -551,7 +548,7 @@ class WorkflowEffectPartitionTest(unittest.TestCase):
             ns = Path(tmp)
             self._run(ns, "w1", "provision", "ok", "2026-08-05T10:00:00Z")
             self._run(ns, "w2", "plan", "failed", "2026-08-05T18:00:00Z")
-            row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
+            row = state_status_rows.compute_namespace_status_map(ns)["workflow"][self.KEY]
             self.assertEqual({"mutative", "non_mutative"}, set(row))
             self.assertEqual("passed", row["mutative"]["status"])
             self.assertEqual("failed", row["non_mutative"]["status"])
@@ -561,7 +558,7 @@ class WorkflowEffectPartitionTest(unittest.TestCase):
             ns = Path(tmp)
             self._run(ns, "w1", "provision", "failed", "2026-08-05T10:00:00Z")
             self._run(ns, "w2", "provision", "ok", "2026-08-05T12:00:00Z")
-            row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
+            row = state_status_rows.compute_namespace_status_map(ns)["workflow"][self.KEY]
             self.assertEqual("passed", row["mutative"]["status"])
             self.assertEqual("2026-08-05T12:00:00Z", row["mutative"]["time"])
 
@@ -572,7 +569,7 @@ class WorkflowEffectPartitionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._run(ns, "w1", "plan", "ok", "2026-08-05T10:00:00Z")
-            row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
+            row = state_status_rows.compute_namespace_status_map(ns)["workflow"][self.KEY]
             self.assertEqual(["non_mutative"], list(row))
 
     def test_latest_plan_or_readonly_run_represents_non_mutative(self):
@@ -580,7 +577,7 @@ class WorkflowEffectPartitionTest(unittest.TestCase):
             ns = Path(tmp)
             self._run(ns, "w1", "plan", "failed", "2026-08-05T10:00:00Z")
             self._run(ns, "w2", "readonly", "ok", "2026-08-05T12:00:00Z")
-            row = state_status.compute_namespace_status_map(ns)["workflow"][self.KEY]
+            row = state_status_rows.compute_namespace_status_map(ns)["workflow"][self.KEY]
             self.assertEqual(["non_mutative"], list(row))
             self.assertEqual("passed", row["non_mutative"]["status"])
             self.assertEqual(["readonly"], row["non_mutative"]["actions"])
@@ -620,16 +617,16 @@ class WorkflowInstanceTest(unittest.TestCase):
             self._run(
                 ns, ["env.type=test"], run_id="w-test", status="failed", at="2026-08-03T11:00:00Z"
             )
-            rows = state_status.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
+            rows = state_status_rows.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
             self.assertEqual({"env.type=dev", "env.type=test"}, set(rows["instances"]))
             self.assertEqual("passed", rows["instances"]["env.type=dev"]["mutative"]["status"])
             self.assertEqual("failed", rows["instances"]["env.type=test"]["mutative"]["status"])
 
     def test_a_later_run_elsewhere_does_not_answer_for_this_instance(self):
-        """
+        """The exact failure: dev succeeded, then test failed later, and the one
 
-        the exact failure: dev succeeded, then test failed later, and the one
-        row reported `failed` for the whole key."""
+        row reported `failed` for the whole key.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
@@ -637,7 +634,7 @@ class WorkflowInstanceTest(unittest.TestCase):
             self._run(
                 ns, ["env.type=test"], run_id="w-test", status="failed", at="2026-08-03T23:00:00Z"
             )
-            dev = state_status.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY][
+            dev = state_status_rows.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY][
                 "instances"
             ]["env.type=dev"]["mutative"]
             self.assertEqual("passed", dev["status"])
@@ -649,7 +646,7 @@ class WorkflowInstanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ns = Path(tmp)
             self._run(ns, [], run_id="w1", status="ok", at="2026-08-03T10:00:00Z")
-            row = state_status.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
+            row = state_status_rows.compute_namespace_status_map(ns)["workflow"][WORKFLOW_KEY]
             self.assertIn("mutative", row)
             self.assertNotIn("instances", row)
 
@@ -678,9 +675,9 @@ class ParentWorkflowLinkTest(unittest.TestCase):
                 **slot_facts,
             },
         )
-        return state_status.compute_namespace_status_map(ns)["target"][TARGET_KEY]["instances"][
-            "/".join(TARGET_SEGMENTS)
-        ]["mutative"]
+        return state_status_rows.compute_namespace_status_map(ns)["target"][TARGET_KEY][
+            "instances"
+        ]["/".join(TARGET_SEGMENTS)]["mutative"]
 
     def test_a_spawned_target_names_its_workflow_instance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -688,19 +685,16 @@ class ParentWorkflowLinkTest(unittest.TestCase):
             self.assertEqual(f"workflow/{self.PARENT}", row["parent_workflow"])
 
     def test_a_directly_invoked_target_names_none(self):
-        """
-
-        absent is a real distinction — the run had no parent — not a gap."""
-
+        """Absent is a real distinction — the run had no parent — not a gap."""
         with tempfile.TemporaryDirectory() as tmp:
             row = self._row(Path(tmp))
             self.assertNotIn("parent_workflow", row)
 
     def test_the_run_id_goes_under_its_own_key_when_no_address_was_recorded(self):
-        """
+        """Older runs recorded only the id. It gets its OWN field: one key meaning
 
-        older runs recorded only the id. It gets its OWN field: one key meaning
-        "an address, or else an id" makes every reader branch on shape."""
+        "an address, or else an id" makes every reader branch on shape.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             row = self._row(Path(tmp), parent_workflow_run_id="019fc756")
@@ -849,9 +843,7 @@ class StatusQueryHistoryTest(unittest.TestCase):
             )
 
     def test_history_lives_under_the_local_root_only(self):
-        """
-
-        the synced ctl-state must contain no query record at all."""
+        """The synced ctl-state must contain no query record at all."""
 
         source = inspect.getsource(commands_status.StatusCommand.all_run_types)
         self.assertIn("ctl_state_local_root", source)
@@ -916,11 +908,11 @@ class WorkflowClassificationIsDerivedTest(unittest.TestCase):
         self.assertEqual(["provision", "provision"], run_addressing.recorded_member_actions(facts))
 
     def test_a_dict_member_without_an_action_also_inherits_it(self):
-        """
+        """Both member forms appear in ONE list, so both must fall back the same
 
-        both member forms appear in ONE list, so both must fall back the same
         way — a dict entry that carries only an instance is still a member that
-        took the default."""
+        took the default.
+        """
 
         facts = {
             "default_action": "provision",
@@ -937,10 +929,10 @@ class WorkflowClassificationIsDerivedTest(unittest.TestCase):
         self.assertIsNone(run_addressing.workflow_group({"target_instances": []}))
 
     def test_the_group_is_recorded_with_the_composition(self):
-        """
+        """Derived where the members are known, so no reader re-derives it and
 
-        derived where the members are known, so no reader re-derives it and
-        none can derive it differently."""
+        none can derive it differently.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "runs" / "w1"
@@ -999,12 +991,12 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
     def test_a_mutative_workflow_survives_its_own_group_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             ns = self._namespace(Path(tmp), default_action="provision")
-            rows = state_status.compute_namespace_status_map(ns)
+            rows = state_status_rows.compute_namespace_status_map(ns)
             self.assertIn(
                 "env/baseline", rows["workflow"], "precondition: the row exists unfiltered"
             )
 
-            kept = state_status.filter_status_map(
+            kept = state_status_query.filter_status_map(
                 rows, {"kind": ["workflow"], "group": ["mutative"]}
             )
             self.assertIn(
@@ -1016,21 +1008,23 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
             self.assertIn("env/baseline", kept["workflow"])
 
     def test_a_plan_workflow_is_excluded_by_that_same_filter(self):
-        """
+        """The filter must still filter — surviving everything would be the
 
-        the filter must still filter — surviving everything would be the
-        opposite bug and just as invisible."""
+        opposite bug and just as invisible.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             ns = self._namespace(Path(tmp), default_action="plan")
-            rows = state_status.compute_namespace_status_map(ns)
+            rows = state_status_rows.compute_namespace_status_map(ns)
             self.assertEqual(
                 {},
-                state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}),
+                state_status_query.filter_status_map(
+                    rows, {"kind": ["workflow"], "group": ["mutative"]}
+                ),
             )
             self.assertIn(
                 "workflow",
-                state_status.filter_status_map(
+                state_status_query.filter_status_map(
                     rows, {"kind": ["workflow"], "group": ["non_mutative"]}
                 ),
             )
@@ -1059,11 +1053,13 @@ class WorkflowGroupFilterAgainstRealRowsTest(unittest.TestCase):
                     "target_instances": ["env/core"],
                 },
             )
-            rows = state_status.compute_namespace_status_map(ns)
+            rows = state_status_rows.compute_namespace_status_map(ns)
             self.assertIn("mutative", rows["workflow"]["env/minimal_record"])
             self.assertIn(
                 "workflow",
-                state_status.filter_status_map(rows, {"kind": ["workflow"], "group": ["mutative"]}),
+                state_status_query.filter_status_map(
+                    rows, {"kind": ["workflow"], "group": ["mutative"]}
+                ),
             )
 
 
@@ -1151,10 +1147,10 @@ class WorkflowStateSlotFollowsItsGroupTest(unittest.TestCase):
             )
 
     def test_the_run_then_clears_its_own_slot(self):
-        """
+        """The failure the move prevents: finishing looks under the derived group,
 
-        the failure the move prevents: finishing looks under the derived group,
-        so a slot left in the old one is never removed."""
+        so a slot left in the old one is never removed.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run(Path(tmp), "plan")
@@ -1179,10 +1175,10 @@ class WorkflowStateSlotFollowsItsGroupTest(unittest.TestCase):
             self.assertEqual(["mutative"], self._groups_holding(run_dir, "in_progress"))
 
     def test_another_runs_slot_in_the_same_instance_is_not_moved(self):
-        """
+        """Slots are found by whose they are, not by where this run would have put
 
-        slots are found by whose they are, not by where this run would have put
-        them: an instance holds slots from other runs."""
+        them: an instance holds slots from other runs.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = self._run(Path(tmp), "plan")

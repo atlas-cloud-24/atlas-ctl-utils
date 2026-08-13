@@ -104,19 +104,22 @@ class LabelReachesTheRunRecordTest(unittest.TestCase):
             commands_selection.setup_run_dirs,
             commands_selection.setup_preflight_run_dirs,
         )
+        # one RunLocation carries the label for both, so the two cannot disagree
+        self.assertIn("label", commands_selection.RunLocation.__dataclass_fields__)
         for builder in builders:
             with self.subTest(builder=builder.__name__):
-                self.assertIn("label", inspect.signature(builder).parameters)
                 with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
                     run_dir, *_ = builder(
-                        "labelled-run",
-                        "provision",
-                        "target",
-                        "env/seed/baseline",
-                        Path(tmp),
+                        commands_selection.RunLocation(
+                            run_id="labelled-run",
+                            action="provision",
+                            run_type="target",
+                            result_name="env/seed/baseline",
+                            ctl_state_local_root=Path(tmp),
+                            locator_segments=["live"],
+                            label=LABEL,
+                        ),
                         _memory_handler(),
-                        locator_segments=["live"],
-                        label=LABEL,
                     )
                     self.assertEqual(state_run_store.load_run_metadata(run_dir).get("label"), LABEL)
 
@@ -126,13 +129,15 @@ class LabelReachesTheRunRecordTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "plain-run",
-                "provision",
-                "target",
-                "env/seed/baseline",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="plain-run",
+                    action="provision",
+                    run_type="target",
+                    result_name="env/seed/baseline",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=["live"],
+                ),
                 _memory_handler(),
-                locator_segments=["live"],
             )
             self.assertNotIn("label", state_run_store.load_run_metadata(run_dir))
 
@@ -145,14 +150,16 @@ class LabelPropagatesToChildrenTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             parent_run_dir, *_ = commands_selection.setup_run_dirs(
-                "parent-run",
-                "provision",
-                "workflow",
-                "env/seed",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="parent-run",
+                    action="provision",
+                    run_type="workflow",
+                    result_name="env/seed",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=["live"],
+                    label=LABEL,
+                ),
                 _memory_handler(),
-                locator_segments=["live"],
-                label=LABEL,
             )
             argv = catalog_workflow.WorkflowChildren.build_command(
                 {
@@ -173,13 +180,15 @@ class LabelPropagatesToChildrenTest(unittest.TestCase):
     def test_an_unlabelled_parent_passes_no_label_flag(self):
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             parent_run_dir, *_ = commands_selection.setup_run_dirs(
-                "parent-run",
-                "provision",
-                "workflow",
-                "env/seed",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="parent-run",
+                    action="provision",
+                    run_type="workflow",
+                    result_name="env/seed",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=["live"],
+                ),
                 _memory_handler(),
-                locator_segments=["live"],
             )
             argv = catalog_workflow.WorkflowChildren.build_command(
                 {
@@ -205,14 +214,16 @@ class LabelIsDenormalizedOntoThePointerTest(unittest.TestCase):
         self.assertIn("label", state_run_store._COMMITTED_FACT_KEYS)
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "published-run",
-                "provision",
-                "target",
-                "env/seed/baseline",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="published-run",
+                    action="provision",
+                    run_type="target",
+                    result_name="env/seed/baseline",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=["live"],
+                    label=LABEL,
+                ),
                 _memory_handler(),
-                locator_segments=["live"],
-                label=LABEL,
             )
             payload = state_status.build_status_payload(run_dir, state_run_store.RunStatus.OK)
             state_run_store.publish_committed_pointer(run_dir, payload)
@@ -276,14 +287,16 @@ class LabelIsReadableFromStatusTest(unittest.TestCase):
     def test_a_row_reports_the_label_of_the_run_that_produced_its_status(self):
         with tempfile.TemporaryDirectory(prefix="atlas-run-label-") as tmp:
             run_dir, *_ = commands_selection.setup_run_dirs(
-                "published-run",
-                "provision",
-                "target",
-                "env/seed/baseline",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="published-run",
+                    action="provision",
+                    run_type="target",
+                    result_name="env/seed/baseline",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=["live"],
+                    label=LABEL,
+                ),
                 _memory_handler(),
-                locator_segments=["live"],
-                label=LABEL,
             )
             state_run_store.publish_committed_pointer(
                 run_dir,

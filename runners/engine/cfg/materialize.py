@@ -21,7 +21,6 @@ from engine.kernel import git as kernel_git
 from engine.kernel import ids as kernel_ids
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
-from engine.kernel.git import write_git_meta_to_file
 from engine.run import policy as run_policy
 from engine.state import run_store as state_run_store
 from engine.units import step as units_step
@@ -34,9 +33,7 @@ STEP_IMAGES = ("infra", "ops")
 
 
 def load_cfg_sources(ctl_cfg_root: Path) -> dict[str, dict[str, object]]:
-    """
-
-    load the ctl-owned one-to-one plt and guardrail source bindings."""
+    """Load the ctl-owned one-to-one plt and guardrail source bindings."""
 
     entries = cfg_resources.collect_resource(ctl_cfg_root, "cfg_sources")
     expected = set(cfg_layout.CFG_SOURCE_KEYS)
@@ -90,9 +87,7 @@ def materialize_cfg_sources(
     run_cfg_dir: Path,
     token: str | None = None,
 ) -> dict[str, Path]:
-    """
-
-    resolve local companion roots or clone their ctl-bound remote refs."""
+    """Resolve local companion roots or clone their ctl-bound remote refs."""
 
     sources = load_cfg_sources(ctl_cfg_root)
     cfg_validate.CommitPinning(ref_policy).check_cfg_sources(sources)
@@ -192,7 +187,7 @@ def write_git_metas(
 ) -> None:
     """Write ctl, plt, guardrail, and orchestrator git metadata."""
     # ctl_cfg_git_meta
-    write_git_meta_to_file(
+    kernel_git.write_git_meta_to_file(
         git_dir=ctl_cfg_root,
         dest_dir=artifacts_dir,
         filename="piepeline_orchestrator_cfg_git_meta.yaml",
@@ -200,7 +195,7 @@ def write_git_metas(
     )
 
     # orchestrator_git_meta
-    write_git_meta_to_file(
+    kernel_git.write_git_meta_to_file(
         git_dir=os.getcwd(),
         dest_dir=artifacts_dir,
         filename="piepeline_orchestrator_git_meta.yaml",
@@ -208,13 +203,13 @@ def write_git_metas(
     )
 
     # plt_cfg_git_meta
-    write_git_meta_to_file(
+    kernel_git.write_git_meta_to_file(
         git_dir=plt_cfg_root,
         dest_dir=artifacts_dir,
         filename="plt_cfg_git_meta.yaml",
         generator=kernel_ids.SERVICE_ID,
     )
-    write_git_meta_to_file(
+    kernel_git.write_git_meta_to_file(
         git_dir=guardrails_cfg_root,
         dest_dir=artifacts_dir,
         filename="guardrails_cfg_git_meta.yaml",
@@ -223,11 +218,11 @@ def write_git_metas(
 
 
 def _step_utils_module(name: str):
-    """
+    """Import a step_utils/ctl python module by file path (shared primitives:
 
-    import a step_utils/ctl python module by file path (shared primitives:
     Resolver, merge_values, cfg-entry refs). The module stays self-contained in
-    step_utils because it also executes inside target_run containers."""
+    step_utils because it also executes inside target_run containers.
+    """
 
     import importlib.util
 
@@ -308,9 +303,7 @@ def run_cfg_distribution(
 def materialize_target_modules(
     target_run_id: str, target_run: dict, repo_path: Path, secret_store=None
 ) -> None:
-    """
-
-    populate target_run-local child modules before setup runs."""
+    """Populate target_run-local child modules before setup runs."""
 
     modules = target_run.get("modules") or {}
     if not modules:
@@ -389,7 +382,7 @@ def rebind_step_credentials(
     provider_adapter,
     provider_catalogs: dict,
     execution_context: dict,
-    provider_implementation_key: str,
+    credential_acquisition: str,
     execution_access_modes: dict[str, str] | None,
     provider_options: dict[str, str] | None,
 ) -> None:
@@ -421,7 +414,7 @@ def rebind_step_credentials(
         step_env,
         provider_catalogs,
         execution_context=execution_context,
-        implementation_key=provider_implementation_key,
+        credential_acquisition=credential_acquisition,
         execution_access_mode=adapter_access_mode,
         provider_options=adapter_options,
     )
@@ -435,7 +428,7 @@ def prepare_target_repo(
     provider_adapter=None,
     provider_catalogs: dict | None = None,
     execution_context: dict[str, object] | None = None,
-    provider_implementation_key: str | None = None,
+    credential_acquisition: str | None = None,
     execution_access_modes: dict[str, str] | None = None,
     provider_options: dict[str, str] | None = None,
     secret_store=None,
@@ -481,11 +474,7 @@ def prepare_target_repo(
     target_env.update(tooling_env)
     target_env["ATLAS_STEP_UTILS_DIR"] = str(materialize_step_utils(run_dir).parent)
     if provider_adapter is not None:
-        if (
-            provider_catalogs is None
-            or execution_context is None
-            or provider_implementation_key is None
-        ):
+        if provider_catalogs is None or execution_context is None or credential_acquisition is None:
             raise RuntimeError("❌ incomplete provider inputs for target_run preparation")
         adapter_access_mode, adapter_options = execution_providers.provider_inputs(
             provider_adapter.PROVIDER_NAME, execution_access_modes, provider_options
@@ -496,7 +485,7 @@ def prepare_target_repo(
             target_env,
             provider_catalogs,
             execution_context=execution_context,
-            implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             execution_access_mode=adapter_access_mode,
             provider_options=adapter_options,
         )

@@ -5,6 +5,7 @@ target that cannot say who runs it is not runnable, and finding that out at
 execution time is finding it out too late."""
 
 import collections
+from dataclasses import dataclass
 from pathlib import Path
 
 from engine.cfg import references as cfg_references
@@ -36,6 +37,20 @@ def _resolve_instance_params_members(
         value_field="params",
         label=f"target {target_name!r} target_instance_params",
     )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TargetResolutionInputs:
+    """The registries one target definition is resolved against."""
+
+    cfg_key_sets: dict
+    cfg_key_sets_path: Path
+    domain_registry: dict
+    param_sets: dict
+    execution_context: dict | None
+    targets: dict
+    target_actions: dict
+    target_reuse_policies: dict
 
 
 class TargetCatalog:
@@ -151,322 +166,20 @@ class TargetCatalog:
         TargetCatalog.validate_distinct_signatures(all_targets)
 
         resolved_targets: dict = {}
+        inputs = TargetResolutionInputs(
+            cfg_key_sets=cfg_key_sets,
+            cfg_key_sets_path=cfg_key_sets_path,
+            domain_registry=domain_registry,
+            param_sets=param_sets,
+            execution_context=execution_context,
+            targets=targets,
+            target_actions=target_actions,
+            target_reuse_policies=target_reuse_policies,
+        )
         for target_name, target_def in targets.items():
-            consumed_group_axes: set[str] = set()
-
-            source = target_def.get("source_key")
-            if not isinstance(source, str) or not source:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} must define a non-empty 'source_key'"
-                )
-
-            target_ref = target_def.get("ref_key")
-            if not isinstance(target_ref, str) or not target_ref.strip():
-                raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'ref_key'")
-
-            # The target DECLARES the domains it reads and, per domain, the
-            # content keys it consumes. `domains` is identity (which namespaces this
-            # target subscribes to); `cfg_keys` is the contract (what it takes out of
-            # them). Neither names a plt FILE, so plt owns its own layout.
-            declared_domains = target_def.get("domains")
-            if not isinstance(declared_domains, list) or not declared_domains:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} must define a non-empty 'domains' list"
-                )
-            # A domain-GENERIC target (the state-backend one) takes its domain from the
-            # execution context. If that axis is not bound — a generic target in a
-            # shared action this run does not activate — resolution is deferred
-            # (None) rather than failing an unrelated run.
-            domains: list[str] | None = []
-            for raw_domain in declared_domains:
-                if not isinstance(raw_domain, str) or not raw_domain.strip():
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} domains entries must be non-empty strings"
-                    )
-                raw_domain = raw_domain.strip()
-                if "${" not in raw_domain:
-                    domains.append(raw_domain)
-                    continue
-                if execution_context is None:
-                    domains = None
-                    break
-                consumed_group_axes.update(
-                    ref[len(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.") :]
-                    for ref in execution_references.RUNTIME_SCALAR_TOKEN_RE.findall(raw_domain)
-                    if ref.startswith(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.")
-                )
-                resolved_domain = execution_references.resolve_runtime_scalar(
-                    raw_domain,
-                    execution_context,
-                    label=f"target {target_name!r} domains entry",
-                    tolerate_missing=True,
-                )
-                if resolved_domain is None:
-                    domains = None
-                    break
-                domains.append(str(resolved_domain))
-            if domains is not None:
-                if len(set(domains)) != len(domains):
-                    raise RuntimeError(f"❌ target {target_name!r} lists a domain twice: {domains}")
-                for domain in domains:
-                    execution_run_context.validate_domain_value(
-                        domain_registry, domain, label=f"target {target_name!r} domains"
-                    )
-
-            raw_cfg_keys = target_def.get("cfg_keys") or {}
-            raw_cfg_key_sets = target_def.get("cfg_key_sets") or {}
-            for field, value in (("cfg_keys", raw_cfg_keys), ("cfg_key_sets", raw_cfg_key_sets)):
-                if not isinstance(value, dict):
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} {field} must be a map (domain -> list)"
-                    )
-            if not raw_cfg_keys and not raw_cfg_key_sets:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} must define cfg_key_sets and/or cfg_keys "
-                    "(domain -> what it consumes)"
-                )
-            cfg_keys: dict[str, list[str]] | None = None
-            if domains is not None:
-
-                def _domain_key(raw, target_name=target_name):
-                    key = str(raw).strip()
-                    if "${" in key:
-                        key = str(
-                            execution_references.resolve_runtime_scalar(
-                                key,
-                                execution_context,
-                                label=f"target {target_name!r} cfg_keys domain",
-                            )
-                        )
-                    return key
-
-                per_domain: dict[str, dict] = {}
-                for raw_key, entries in raw_cfg_key_sets.items():
-                    per_domain.setdefault(_domain_key(raw_key), {})["cfg_key_sets"] = entries
-                for raw_key, entries in raw_cfg_keys.items():
-                    per_domain.setdefault(_domain_key(raw_key), {})["cfg_keys"] = entries
-                cfg_keys = {
-                    domain_key: execution_references.resolve_cfg_key_entries(
-                        spec.get("cfg_keys"),
-                        spec.get("cfg_key_sets"),
-                        cfg_key_sets,
-                        label=f"target {target_name!r} [{domain_key}]",
-                        cfg_path=cfg_key_sets_path,
-                    )
-                    for domain_key, spec in per_domain.items()
-                }
-                # Assertion 2: cfg_keys for a domain this target does not read
-                extra = sorted(set(cfg_keys) - set(domains))
-                if extra:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} declares cfg_keys for {extra}, "
-                        f"which are not in its domains {domains}"
-                    )
-                # Assertion 3: a declared domain this target takes nothing from
-                missing = sorted(set(domains) - set(cfg_keys))
-                if missing:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} declares domains {missing} with no "
-                        "cfg_keys entry — a subscription that consumes nothing"
-                    )
-
-            procedure = target_def.get("procedure_key")
-            if not isinstance(procedure, str) or not procedure:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} must define a non-empty 'procedure_key'"
-                )
-
-            # The target declares its execution axes inline. The old
-            # `execution_identity_key` (a bundle of account + role + credential,
-            # dispatched through named identity groups) is gone: per-action variation
-            # is now `execution.roles`, keyed by authorization class.
-            if "execution_identity_key" in target_def:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} uses `execution_identity_key`, which is removed; "
-                    "declare an `execution_identity:` block (provider, account, roles) instead"
-                )
-            target_execution_identity = target_def.get("execution_identities")
-            target_providers = None
-            if target_execution_identity is not None:
-                target_execution_identity = TargetExecutionIdentity.validate_all(
-                    target_execution_identity, label=f"target {target_name!r}"
-                )
-                target_providers = execution_providers.validate_target_providers(
-                    target_def.get("providers"),
-                    target_execution_identity,
-                    label=f"target {target_name!r}",
-                )
-
-            # A target declares the COORDINATES it consumes and the
-            # CONSTANTS it always uses. The two must not intersect — a name is either
-            # A coordinate or a constant, never both.
-            declared_input_params = execution_run_context.resolve_input_params(
-                target_def.get("input_params"),
-                target_def.get("input_param_sets"),
-                param_sets,
-                label=f"target {target_name!r}",
-                cfg_path=cfg_key_sets_path,
+            resolved_targets[target_name] = TargetCatalog._resolved_target(
+                target_name, target_def, inputs
             )
-            static_vars = target_def.get("static_vars") or {}
-            if not isinstance(static_vars, dict):
-                raise RuntimeError(f"❌ target {target_name!r} static_vars must be a map")
-            for var_name, var_value in static_vars.items():
-                if not isinstance(
-                    var_name, str
-                ) or not execution_references.CONTEXT_KEY_RE.fullmatch(var_name):
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} static_vars key {var_name!r} must be an identifier"
-                    )
-                if isinstance(var_value, (dict, list)):
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} static_vars.{var_name} must be a literal scalar; "
-                        "a selector-dependent constant varies per instance, which makes it a coordinate"
-                    )
-            overlap = sorted(set(declared_input_params) & set(static_vars))
-            if overlap:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} declares {overlap} as BOTH an input param and a "
-                    "static var; a name is either a coordinate or a constant"
-                )
-
-            resolved = {
-                "source": source,
-                "ref": target_ref.strip(),
-                "procedure": procedure,
-                "domains": domains,
-                "cfg_keys": cfg_keys,
-                "input_params": declared_input_params,
-                "static_vars": dict(static_vars),
-                # The allowlist is carried onto the action entry, not
-                # consumed by the filter that built it. A workflow member may name an
-                # action, and the check that it is permitted needs the list at the
-                # point the member is resolved.
-                "allowed_actions": target_actions[target_name],
-                "committed_result_reuse": target_reuse_policies[target_name],
-            }
-            if domains is None:
-                # Domain-generic target whose domain axis is not bound in this run.
-                # Record the AXIS NAMES it needs, never the raw `${...}` template:
-                # The ctl cfg snapshot resolves every scalar it walks, so an
-                # unresolved placeholder stored here would fail the whole run.
-                resolved["domains_unresolved"] = sorted(
-                    {
-                        ref
-                        for raw in declared_domains
-                        for ref in execution_references.RUNTIME_SCALAR_TOKEN_RE.findall(str(raw))
-                    }
-                )
-            # Declared instance identity flows through to the resolved
-            # target (consumed by resolve_run_instance_identity).
-            # A GENERIC target whose instance axes vary by another axis
-            # dispatches its schema by `members` ({params: [...], selectors: {...}}),
-            # the same pattern as its ref groups. Exactly one member
-            # matches; an unbound dispatch axis defers (hard error only if the
-            # target is actually activated in a run).
-            instance_params = target_def.get("target_instance_params")
-            # Every coordinate must be a declared input — checked on ALL
-            # members branches, not just the one this run selects, so an unreachable
-            # branch cannot hide a typo until some later execution context picks it.
-            for branch in (
-                [m.get("params") for m in (instance_params.get("members") or [])]
-                if isinstance(instance_params, dict)
-                else [instance_params]
-            ):
-                if not isinstance(branch, list):
-                    continue
-                undeclared = sorted(
-                    {str(x).strip() for x in branch if isinstance(x, str)}
-                    - set(declared_input_params)
-                )
-                if undeclared:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} target_instance_params {undeclared} are not "
-                        f"declared input params (declared: {sorted(declared_input_params) or 'none'}); "
-                        "a target cannot be identified by a coordinate it does not read"
-                    )
-            if isinstance(instance_params, dict):
-                # The dispatch axes of the schema itself are consumed axes too
-                consumed_group_axes.update(
-                    run_selectors.collect_member_dispatch_axes(
-                        instance_params.get("members"),
-                        label=f"target {target_name!r} target_instance_params members",
-                    )
-                )
-                instance_params = _resolve_instance_params_members(
-                    instance_params, execution_context, target_name=target_name
-                )
-                if instance_params is None:
-                    resolved["target_instance_params_unresolved"] = True
-            if consumed_group_axes:
-                resolved["consumed_group_axes"] = sorted(consumed_group_axes)
-            if instance_params is not None:
-                if not isinstance(instance_params, list) or not all(
-                    isinstance(p, str) and p.strip() for p in instance_params
-                ):
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} target_instance_params must be a list of non-empty strings"
-                    )
-                resolved["target_instance_params"] = [p.strip() for p in instance_params]
-            if target_execution_identity is not None:
-                resolved["execution_identities"] = target_execution_identity
-                resolved["providers"] = target_providers
-            if "provisions_ctl_state_bucket" in target_def:
-                raise RuntimeError(
-                    f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
-                    "use provisions_ctl_state_backend"
-                )
-            if target_def.get("provisions_ctl_state_backend") is True:
-                resolved["provisions_ctl_state_backend"] = True
-            # per-target consent to a mode that requires it (§12); the adapter names
-            # the field, the engine only carries it through. Default: not granted.
-            for consent_field in TargetCatalog.consent_opt_in_fields():
-                if consent_field in target_def:
-                    if not isinstance(target_def[consent_field], bool):
-                        raise RuntimeError(f"❌ target {consent_field} must be a boolean")
-                    resolved[consent_field] = target_def[consent_field]
-            for legacy_flag in (  # removed keys
-                "allow_skip_ctl_entry",
-                "allow_skip_ctl_state_sync",
-                "skip_ctl_role_chain",  # removed
-                "execution_access_mode",
-            ):
-                if legacy_flag in target_def:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} uses removed {legacy_flag}; "
-                        "use the execution_identity block's consent fields (§12) for access, "
-                        "allow_agreed_defer_ctl_state_backend_sync for deferred sync"
-                    )
-            # Static policy: the target may participate in an explicitly agreed
-            # deferred-sync bootstrap graph. Runtime agreement is a separate CLI fact.
-            if "allow_agreed_defer_ctl_state_backend_sync" in target_def:
-                value = target_def["allow_agreed_defer_ctl_state_backend_sync"]
-                if value is not True:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} allow_agreed_defer_ctl_state_backend_sync "
-                        "must be literal true when present"
-                    )
-                resolved["allow_agreed_defer_ctl_state_backend_sync"] = True
-            if "selectors" in target_def:
-                resolved["selectors"] = target_def["selectors"]
-            if "required_plt_overlay_keys" in target_def:
-                overlay_keys = target_def["required_plt_overlay_keys"]
-                if not isinstance(overlay_keys, list) or not all(
-                    isinstance(key, str) and key for key in overlay_keys
-                ):
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} required_plt_overlay_keys must be "
-                        "a list of non-empty strings"
-                    )
-                duplicate_overlay_keys = [
-                    key for key, count in collections.Counter(overlay_keys).items() if count > 1
-                ]
-                if duplicate_overlay_keys:
-                    raise RuntimeError(
-                        f"❌ target {target_name!r} required_plt_overlay_keys must be unique; "
-                        f"duplicates: {', '.join(sorted(duplicate_overlay_keys))}"
-                    )
-                resolved["requires_plt_overlays"] = overlay_keys
-            resolved_targets[target_name] = resolved
 
         return {
             "target_sources": target_sources,
@@ -545,6 +258,353 @@ class TargetCatalog:
                     "target, or make them differ"
                 )
             seen[sig] = key
+
+    @staticmethod
+    def _resolved_target(target_name: str, target_def: dict, inputs) -> dict:
+        """Validate one target definition and resolve it into its action form.
+
+        Every rule a target must satisfy is here: its source and ref, its
+        domains and their cfg keys, its procedure, execution identity, static
+        vars and instance params.
+        """
+
+        source = target_def.get("source_key")
+        if not isinstance(source, str) or not source:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'source_key'")
+
+        target_ref = target_def.get("ref_key")
+        if not isinstance(target_ref, str) or not target_ref.strip():
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'ref_key'")
+
+        # The target DECLARES the domains it reads and, per domain, the
+        # content keys it consumes. `domains` is identity (which namespaces this
+        # target subscribes to); `cfg_keys` is the contract (what it takes out of
+        # them). Neither names a plt FILE, so plt owns its own layout.
+        domains, consumed_group_axes = TargetCatalog._resolved_domains(
+            target_name, target_def, inputs
+        )
+        cfg_keys = TargetCatalog._resolved_cfg_keys(target_name, target_def, domains, inputs)
+        procedure = target_def.get("procedure_key")
+        if not isinstance(procedure, str) or not procedure:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'procedure_key'")
+
+        # The target declares its execution axes inline. The old
+        # `execution_identity_key` (a bundle of account + role + credential,
+        # dispatched through named identity groups) is gone: per-action variation
+        # is now `execution.roles`, keyed by authorization class.
+        if "execution_identity_key" in target_def:
+            raise RuntimeError(
+                f"❌ target {target_name!r} uses `execution_identity_key`, which is removed; "
+                "declare an `execution_identity:` block (provider, account, roles) instead"
+            )
+        target_execution_identity = target_def.get("execution_identities")
+        target_providers = None
+        if target_execution_identity is not None:
+            target_execution_identity = TargetExecutionIdentity.validate_all(
+                target_execution_identity, label=f"target {target_name!r}"
+            )
+            target_providers = execution_providers.validate_target_providers(
+                target_def.get("providers"),
+                target_execution_identity,
+                label=f"target {target_name!r}",
+            )
+
+        # A target declares the COORDINATES it consumes and the
+        # CONSTANTS it always uses. The two must not intersect — a name is either
+        # A coordinate or a constant, never both.
+        declared_input_params = execution_run_context.resolve_input_params(
+            target_def.get("input_params"),
+            target_def.get("input_param_sets"),
+            inputs.param_sets,
+            label=f"target {target_name!r}",
+            cfg_path=inputs.cfg_key_sets_path,
+        )
+        static_vars = target_def.get("static_vars") or {}
+        if not isinstance(static_vars, dict):
+            raise RuntimeError(f"❌ target {target_name!r} static_vars must be a map")
+        for var_name, var_value in static_vars.items():
+            if not isinstance(var_name, str) or not execution_references.CONTEXT_KEY_RE.fullmatch(
+                var_name
+            ):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} static_vars key {var_name!r} must be an identifier"
+                )
+            if isinstance(var_value, (dict, list)):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} static_vars.{var_name} must be a literal scalar; "
+                    "a selector-dependent constant varies per instance, which makes it a coordinate"
+                )
+        overlap = sorted(set(declared_input_params) & set(static_vars))
+        if overlap:
+            raise RuntimeError(
+                f"❌ target {target_name!r} declares {overlap} as BOTH an input param and a "
+                "static var; a name is either a coordinate or a constant"
+            )
+
+        resolved = {
+            "source": source,
+            "ref": target_ref.strip(),
+            "procedure": procedure,
+            "domains": domains,
+            "cfg_keys": cfg_keys,
+            "input_params": declared_input_params,
+            "static_vars": dict(static_vars),
+            # The allowlist is carried onto the action entry, not
+            # consumed by the filter that built it. A workflow member may name an
+            # action, and the check that it is permitted needs the list at the
+            # point the member is resolved.
+            "allowed_actions": inputs.target_actions[target_name],
+            "committed_result_reuse": inputs.target_reuse_policies[target_name],
+        }
+        if domains is None:
+            # Domain-generic target whose domain axis is not bound in this run.
+            # Record the AXIS NAMES it needs, never the raw `${...}` template:
+            # The ctl cfg snapshot resolves every scalar it walks, so an
+            # unresolved placeholder stored here would fail the whole run.
+            resolved["domains_unresolved"] = sorted(
+                {
+                    ref
+                    for raw in (target_def.get("domains") or ())
+                    for ref in execution_references.RUNTIME_SCALAR_TOKEN_RE.findall(str(raw))
+                }
+            )
+        # Declared instance identity flows through to the resolved
+        # target (consumed by resolve_run_instance_identity).
+        # A GENERIC target whose instance axes vary by another axis
+        # dispatches its schema by `members` ({params: [...], selectors: {...}}),
+        # the same pattern as its ref groups. Exactly one member
+        # matches; an unbound dispatch axis defers (hard error only if the
+        # target is actually activated in a run).
+        instance_params = target_def.get("target_instance_params")
+        # Every coordinate must be a declared input — checked on ALL
+        # members branches, not just the one this run selects, so an unreachable
+        # branch cannot hide a typo until some later execution context picks it.
+        for branch in (
+            [m.get("params") for m in (instance_params.get("members") or [])]
+            if isinstance(instance_params, dict)
+            else [instance_params]
+        ):
+            if not isinstance(branch, list):
+                continue
+            undeclared = sorted(
+                {str(x).strip() for x in branch if isinstance(x, str)} - set(declared_input_params)
+            )
+            if undeclared:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} target_instance_params {undeclared} are not "
+                    f"declared input params (declared: {sorted(declared_input_params) or 'none'}); "
+                    "a target cannot be identified by a coordinate it does not read"
+                )
+        if isinstance(instance_params, dict):
+            # The dispatch axes of the schema itself are consumed axes too
+            consumed_group_axes.update(
+                run_selectors.collect_member_dispatch_axes(
+                    instance_params.get("members"),
+                    label=f"target {target_name!r} target_instance_params members",
+                )
+            )
+            instance_params = _resolve_instance_params_members(
+                instance_params, inputs.execution_context, target_name=target_name
+            )
+            if instance_params is None:
+                resolved["target_instance_params_unresolved"] = True
+        if consumed_group_axes:
+            resolved["consumed_group_axes"] = sorted(consumed_group_axes)
+        if instance_params is not None:
+            if not isinstance(instance_params, list) or not all(
+                isinstance(p, str) and p.strip() for p in instance_params
+            ):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} target_instance_params must be a list of non-empty strings"
+                )
+            resolved["target_instance_params"] = [p.strip() for p in instance_params]
+        if target_execution_identity is not None:
+            resolved["execution_identities"] = target_execution_identity
+            resolved["providers"] = target_providers
+        TargetCatalog._validate_target_consent(target_name, target_def, resolved)
+        return resolved
+
+    @staticmethod
+    def _resolved_domains(
+        target_name: str, target_def: dict, inputs
+    ) -> tuple[list[str] | None, set[str]]:
+        """The domains this target declares, and the group axes resolving them consumed.
+
+        `None` means the target declares the whole tree rather than a domain list.
+        The consumed axes travel with it because a domain resolved from a group
+        is what consumed them — nothing else can say which.
+        """
+
+        consumed_group_axes: set[str] = set()
+        declared_domains = target_def.get("domains")
+        if not isinstance(declared_domains, list) or not declared_domains:
+            raise RuntimeError(f"❌ target {target_name!r} must define a non-empty 'domains' list")
+        # A domain-GENERIC target (the state-backend one) takes its domain from the
+        # execution context. If that axis is not bound — a generic target in a
+        # shared action this run does not activate — resolution is deferred
+        # (None) rather than failing an unrelated run.
+        domains: list[str] | None = []
+        for raw_domain in declared_domains:
+            if not isinstance(raw_domain, str) or not raw_domain.strip():
+                raise RuntimeError(
+                    f"❌ target {target_name!r} domains entries must be non-empty strings"
+                )
+            raw_domain = raw_domain.strip()
+            if "${" not in raw_domain:
+                domains.append(raw_domain)
+                continue
+            if inputs.execution_context is None:
+                domains = None
+                break
+            consumed_group_axes.update(
+                ref[len(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.") :]
+                for ref in execution_references.RUNTIME_SCALAR_TOKEN_RE.findall(raw_domain)
+                if ref.startswith(f"{execution_references.EXECUTION_CONTEXT_ROOT}.params.")
+            )
+            resolved_domain = execution_references.resolve_runtime_scalar(
+                raw_domain,
+                inputs.execution_context,
+                label=f"target {target_name!r} domains entry",
+                tolerate_missing=True,
+            )
+            if resolved_domain is None:
+                domains = None
+                break
+            domains.append(str(resolved_domain))
+        if domains is not None:
+            if len(set(domains)) != len(domains):
+                raise RuntimeError(f"❌ target {target_name!r} lists a domain twice: {domains}")
+            for domain in domains:
+                execution_run_context.validate_domain_value(
+                    inputs.domain_registry, domain, label=f"target {target_name!r} domains"
+                )
+        return domains, consumed_group_axes
+
+    @staticmethod
+    def _resolved_cfg_keys(
+        target_name: str, target_def: dict, domains: list[str] | None, inputs
+    ) -> dict[str, list[str]] | None:
+        """The cfg keys each declared domain projects, expanded from its key sets."""
+
+        raw_cfg_keys = target_def.get("cfg_keys") or {}
+        raw_cfg_key_sets = target_def.get("cfg_key_sets") or {}
+        for field, value in (("cfg_keys", raw_cfg_keys), ("cfg_key_sets", raw_cfg_key_sets)):
+            if not isinstance(value, dict):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} {field} must be a map (domain -> list)"
+                )
+        if not raw_cfg_keys and not raw_cfg_key_sets:
+            raise RuntimeError(
+                f"❌ target {target_name!r} must define cfg_key_sets and/or cfg_keys "
+                "(domain -> what it consumes)"
+            )
+        cfg_keys: dict[str, list[str]] | None = None
+        if domains is not None:
+
+            def _domain_key(raw, target_name=target_name):
+                key = str(raw).strip()
+                if "${" in key:
+                    key = str(
+                        execution_references.resolve_runtime_scalar(
+                            key,
+                            inputs.execution_context,
+                            label=f"target {target_name!r} cfg_keys domain",
+                        )
+                    )
+                return key
+
+            per_domain: dict[str, dict] = {}
+            for raw_key, entries in raw_cfg_key_sets.items():
+                per_domain.setdefault(_domain_key(raw_key), {})["cfg_key_sets"] = entries
+            for raw_key, entries in raw_cfg_keys.items():
+                per_domain.setdefault(_domain_key(raw_key), {})["cfg_keys"] = entries
+            cfg_keys = {
+                domain_key: execution_references.resolve_cfg_key_entries(
+                    spec.get("cfg_keys"),
+                    spec.get("cfg_key_sets"),
+                    inputs.cfg_key_sets,
+                    label=f"target {target_name!r} [{domain_key}]",
+                    cfg_path=inputs.cfg_key_sets_path,
+                )
+                for domain_key, spec in per_domain.items()
+            }
+            # Assertion 2: cfg_keys for a domain this target does not read
+            extra = sorted(set(cfg_keys) - set(domains))
+            if extra:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} declares cfg_keys for {extra}, "
+                    f"which are not in its domains {domains}"
+                )
+            # Assertion 3: a declared domain this target takes nothing from
+            missing = sorted(set(domains) - set(cfg_keys))
+            if missing:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} declares domains {missing} with no "
+                    "cfg_keys entry — a subscription that consumes nothing"
+                )
+
+        return cfg_keys
+
+    @staticmethod
+    def _validate_target_consent(target_name: str, target_def: dict, resolved: dict) -> None:
+        """Carry the opt-in consent flags across, and refuse the keys that were removed."""
+
+        if "provisions_ctl_state_bucket" in target_def:
+            raise RuntimeError(
+                f"❌ target {target_name!r} uses deprecated provisions_ctl_state_bucket; "
+                "use provisions_ctl_state_backend"
+            )
+        if target_def.get("provisions_ctl_state_backend") is True:
+            resolved["provisions_ctl_state_backend"] = True
+        # per-target consent to a mode that requires it (§12); the adapter names
+        # the field, the engine only carries it through. Default: not granted.
+        for consent_field in TargetCatalog.consent_opt_in_fields():
+            if consent_field in target_def:
+                if not isinstance(target_def[consent_field], bool):
+                    raise RuntimeError(f"❌ target {consent_field} must be a boolean")
+                resolved[consent_field] = target_def[consent_field]
+        for legacy_flag in (  # removed keys
+            "allow_skip_ctl_entry",
+            "allow_skip_ctl_state_sync",
+            "skip_ctl_role_chain",  # removed
+            "execution_access_mode",
+        ):
+            if legacy_flag in target_def:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} uses removed {legacy_flag}; "
+                    "use the execution_identity block's consent fields (§12) for access, "
+                    "allow_agreed_defer_ctl_state_backend_sync for deferred sync"
+                )
+        # Static policy: the target may participate in an explicitly agreed
+        # deferred-sync bootstrap graph. Runtime agreement is a separate CLI fact.
+        if "allow_agreed_defer_ctl_state_backend_sync" in target_def:
+            value = target_def["allow_agreed_defer_ctl_state_backend_sync"]
+            if value is not True:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} allow_agreed_defer_ctl_state_backend_sync "
+                    "must be literal true when present"
+                )
+            resolved["allow_agreed_defer_ctl_state_backend_sync"] = True
+        if "selectors" in target_def:
+            resolved["selectors"] = target_def["selectors"]
+        if "required_plt_overlay_keys" in target_def:
+            overlay_keys = target_def["required_plt_overlay_keys"]
+            if not isinstance(overlay_keys, list) or not all(
+                isinstance(key, str) and key for key in overlay_keys
+            ):
+                raise RuntimeError(
+                    f"❌ target {target_name!r} required_plt_overlay_keys must be "
+                    "a list of non-empty strings"
+                )
+            duplicate_overlay_keys = [
+                key for key, count in collections.Counter(overlay_keys).items() if count > 1
+            ]
+            if duplicate_overlay_keys:
+                raise RuntimeError(
+                    f"❌ target {target_name!r} required_plt_overlay_keys must be unique; "
+                    f"duplicates: {', '.join(sorted(duplicate_overlay_keys))}"
+                )
+            resolved["requires_plt_overlays"] = overlay_keys
 
 
 class TargetExecutionIdentity:
@@ -786,39 +846,14 @@ class ActiveTargetRuns:
             target_ref = target_cfg.get("ref")
             ctx_target_source_refs: dict = {}
             ctx_module_refs: dict = {}
-            if scoped_refs and target_ref:
-                ctx = execution_run_context.resolve_ref_context(target_ref, ref_context_values)
-                ctx_block = scoped_refs.get(ctx)
-                if ctx_block is None:
-                    raise RuntimeError(
-                        f"Target run target {target_key!r} ref context {ctx!r} not found in refs.scoped"
-                    )
-                # A scoped-ref group resolves to one concrete scoped
-                # entry (the member ref_key may carry ${execution_context.*}
-                # placeholders, rendered here before the second lookup).
-                if run_selectors.selector_group_is_group(ctx_block):
-                    member_ref = run_selectors.resolve_selector_group_member(
-                        ctx_block,
-                        ref_context_values,
-                        value_field="ref_key",
-                        label=f"refs.scoped group {ctx!r}",
-                    )
-                    concrete_ctx = execution_run_context.resolve_ref_context(
-                        member_ref, ref_context_values
-                    )
-                    ctx_block = scoped_refs.get(concrete_ctx)
-                    if ctx_block is None:
-                        raise RuntimeError(
-                            f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
-                            f"resolved to {concrete_ctx!r}, which is not in refs.scoped"
-                        )
-                    if run_selectors.selector_group_is_group(ctx_block):
-                        raise RuntimeError(
-                            f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
-                            f"{concrete_ctx!r} is itself a group (no nested groups)"
-                        )
-                ctx_target_source_refs = ctx_block.get("target_sources") or {}
-                ctx_module_refs = ctx_block.get("modules") or {}
+            ctx_target_source_refs, ctx_module_refs = ActiveTargetRuns._scoped_refs(
+                target_key,
+                target_ref,
+                scoped_refs=scoped_refs,
+                ref_context_values=ref_context_values,
+                ctx_target_source_refs=ctx_target_source_refs,
+                ctx_module_refs=ctx_module_refs,
+            )
 
             target_source_ref = ctx_target_source_refs.get(target_source) or {}
             if not isinstance(target_source_ref, dict):
@@ -962,75 +997,16 @@ class ActiveTargetRuns:
                     f"Target run {target_run_id!r} source {target_source!r} modules must be a mapping, got: {type(raw_modules).__name__}"
                 )
 
-            resolved_modules = {}
-            for module_name, module_meta in raw_modules.items():
-                if not isinstance(module_name, str):
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module names must be strings, got: {type(module_name).__name__}"
-                    )
-                if module_meta is None:
-                    module_meta = {}
-                if not isinstance(module_meta, dict):
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
-                    )
-
-                module_ref = ctx_module_refs.get(module_name) or {}
-                if not isinstance(module_ref, dict):
-                    raise RuntimeError(
-                        f"Module refs for {module_name!r} must be a mapping, got: {type(module_ref).__name__}"
-                    )
-
-                module_branch = module_ref.get("branch")
-                module_commit = module_ref.get("commit")
-                if module_branch and module_commit:
-                    raise RuntimeError(
-                        f"Module {module_name!r} resolved both branch={module_branch!r} and commit={module_commit!r}. "
-                        "Only one ref type may be set."
-                    )
-                if require_branch_or_commit and not module_branch and not module_commit:
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} has neither branch nor commit configured"
-                    )
-                if require_branch_or_commit and require_commit_refs and not module_commit:
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} ref {target_ref!r} requires an explicit commit"
-                    )
-
-                dest = module_meta.get("dest")
-                if not isinstance(dest, str) or not dest.strip():
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} must define non-empty 'dest'"
-                    )
-                dest_path = Path(dest)
-                if dest_path.is_absolute() or ".." in dest_path.parts:
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} dest must stay within the target_run repo: {dest}"
-                    )
-
-                module_repo_value = module_meta.get(repo_key)
-                if not module_repo_value:
-                    raise RuntimeError(
-                        f"Target run {target_run_id!r} module {module_name!r} missing {repo_key!r} in action {workflow_cfg.get('action')!r}"
-                    )
-
-                resolved_module = {
-                    "dest": dest,
-                    "branch": module_branch,
-                    "commit": module_commit,
-                }
-                if repo_key == "repo_path":
-                    module_repo_path = Path(module_repo_value).expanduser()
-                    if not module_repo_path.is_absolute():
-                        raise RuntimeError(
-                            f"Target run {target_run_id!r} module {module_name!r} repo_path must be absolute, got: {module_repo_value}"
-                        )
-                    resolved_module["repo_path"] = str(module_repo_path.resolve())
-                else:
-                    resolved_module["repo_url"] = module_repo_value
-                    resolved_module["secret_key"] = module_meta.get("secret_key")
-
-                resolved_modules[module_name] = resolved_module
+            resolved_modules = ActiveTargetRuns._resolved_modules(
+                raw_modules,
+                target_run_id=target_run_id,
+                target_ref=target_ref,
+                workflow_cfg=workflow_cfg,
+                repo_key=repo_key,
+                ctx_module_refs=ctx_module_refs,
+                require_commit_refs=require_commit_refs,
+                require_branch_or_commit=require_branch_or_commit,
+            )
 
             if resolved_modules:
                 active_target_run["modules"] = resolved_modules
@@ -1094,6 +1070,138 @@ class ActiveTargetRuns:
         if modules:
             definition["modules"] = modules
         return definition
+
+    @staticmethod
+    def _scoped_refs(
+        target_key: str,
+        target_ref: str,
+        *,
+        scoped_refs: dict,
+        ref_context_values: dict,
+        ctx_target_source_refs: dict,
+        ctx_module_refs: dict,
+    ) -> tuple[dict, dict]:
+        """Resolve this target's scoped refs into source and module ref maps."""
+
+        if scoped_refs and target_ref:
+            ctx = execution_run_context.resolve_ref_context(target_ref, ref_context_values)
+            ctx_block = scoped_refs.get(ctx)
+            if ctx_block is None:
+                raise RuntimeError(
+                    f"Target run target {target_key!r} ref context {ctx!r} not found in refs.scoped"
+                )
+            # A scoped-ref group resolves to one concrete scoped
+            # entry (the member ref_key may carry ${execution_context.*}
+            # placeholders, rendered here before the second lookup).
+            if run_selectors.selector_group_is_group(ctx_block):
+                member_ref = run_selectors.resolve_selector_group_member(
+                    ctx_block,
+                    ref_context_values,
+                    value_field="ref_key",
+                    label=f"refs.scoped group {ctx!r}",
+                )
+                concrete_ctx = execution_run_context.resolve_ref_context(
+                    member_ref, ref_context_values
+                )
+                ctx_block = scoped_refs.get(concrete_ctx)
+                if ctx_block is None:
+                    raise RuntimeError(
+                        f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
+                        f"resolved to {concrete_ctx!r}, which is not in refs.scoped"
+                    )
+                if run_selectors.selector_group_is_group(ctx_block):
+                    raise RuntimeError(
+                        f"Target run target {target_key!r} refs.scoped group {ctx!r} member "
+                        f"{concrete_ctx!r} is itself a group (no nested groups)"
+                    )
+            ctx_target_source_refs = ctx_block.get("target_sources") or {}
+            ctx_module_refs = ctx_block.get("modules") or {}
+        return ctx_target_source_refs, ctx_module_refs
+
+    @staticmethod
+    def _resolved_modules(
+        raw_modules: dict,
+        *,
+        target_run_id: str,
+        target_ref: str,
+        workflow_cfg: dict,
+        repo_key: str,
+        ctx_module_refs: dict,
+        require_commit_refs: bool,
+        require_branch_or_commit: bool,
+    ) -> dict:
+        """Resolve every child module a target declares, against the refs in scope."""
+
+        resolved_modules: dict = {}
+        for module_name, module_meta in raw_modules.items():
+            if not isinstance(module_name, str):
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module names must be strings, got: {type(module_name).__name__}"
+                )
+            if module_meta is None:
+                module_meta = {}
+            if not isinstance(module_meta, dict):
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} metadata must be a mapping, got: {type(module_meta).__name__}"
+                )
+
+            module_ref = ctx_module_refs.get(module_name) or {}
+            if not isinstance(module_ref, dict):
+                raise RuntimeError(
+                    f"Module refs for {module_name!r} must be a mapping, got: {type(module_ref).__name__}"
+                )
+
+            module_branch = module_ref.get("branch")
+            module_commit = module_ref.get("commit")
+            if module_branch and module_commit:
+                raise RuntimeError(
+                    f"Module {module_name!r} resolved both branch={module_branch!r} and commit={module_commit!r}. "
+                    "Only one ref type may be set."
+                )
+            if require_branch_or_commit and not module_branch and not module_commit:
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} has neither branch nor commit configured"
+                )
+            if require_branch_or_commit and require_commit_refs and not module_commit:
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} ref {target_ref!r} requires an explicit commit"
+                )
+
+            dest = module_meta.get("dest")
+            if not isinstance(dest, str) or not dest.strip():
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} must define non-empty 'dest'"
+                )
+            dest_path = Path(dest)
+            if dest_path.is_absolute() or ".." in dest_path.parts:
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} dest must stay within the target_run repo: {dest}"
+                )
+
+            module_repo_value = module_meta.get(repo_key)
+            if not module_repo_value:
+                raise RuntimeError(
+                    f"Target run {target_run_id!r} module {module_name!r} missing {repo_key!r} in action {workflow_cfg.get('action')!r}"
+                )
+
+            resolved_module = {
+                "dest": dest,
+                "branch": module_branch,
+                "commit": module_commit,
+            }
+            if repo_key == "repo_path":
+                module_repo_path = Path(module_repo_value).expanduser()
+                if not module_repo_path.is_absolute():
+                    raise RuntimeError(
+                        f"Target run {target_run_id!r} module {module_name!r} repo_path must be absolute, got: {module_repo_value}"
+                    )
+                resolved_module["repo_path"] = str(module_repo_path.resolve())
+            else:
+                resolved_module["repo_url"] = module_repo_value
+                resolved_module["secret_key"] = module_meta.get("secret_key")
+
+            resolved_modules[module_name] = resolved_module
+        return resolved_modules
 
 
 class TargetEntries:

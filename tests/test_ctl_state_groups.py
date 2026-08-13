@@ -1,3 +1,5 @@
+import argparse
+import ast
 import sys
 import tempfile
 import unittest
@@ -7,6 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import ctl_cfg_fixture
+from engine.catalog import fan_out as catalog_fan_out
 from engine.catalog import target_catalog
 from engine.catalog import workflow as catalog_workflow
 from engine.cli import args as cli_args
@@ -14,9 +17,9 @@ from engine.commands import pipeline as commands_pipeline
 from engine.execution import references as execution_references
 from engine.execution import run_context as execution_run_context
 from engine.kernel import yaml_io as kernel_yaml_io
+from engine.run import request as run_request
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
-from engine.units import fan_out as units_fan_out
 
 LIVE_CTX = {"execution_context.params.landing_zone": "live"}
 CANARY_CTX = {"execution_context.params.landing_zone": "canary"}
@@ -27,7 +30,7 @@ def _write(root: Path, name: str, body: str) -> None:
 
 
 class FanOutMemberSchemaTests(unittest.TestCase):
-    """param-set members are {params, selectors?}; selector-gated
+    """A param-set member is {params, selectors?}; selector-gated
     members drop per the frozen execution context; domain params validate
     against the registry (3d)."""
 
@@ -74,11 +77,11 @@ class FanOutMemberSchemaTests(unittest.TestCase):
                     "          execution_context.params.landing_zone: canary\n"
                 ),
             )
-            live = units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+            live = catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
             self.assertEqual(
                 [c["fan_out_param_entry_key"] for c in live["children"]], ["org", "dev"]
             )
-            canary = units_fan_out.FanOut.expand(root, "lz/all", CANARY_CTX)
+            canary = catalog_fan_out.FanOutCatalog.expand(root, "lz/all", CANARY_CTX)
             self.assertEqual(
                 [c["fan_out_param_entry_key"] for c in canary["children"]], ["org", "prodlike"]
             )
@@ -99,7 +102,7 @@ class FanOutMemberSchemaTests(unittest.TestCase):
                 ),
             )
             with self.assertRaisesRegex(RuntimeError, "selectors must be a member field"):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
     def test_bare_map_member_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,7 +113,7 @@ class FanOutMemberSchemaTests(unittest.TestCase):
                 ("fan_out_param_sets:\n  state_domains:\n    org:\n      domain: org\n"),
             )
             with self.assertRaisesRegex(RuntimeError, "unsupported keys"):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
     def test_unknown_domain_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +130,7 @@ class FanOutMemberSchemaTests(unittest.TestCase):
                 ),
             )
             with self.assertRaisesRegex(RuntimeError, "unknown domain 'identiy'"):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
     def test_all_members_dropped_is_hard_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,11 +150,11 @@ class FanOutMemberSchemaTests(unittest.TestCase):
                 ),
             )
             with self.assertRaisesRegex(RuntimeError, "no member of fan_out_param_set"):
-                units_fan_out.FanOut.expand(root, "lz/all", CANARY_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", CANARY_CTX)
 
 
 class SelectorGroupResolverTests(unittest.TestCase):
-    """selector-membered group entries resolve to exactly one
+    """Selector-membered group entries resolve to exactly one
     member value."""
 
     GROUP = {
@@ -274,10 +277,10 @@ class TargetDomainKeysInventoryTests(unittest.TestCase):
             self.assertEqual(target["domains_unresolved"], ["execution_context.params.domain"])
 
     def test_unresolved_domains_survive_the_ctl_cfg_snapshot(self):
-        """
+        """The snapshot resolves every scalar it walks, so the deferred marker
 
-        the snapshot resolves every scalar it walks, so the deferred marker
-        must record AXIS NAMES, never the raw `${...}` template."""
+        must record AXIS NAMES, never the raw `${...}` template.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)
@@ -539,7 +542,7 @@ class FanOutExtraParamsTests(unittest.TestCase):
     def test_extra_params_are_merged_into_every_member(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, "        extra_params:\n          domain: notifications\n")
-            children = units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)["children"]
+            children = catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)["children"]
             self.assertEqual(
                 [c["params"] for c in children],
                 [
@@ -558,13 +561,13 @@ class FanOutExtraParamsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, "        extra_params:\n          aws.account: org\n")
             with self.assertRaisesRegex(RuntimeError, "define each param\\s+in one place"):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
     def test_domain_value_is_validated_against_the_registry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, "        extra_params:\n          domain: nope\n")
             with self.assertRaises(RuntimeError):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
     def test_extra_params_without_a_param_set_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -585,7 +588,7 @@ class FanOutExtraParamsTests(unittest.TestCase):
             _write(root, "domains.yaml", "domains:\n  notifications: {}\n")
             _write(root, "param_sets.yaml", "fan_out_param_sets: {}\n")
             with self.assertRaisesRegex(RuntimeError, "requires fan_out_param_set_key"):
-                units_fan_out.FanOut.expand(root, "lz/all", LIVE_CTX)
+                catalog_fan_out.FanOutCatalog.expand(root, "lz/all", LIVE_CTX)
 
 
 if __name__ == "__main__":
@@ -637,11 +640,11 @@ class ChildTargetCommandTests(unittest.TestCase):
         self.assertEqual(args.parent_workflow_run_id, "PARENT")
 
     def test_no_credential_is_carried_in_argv(self):
-        """
+        """The lock grant travels by ENVIRONMENT. argv is visible in `ps` and in
 
-        the lock grant travels by ENVIRONMENT. argv is visible in `ps` and in
         the logged command line, so a credential there could be replayed into a
-        concurrent run while the parent is still going."""
+        concurrent run while the parent is still going.
+        """
 
         argv = self._argv()
         self.assertIn("--parent-workflow-run-id", argv)  # provenance
@@ -683,23 +686,58 @@ class RunnerProvidersWiringTests(unittest.TestCase):
 
     ORCHESTRATOR = Path(__file__).resolve().parents[2] / "atlas-ctl-orchestrator" / "runners"
 
-    def test_every_runner_declares_providers(self):
-        missing = []
+    def test_every_runner_runs_the_request_it_prepared(self):
+        # one request, built once in the shared prepare, so a runner cannot
+        # assemble a partial invocation of its own
         for name in ("workflow.py", "target.py", "procedure.py"):
-            body = (self.ORCHESTRATOR / name).read_text()
-            if "providers=args.providers" not in body:
-                missing.append(name)
-        self.assertEqual(missing, [], f"runners not declaring providers: {missing}")
+            tree = ast.parse((self.ORCHESTRATOR / name).read_text())
+            calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run_pipeline"
+            ]
+            self.assertEqual(len(calls), 1, f"{name} must run the pipeline exactly once")
+            first = ast.unparse(calls[0].args[0])
+            with self.subTest(runner=name):
+                self.assertTrue(
+                    first.startswith("ctx.request"),
+                    f"{name} passes {first!r} rather than the prepared request",
+                )
 
-    def test_run_pipeline_forwards_providers_to_its_own_selection(self):
+    def test_the_request_carries_the_providers_a_run_declares(self):
+        request = run_request.RunRequest.from_args(
+            argparse.Namespace(providers=["aws"], ctl_profile="p"),
+            ctl_cfg_root=Path("/cfg"),
+        )
+        self.assertEqual(["aws"], list(request.providers))
+
+    def test_run_pipeline_resolves_its_own_selection_from_the_whole_request(self):
+        """The path used when a runner passes no preflight_selection.
+
+        Every field the selection needs travels inside the request, so what this
+        pins is that the request goes over WHOLE. A call that unpacks a few
+        fields by name is how one of them goes missing, and a run that resolves
+        without its providers fails with 'no providers declared'.
         """
 
-        the path used when a runner passes no preflight_selection."""
-
-        import inspect
-
-        source = inspect.getsource(commands_pipeline.run_pipeline)
-        self.assertIn("providers=providers", source)
+        tree = ast.parse(Path(commands_pipeline.__file__).read_text())
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_pipeline"
+        )
+        calls = [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "resolve_and_preflight_execution_identities"
+        ]
+        self.assertEqual(1, len(calls))
+        self.assertEqual(["request"], [ast.unparse(arg) for arg in calls[0].args])
+        self.assertEqual([], calls[0].keywords)
 
 
 class ChildLockGrantTests(unittest.TestCase):
@@ -767,9 +805,7 @@ class ChildLockGrantTests(unittest.TestCase):
             )
 
     def test_redemption_is_idempotent_within_one_run(self):
-        """
-
-        the lock decision is asked twice per run; that is not a replay."""
+        """The lock decision is asked twice per run; that is not a replay."""
 
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp)

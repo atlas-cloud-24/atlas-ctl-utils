@@ -241,7 +241,7 @@ class ContractWrapperTests(unittest.TestCase):
             target_runs,
             catalogs,
             execution_context={},
-            implementation_key="sso",
+            credential_acquisition="sso",
             execution_access_mode="force_bypass",
             provider_options={"force_bypass_env": "true"},
         )
@@ -257,7 +257,7 @@ class ContractWrapperTests(unittest.TestCase):
                 target_env,
                 catalogs,
                 execution_context={},
-                implementation_key="sso",
+                credential_acquisition="sso",
                 execution_access_mode="force_bypass",
                 provider_options={"force_bypass_env": "true"},
             )
@@ -561,9 +561,7 @@ class AdapterInternalLayeringTest(unittest.TestCase):
         return Path(pkg.__file__).parent
 
     def test_the_three_parts_exist(self):
-        """
-
-        guards the suite: a flat module would make everything below vacuous."""
+        """Guards the suite: a flat module would make everything below vacuous."""
 
         for name in self.ALLOWED:
             self.assertTrue((self._package() / f"{name}.py").is_file(), name)
@@ -597,11 +595,11 @@ class AdapterInternalLayeringTest(unittest.TestCase):
                 self.assertNotIn("import *", body)
 
     def test_the_facade_still_exposes_the_flat_surface(self):
-        """
+        """The adapter contract is module-level callables. Splitting the file must
 
-        the adapter contract is module-level callables. Splitting the file must
         not move a name in the contract, so every engine-facing callable and every
-        internal the tests reach for stays reachable on `utils.providers.aws`."""
+        internal the tests reach for stays reachable on `utils.providers.aws`.
+        """
 
         import atlas_ctl_adapter_aws as pkg
 
@@ -675,10 +673,10 @@ class AdapterActivationTest(unittest.TestCase):
         )
 
     def test_the_adapter_is_not_importable_without_activation(self):
-        """
+        """Guards the test below: if a bare python could already import the
 
-        guards the test below: if a bare python could already import the
-        adapter, that test would pass while proving nothing."""
+        adapter, that test would pass while proving nothing.
+        """
 
         done = self._run_clean("import atlas_ctl_adapter_aws\nprint('IMPORTED')\n")
         self.assertNotEqual(0, done.returncode, f"unexpectedly importable: {done.stdout}")
@@ -695,11 +693,11 @@ class AdapterActivationTest(unittest.TestCase):
         self.assertIn("IMPORTED", done.stdout)
 
     def test_context_building_activates_before_it_reaches_an_adapter(self):
-        """
+        """The real path: `build_execution_context` must not need a caller to
 
-        the real path: `build_execution_context` must not need a caller to
         have activated first. Run for its IMPORT behaviour only — the call is
-        expected to fail on missing params, and MUST NOT fail on the adapter."""
+        expected to fail on missing params, and MUST NOT fail on the adapter.
+        """
 
         done = self._run_clean(
             "from pathlib import Path\n"

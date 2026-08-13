@@ -485,9 +485,7 @@ class WorkflowImports:
 
     @staticmethod
     def expand(action_workflows: dict, name: str, _stack: tuple = ()) -> list:
-        """
-
-        resolve import_workflows in order, then append the workflow targets."""
+        """Resolve import_workflows in order, then append the workflow targets."""
 
         if name in _stack:
             raise RuntimeError(f"❌ workflow import cycle: {' -> '.join([*_stack, name])}")
@@ -892,9 +890,7 @@ class WorkflowArtifacts:
         require_commit_refs: bool,
         refs: dict | None,
     ) -> None:
-        """
-
-        for plan runs, write the matching create-flow preview artifact."""
+        """For plan runs, write the matching create-flow preview artifact."""
 
         if action != "plan" or not workflow_name:
             return
@@ -954,9 +950,9 @@ class WorkflowArtifacts:
 
     @staticmethod
     def selection_state_spec(selection: dict) -> dict:
-        context = selection["execution_context"]
+        context = selection.execution_context
         target_specs: list[dict] = []
-        for target_run in selection["active_target_runs"].values():
+        for target_run in selection.active_target_runs.values():
             target_key = run_actions.normalize_result_name(
                 target_run["target"], label="status target key"
             )
@@ -984,17 +980,15 @@ class WorkflowArtifacts:
                     ).as_posix(),
                 }
             )
-        if selection["selection_kind"] == "target":
+        if selection.kind == "target":
             if len(target_specs) != 1:
                 raise RuntimeError("❌ target status selection must resolve one target instance")
             return target_specs[0]
-        if selection["selection_kind"] != "workflow":
+        if selection.kind != "workflow":
             raise RuntimeError(
                 f"❌ status does not support selection kind {selection['selection_kind']!r}"
             )
-        key = run_actions.normalize_result_name(
-            selection["selection_key"], label="status workflow key"
-        )
+        key = run_actions.normalize_result_name(selection.key, label="status workflow key")
         # The SAME addressing a run writes — declared instance params, not a
         # composition digest. the run side to params and left this one
         # on the hash, so a targeted status query hydrated `instances/sha256=<digest>`,
@@ -1002,15 +996,15 @@ class WorkflowArtifacts:
         # which parses the tree instead of composing a prefix.
         segments = run_addressing.resolve_target_instance_segments(
             WorkflowInstanceParams.resolve_declared(
-                selection["workflow_cfg"].get("workflow_instance_params"),
-                selection["execution_context"],
+                selection.workflow_cfg.get("workflow_instance_params"),
+                selection.execution_context,
                 label=f"workflow {key!r}",
             ),
-            selection["execution_context"],
+            selection.execution_context,
             label=f"workflow {key!r}",
         )
         definition_canonical = json.dumps(
-            selection["workflow_cfg"], separators=(",", ":"), sort_keys=True
+            selection.workflow_cfg, separators=(",", ":"), sort_keys=True
         )
         return {
             "kind": "workflow",

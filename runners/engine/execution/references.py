@@ -221,10 +221,10 @@ EXECUTION_CONTEXT_REF_RE = re.compile(
 
 
 def validate_execution_context_ref(ref: str, *, label: str) -> str:
-    """
+    """Selector/constraint/interpolation references into the execution context are
 
-    selector/constraint/interpolation references into the execution context are
-    always fully-qualified paths starting at the root key."""
+    always fully-qualified paths starting at the root key.
+    """
 
     if not isinstance(ref, str) or not ref.strip():
         raise RuntimeError(f"❌ {label}: execution-context reference must be a non-empty string")

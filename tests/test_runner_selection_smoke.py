@@ -65,27 +65,26 @@ class RealCfgSelectionTest(unittest.TestCase):
 
     def test_a_workflow_resolves_its_members(self):
         selection = self._resolve("plan", workflow="env/baseline")
-        self.assertEqual("workflow", selection["selection_kind"])
-        self.assertIn("env/infra", selection["active_target_runs"])
+        self.assertEqual("workflow", selection.kind)
+        self.assertIn("env/infra", selection.active_target_runs)
 
     def test_a_standalone_target_resolves(self):
-        """
+        """The branch that was broken: it has no workflow cfg of its own, so a
 
-        the branch that was broken: it has no workflow cfg of its own, so a
         change threaded into it read an unassigned local and every target run —
-        including every workflow CHILD — died before doing anything."""
-
+        including every workflow CHILD — died before doing anything.
+        """
         selection = self._resolve("plan", target="env/infra")
-        self.assertEqual("target", selection["selection_kind"])
-        self.assertIn("env/infra", selection["active_target_runs"])
+        self.assertEqual("target", selection.kind)
+        self.assertIn("env/infra", selection.active_target_runs)
 
     def test_a_workflow_member_carries_its_declared_action(self):
         selection = self._resolve("plan", workflow="env/baseline")
-        self.assertEqual("plan", selection["active_target_runs"]["env/infra"]["action"])
+        self.assertEqual("plan", selection.active_target_runs["env/infra"]["action"])
 
     def test_a_destroy_workflow_resolves_its_own_member_list(self):
         selection = self._resolve("destroy", workflow="env/baseline")
-        runs = selection["active_target_runs"]
+        runs = selection.active_target_runs
         self.assertIn("env/infra/prepare_destroy", runs)
         self.assertEqual("destroy", runs["env/infra/prepare_destroy"]["action"])
 

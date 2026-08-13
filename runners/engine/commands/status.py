@@ -10,6 +10,7 @@ from pathlib import Path
 
 import yaml
 
+from engine.catalog import fan_out as catalog_fan_out
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import resources as cfg_resources
 from engine.commands import selection as commands_selection
@@ -17,11 +18,13 @@ from engine.execution import run_context as execution_run_context
 from engine.kernel import ids as kernel_ids
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
+from engine.run import request as run_request
 from engine.state import render as state_render
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_query as state_status_query
+from engine.state import status_rows as state_status_rows
 from engine.state import sync as state_sync
-from engine.units import fan_out as units_fan_out
 
 
 def _read_namespace(
@@ -30,7 +33,7 @@ def _read_namespace(
     execution_context: dict[str, object],
     reader,
     *,
-    provider_implementation_key: str,
+    credential_acquisition: str,
     include_maintenance_manifests: bool = False,
 ):
     """Read one complete namespace locally or from an isolated hydration."""
@@ -54,7 +57,7 @@ def _read_namespace(
             execution_context,
             Path(scratch_root),
             operation="read",
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             execution_access_modes=args.execution_access_modes,
             provider_options=args.provider_options,
         )
@@ -83,24 +86,24 @@ class StatusCommand:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         """Dispatch whole-namespace, maintenance-audit, or targeted status."""
 
         if args.all:
             return StatusCommand.all_run_types(
-                ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+                ctl_cfg_root, args, credential_acquisition=credential_acquisition
             )
         if getattr(args, "maintenance", False):
             return StatusCommand.maintenance(
-                ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+                ctl_cfg_root, args, credential_acquisition=credential_acquisition
             )
         run_type = "workflow" if args.workflow else "fan_out" if args.fan_out else "target"
         return StatusCommand.for_run_type(
             ctl_cfg_root,
             args,
             run_type=run_type,
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
         )
 
     @staticmethod
@@ -109,8 +112,17 @@ class StatusCommand:
         args: argparse.Namespace,
         *,
         run_type: str,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
+        # a status read resolves the same selections a run would, so it asks for
+        # them the same way — the narrowing per child is the only difference
+        base_request = run_request.RunRequest.from_args(
+            args,
+            ctl_cfg_root=ctl_cfg_root,
+            target_repo_key="repo_path",
+            require_target_ref=False,
+            credential_acquisition=credential_acquisition,
+        )
         if run_type == "fan_out":
             expansion_context = execution_run_context.build_execution_context(
                 ctl_cfg_root,
@@ -120,8 +132,10 @@ class StatusCommand:
                 providers=getattr(args, "providers", ()),
                 execution_runtime_mode=args.execution_runtime_mode,
             )
-            plan = units_fan_out.FanOut.expand(ctl_cfg_root, args.fan_out, expansion_context)
-            units_fan_out.FanOut.validate_param_collisions(
+            plan = catalog_fan_out.FanOutCatalog.expand(
+                ctl_cfg_root, args.fan_out, expansion_context
+            )
+            catalog_fan_out.FanOutCatalog.validate_param_collisions(
                 ctl_cfg_root, plan["children"], args.execution_params
             )
             commands_selection.require_unique_fan_out_namespace(
@@ -142,50 +156,36 @@ class StatusCommand:
                 params.update(child["params"])
                 selections.append(
                     commands_selection.resolve_pipeline_selection(
-                        ctl_cfg_root,
-                        args.ctl_profile,
-                        params,
-                        args.ctl_ref_policy,
-                        args.action,
-                        child["key"] if child["kind"] == "workflow" else None,
-                        target_repo_key="repo_path",
-                        require_target_ref=False,
-                        execution_runtime_mode=args.execution_runtime_mode,
-                        provider_options=args.provider_options,
-                        execution_access_modes=args.execution_access_modes,
-                        target_name=child["key"] if child["kind"] == "target" else None,
-                        # A status read needs only the cfg-level state
-                        # spec (prefix/segments); it enforces no mutate policy and
-                        # loads no provider catalogs (which would validate account
-                        # ids a read never uses).
+                        base_request.for_child(
+                            action=args.action,
+                            execution_params=params,
+                            workflow_name=(child["key"] if child["kind"] == "workflow" else None),
+                            target_name=(child["key"] if child["kind"] == "target" else None),
+                        ),
+                        # A status read needs only the cfg-level state spec
+                        # (prefix/segments); it enforces no mutate policy and loads
+                        # no provider catalogs, which would validate account ids a
+                        # read never uses.
                         enforce_ctl_policy=False,
                         load_provider_catalogs=False,
                     )
                 )
                 selection_labels.append(child["label"])
-            specs = units_fan_out.FanOut.validate_unique_materializations(selections)
+            specs = catalog_fan_out.FanOutCatalog.validate_unique_materializations(selections)
         else:
             selection = commands_selection.resolve_pipeline_selection(
-                ctl_cfg_root,
-                args.ctl_profile,
-                args.execution_params,
-                args.ctl_ref_policy,
-                args.action,
-                args.workflow if run_type == "workflow" else None,
-                target_repo_key="repo_path",
-                require_target_ref=False,
-                execution_runtime_mode=args.execution_runtime_mode,
-                provider_options=args.provider_options,
-                execution_access_modes=args.execution_access_modes,
-                target_name=args.target if run_type == "target" else None,
-                # cfg-level state spec only — no mutate policy, no
-                # provider catalogs (a read never uses account ids).
+                base_request.for_child(
+                    action=args.action,
+                    execution_params=args.execution_params,
+                    workflow_name=(args.workflow if run_type == "workflow" else None),
+                    target_name=(args.target if run_type == "target" else None),
+                ),
                 enforce_ctl_policy=False,
                 load_provider_catalogs=False,
             )
             selections = [selection]
             specs = [catalog_workflow.WorkflowArtifacts.selection_state_spec(selection)]
-            selection_labels = [selection["selection_key"]]
+            selection_labels = [selection.key]
 
         # A query must NEVER mutate local ctl-state. `remote` hydrates
         # into an auto-generated throwaway root (an implementation detail — never a
@@ -197,7 +197,7 @@ class StatusCommand:
                 selections[0]["execution_context"],
                 args.ctl_state_local_root,
             )
-            results = state_status._compute_status_results(
+            results = state_status_rows._compute_status_results(
                 namespace_root, args.action, selection_labels, specs
             )
         else:
@@ -206,7 +206,7 @@ class StatusCommand:
                     ctl_cfg_root,
                     selections[0],
                     Path(scratch_root),
-                    provider_implementation_key=provider_implementation_key,
+                    credential_acquisition=credential_acquisition,
                     execution_access_modes=args.execution_access_modes,
                     provider_options=args.provider_options,
                 )
@@ -217,7 +217,7 @@ class StatusCommand:
                         child_prefixes,
                         committed_groups=run_actions.RESULT_GROUPS,
                     )
-                results = state_status._compute_status_results(
+                results = state_status_rows._compute_status_results(
                     namespace_root, args.action, selection_labels, specs
                 )
         report = {
@@ -276,7 +276,7 @@ class StatusCommand:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         """Namespace status: resolve the namespace from the axes,
         then read every instance — local walks the dir offline; remote hydrates the
@@ -307,16 +307,16 @@ class StatusCommand:
             ctl_cfg_root,
             args,
             execution_context,
-            lambda namespace_root: state_status.compute_namespace_status_map(
+            lambda namespace_root: state_status_rows.compute_namespace_status_map(
                 namespace_root,
                 exclusive_target_relations,
                 exclusive_workflow_relations,
             ),
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
         )
         filters = getattr(args, "filters", None) or {}
-        instances = state_status.filter_status_map(instances, filters)
-        instances = state_status.structure_status_map(instances, args.structure, args.sort)
+        instances = state_status_query.filter_status_map(instances, filters)
+        instances = state_status_query.structure_status_map(instances, args.structure, args.sort)
         # Kinds sit at the TOP level, not under an `instances:` wrapper: the wrapper
         # said nothing the kind keys do not, and cost a level of nesting on every read.
         report = {
@@ -388,7 +388,7 @@ class StatusCommand:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         """Report durable maintenance activity outside normal instance status."""
 
@@ -405,8 +405,8 @@ class StatusCommand:
             ctl_cfg_root,
             args,
             execution_context,
-            state_status.maintenance_status_rows,
-            provider_implementation_key=provider_implementation_key,
+            state_status_rows.maintenance_status_rows,
+            credential_acquisition=credential_acquisition,
             include_maintenance_manifests=True,
         )
         report = {

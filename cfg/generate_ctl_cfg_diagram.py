@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-
-
-generate Mermaid and SVG dependency diagrams from Atlas ctl cfg."""
+"""Generate Mermaid and SVG dependency diagrams from Atlas ctl cfg."""
 
 from __future__ import annotations
 

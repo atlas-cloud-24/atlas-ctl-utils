@@ -27,9 +27,7 @@ def workflow_target_run_signature(target_run_entry) -> tuple[str, str | None]:
 
 
 def get_workflow_target_run_id(target_run_entry) -> str:
-    """
-
-    return the target_run id from a workflow target_run entry."""
+    """Return the target_run id from a workflow target_run entry."""
 
     if isinstance(target_run_entry, str):
         return target_run_entry
@@ -104,12 +102,12 @@ def rendered_scope_target_dir(plt_rendered_dir: Path, target_path: str) -> Path:
 
 
 def split_target_instance_address(address: str) -> tuple[str, list[str]]:
-    """
+    """Split a path-form instance address into (key, segments): trailing
 
-    split a path-form instance address into (key, segments): trailing
     components containing `=` are instance segments; key components never contain
     one (Q1j parse boundary). Workflow and target instances are both addressed by
-    `param=value` segments, so neither needs a special case."""
+    `param=value` segments, so neither needs a special case.
+    """
 
     if not isinstance(address, str) or not address:
         raise RuntimeError("❌ target instance address must be a non-empty string")
@@ -459,10 +457,10 @@ def parse_state_relpath(namespace_root: Path, state_dir: Path) -> dict | None:
 
 
 def instance_relpath(instance_segments: list[str]) -> str:
-    """
+    """The `instances/<seg>/<seg>` relative path for a target instance, or ''
 
-    the `instances/<seg>/<seg>` relative path for a target instance, or ''
-    for a singleton target (no instances/ layer,)."""
+    for a singleton target (no instances/ layer,).
+    """
 
     if not instance_segments:
         return ""

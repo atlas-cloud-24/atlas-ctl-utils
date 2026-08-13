@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 
 from engine.run import actions as run_actions  # noqa: E402
 from engine.state import status as state_status  # noqa: E402
+from engine.state import status_rows as state_status_rows
 
 BASELINE = "env/core/baseline/instances/env.type=dev"
 TECH_JOBS = "env/core/tech_jobs/instances/env.type=dev"
@@ -221,7 +222,7 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             namespace = self._namespace(Path(tmp), [BASELINE, TECH_JOBS])
-            rows = state_status.compute_namespace_status_map(namespace, RELATIONS)
+            rows = state_status_rows.compute_namespace_status_map(namespace, RELATIONS)
             baseline = rows["target"]["env/core/baseline"]["instances"]["env.type=dev"]["mutative"]
             tech_jobs = rows["target"]["env/core/tech_jobs"]["instances"]["env.type=dev"][
                 "mutative"
@@ -253,7 +254,7 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
                 },
             )
 
-            rows = state_status.compute_namespace_status_map(namespace, RELATIONS)
+            rows = state_status_rows.compute_namespace_status_map(namespace, RELATIONS)
             plan = rows["target"]["env/core/tech_jobs"]["instances"]["env.type=dev"]["plan"]
             self.assertEqual("active", plan["standing"])
 
@@ -264,7 +265,7 @@ class SupersessionReachesTheRowTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             namespace = self._namespace(Path(tmp), [BASELINE, TECH_JOBS])
-            rows = state_status.compute_namespace_status_map(namespace, {})
+            rows = state_status_rows.compute_namespace_status_map(namespace, {})
             baseline = rows["target"]["env/core/baseline"]["instances"]["env.type=dev"]["mutative"]
             self.assertNotIn("standing", baseline)
 

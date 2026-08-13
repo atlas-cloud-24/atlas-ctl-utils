@@ -54,9 +54,7 @@ def render_merged_cfg_header(
 
 
 def _deep_merge_refs(dst: dict, src: dict, yf: Path, path: str = "") -> None:
-    """
-
-    deep-merge a `refs` subtree across files; a duplicate leaf is a load error."""
+    """Deep-merge a `refs` subtree across files; a duplicate leaf is a load error."""
 
     for k, v in src.items():
         cur = f"{path}.{k}" if path else str(k)
@@ -78,9 +76,7 @@ def merge_config_dirs(
     merged_files: dict[str, list[str]] | None = None,
     skip_filenames: set[str] | None = None,
 ) -> dict[str, list[str]]:
-    """
-
-    merge config directories in sequence using YAML-aware overlay semantics."""
+    """Merge config directories in sequence using YAML-aware overlay semantics."""
 
     if clear_dest and os.path.exists(dest_dir):
         shutil.rmtree(dest_dir)
@@ -105,8 +101,8 @@ def merge_config_dirs(
 
                 if os.path.exists(dest_file):
                     merged_data = merge_cfg_values(
-                        kernel_yaml_io.load_cfg_yaml(dest_file),
-                        kernel_yaml_io.load_cfg_yaml(src_file),
+                        kernel_yaml_io.load_yaml(dest_file),
+                        kernel_yaml_io.load_yaml(src_file),
                     )
                     source_list = merged_files.setdefault(dest_file, [])
                     source_list.append(src_file)
@@ -165,7 +161,7 @@ def _scope_final_yaml_leaves(
         leaves: dict[tuple[str, tuple[object, ...]], object] = {}
         for yaml_path in sorted(tmp_path.rglob("*.yaml")):
             rel_path = yaml_path.relative_to(tmp_path).as_posix()
-            data = kernel_yaml_io.load_cfg_yaml(str(yaml_path))
+            data = kernel_yaml_io.load_yaml(str(yaml_path))
             for leaf_path, leaf_value in _flatten_yaml_leaf_values(data).items():
                 leaves[(rel_path, leaf_path)] = leaf_value
         return leaves

@@ -22,6 +22,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 
 from engine.state import status as state_status  # noqa: E402
+from engine.state import status_rows as state_status_rows
 
 MEMBERS = [
     "target/env/core/baseline/instances/env.type=dev",
@@ -48,7 +49,7 @@ def _with_member_freshness(values: list[str | None]):
 class WorkflowFreshnessTest(unittest.TestCase):
     def _resolve(self, values, members=MEMBERS):
         with tempfile.TemporaryDirectory() as tmp, _with_member_freshness(values):
-            return state_status.workflow_member_freshness(Path(tmp), "provision", members)
+            return state_status_rows.workflow_member_freshness(Path(tmp), "provision", members)
 
     def test_every_member_fresh_makes_the_workflow_fresh(self):
         freshness, members, reasons = self._resolve(["up_to_date", "up_to_date"])
@@ -105,7 +106,7 @@ class WorkflowFreshnessTest(unittest.TestCase):
                 return_value=answer,
             ),
         ):
-            _, members, _ = state_status.workflow_member_freshness(
+            _, members, _ = state_status_rows.workflow_member_freshness(
                 Path(tmp),
                 "provision",
                 [MEMBERS[0]],

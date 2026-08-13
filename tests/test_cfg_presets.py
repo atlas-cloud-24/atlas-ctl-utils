@@ -364,9 +364,7 @@ class CompositionTest(PresetTestCase):
 
 
 class RedundantImportTest(PresetTestCase):
-    """
-
-    an import must state something the unit could not get without it."""
+    """An import must state something the unit could not get without it."""
 
     def _chain(self) -> None:
         write(self.root / "leaf" / "a.yaml", "leaf_key:\n  value: 1\n")
@@ -406,9 +404,7 @@ class RedundantImportTest(PresetTestCase):
 
 
 class ReachabilityTest(unittest.TestCase):
-    """
-
-    payload outside every scope and preset is dead cfg, not an inert extra."""
+    """Payload outside every scope and preset is dead cfg, not an inert extra."""
 
     def _tree(self, extra: dict[str, str]) -> Path:
         tmp = tempfile.TemporaryDirectory(prefix="atlas-reach-test-")

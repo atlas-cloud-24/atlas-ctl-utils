@@ -106,10 +106,10 @@ class RegistryStatesTheFactsTest(unittest.TestCase):
         self.assertEqual("provision", run_actions.group_representative_action("mutative"))
 
     def test_a_group_with_two_forward_actions_is_refused(self):
-        """
+        """Silently picking one would make the status of every instance in that
 
-        silently picking one would make the status of every instance in that
-        group depend on dict order."""
+        group depend on dict order.
+        """
 
         original = run_actions.ACTIONS["destroy"]
         run_actions.ACTIONS["destroy"] = dataclasses.replace(

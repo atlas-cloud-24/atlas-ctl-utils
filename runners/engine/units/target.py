@@ -1,7 +1,13 @@
 """The target a run acts on."""
 
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import TracebackType
+from typing import Protocol
+
+from engine.run import actions as run_actions
+from engine.units import procedure as units_procedure
+from engine.units import shared as units_shared
+from engine.units import step as units_step
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -41,12 +47,44 @@ class TargetSource:
 
 
 @dataclass(frozen=True, kw_only=True)
-class TargetContext:
-    """Ports a target needs to run its steps."""
+class PreparedTarget:
+    """What a target needs to run its procedure, once its repo and cfg exist.
 
-    step_context: object
-    mark_mutation_started: Callable[[], None]
-    banner: Callable[[str], None]
+    `progress` is separate from `TargetContext` because a target that runs
+    nothing here owes none of it, and a port nobody can answer is worse than one
+    nobody asks.
+    """
+
+    procedure: units_procedure.Procedure
+    base_env: dict[str, str]
+    step_context: units_step.StepContext
+    progress: units_procedure.StepProgress
+
+
+class TargetContext(Protocol):
+    """What a target needs from whoever runs it.
+
+    A context manager, because a target's state slot and log open before its
+    first step and close however it ends — including by an exception, which the
+    slot must record rather than lose.
+    """
+
+    def __enter__(self) -> "TargetContext":
+        """Open this target's state slot and log."""
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        """Close the slot, recording `exc` when the target failed."""
+
+    def prepare(self, target: "Target") -> PreparedTarget | None:
+        """What the target needs to run, or nothing when it does not run here."""
+
+    def finish(self, target: "Target") -> units_shared.Revision | None:
+        """Publish the result and answer with the revision it published."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -66,6 +104,7 @@ class Target:
     instance_params: dict[str, str] | None = None
     plt_overlays: tuple[str, ...] = ()
     reuse_committed_result: bool = False
+    source_run: dict = field(default_factory=dict)
 
     @classmethod
     def from_target_run(cls, key: str, target_run: dict) -> "Target":
@@ -89,13 +128,12 @@ class Target:
             instance_params=target_run.get("target_instance_params"),
             plt_overlays=tuple(target_run.get("plt_overlays") or ()),
             reuse_committed_result=bool(target_run.get("reuse_committed_result")),
+            source_run=dict(target_run),
         )
 
     @property
     def is_mutating(self) -> bool:
         """Whether this target's action changes anything."""
-
-        from engine.run import actions as run_actions
 
         return self.action in run_actions.MUTATING_ACTIONS
 
@@ -117,13 +155,20 @@ class Target:
             document["plt_overlays"] = list(self.plt_overlays)
         return document
 
-    def run(self, steps: "Iterable", base_env: dict[str, str], *, context) -> None:
-        """Run this target's steps in order, marking a mutation once."""
+    def run(self, *, context: TargetContext) -> units_shared.Revision | None:
+        """Run this target's procedure, and answer with its revision.
 
-        marked = False
-        for step in steps:
-            if self.is_mutating and not marked:
-                context.mark_mutation_started()
-                marked = True
-            context.banner(f"[{self.action}] [{self.key}] [{step.id}]")
-            step.run(base_env, context=context.step_context)
+        A target that prepares nothing runs nowhere — reused from a committed
+        result, or spawned as its own child run — and its context answers with
+        the revision that already exists.
+        """
+
+        with context:
+            prepared = context.prepare(self)
+            if prepared is not None:
+                prepared.procedure.run(
+                    prepared.base_env,
+                    progress=prepared.progress,
+                    step_context=prepared.step_context,
+                )
+            return context.finish(self)

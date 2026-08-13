@@ -10,6 +10,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runners"))
 import atlas_ctl_adapter_aws as aws_adapter
 import ctl_cfg_fixture
+from engine.catalog import fan_out as catalog_fan_out
 from engine.cfg import validate as cfg_validate
 from engine.cli import args as cli_args
 from engine.commands import selection as commands_selection
@@ -19,16 +20,16 @@ from engine.preflight import checks as preflight_checks
 from engine.preflight import render as preflight_render
 from engine.preflight import reports as preflight_reports
 from engine.run import policy as run_policy
+from engine.run import selection as run_selection
 from engine.state import run_store as state_run_store
-from engine.units import fan_out as units_fan_out
 
 
 class PreflightRollupTests(unittest.TestCase):
-    """
+    """Container status ladder: failed > (partial | not_evaluated) > passed —
 
-    container status ladder: failed > (partial | not_evaluated) > passed —
     a container is NEVER a false green, and mixed passed/blocked is `partial`,
-    not `not_evaluated` (which is reserved for fully-blocked containers)."""
+    not `not_evaluated` (which is reserved for fully-blocked containers).
+    """
 
     def test_status_ladder(self):
         f = preflight_reports.aggregate_execution_identity_preflight_status
@@ -266,10 +267,10 @@ class PreflightArtifactTests(unittest.TestCase):
                     ],
                 }
 
-        selection = {
-            "selection_kind": "workflow",
-            "selection_key": "example/workflow",
-            "active_target_runs": {
+        selection = run_selection.RunSelection(
+            kind="workflow",
+            key="example/workflow",
+            active_target_runs={
                 "one": {
                     "target": "target/one",
                     "execution_identities": {
@@ -283,13 +284,13 @@ class PreflightArtifactTests(unittest.TestCase):
                     },
                 },
             },
-            "provider_adapter": Adapter(),
-            "provider_catalogs": {},
-            "execution_context": {},
-        }
+            provider_adapter=Adapter(),
+            provider_catalogs={},
+            execution_context={},
+        )
         report = preflight_reports.build_execution_identity_preflight_report(
             selection,
-            implementation_key="sso",
+            credential_acquisition="sso",
             execution_access_modes={"aws": "standard"},
             provider_options={},
             force_skip_providers=[],
@@ -347,14 +348,14 @@ class PreflightArtifactTests(unittest.TestCase):
         self.assertNotIn("note:", rendered)
 
     def test_policy_failure_does_not_replace_identity_report(self):
-        selection = {
-            "selection_kind": "workflow",
-            "selection_key": "landing_zone/bootstrap",
-            "workflow_cfg": {"target_runs": ["target"]},
-            "action_cfg": {"targets": {"target": {}}},
-            "execution_context": {},
-            "active_target_runs": {},
-        }
+        selection = run_selection.RunSelection(
+            kind="workflow",
+            key="landing_zone/bootstrap",
+            workflow_cfg={"target_runs": ["target"]},
+            action_cfg={"targets": {"target": {}}},
+            execution_context={},
+            active_target_runs={},
+        )
         with (
             mock.patch.object(
                 run_policy,
@@ -412,7 +413,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        dev = units_fan_out.FanOut.wrap_preflight_child(
+        dev = catalog_fan_out.FanOutCatalog.wrap_preflight_child(
             workflow_report,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -436,7 +437,7 @@ class PreflightArtifactTests(unittest.TestCase):
                 }
             ],
         }
-        test = units_fan_out.FanOut.wrap_preflight_child(
+        test = catalog_fan_out.FanOutCatalog.wrap_preflight_child(
             failed_workflow,
             {
                 "fan_out_param_set_key": "non_prod_accounts",
@@ -476,7 +477,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        self.assertIs(units_fan_out.FanOut.wrap_preflight_child(report, child), report)
+        self.assertIs(catalog_fan_out.FanOutCatalog.wrap_preflight_child(report, child), report)
 
     def test_unparameterized_fan_out_child_shows_effective_params(self):
         report = {
@@ -492,7 +493,7 @@ class PreflightArtifactTests(unittest.TestCase):
             "fan_out_param_entry_key": None,
             "params": {},
         }
-        wrapped = units_fan_out.FanOut.wrap_preflight_child(
+        wrapped = catalog_fan_out.FanOutCatalog.wrap_preflight_child(
             report,
             child,
             effective_params={
@@ -522,7 +523,9 @@ class PreflightArtifactTests(unittest.TestCase):
                 r"non_prod_accounts\.dev.*account.*--execution-params",
             ),
         ):
-            units_fan_out.FanOut.validate_param_collisions(Path(tmp), children, {"account": "test"})
+            catalog_fan_out.FanOutCatalog.validate_param_collisions(
+                Path(tmp), children, {"account": "test"}
+            )
 
     def test_fan_out_params_cannot_override_ctl_execution_params(self):
         children = [
@@ -535,7 +538,7 @@ class PreflightArtifactTests(unittest.TestCase):
             root = Path(tmp)
             (root / "execution_params.yaml").write_text("execution_params:\n  region: eu-west-1\n")
             with self.assertRaisesRegex(RuntimeError, r"eu_west_2.*region.*ctl execution_params"):
-                units_fan_out.FanOut.validate_param_collisions(root, children, {})
+                catalog_fan_out.FanOutCatalog.validate_param_collisions(root, children, {})
 
     def test_non_overlapping_fan_out_params_are_allowed(self):
         children = [
@@ -547,19 +550,23 @@ class PreflightArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "execution_params.yaml").write_text("execution_params:\n  main_tag: oxygen\n")
-            units_fan_out.FanOut.validate_param_collisions(root, children, {"landing_zone": "live"})
+            catalog_fan_out.FanOutCatalog.validate_param_collisions(
+                root, children, {"landing_zone": "live"}
+            )
 
     def test_preflight_only_dirs_do_not_materialize_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
             run_dir, artifacts_dir, log_file = commands_selection.setup_preflight_run_dirs(
-                "run-id",
-                "plan",
-                "target",
-                "example",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="run-id",
+                    action="plan",
+                    run_type="target",
+                    result_name="example",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
+                ),
                 memory,
-                locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
             )
             self.assertTrue(artifacts_dir.is_dir())
             self.assertTrue(log_file.is_file())
@@ -568,23 +575,25 @@ class PreflightArtifactTests(unittest.TestCase):
             self.assertFalse((run_dir / "step_utils").exists())
 
     def test_run_metadata_records_execution_access_modes_for_degraded_audit(self):
-        """
+        """Each provider's access mode must be persisted structurally in RUN.yaml
 
-        each provider's access mode must be persisted structurally in RUN.yaml
         (not only in the logged command) so a later audit of committed run
-        records shows which runs escalated, and for which provider."""
+        records shows which runs escalated, and for which provider.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             memory = logging.handlers.MemoryHandler(capacity=10)
             run_dir, _artifacts, _log = commands_selection.setup_preflight_run_dirs(
-                "run-id",
-                "plan",
-                "target",
-                "example",
-                Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="run-id",
+                    action="plan",
+                    run_type="target",
+                    result_name="example",
+                    ctl_state_local_root=Path(tmp),
+                    locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
+                    execution_access_modes={"aws": "force_bypass"},
+                ),
                 memory,
-                locator_segments=list(state_run_store.LOCAL_ONLY_LOCATOR),
-                execution_access_modes={"aws": "force_bypass"},
             )
             meta = state_run_store.load_run_metadata(run_dir)
             self.assertEqual(meta.get("execution_access_modes"), {"aws": "force_bypass"})
@@ -652,7 +661,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "dev"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="sso",
+                credential_acquisition="sso",
                 execution_access_mode="agreed_direct",
             )
         self.assertEqual(result["status"], "passed")
@@ -688,7 +697,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="sso",
+                credential_acquisition="sso",
                 live_check=False,
             )
         self.assertEqual(result["status"], "force_skipped")
@@ -742,7 +751,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={"execution_context.params.main_tag": "oxygen"},
-                implementation_key="sso",
+                credential_acquisition="sso",
             )
         self.assertEqual(result["status"], "passed")
         self.assertEqual(assume.call_count, 2)
@@ -794,7 +803,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="sso",
+                credential_acquisition="sso",
             )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["provider_path"][-1]["status"], "failed")
@@ -810,7 +819,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "prod"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="sso",
+                credential_acquisition="sso",
                 live_check=False,
             )
         self.assertEqual(result["status"], "failed")
@@ -827,7 +836,7 @@ class AwsPreflightTests(unittest.TestCase):
                 {"execution_identity_key": "env_dev_deploy"},
                 self.catalogs(),
                 execution_context={},
-                implementation_key="sso",
+                credential_acquisition="sso",
                 execution_access_mode="force_bypass",
                 provider_options={"force_bypass_profile": "do-not-render"},
                 live_check=False,

@@ -272,13 +272,12 @@ if __name__ == "__main__":
 
 
 class DestroyedIsNotIndistinguishableTest(unittest.TestCase):
-    """
-
-       Regression: a destroyed composition must not look like an absent one.
+    """Regression: a destroyed composition must not look like an absent one.
 
     keyed "owns no state" on the ABSENCE of a provision pointer, which
        also matches a deployable composition destroyed under a hash whose provision
        record is not present. The result: `env/seed` at one instance reported
        `status: passed` with no `state`, so `--all` could not tell "torn down" from
        "never deployed".
+
     """

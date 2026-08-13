@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from engine.cli import args as cli_args
 from engine.state import render as state_render
-from engine.state import status as state_status
+from engine.state import status_query as state_status_query
 
 MEMBER = {
     "address": "target/env/seed/baseline/instances/env.type=dev/aws.account=dev",
@@ -450,7 +450,7 @@ class TheTableAgreesWithTheStructureItRendersTest(unittest.TestCase):
         vocabularies cannot drift into a shape with no rendering."""
 
         self.assertEqual(
-            sorted(state_status.STATUS_STRUCTURES),
+            sorted(state_status_query.STATUS_STRUCTURES),
             sorted((NESTED_REPORT["structure"], FLAT_REPORT["structure"])),
         )
 

@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import shutil
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +32,8 @@ from engine.preflight import reports as preflight_reports
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.run import policy as run_policy
+from engine.run import request as run_request
+from engine.run import selection as run_selection
 from engine.state import run_store as state_run_store
 from engine.state import sync as state_sync
 from engine.units import procedure as units_procedure
@@ -222,7 +225,7 @@ class ProcedureArguments(RunArguments):
                 "❌ a synthetic target's execution is declared in full or not at all; missing "
                 + ", ".join(f"--{m.replace('_', '-')}" for m in missing_execution)
             )
-        procedure = units_procedure.Procedure.from_args(args)
+        procedure = units_procedure.ProcedureRequest.from_args(args)
         affected_target_keys = list(procedure.affected_target_keys)
         if affected_target_keys:
             args.affected_target_keys = run_addressing.normalize_target_keys(
@@ -254,59 +257,167 @@ def validate_run_args(run_type: str, args: argparse.Namespace) -> None:
     rules.validate(args)
 
 
-def setup_run_dirs(
-    run_id: str,
-    action: str | None,
-    run_type: str,
-    result_name: str,
-    ctl_state_local_root: Path,
-    memory_handler: logging.handlers.MemoryHandler,
-    *,
-    locator_segments: list[str],
-    label: str | None = None,
-    parent_fan_out_run_id: str | None = None,
-    parent_workflow_run_id: str | None = None,
-    parent_workflow_instance_address: str | None = None,
-    instance_segments: list[str] | None = None,
-    instance_address: str | None = None,
-    target_addresses: list[str] | None = None,
-    identity_doc: dict | None = None,
-    execution_access_modes: str | None = None,
-) -> tuple[Path, Path, Path, Path]:
-    """Create run directories under the stable ctl result key and setup file logging.
+@dataclass(frozen=True, kw_only=True)
+class RunLocation:
+    """Where one run's directories live, and what identifies it there.
 
-    results nest under the resolved ctl-state NAMESPACE tree
-    (`_local` for stateless/synthetic runs), with the target/workflow instance
-    layer between the key and `runs/`:
-      <root>/<namespace>/<run_type>/<key>[/instances/<seg>...]/runs/<id>
-    A parameterized instance writes its authoritative identity.yaml
-    (manifest-first ordering, Q2) before any run content."""
-    result_name = run_actions.normalize_result_name(result_name, label="ctl result name")
-    # composed, never hand-assembled. Building `/ action / run_type /`
-    # Here is what kept every real run on the action-prefixed layout while the
-    # readers had already moved — the two agreed with each other and with nothing.
-    ctl_state_dir = Path(ctl_state_local_root).joinpath(
-        *locator_segments
-    ) / run_addressing.compose_state_relpath(run_type, result_name, list(instance_segments or []))
-    runs_dir = ctl_state_dir / "runs"
-    run_dir = runs_dir / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if instance_segments and identity_doc is not None:
-        identity_path = ctl_state_dir / "identity.yaml"
+    Both ways of creating a run — full and preflight-only — compose the same
+    path and write the same metadata; only the tooling and cfg they materialize
+    differ. This is the part they share, stated once.
+    """
+
+    run_id: str
+    action: str | None
+    run_type: str
+    result_name: str
+    ctl_state_local_root: Path
+    locator_segments: list[str]
+    label: str | None = None
+    parent_fan_out_run_id: str | None = None
+    parent_workflow_run_id: str | None = None
+    parent_workflow_instance_address: str | None = None
+    instance_segments: list[str] | None = None
+    instance_address: str | None = None
+    target_addresses: list[str] | None = None
+    identity_doc: dict | None = None
+    execution_access_modes: str | None = None
+
+    @property
+    def ctl_state_dir(self) -> Path:
+        """The instance directory this run writes under.
+
+        Composed, never hand-assembled: hand-building `/ action / run_type /` is
+        what kept every real run on the action-prefixed layout after the readers
+        had moved off it — the two agreed with each other and with nothing.
+        """
+
+        return Path(self.ctl_state_local_root).joinpath(
+            *self.locator_segments
+        ) / run_addressing.compose_state_relpath(
+            self.run_type,
+            run_actions.normalize_result_name(self.result_name, label="ctl result name"),
+            list(self.instance_segments or []),
+        )
+
+    def write_identity(self) -> None:
+        """Write the instance's authoritative identity.yaml, before any run content."""
+
+        if not (self.instance_segments and self.identity_doc is not None):
+            return
+        identity_path = self.ctl_state_dir / "identity.yaml"
         if not identity_path.exists():
-            kernel_yaml_io.write_yaml_file(identity_path, identity_doc)
+            self.ctl_state_dir.mkdir(parents=True, exist_ok=True)
+            kernel_yaml_io.write_yaml_file(identity_path, self.identity_doc)
+
+    def metadata(self, *, run_dir: Path, log_file: Path, **extra) -> dict:
+        """The run record both creation paths write."""
+
+        result_name = run_actions.normalize_result_name(self.result_name, label="ctl result name")
+        namespace = self.locator_segments[0] if self.locator_segments else None
+        return {
+            "run_id": self.run_id,
+            "run_type": self.run_type,
+            "result_name": result_name,
+            **(
+                {
+                    "action": self.action,
+                    "result_key": f"{self.action}/{self.run_type}/{result_name}",
+                }
+                if self.action is not None
+                else {}
+            ),
+            "ctl_state_local_root": str(Path(self.ctl_state_local_root)),
+            "ctl_state_locator": list(self.locator_segments),
+            "ctl_state_dir": str(self.ctl_state_dir),
+            "run_dir": str(run_dir),
+            "log_path": str(log_file),
+            "target_keys": [],
+            "mutation_started": False,
+            **extra,
+            # Degraded-mode audit: each provider's access mode is persisted
+            # structurally (not only in the logged command) so an audit of
+            # committed run records can tell which runs escalated, and where.
+            **(
+                {"execution_access_modes": self.execution_access_modes}
+                if self.execution_access_modes
+                else {}
+            ),
+            # Instance identity + namespace facts of this run.
+            **(
+                {"ctl_state_namespace": namespace}
+                if namespace and namespace != state_run_store.LOCAL_ONLY_LOCATOR[0]
+                else {}
+            ),
+            **({"instance": list(self.instance_segments)} if self.instance_segments else {}),
+            **({"instance_address": self.instance_address} if self.instance_address else {}),
+            **({"target_addresses": list(self.target_addresses)} if self.target_addresses else {}),
+            # The operator's name for the invocation this run belongs to,
+            # inherited from the parent rather than minted here. Metadata: it is
+            # denormalized onto the committed pointer for reading, and absent
+            # from every identity and reuse comparison — see _COMMITTED_FACT_KEYS.
+            **({"label": self.label} if self.label else {}),
+            # The stateless fan-out's batch audit record — "these runs were one
+            # invocation" lives only in child metadata.
+            **(
+                {"fan_out_run_id": self.parent_fan_out_run_id} if self.parent_fan_out_run_id else {}
+            ),
+            # A child spawned by a workflow records its parent, so the namespace
+            # mutation lock can tell "my parent holds it" from contention.
+            **(
+                {"parent_workflow_run_id": self.parent_workflow_run_id}
+                if self.parent_workflow_run_id
+                else {}
+            ),
+            **(
+                {"parent_workflow_instance_address": self.parent_workflow_instance_address}
+                if self.parent_workflow_instance_address
+                else {}
+            ),
+        }
+
+
+def _attach_run_log(run_dir: Path, memory_handler: logging.handlers.MemoryHandler) -> Path:
+    """Open this run's log file and redirect buffered logging into it."""
+
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logs_run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
+    log_file = logs_dir / f"{kernel_ids.SERVICE_ID}_{logs_run_id}.log"
+    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+    memory_handler.setTarget(file_handler)
+    memory_handler.flush()
+    logging.getLogger().removeHandler(memory_handler)
+    return log_file
+
+
+def setup_run_dirs(
+    location: RunLocation, memory_handler: logging.handlers.MemoryHandler
+) -> tuple[Path, Path, Path]:
+    """Create a run's directories, materialize the ctl runtime, and start file logging.
+
+    Results nest under the resolved ctl-state NAMESPACE tree (`_local` for
+    stateless runs), with the instance layer between the key and `runs/`:
+      <root>/<namespace>/<run_type>/<key>[/instances/<seg>...]/runs/<id>
+    """
+
+    ctl_state_dir = location.ctl_state_dir
+    run_dir = ctl_state_dir / "runs" / location.run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    location.write_identity()
     logging.info(f"Using ctl_state_dir: {ctl_state_dir}")
     logging.info(f"Using run_dir: {run_dir}")
 
-    # Materialize the pinned ctl target_run runtime once, up front — it is a run-scoped
-    # (workspace-scoped) precondition, not a per-target_run step. Idempotent thereafter.
+    # Materialize the pinned ctl runtime once, up front — it is a run-scoped
+    # precondition, not a per-target step. Idempotent thereafter.
     step_utils_dir = cfg_materialize.materialize_step_utils(run_dir)
     logging.info(f"Using ctl target_run runtime: {step_utils_dir}")
 
-    # artifacts/ splits into general/ (run-level validation reports + metadata)
-    # And target_runs/<target_run>/ (per-target_run outputs, created when target_runs run).
-    # Logs are a top-level run concern (run_dir/logs/), sibling of cfg/ — not buried
-    # under artifacts/.
+    # artifacts/ splits into general/ (run-level reports + metadata) and
+    # target_runs/<target_run>/. Logs are a top-level run concern, sibling of
+    # cfg/ — not buried under artifacts/.
     artifacts_dir = run_dir / "artifacts" / "general"
     os.makedirs(artifacts_dir, exist_ok=True)
 
@@ -315,81 +426,18 @@ def setup_run_dirs(
         shutil.rmtree(cfg_dir)
     os.makedirs(cfg_dir)
 
-    logs_dir = run_dir / "logs"
-    os.makedirs(logs_dir, exist_ok=True)
-    logs_run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
-    log_file = logs_dir / f"{kernel_ids.SERVICE_ID}_{logs_run_id}.log"
-    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(file_handler)
-
-    memory_handler.setTarget(file_handler)
-    memory_handler.flush()
-    logging.getLogger().removeHandler(memory_handler)
-
+    log_file = _attach_run_log(run_dir, memory_handler)
     state_run_store.write_run_metadata(
-        run_dir,
-        {
-            "run_id": run_id,
-            "run_type": run_type,
-            "result_name": result_name,
-            **(
-                {"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
-                if action is not None
-                else {}
-            ),
-            "ctl_state_local_root": str(Path(ctl_state_local_root)),
-            "ctl_state_locator": list(locator_segments),
-            "ctl_state_dir": str(ctl_state_dir),
-            "run_dir": str(run_dir),
-            "log_path": str(log_file),
-            "target_keys": [],
-            "mutation_started": False,
-            # Degraded-mode audit: each provider's access mode is persisted
-            # structurally (not only in the logged command) so an audit of
-            # committed run records can tell which runs escalated, and where.
-            **(
-                {"execution_access_modes": execution_access_modes} if execution_access_modes else {}
-            ),
-            # Instance identity + namespace facts of this run.
-            **(
-                {"ctl_state_namespace": locator_segments[0]}
-                if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0]
-                else {}
-            ),
-            **({"instance": list(instance_segments)} if instance_segments else {}),
-            **({"instance_address": instance_address} if instance_address else {}),
-            **({"target_addresses": list(target_addresses)} if target_addresses else {}),
-            # The operator's name for the invocation this run belongs to,
-            # inherited from the parent rather than minted here. Metadata: it is
-            # denormalized onto the committed pointer for reading, and absent
-            # from every identity and reuse comparison — see _COMMITTED_FACT_KEYS.
-            **({"label": label} if label else {}),
-            # 8: the stateless fan-out's batch audit record —
-            # "these runs were one invocation" lives only in child metadata.
-            **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
-            # A child spawned by a workflow records its parent, so the
-            # namespace mutation lock can tell "my parent holds it" from contention.
-            **(
-                {"parent_workflow_run_id": parent_workflow_run_id} if parent_workflow_run_id else {}
-            ),
-            **(
-                {"parent_workflow_instance_address": parent_workflow_instance_address}
-                if parent_workflow_instance_address
-                else {}
-            ),
-        },
+        run_dir, location.metadata(run_dir=run_dir, log_file=log_file)
     )
-
     logging.info(f"Using artifacts_dir: {artifacts_dir}")
     logging.info(f"Logging to: {log_file}")
-
     return run_dir, artifacts_dir, log_file
 
 
 def setup_run_workspace(run_dir: Path) -> Path:
     """Materialize the target_run runtime and mutable cfg workspace after preflight."""
+
     step_utils_dir = cfg_materialize.materialize_step_utils(run_dir)
     logging.info("Using ctl target_run runtime: %s", step_utils_dir)
 
@@ -402,100 +450,25 @@ def setup_run_workspace(run_dir: Path) -> Path:
 
 
 def setup_preflight_run_dirs(
-    run_id: str,
-    action: str | None,
-    run_type: str,
-    result_name: str,
-    ctl_state_local_root: Path,
+    location: RunLocation,
     memory_handler: logging.handlers.MemoryHandler,
     *,
-    locator_segments: list[str],
     check_only: bool = True,
-    label: str | None = None,
-    instance_segments: list[str] | None = None,
-    instance_address: str | None = None,
-    target_addresses: list[str] | None = None,
-    identity_doc: dict | None = None,
-    parent_fan_out_run_id: str | None = None,
-    parent_workflow_run_id: str | None = None,
-    parent_workflow_instance_address: str | None = None,
-    execution_access_modes: str | None = None,
 ) -> tuple[Path, Path, Path]:
     """Create a preflight result without target_run tooling or companion cfg."""
-    result_name = run_actions.normalize_result_name(result_name, label="ctl result name")
-    # composed, never hand-assembled. Building `/ action / run_type /`
-    # Here is what kept every real run on the action-prefixed layout while the
-    # readers had already moved — the two agreed with each other and with nothing.
-    ctl_state_dir = Path(ctl_state_local_root).joinpath(
-        *locator_segments
-    ) / run_addressing.compose_state_relpath(run_type, result_name, list(instance_segments or []))
-    if instance_segments and identity_doc is not None:
-        identity_path = ctl_state_dir / "identity.yaml"
-        if not identity_path.exists():
-            ctl_state_dir.mkdir(parents=True, exist_ok=True)
-            kernel_yaml_io.write_yaml_file(identity_path, identity_doc)
-    run_dir = ctl_state_dir / "runs" / run_id
+
+    location.write_identity()
+    run_dir = location.ctl_state_dir / "runs" / location.run_id
     artifacts_dir = run_dir / "artifacts" / "general"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir = run_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    logs_run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "_" + uuid.uuid4().hex[:6]
-    log_file = logs_dir / f"{kernel_ids.SERVICE_ID}_{logs_run_id}.log"
-    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logging.getLogger().addHandler(file_handler)
-    memory_handler.setTarget(file_handler)
-    memory_handler.flush()
-    logging.getLogger().removeHandler(memory_handler)
-
+    log_file = _attach_run_log(run_dir, memory_handler)
     state_run_store.write_run_metadata(
         run_dir,
-        {
-            "run_id": run_id,
-            "run_type": run_type,
-            "result_name": result_name,
-            **(
-                {"action": action, "result_key": f"{action}/{run_type}/{result_name}"}
-                if action is not None
-                else {}
-            ),
-            "ctl_state_local_root": str(Path(ctl_state_local_root)),
-            "ctl_state_locator": list(locator_segments),
-            "ctl_state_dir": str(ctl_state_dir),
-            "run_dir": str(run_dir),
-            "log_path": str(log_file),
-            "target_keys": [],
-            "mutation_started": False,
-            "execution_identity_preflight_check_only": bool(check_only),
-            # Degraded-mode audit (see setup_run_dirs).
-            **(
-                {"execution_access_modes": execution_access_modes} if execution_access_modes else {}
-            ),
-            # Instance identity + namespace facts of this run.
-            **(
-                {"ctl_state_namespace": locator_segments[0]}
-                if locator_segments and locator_segments[0] != state_run_store.LOCAL_ONLY_LOCATOR[0]
-                else {}
-            ),
-            **({"instance": list(instance_segments)} if instance_segments else {}),
-            **({"instance_address": instance_address} if instance_address else {}),
-            **({"target_addresses": list(target_addresses)} if target_addresses else {}),
-            # The invocation this run belongs to (see setup_run_dirs).
-            **({"label": label} if label else {}),
-            **({"fan_out_run_id": parent_fan_out_run_id} if parent_fan_out_run_id else {}),
-            # A child spawned by a workflow records its parent, so the
-            # namespace mutation lock can tell "my parent holds it" from contention.
-            **(
-                {"parent_workflow_run_id": parent_workflow_run_id} if parent_workflow_run_id else {}
-            ),
-            **(
-                {"parent_workflow_instance_address": parent_workflow_instance_address}
-                if parent_workflow_instance_address
-                else {}
-            ),
-        },
+        location.metadata(
+            run_dir=run_dir,
+            log_file=log_file,
+            execution_identity_preflight_check_only=bool(check_only),
+        ),
     )
     logging.info("Using preflight run_dir: %s", run_dir)
     logging.info("Using artifacts_dir: %s", artifacts_dir)
@@ -772,29 +745,11 @@ def resolve_run_instance_identity(
 
 
 def resolve_pipeline_selection(
-    ctl_cfg_root: Path,
-    ctl_profile: str,
-    execution_params: dict[str, str],
-    ctl_ref_policy: str,
-    action: str,
-    workflow_name: str | None,
+    request: run_request.RunRequest,
     *,
-    target_repo_key: str,
-    require_target_ref: bool,
-    execution_runtime_mode: str,
-    provider_options: dict[str, str] | None,
-    execution_access_modes: dict[str, str],
-    target_name: str | None = None,
-    procedure_run: dict | None = None,
-    agreed_defer_ctl_state_backend_sync: bool = False,
-    force_skip_ctl_state_backend_sync: bool = False,
-    force_skip_guardrails: bool = False,
-    force_skip_full_cfg_validation_gate: bool = False,
-    force_skip_execution_identity_preflight_check: list[str] | None = None,
     enforce_ctl_policy: bool = True,
     load_provider_catalogs: bool = True,
-    providers: list[str] | tuple[str, ...] = (),
-) -> dict:
+) -> run_selection.RunSelection:
     """Resolve a run through active target_runs without touching state or plt cfg.
 
     Policy-free resolution is used only to produce independent ctl-policy and
@@ -810,211 +765,172 @@ def resolve_pipeline_selection(
     ctl-policy failure.
     """
     execution_context = execution_run_context.build_execution_context(
-        ctl_cfg_root,
-        action=None if workflow_name and not target_name and not procedure_run else action,
-        ctl_profile=ctl_profile,
-        execution_params=execution_params,
-        providers=providers,
-        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        force_skip_guardrails=force_skip_guardrails,
-        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
-        execution_access_modes=execution_access_modes,
-        execution_runtime_mode=execution_runtime_mode,
+        request.ctl_cfg_root,
+        action=None
+        if request.workflow_name and not request.target_name and not request.procedure_run
+        else request.action,
+        ctl_profile=request.ctl_profile,
+        execution_params=request.execution_params,
+        providers=request.providers,
+        agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
+        force_skip_guardrails=request.force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=request.force_skip_full_cfg_validation_gate,
+        execution_access_modes=request.execution_access_modes,
+        execution_runtime_mode=request.execution_runtime_mode,
         force_skip_execution_identity_preflight_check=(
-            force_skip_execution_identity_preflight_check
+            request.force_skip_execution_identity_preflight_check
         ),
     )
     if enforce_ctl_policy:
         execution_run_context.validate_execution_context_constraints(
-            ctl_cfg_root, execution_context
+            request.ctl_cfg_root, execution_context
         )
-    require_commit_refs = run_policy.ref_policy_requires_commits(ctl_ref_policy)
+    require_commit_refs = run_policy.ref_policy_requires_commits(request.ctl_ref_policy)
 
-    if procedure_run:
+    if request.procedure_run:
         workflow_cfg, action_cfg = catalog_workflow.WorkflowCatalog.procedure_cfg(
-            ctl_cfg_root,
-            action,
-            source=procedure_run["source"],
-            ref=procedure_run["ref"],
-            domain_name=procedure_run["domain"],
-            procedure=procedure_run["procedure"],
-            execution_provider=procedure_run.get("execution_provider"),
-            execution_account=procedure_run.get("execution_account"),
-            execution_role=procedure_run.get("execution_role"),
+            request.ctl_cfg_root,
+            request.action,
+            source=request.procedure_run["source"],
+            ref=request.procedure_run["ref"],
+            domain_name=request.procedure_run["domain"],
+            procedure=request.procedure_run["procedure"],
+            execution_provider=request.procedure_run.get("execution_provider"),
+            execution_account=request.procedure_run.get("execution_account"),
+            execution_role=request.procedure_run.get("execution_role"),
         )
         selection_kind = "procedure"
-        selection_key = procedure_run["procedure"]
-    elif target_name:
+        selection_key = request.procedure_run["procedure"]
+    elif request.target_name:
         # A standalone target run has no members, so the action is filtered by
         # the invoked action alone.
         action_cfg = target_catalog.TargetCatalog.action_cfg(
-            ctl_cfg_root, action, execution_context
+            request.ctl_cfg_root, request.action, execution_context
         )
         workflow_cfg = {
             "meta": {
-                "name": f"{ctl_profile}/{action}/{target_name}",
-                "action": action,
+                "name": f"{request.ctl_profile}/{request.action}/{request.target_name}",
+                "action": request.action,
             },
-            "target_runs": [target_name],
+            "target_runs": [request.target_name],
         }
         selection_kind = "target"
-        selection_key = target_name
+        selection_key = request.target_name
     else:
         workflow_cfg = catalog_workflow.WorkflowCatalog.workflow_cfg(
-            ctl_cfg_root,
-            ctl_profile,
-            action,
-            workflow_name,
+            request.ctl_cfg_root,
+            request.ctl_profile,
+            request.action,
+            request.workflow_name,
             execution_context,
         )
         action_cfg = target_catalog.TargetCatalog.action_cfg(
-            ctl_cfg_root,
-            action,
+            request.ctl_cfg_root,
+            request.action,
             execution_context,
             member_actions=units_workflow.Workflow.from_cfg(
-                workflow_name or "", workflow_cfg, action=action
+                request.workflow_name or "", workflow_cfg, action=request.action
             ).member_actions,
         )
         selection_kind = "workflow"
-        selection_key = workflow_name
+        selection_key = request.workflow_name
 
-    if not procedure_run:
+    if not request.procedure_run:
         target_catalog.TargetEntries.validate_selectors(workflow_cfg, action_cfg, execution_context)
     if enforce_ctl_policy:
         run_policy.validate_target_policy_constraints(
-            ctl_cfg_root, ctl_profile, workflow_cfg, action_cfg
+            request.ctl_cfg_root, request.ctl_profile, workflow_cfg, action_cfg
         )
         run_policy.validate_execution_access(
-            ctl_cfg_root,
-            ctl_profile,
+            request.ctl_cfg_root,
+            request.ctl_profile,
             workflow_cfg,
             action_cfg,
             execution_context=execution_context,
-            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-            force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-            execution_access_modes=execution_access_modes,
-            provider_options=provider_options,
+            agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+            force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
+            execution_access_modes=request.execution_access_modes,
+            provider_options=request.provider_options,
             force_skip_execution_identity_preflight_check=(
-                force_skip_execution_identity_preflight_check
+                request.force_skip_execution_identity_preflight_check
             ),
         )
         run_policy.validate_execution_runtime_mode(
-            ctl_cfg_root, ctl_profile, execution_runtime_mode
+            request.ctl_cfg_root, request.ctl_profile, request.execution_runtime_mode
         )
 
-    refs = cfg_tooling.load_refs_cfg(ctl_cfg_root)
+    refs = cfg_tooling.load_refs_cfg(request.ctl_cfg_root)
     active_target_runs = target_catalog.ActiveTargetRuns.build(
         workflow_cfg,
         action_cfg,
-        repo_key=target_repo_key,
-        require_branch_or_commit=require_target_ref,
+        repo_key=request.target_repo_key,
+        require_branch_or_commit=request.require_target_ref,
         refs=refs,
         execution_context=execution_context,
         require_commit_refs=require_commit_refs if enforce_ctl_policy else False,
     )
     if enforce_ctl_policy:
-        cfg_validate.CommitPinning(ctl_ref_policy).check_target_runs(active_target_runs)
+        cfg_validate.CommitPinning(request.ctl_ref_policy).check_target_runs(active_target_runs)
     provider_adapter = None
     provider_catalogs = None
     if load_provider_catalogs:
         provider_adapter = execution_providers.run_provider_adapter(execution_context)
         provider_catalogs = provider_adapter.load_runtime_catalogs(
-            ctl_cfg_root, execution_context=execution_context
+            request.ctl_cfg_root, execution_context=execution_context
         )
-    return {
-        "selection_kind": selection_kind,
-        "selection_key": selection_key,
-        "execution_context": execution_context,
-        "scope_params": execution_run_context.scope_params_from_context(execution_context),
-        "require_commit_refs": require_commit_refs,
-        "workflow_cfg": workflow_cfg,
-        "action_cfg": action_cfg,
-        "refs": refs,
-        "active_target_runs": active_target_runs,
-        "provider_adapter": provider_adapter,
-        "provider_catalogs": provider_catalogs,
-    }
+    return run_selection.RunSelection(
+        kind=selection_kind,
+        key=selection_key,
+        execution_context=execution_context,
+        scope_params=execution_run_context.scope_params_from_context(execution_context),
+        require_commit_refs=require_commit_refs,
+        workflow_cfg=workflow_cfg,
+        action_cfg=action_cfg,
+        refs=refs,
+        active_target_runs=active_target_runs,
+        provider_adapter=provider_adapter,
+        provider_catalogs=provider_catalogs,
+    )
 
 
 def resolve_and_preflight_execution_identities(
-    ctl_cfg_root: Path,
-    ctl_profile: str,
-    execution_params: dict[str, str],
-    ctl_ref_policy: str,
-    action: str,
-    workflow_name: str | None,
-    *,
-    target_repo_key: str,
-    require_target_ref: bool,
-    provider_implementation_key: str,
-    execution_runtime_mode: str,
-    provider_options: dict[str, str] | None,
-    execution_access_modes: dict[str, str],
-    artifacts_dir: Path,
-    gates_dir: Path,
-    target_name: str | None = None,
-    procedure_run: dict | None = None,
-    agreed_defer_ctl_state_backend_sync: bool = False,
-    force_skip_ctl_state_backend_sync: bool = False,
-    force_skip_guardrails: bool = False,
-    force_skip_full_cfg_validation_gate: bool = False,
-    force_skip_execution_identity_preflight_check: list[str] | None = None,
-    providers: list[str] | tuple[str, ...] = (),
-) -> tuple[dict, dict]:
+    request: run_request.RunRequest,
+) -> tuple[run_selection.RunSelection, dict]:
+    """Single-runner (workflow/target/procedure) preflight: the same four
+
+    validation reports the fan-out produces, for this one selection.
     """
 
-    single-runner (workflow/target/procedure) preflight: the same four
-    validation reports the fan-out produces, for this one selection."""
-
+    gates_dir = cfg_materialize.run_gates_dir(request.run_dir)
     selection = resolve_pipeline_selection(
-        ctl_cfg_root,
-        ctl_profile,
-        execution_params,
-        ctl_ref_policy,
-        action,
-        workflow_name,
-        target_repo_key=target_repo_key,
-        require_target_ref=require_target_ref,
-        execution_runtime_mode=execution_runtime_mode,
-        provider_options=provider_options,
-        execution_access_modes=execution_access_modes,
-        target_name=target_name,
-        procedure_run=procedure_run,
-        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        force_skip_guardrails=force_skip_guardrails,
-        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
-        force_skip_execution_identity_preflight_check=(
-            force_skip_execution_identity_preflight_check
-        ),
+        request,
         enforce_ctl_policy=False,
         load_provider_catalogs=False,
-        providers=providers,
     )
     cfg_report = preflight_checks.CFG_VALIDATION.build(
         preflight_reports.collect_provider_cfg_findings(
-            ctl_cfg_root, selection["execution_context"]
+            request.ctl_cfg_root, selection.execution_context
         )
     )
     preflight_checks.CFG_VALIDATION.apply_gate(
-        cfg_report, force_skip=force_skip_full_cfg_validation_gate
+        cfg_report, force_skip=request.force_skip_full_cfg_validation_gate
     )
     outcome = preflight_checks.build_selection_validation_reports(
         selection,
         preflight_checks.PreflightInputs(
-            ctl_cfg_root=ctl_cfg_root,
-            ctl_profile=ctl_profile,
-            ctl_ref_policy=ctl_ref_policy,
-            execution_runtime_mode=execution_runtime_mode,
-            execution_access_modes=execution_access_modes,
-            provider_options=provider_options,
-            implementation_key=provider_implementation_key,
+            ctl_cfg_root=request.ctl_cfg_root,
+            ctl_profile=request.ctl_profile,
+            ctl_ref_policy=request.ctl_ref_policy,
+            execution_runtime_mode=request.execution_runtime_mode,
+            execution_access_modes=request.execution_access_modes,
+            provider_options=request.provider_options,
+            credential_acquisition=request.credential_acquisition,
             force_skip_execution_identity_preflight_check=(
-                force_skip_execution_identity_preflight_check
+                request.force_skip_execution_identity_preflight_check
             ),
-            agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-            force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
+            agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+            force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
         ),
     )
     reports = {preflight_checks.CFG_VALIDATION.name: cfg_report, **outcome["reports"]}

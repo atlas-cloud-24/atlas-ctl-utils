@@ -19,7 +19,7 @@ import contextlib
 
 from engine.commands import selection as commands_selection
 from engine.kernel import yaml_io as kernel_yaml_io
-from engine.state import status as state_status
+from engine.state import status_outdating as state_status_outdating
 from engine.state import sync as state_sync
 from engine_surface import engine_source
 
@@ -84,7 +84,8 @@ class ForgetSelectionTest(unittest.TestCase):
 
     def _addrs(self, older_than, addresses):
         return sorted(
-            i["address"] for i in state_status.forget_selection(self.root, older_than, addresses)
+            i["address"]
+            for i in state_status_outdating.forget_selection(self.root, older_than, addresses)
         )
 
     def test_both_filters_compose(self):
@@ -92,7 +93,7 @@ class ForgetSelectionTest(unittest.TestCase):
 
     def test_a_bad_date_is_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "ISO-8601"):
-            state_status.forget_selection(self.root, "yesterday", ["all"])
+            state_status_outdating.forget_selection(self.root, "yesterday", ["all"])
 
 
 class ForgetValidationTest(unittest.TestCase):
@@ -146,7 +147,7 @@ class ForgetGuardTest(unittest.TestCase):
     def _guard(self, **kw):
         base = dict(accept_orphans=False, cascade=False, referenced_by={})
         base.update(kw)
-        return state_status.forget_guard(self.root, self.rel, **base)
+        return state_status_outdating.forget_guard(self.root, self.rel, **base)
 
     def test_a_referenced_instance_needs_cascade(self):
         refs = {self.rel: {"workflow/env/seed/instances/sha256=abc"}}

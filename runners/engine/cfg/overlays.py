@@ -139,9 +139,7 @@ def resolve_run_plt_overlays(
     *,
     execution_context: dict[str, object],
 ) -> list[str]:
-    """
-
-    append target-required overlays in target order and validate conflicts."""
+    """Append target-required overlays in target order and validate conflicts."""
 
     duplicates = [
         item for item, count in collections.Counter(explicit_overlays).items() if count > 1

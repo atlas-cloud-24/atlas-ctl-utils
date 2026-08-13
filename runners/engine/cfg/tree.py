@@ -29,9 +29,7 @@ from engine.run import selectors as run_selectors
 def validate_cross_scope_leaf_conflicts(
     scopes: list[dict], *, target_path: str, skip_filenames: set[str]
 ) -> None:
-    """
-
-    reject shared-target producers that define different final values for one YAML leaf."""
+    """Reject shared-target producers that define different final values for one YAML leaf."""
 
     if len(scopes) < 2:
         return
@@ -423,12 +421,12 @@ def merge_plt_cfg_dirs(
 
 
 def render_scope_tree(scope_dir: Path, dest_dir: Path, env_ctx: dict) -> None:
-    """
+    """Render one scope: merge all scope YAML for lookups, interpolate,
 
-    render one scope: merge all scope YAML for lookups, interpolate,
     normalize cfg-entry refs whole-scope, write back per-file YAML, copy
     non-YAML verbatim. Engine logic (folded from the former target_run-side
-    render_cfg.py)."""
+    render_cfg.py).
+    """
 
     brc = cfg_materialize._step_utils_module("build_runtime_cfg")
     yaml_files = sorted(p for p in scope_dir.rglob("*.yaml") if p.is_file())

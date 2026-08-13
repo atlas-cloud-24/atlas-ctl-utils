@@ -33,6 +33,8 @@ import re
 import shutil
 from pathlib import Path
 
+from engine.kernel import yaml_io as kernel_yaml_io
+
 IMPORTS_FILENAME = "__imports__.yaml"
 PARAMS_FILENAME = "__params__.yaml"
 ALIASES_FILENAME = "__aliases__.yaml"
@@ -53,14 +55,10 @@ class PresetError(RuntimeError):
 
 
 def _load_yaml_mapping(path: Path) -> dict:
-    import yaml
-
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise PresetError(f"❌ {path} must contain a mapping")
-    return data
+    try:
+        return kernel_yaml_io.load_yaml(path)
+    except RuntimeError as error:
+        raise PresetError(f"❌ {path} must contain a mapping") from error
 
 
 def _payload_files(preset_dir: Path) -> list[Path]:
@@ -393,8 +391,6 @@ def materialize(
     DIFFERENT bindings it is an error: the two copies would merge silently and the
     last one would win, with nothing in either import saying so.
     """
-    import yaml
-
     if preset_path in stack:
         chain = " -> ".join((*stack, preset_path))
         raise PresetError(f"❌ cfg import cycle: {chain}")
@@ -478,19 +474,17 @@ def materialize(
         text = _bind_aliases(text, aliases)
         if params:
             text = _bind_params(text, bindings, label=label, params=params)
-        doc = yaml.safe_load(text)
-        doc = {} if doc is None else doc
-        if not isinstance(doc, dict):
-            raise PresetError(f"❌ cfg payload must be a mapping: {path}")
+        try:
+            doc = kernel_yaml_io.load_yaml_text(text, label=str(path))
+        except RuntimeError as error:
+            raise PresetError(f"❌ cfg payload must be a mapping: {path}") from error
         if PARAM_NAMESPACE in doc:
             raise PresetError(
                 f"❌ plt payload must not define reserved top-level key {PARAM_NAMESPACE!r}: {path}"
             )
         if target.exists():
             doc = _merge(_load_yaml_mapping(target), doc)
-        target.write_text(
-            yaml.safe_dump(doc, sort_keys=False, default_flow_style=False), encoding="utf-8"
-        )
+        kernel_yaml_io.write_yaml_file(target, doc)
 
 
 _REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(?::-.*?)?\}")
@@ -546,9 +540,7 @@ def _owns(name: str, defined: set[str]) -> bool:
 def _assert_self_contained(
     preset_dir: Path, preset_path: str, imported: set[str], params: list[str], aliases: dict
 ) -> None:
-    """
-
-    A6: every reference a preset makes resolves to something the preset has.
+    """A6: every reference a preset makes resolves to something the preset has.
 
     Locally defined, imported, declared as a param, or the execution context —
     nothing else. A reference that only resolves once the preset lands in some
@@ -559,6 +551,7 @@ def _assert_self_contained(
     binding is substituted. A bound value may itself carry a reference (O2), but
     that reference is the importer's to satisfy, not the preset's — and the
     importer is judged by this same rule.
+
     """
 
     defined = set(imported) | set(aliases)
@@ -605,8 +598,6 @@ def _absorb(source: Path, dest: Path, *, selection, alias: str | None, label: st
     spread across many files (`foundation` spans 42) is projected file by file
     and stays spread.
     """
-    import yaml
-
     dest.mkdir(parents=True, exist_ok=True)
     yaml_paths = [p for p in sorted(source.rglob("*")) if p.is_file() and p.suffix == ".yaml"]
 
@@ -636,9 +627,7 @@ def _absorb(source: Path, dest: Path, *, selection, alias: str | None, label: st
             doc = {alias: doc}
         if target.exists():
             doc = _merge(_load_yaml_mapping(target), doc)
-        target.write_text(
-            yaml.safe_dump(doc, sort_keys=False, default_flow_style=False), encoding="utf-8"
-        )
+        kernel_yaml_io.write_yaml_file(target, doc)
 
 
 def _selected(key: str, selection) -> bool:

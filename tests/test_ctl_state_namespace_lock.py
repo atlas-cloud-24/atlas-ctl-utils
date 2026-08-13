@@ -49,7 +49,7 @@ def ctx(**params):
 
 
 class NamespaceResolverTests(unittest.TestCase):
-    """exact-one namespace resolution."""
+    """Exactly one namespace must resolve."""
 
     def _root(self, tmp: str, backends: str = BACKENDS) -> Path:
         root = Path(tmp)
@@ -91,7 +91,7 @@ class NamespaceResolverTests(unittest.TestCase):
 
 
 class FanOutNamespaceGateTests(unittest.TestCase):
-    """cross-namespace fan-out rejection."""
+    """A cross-namespace fan-out is rejected."""
 
     def _root(self, tmp: str) -> Path:
         root = Path(tmp)
@@ -160,9 +160,7 @@ class WorkflowCompositionTests(unittest.TestCase):
 
 
 class MutationLockTests(unittest.TestCase):
-    """
-
-    interim global mutation lock decision logic."""
+    """Interim global mutation lock decision logic."""
 
     def test_mutating_acquires_free_lock(self):
         out = state_run_store.evaluate_mutation_lock(None, action="provision", run_id="r1")
@@ -250,22 +248,21 @@ class ParentRunIdIsRecordedTest(unittest.TestCase):
     """
 
     def test_setup_run_dirs_records_parent_workflow_run_id(self):
-        import inspect
-
-        signature = inspect.signature(commands_selection.setup_run_dirs)
-        self.assertIn("parent_workflow_run_id", signature.parameters)
+        self.assertIn("parent_workflow_run_id", commands_selection.RunLocation.__dataclass_fields__)
 
         with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
             memory_handler = logging.handlers.MemoryHandler(capacity=1024)
             run_dir, _, _ = commands_selection.setup_run_dirs(
-                "child-run",
-                "destroy",
-                "target",
-                "env/seed/baseline",
-                pathlib.Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="child-run",
+                    action="destroy",
+                    run_type="target",
+                    result_name="env/seed/baseline",
+                    ctl_state_local_root=pathlib.Path(tmp),
+                    locator_segments=["live"],
+                    parent_workflow_run_id="parent-run",
+                ),
                 memory_handler,
-                locator_segments=["live"],
-                parent_workflow_run_id="parent-run",
             )
             metadata = state_run_store.load_run_metadata(run_dir)
             self.assertEqual(metadata.get("parent_workflow_run_id"), "parent-run")
@@ -274,13 +271,15 @@ class ParentRunIdIsRecordedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="atlas-parent-meta-") as tmp:
             memory_handler = logging.handlers.MemoryHandler(capacity=1024)
             run_dir, _, _ = commands_selection.setup_run_dirs(
-                "solo-run",
-                "destroy",
-                "target",
-                "env/seed/baseline",
-                pathlib.Path(tmp),
+                commands_selection.RunLocation(
+                    run_id="solo-run",
+                    action="destroy",
+                    run_type="target",
+                    result_name="env/seed/baseline",
+                    ctl_state_local_root=pathlib.Path(tmp),
+                    locator_segments=["live"],
+                ),
                 memory_handler,
-                locator_segments=["live"],
             )
             self.assertIsNone(
                 state_run_store.load_run_metadata(run_dir).get("parent_workflow_run_id")
@@ -316,9 +315,7 @@ class _FakeSyncer:
 
 
 class MutationLockGateTests(unittest.TestCase):
-    """
-
-    engine gate + release around the adapter."""
+    """Engine gate + release around the adapter."""
 
     def tearDown(self):
         state_run_store._MUTATION_LOCK_HELD = None
@@ -342,10 +339,10 @@ class MutationLockGateTests(unittest.TestCase):
             state_run_store.enforce_mutation_lock(syncer, action="provision", run_id="r2")
 
     def test_a_reader_is_not_blocked_and_does_not_even_look(self):
-        """
+        """Reading the lock object cost a GET per query to answer a
 
-        reading the lock object cost a GET per query to answer a
-        question whose only possible outcome was to refuse the caller."""
+        question whose only possible outcome was to refuse the caller.
+        """
 
         live = state_run_store.build_mutation_lock_doc("holder", "provision")
         syncer = _FakeSyncer(existing=live)
@@ -371,9 +368,7 @@ class MutationLockGateTests(unittest.TestCase):
 
 
 class DuplicateSelectorGuardTests(unittest.TestCase):
-    """
-
-    reject byte-identical selectors at load (exactly-one structures)."""
+    """Reject byte-identical selectors at load (exactly-one structures)."""
 
     def test_identical_backend_selectors_rejected_at_load(self):
         dup = BACKENDS.replace(
@@ -431,10 +426,10 @@ class MutationLockTtlTest(unittest.TestCase):
                 )
 
     def test_a_nonsense_ttl_is_refused(self):
-        """
+        """Silently falling back to the default would give a namespace a lock
 
-        silently falling back to the default would give a namespace a lock
-        window its author did not choose and does not know about."""
+        window its author did not choose and does not know about.
+        """
 
         for bad in ("3600", 0, -1, 1.5, True, [3600]):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
@@ -448,20 +443,17 @@ class MutationLockTtlTest(unittest.TestCase):
         self.assertAlmostEqual(60, (expires - acquired).total_seconds(), delta=2)
 
     def test_a_lock_taken_under_a_long_ttl_is_not_stale_after_an_hour(self):
-        """
+        """The regression itself: this is the run that used to have its own lock
 
-        the regression itself: this is the run that used to have its own lock
-        broken out from under it."""
+        broken out from under it.
+        """
 
         doc = state_run_store.build_mutation_lock_doc("slow-apply", "provision")
         an_hour_in = datetime.now(UTC) + timedelta(seconds=3601)
         self.assertFalse(state_run_store.mutation_lock_is_stale(doc, now=an_hour_in))
 
     def test_a_lock_is_still_breakable_once_its_own_ttl_passes(self):
-        """
-
-        longer, not infinite — an abandoned lock must still clear."""
-
+        """Longer, not infinite — an abandoned lock must still clear."""
         doc = state_run_store.build_mutation_lock_doc("abandoned", "provision", ttl_seconds=60)
         later = datetime.now(UTC) + timedelta(seconds=61)
         self.assertTrue(state_run_store.mutation_lock_is_stale(doc, now=later))
@@ -483,12 +475,12 @@ class MutationLockTtlTest(unittest.TestCase):
         return root
 
     def test_a_namespace_is_allowed_to_declare_the_field_at_all(self):
-        """
+        """Backend entries are key-ALLOWLISTED, so a new field is refused until it
 
-        backend entries are key-ALLOWLISTED, so a new field is refused until it
         is listed. Without this the whole option is dead cfg: declaring it fails
         at load with `unsupported keys`, and every other test here works on dicts
-        that never went through the loader."""
+        that never went through the loader.
+        """
 
         import tempfile
 

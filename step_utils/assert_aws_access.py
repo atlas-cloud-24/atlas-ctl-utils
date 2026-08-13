@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-
-
-assert that active AWS credentials match the target account and principal."""
+"""Assert that active AWS credentials match the target account and principal."""
 
 import json
 import os

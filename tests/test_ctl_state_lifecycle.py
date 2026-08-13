@@ -153,10 +153,10 @@ class LifecycleWiringTests(unittest.TestCase):
             )
 
     def test_a_workflow_must_declare_exactly_its_members_axes(self):
-        """
+        """Under-declaring merges two instances' histories; over-declaring makes
 
-        under-declaring merges two instances' histories; over-declaring makes
-        an address that can never differ."""
+        an address that can never differ.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             root = make_cfg(self, tmp)
@@ -315,10 +315,10 @@ class StaticWorkflowParamsGateTests(unittest.TestCase):
         )
 
     def test_an_unpinned_dispatch_axis_is_refused_rather_than_guessed(self):
-        """
+        """One workflow branch matching two different target branches has no
 
-        one workflow branch matching two different target branches has no
-        single correct declaration."""
+        single correct declaration.
+        """
 
         with self.assertRaisesRegex(RuntimeError, "does not pin"):
             self._check(

@@ -30,6 +30,8 @@ from engine.run import addressing as run_addressing
 from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_outdating as state_status_outdating
+from engine.state import status_rows as state_status_rows
 
 
 class Namespace:
@@ -136,13 +138,13 @@ class Namespace:
         reason: str = "a dependency changed",
     ) -> None:
         path = state_run_store.committed_pointer_path(self.instance(kind, key, segments), group)
-        state_status.mark_committed_status_outdated(
+        state_status_outdating.mark_committed_status_outdated(
             path, kernel_yaml_io.load_yaml(path) or {}, reason=reason
         )
 
     # ── reading ─────────────────────────────────────────────────────────────
     def rows(self) -> dict:
-        return state_status.compute_namespace_status_map(self.root)
+        return state_status_rows.compute_namespace_status_map(self.root)
 
     def row(self, kind: str, key: str, segments: list[str], group: str = "mutative") -> dict:
         instances = self.rows()[kind][key]

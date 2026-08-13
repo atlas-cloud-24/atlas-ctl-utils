@@ -135,9 +135,7 @@ class Graph:
         return sorted(self.units - set(self.scopes))
 
     def reachable_from(self, unit: str, seen: tuple[str, ...] = ()) -> list[str]:
-        """
-
-        every unit reached by following this unit's imports, depth-first."""
+        """Every unit reached by following this unit's imports, depth-first."""
 
         if unit in seen:
             return []
@@ -292,9 +290,7 @@ class Graph:
         return findings
 
     def composition_of(self, scope: str) -> list[str]:
-        """
-
-        every unit in one scope's composition, the scope included."""
+        """Every unit in one scope's composition, the scope included."""
 
         return sorted({scope, *self.reachable_from(scope)})
 
@@ -447,9 +443,7 @@ class Graph:
         return "\n".join(lines) + "\n"
 
     def preset_consumers_text(self, preset: str) -> str:
-        """
-
-        the same answer as a flat list, for reading in a terminal."""
+        """The same answer as a flat list, for reading in a terminal."""
 
         consumers = self.consumers_of(preset)
         lines = [preset, ""]
@@ -467,9 +461,7 @@ class Graph:
         return "\n".join(lines) + "\n"
 
     def scope_tree(self, scope: str) -> str:
-        """
-
-        the same composition as an indented text tree, for reading in a terminal."""
+        """The same composition as an indented text tree, for reading in a terminal."""
 
         lines = [scope]
 

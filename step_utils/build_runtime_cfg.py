@@ -57,9 +57,7 @@ EXECUTION_CONTEXT_ROOT = "execution_context"
 
 
 def load_execution_context(path: Path) -> tuple[dict[str, object], dict]:
-    """
-
-    load the nested execution_context file; return (flat dotted map, nested)."""
+    """Load the nested execution_context file; return (flat dotted map, nested)."""
 
     data = load_yaml_mapping(path)
     nested = data.get(EXECUTION_CONTEXT_ROOT)

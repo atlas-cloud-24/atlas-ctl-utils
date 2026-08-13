@@ -35,9 +35,11 @@ from engine.kernel import yaml_io as kernel_yaml_io
 from engine.preflight import checks as preflight_checks
 from engine.preflight import reports as preflight_reports
 from engine.run import policy as run_policy
+from engine.run import request as run_request
 from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
-from engine.state import status as state_status
+from engine.state import status_outdating as state_status_outdating
+from engine.state import status_rows as state_status_rows
 from engine.state import sync as state_sync
 
 
@@ -49,7 +51,7 @@ class CtlStateMaintenance:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         context = _maintenance_context(ctl_cfg_root, args)
         # The sweep is a QUERY over bucket truth (its only output, an
@@ -63,7 +65,7 @@ class CtlStateMaintenance:
                 args,
                 context,
                 Path(scratch),
-                provider_implementation_key=provider_implementation_key,
+                credential_acquisition=credential_acquisition,
             )
 
     @staticmethod
@@ -71,7 +73,7 @@ class CtlStateMaintenance:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         """Remove ctl-state records selected by AGE and ADDRESS.
 
@@ -121,7 +123,7 @@ class CtlStateMaintenance:
                 context,
                 Path(scratch.name),
                 operation="maintenance",
-                provider_implementation_key=provider_implementation_key,
+                credential_acquisition=credential_acquisition,
                 execution_access_modes=args.execution_access_modes,
                 provider_options=args.provider_options,
             )
@@ -135,12 +137,12 @@ class CtlStateMaintenance:
             for where, root in roots.items():
                 if not root.is_dir():
                     continue
-                referenced_by = state_status.workflow_references(root)
-                for item in state_status.forget_selection(
+                referenced_by = state_status_outdating.workflow_references(root)
+                for item in state_status_outdating.forget_selection(
                     root, args.older_than, args.forget_address
                 ):
                     row = results.setdefault(item["address"], {})
-                    refusal = state_status.forget_guard(
+                    refusal = state_status_outdating.forget_guard(
                         root,
                         item["address"],
                         accept_orphans=agree_active,
@@ -183,7 +185,7 @@ class CtlStateMaintenance:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         if not run_policy.Permissions.CTL_STATE_HISTORY_MAINTENANCE.granted(
             ctl_cfg_root, args.ctl_profile
@@ -198,7 +200,7 @@ class CtlStateMaintenance:
             context,
             args.ctl_state_local_root,
             operation="read",
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             execution_access_modes=args.execution_access_modes,
             provider_options=args.provider_options,
         )
@@ -305,7 +307,7 @@ class CtlStateMaintenance:
             args.ctl_state_local_root,
             operation="maintenance",
             object_keys=[manifest_key, *deletion_keys],
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             execution_access_modes=args.execution_access_modes,
             provider_options=args.provider_options,
         )
@@ -323,7 +325,7 @@ class CtlStateMaintenance:
         ctl_cfg_root: Path,
         args: argparse.Namespace,
         *,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict:
         commands_selection.validate_run_args("maintenance", args)
         context = execution_run_context.build_execution_context(
@@ -357,15 +359,15 @@ class CtlStateMaintenance:
         preflight_checks.CFG_VALIDATION.assert_accepted(cfg_report)
         if args.maintenance_action == "forget":
             return CtlStateMaintenance.forget(
-                ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+                ctl_cfg_root, args, credential_acquisition=credential_acquisition
             )
         if args.maintenance_action == "status-sweep":
             return CtlStateMaintenance.status_sweep(
-                ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+                ctl_cfg_root, args, credential_acquisition=credential_acquisition
             )
         if args.maintenance_action == "history-prune":
             return CtlStateMaintenance.history_prune(
-                ctl_cfg_root, args, provider_implementation_key=provider_implementation_key
+                ctl_cfg_root, args, credential_acquisition=credential_acquisition
             )
         raise RuntimeError(
             f"❌ {args.maintenance_action!r} is not a ctl-state-only maintenance operation"
@@ -376,14 +378,14 @@ class CtlStateMaintenance:
         selections: list[dict],
         ctl_cfg_root: Path,
         *,
-        implementation_key: str,
+        credential_acquisition: str,
         execution_access_modes: dict[str, str],
         provider_options: dict[str, str] | None,
     ) -> dict[str, object]:
         """Find the one backend provisioner and classify the selected backend."""
         provisioners: list[tuple[dict, str, dict]] = []
         for selection in selections:
-            for target_run_id, target_run in selection["active_target_runs"].items():
+            for target_run_id, target_run in selection.active_target_runs.items():
                 if target_run.get("provisions_ctl_state_backend") is True:
                     provisioners.append((selection, target_run_id, target_run))
         if len(provisioners) != 1:
@@ -394,14 +396,14 @@ class CtlStateMaintenance:
 
         selection, target_run_id, target_run = provisioners[0]
         namespace_key, entry = state_sync.CtlStateBackends.resolve_namespace(
-            ctl_cfg_root, selection["execution_context"]
+            ctl_cfg_root, selection.execution_context
         )
         adapter = execution_adapters.get_adapter(entry["provider"])
         adapter.validate_state_backend_entry(namespace_key, entry, ctl_cfg_root)
         bucket_name = str(
             execution_references.resolve_runtime_scalar(
                 entry["bucket_name"],
-                selection["execution_context"],
+                selection.execution_context,
                 label=f"ctl_state_backends.{namespace_key}.bucket_name",
             )
         )
@@ -411,9 +413,9 @@ class CtlStateMaintenance:
         )
         credential = adapter.resolve_state_backend_probe_credential(
             target_run,
-            selection["provider_catalogs"],
-            execution_context=selection["execution_context"],
-            implementation_key=implementation_key,
+            selection.provider_catalogs,
+            execution_context=selection.execution_context,
+            credential_acquisition=credential_acquisition,
             execution_access_mode=probe_access_mode,
             provider_options=probe_options,
         )
@@ -459,14 +461,14 @@ def _run_ctl_state_status_sweep_in(
     context: dict[str, object],
     ctl_state_root: Path,
     *,
-    provider_implementation_key: str,
+    credential_acquisition: str,
 ) -> dict:
     namespace_key, namespace_root, reader = state_sync.CtlStateAccess.arm_operation(
         ctl_cfg_root,
         context,
         ctl_state_root,
         operation="read",
-        provider_implementation_key=provider_implementation_key,
+        credential_acquisition=credential_acquisition,
         execution_access_modes=args.execution_access_modes,
         provider_options=args.provider_options,
     )
@@ -474,7 +476,7 @@ def _run_ctl_state_status_sweep_in(
     # .10: ONE lean root-level map (advisory, bucket-owned), replacing
     # the old per-workflow-instance verbose docs. Flat address -> verdict over
     # every target and workflow instance, lifecycle-collapsed.
-    instances = state_status.compute_namespace_status_map(namespace_root)
+    instances = state_status_rows.compute_namespace_status_map(namespace_root)
     # .10: same self-describing shape status.py --write-cache emits, so
     # A reader never has to guess which view / when produced this snapshot.
     cache = {
@@ -494,7 +496,7 @@ def _run_ctl_state_status_sweep_in(
         ctl_state_root,
         operation="sync",
         object_keys=[cache_key],
-        provider_implementation_key=provider_implementation_key,
+        credential_acquisition=credential_acquisition,
         execution_access_modes=args.execution_access_modes,
         provider_options=args.provider_options,
     )
@@ -508,40 +510,12 @@ def _run_ctl_state_status_sweep_in(
     return report
 
 
-def run_maintenance(
-    ctl_cfg_root: Path,
-    plt_cfg_root: Path,
-    guardrails_cfg_root: Path,
-    ctl_state_local_root: Path,
-    ctl_profile: str,
-    execution_params: dict[str, str],
-    ctl_ref_policy: str,
-    action: str,
-    maintenance_action: str,
-    target_key: str,
-    lock_id: str,
-    run_id: str,
-    target_repo_key: str,
-    require_target_ref: bool,
-    use_local_tooling_cfg: bool,
-    provider_implementation_key: str,
-    run_dir: Path,
-    artifacts_dir: Path,
-    log_file: Path,
-    provider_options: dict[str, str] | None,
-    execution_runtime_mode: str,
-    agreed_defer_ctl_state_backend_sync: bool = False,
-    force_skip_ctl_state_backend_sync: bool = False,
-    force_skip_guardrails: bool = False,
-    force_skip_full_cfg_validation_gate: bool = False,
-    execution_access_modes: dict[str, str] | None = None,
-    providers: list[str] | tuple[str, ...] = (),
-    unlock_scope: str | None = None,
+def _unlock_ctl_state(
+    request: run_request.RunRequest, *, lock_id: str, unlock_scope: str | None
 ) -> None:
-    """
+    """Release a ctl-state lock without resolving a target or touching plt cfg."""
 
-    run a maintenance action against a single target_run target."""
-
+    maintenance_action = "unlock-ctl-state"
     if maintenance_action == "unlock-ctl-state":
         # Two locks with different reach. `both` clears the remote lock and THIS
         # machine's local one; remote is namespace-wide, local is one directory,
@@ -553,28 +527,28 @@ def run_maintenance(
             outcome["local"] = (
                 "released"
                 if state_lifecycle.force_unlock_ctl_state_lock(
-                    ctl_state_local_root, lock_id, run_dir
+                    request.ctl_state_local_root, lock_id, request.run_dir
                 )
                 else "not present — skipped"
             )
         if scope in ("remote", "both"):
             with tempfile.TemporaryDirectory(prefix="atlas-ctl-state-unlock-") as scratch:
                 context = execution_run_context.build_execution_context(
-                    ctl_cfg_root,
-                    action=action,
-                    ctl_profile=ctl_profile,
-                    execution_params=execution_params,
-                    providers=providers,
-                    execution_runtime_mode=execution_runtime_mode,
+                    request.ctl_cfg_root,
+                    action=request.action,
+                    ctl_profile=request.ctl_profile,
+                    execution_params=request.execution_params,
+                    providers=request.providers,
+                    execution_runtime_mode=request.execution_runtime_mode,
                 )
                 _, _, syncer = state_sync.CtlStateAccess.arm_operation(
-                    ctl_cfg_root,
+                    request.ctl_cfg_root,
                     context,
                     Path(scratch),
                     operation="maintenance",
-                    provider_implementation_key=provider_implementation_key,
-                    execution_access_modes=execution_access_modes,
-                    provider_options=provider_options,
+                    credential_acquisition=request.credential_acquisition,
+                    execution_access_modes=request.execution_access_modes,
+                    provider_options=request.provider_options,
                 )
                 outcome["remote"] = state_sync.release_remote_mutation_lock(syncer, lock_id)
         print(
@@ -588,169 +562,76 @@ def run_maintenance(
                 sort_keys=False,
             ).rstrip()
         )
-        state_lifecycle.print_run_summary(run_id, log_file)
+        state_lifecycle.print_run_summary(request.run_id, request.log_file)
         return
 
+
+def _resolve_maintenance_context(
+    request: run_request.RunRequest, *, target_key: str
+) -> tuple[dict, dict]:
+    """Resolve the execution context for one target, and gate it on policy and cfg."""
+
     execution_context = execution_run_context.build_execution_context(
-        ctl_cfg_root,
-        action=action,
-        ctl_profile=ctl_profile,
-        execution_params=execution_params,
-        providers=providers,
-        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        force_skip_guardrails=force_skip_guardrails,
-        force_skip_full_cfg_validation_gate=force_skip_full_cfg_validation_gate,
-        execution_access_modes=execution_access_modes,
-        execution_runtime_mode=execution_runtime_mode,
+        request.ctl_cfg_root,
+        action=request.action,
+        ctl_profile=request.ctl_profile,
+        execution_params=request.execution_params,
+        providers=request.providers,
+        agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
+        force_skip_guardrails=request.force_skip_guardrails,
+        force_skip_full_cfg_validation_gate=request.force_skip_full_cfg_validation_gate,
+        execution_access_modes=request.execution_access_modes,
+        execution_runtime_mode=request.execution_runtime_mode,
     )
-    scope_params = execution_run_context.scope_params_from_context(execution_context)
-    execution_run_context.validate_execution_context_constraints(ctl_cfg_root, execution_context)
-    action_cfg = target_catalog.TargetCatalog.action_cfg(ctl_cfg_root, action, execution_context)
+    execution_run_context.validate_execution_context_constraints(
+        request.ctl_cfg_root, execution_context
+    )
+    action_cfg = target_catalog.TargetCatalog.action_cfg(
+        request.ctl_cfg_root, request.action, execution_context
+    )
     maintenance_workflow_cfg = {"target_runs": [{"target": target_key}]}
     run_policy.validate_target_policy_constraints(
-        ctl_cfg_root, ctl_profile, maintenance_workflow_cfg, action_cfg
+        request.ctl_cfg_root, request.ctl_profile, maintenance_workflow_cfg, action_cfg
     )
     run_policy.validate_execution_access(
-        ctl_cfg_root,
-        ctl_profile,
+        request.ctl_cfg_root,
+        request.ctl_profile,
         maintenance_workflow_cfg,
         action_cfg,
         execution_context=execution_context,
-        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        execution_access_modes=execution_access_modes,
-        provider_options=provider_options,
+        agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
+        execution_access_modes=request.execution_access_modes,
+        provider_options=request.provider_options,
     )
     cfg_report = preflight_checks.CFG_VALIDATION.build(
-        preflight_reports.collect_provider_cfg_findings(ctl_cfg_root, execution_context)
+        preflight_reports.collect_provider_cfg_findings(request.ctl_cfg_root, execution_context)
     )
     preflight_checks.CFG_VALIDATION.apply_gate(
-        cfg_report, force_skip=force_skip_full_cfg_validation_gate
+        cfg_report, force_skip=request.force_skip_full_cfg_validation_gate
     )
     preflight_checks.CFG_VALIDATION.write_artifacts(
-        cfg_materialize.run_gates_dir(run_dir), cfg_report
+        cfg_materialize.run_gates_dir(request.run_dir), cfg_report
     )
     preflight_checks.CFG_VALIDATION.assert_accepted(cfg_report)
-    ctl_state_namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
-        ctl_cfg_root, execution_context
-    )
-    guardrails_verify.verify_ctl_guardrails(
-        ctl_cfg_root,
-        guardrails_cfg_root,
-        execution_context,
-    )
-    state_sync.PUBLICATION.configure(
-        ctl_cfg_root,
-        ctl_profile,
-        ctl_state_namespace_key,
-        execution_context,
-        run_dir,
-        agreed_defer_ctl_state_backend_sync=agreed_defer_ctl_state_backend_sync,
-        force_skip_ctl_state_backend_sync=force_skip_ctl_state_backend_sync,
-        execution_access_modes=execution_access_modes,
-        provider_options=provider_options,
-        provider_implementation_key=provider_implementation_key,
-    )
-    execution_run_context.write_execution_context_artifact(run_dir, execution_context)
-    require_commit_refs = run_policy.ref_policy_requires_commits(ctl_ref_policy)
+    return execution_context, action_cfg
 
-    refs = cfg_tooling.load_refs_cfg(ctl_cfg_root)
-    if use_local_tooling_cfg:
-        tooling_refs = cfg_tooling.load_local_tooling_cfg(ctl_cfg_root)
-    else:
-        tooling_refs = refs.get("global") or {}
-        cfg_validate.CommitPinning(ctl_ref_policy).check_tooling_refs(tooling_refs)
 
-    logging.info(f"Selector policy validation passed: ctl_profile={ctl_profile}")
+def _execute_maintenance_target(
+    request: run_request.RunRequest,
+    execution_context: dict,
+    *,
+    active_target_runs: dict,
+    tooling_refs: dict,
+    provider_adapter,
+    provider_catalogs: dict,
+    plt_targets_dir_path: Path,
+    maintenance_action: str,
+) -> None:
+    """Materialize the single selected target and run its maintenance step."""
 
-    workflow_cfg = {
-        "meta": {
-            "name": f"{ctl_profile}/{action}/maintenance/{maintenance_action}/{target_key}",
-            "action": action,
-        },
-        "target_runs": [
-            {
-                "id": target_key,
-                "target": target_key,
-            }
-        ],
-    }
-    target_catalog.TargetEntries.validate_selectors(workflow_cfg, action_cfg, execution_context)
-
-    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = (
-        commands_selection.prepare_pipeline_cfg(
-            plt_cfg_root,
-            workflow_cfg,
-            action_cfg,
-            artifacts_dir,
-            ctl_profile,
-            scope_params=scope_params,
-            execution_context=execution_context,
-            target_repo_key=target_repo_key,
-            require_target_ref=require_target_ref,
-            require_commit_refs=require_commit_refs,
-            refs=refs,
-        )
-    )
-    state_run_store.update_run_metadata(run_dir, {"plt_overlays": final_plt_overlays})
-    state_run_store.record_run_target_keys(
-        run_dir, target_catalog.ActiveTargetRuns.target_keys(active_target_runs)
-    )
-    # per-target derivation, same as run_pipeline.
-    run_type_now = str(state_run_store.load_run_metadata(run_dir).get("run_type"))
-    plt_targets_dir_path = cfg_views.target_cfg_views_root(run_dir, run_type_now)
-    for target_run_id, target_run in active_target_runs.items():
-        if not target_run.get("domains"):
-            continue
-        target_context = execution_run_context.build_target_execution_context(
-            target_run_id, target_run, execution_context
-        )
-        target_rendered_dir = cfg_views.prepare_target_cfg_view(
-            target_run_id,
-            target_run,
-            plt_cfg_root=plt_cfg_root,
-            target_cfg_dir=cfg_views.target_cfg_view_dir(run_dir, run_type_now, target_run_id),
-            ctl_profile=ctl_profile,
-            scope_params=execution_run_context.scope_params_from_context(target_context),
-            execution_context=target_context,
-        )
-        guardrails_verify.verify_guardrails(
-            ctl_cfg_root,
-            plt_cfg_root,
-            guardrails_cfg_root,
-            target_rendered_dir,
-            target_context,
-            execution_run_context.scope_params_from_context(target_context),
-        )
-
-    cfg_validate.CommitPinning(ctl_ref_policy).check_target_runs(active_target_runs)
-    provider_adapter = execution_providers.run_provider_adapter(execution_context)
-    provider_catalogs = provider_adapter.load_runtime_catalogs(
-        ctl_cfg_root, execution_context=execution_context
-    )
-    adapter_access_mode, adapter_options = execution_providers.provider_inputs(
-        execution_providers.run_provider(execution_context),
-        execution_access_modes,
-        provider_options,
-    )
-    provider_adapter.validate_active_target_access(
-        active_target_runs,
-        provider_catalogs,
-        execution_context=execution_context,
-        implementation_key=provider_implementation_key,
-        execution_access_mode=adapter_access_mode,
-        provider_options=adapter_options,
-    )
-    cfg_materialize.write_git_metas(ctl_cfg_root, plt_cfg_root, guardrails_cfg_root, artifacts_dir)
-    plt_targets_dir_path = cfg_materialize.run_cfg_distribution(
-        pipeline_run_cfg_path, plt_targets_dir_path, run_type_now
-    )
-    cfg_views.finalize_target_cfg_view_facts(
-        active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
-    )
-
-    os.chdir(run_dir)
+    os.chdir(request.run_dir)
     tooling_env = cfg_tooling.build_tooling_env(tooling_refs)
     if len(active_target_runs) != 1:
         raise RuntimeError(
@@ -759,23 +640,23 @@ def run_maintenance(
 
     target_run_id, target_run = next(iter(active_target_runs.items()))
     state_lifecycle.log_target_run_banner(
-        f"[{action}] [maintenance/{maintenance_action}/{target_run_id}]"
+        f"[{request.action}] [maintenance/{maintenance_action}/{target_run_id}]"
     )
     repo_path, target_env = cfg_materialize.prepare_target_repo(
         target_run_id,
         target_run,
-        run_dir,
+        request.run_dir,
         tooling_env,
-        secret_store=cfg_secrets.SecretStore(ctl_cfg_root),
+        secret_store=cfg_secrets.SecretStore(request.ctl_cfg_root),
         provider_adapter=provider_adapter,
         provider_catalogs=provider_catalogs,
         execution_context=execution_context,
-        provider_implementation_key=provider_implementation_key,
-        execution_access_modes=execution_access_modes,
-        provider_options=provider_options,
+        credential_acquisition=request.credential_acquisition,
+        execution_access_modes=request.execution_access_modes,
+        provider_options=request.provider_options,
     )
     assertion_argv = provider_adapter.target_assertion_argv(
-        cfg_materialize.materialize_step_utils(run_dir)
+        cfg_materialize.materialize_step_utils(request.run_dir)
     )
     if assertion_argv:
         kernel_process.run_and_log(assertion_argv, cwd=repo_path, env=target_env)
@@ -803,4 +684,155 @@ def run_maintenance(
         "--target <key> --lock-id <id>"
     )
 
-    state_lifecycle.print_run_summary(run_id, log_file)
+
+def run_maintenance(
+    request: run_request.RunRequest,
+    *,
+    maintenance_action: str,
+    target_key: str,
+    lock_id: str,
+    unlock_scope: str | None = None,
+) -> None:
+    """Run a maintenance action against a single target_run target."""
+
+    if maintenance_action == "unlock-ctl-state":
+        _unlock_ctl_state(request, lock_id=lock_id, unlock_scope=unlock_scope)
+        return
+
+    execution_context, action_cfg = _resolve_maintenance_context(request, target_key=target_key)
+    ctl_state_namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
+        request.ctl_cfg_root, execution_context
+    )
+    guardrails_verify.verify_ctl_guardrails(
+        request.ctl_cfg_root,
+        request.guardrails_cfg_root,
+        execution_context,
+    )
+    state_sync.PUBLICATION.configure(
+        request.ctl_cfg_root,
+        request.ctl_profile,
+        ctl_state_namespace_key,
+        execution_context,
+        request.run_dir,
+        agreed_defer_ctl_state_backend_sync=request.agreed_defer_ctl_state_backend_sync,
+        force_skip_ctl_state_backend_sync=request.force_skip_ctl_state_backend_sync,
+        execution_access_modes=request.execution_access_modes,
+        provider_options=request.provider_options,
+        credential_acquisition=request.credential_acquisition,
+    )
+    execution_run_context.write_execution_context_artifact(request.run_dir, execution_context)
+    require_commit_refs = run_policy.ref_policy_requires_commits(request.ctl_ref_policy)
+
+    refs = cfg_tooling.load_refs_cfg(request.ctl_cfg_root)
+    if request.use_local_tooling_cfg:
+        tooling_refs = cfg_tooling.load_local_tooling_cfg(request.ctl_cfg_root)
+    else:
+        tooling_refs = refs.get("global") or {}
+        cfg_validate.CommitPinning(request.ctl_ref_policy).check_tooling_refs(tooling_refs)
+
+    logging.info(f"Selector policy validation passed: ctl_profile={request.ctl_profile}")
+
+    workflow_cfg = {
+        "meta": {
+            "name": f"{request.ctl_profile}/{request.action}/maintenance/{maintenance_action}/{target_key}",
+            "action": request.action,
+        },
+        "target_runs": [
+            {
+                "id": target_key,
+                "target": target_key,
+            }
+        ],
+    }
+    target_catalog.TargetEntries.validate_selectors(workflow_cfg, action_cfg, execution_context)
+
+    active_target_runs, pipeline_run_cfg_path, final_plt_overlays = (
+        commands_selection.prepare_pipeline_cfg(
+            request.plt_cfg_root,
+            workflow_cfg,
+            action_cfg,
+            request.artifacts_dir,
+            request.ctl_profile,
+            scope_params=execution_run_context.scope_params_from_context(execution_context),
+            execution_context=execution_context,
+            target_repo_key=request.target_repo_key,
+            require_target_ref=request.require_target_ref,
+            require_commit_refs=require_commit_refs,
+            refs=refs,
+        )
+    )
+    state_run_store.update_run_metadata(request.run_dir, {"plt_overlays": final_plt_overlays})
+    state_run_store.record_run_target_keys(
+        request.run_dir, target_catalog.ActiveTargetRuns.target_keys(active_target_runs)
+    )
+    # per-target derivation, same as run_pipeline.
+    run_type_now = str(state_run_store.load_run_metadata(request.run_dir).get("run_type"))
+    plt_targets_dir_path = cfg_views.target_cfg_views_root(request.run_dir, run_type_now)
+    for target_run_id, target_run in active_target_runs.items():
+        if not target_run.get("domains"):
+            continue
+        target_context = execution_run_context.build_target_execution_context(
+            target_run_id, target_run, execution_context
+        )
+        target_rendered_dir = cfg_views.prepare_target_cfg_view(
+            target_run_id,
+            target_run,
+            plt_cfg_root=request.plt_cfg_root,
+            target_cfg_dir=cfg_views.target_cfg_view_dir(
+                request.run_dir, run_type_now, target_run_id
+            ),
+            ctl_profile=request.ctl_profile,
+            scope_params=execution_run_context.scope_params_from_context(target_context),
+            execution_context=target_context,
+        )
+        guardrails_verify.verify_guardrails(
+            request.ctl_cfg_root,
+            request.plt_cfg_root,
+            request.guardrails_cfg_root,
+            target_rendered_dir,
+            target_context,
+            execution_run_context.scope_params_from_context(target_context),
+        )
+
+    cfg_validate.CommitPinning(request.ctl_ref_policy).check_target_runs(active_target_runs)
+    provider_adapter = execution_providers.run_provider_adapter(execution_context)
+    provider_catalogs = provider_adapter.load_runtime_catalogs(
+        request.ctl_cfg_root, execution_context=execution_context
+    )
+    adapter_access_mode, adapter_options = execution_providers.provider_inputs(
+        execution_providers.run_provider(execution_context),
+        request.execution_access_modes,
+        request.provider_options,
+    )
+    provider_adapter.validate_active_target_access(
+        active_target_runs,
+        provider_catalogs,
+        execution_context=execution_context,
+        credential_acquisition=request.credential_acquisition,
+        execution_access_mode=adapter_access_mode,
+        provider_options=adapter_options,
+    )
+    cfg_materialize.write_git_metas(
+        request.ctl_cfg_root,
+        request.plt_cfg_root,
+        request.guardrails_cfg_root,
+        request.artifacts_dir,
+    )
+    plt_targets_dir_path = cfg_materialize.run_cfg_distribution(
+        pipeline_run_cfg_path, plt_targets_dir_path, run_type_now
+    )
+    cfg_views.finalize_target_cfg_view_facts(
+        active_target_runs, plt_targets_dir_path, pipeline_run_cfg_path
+    )
+
+    _execute_maintenance_target(
+        request,
+        execution_context,
+        active_target_runs=active_target_runs,
+        tooling_refs=tooling_refs,
+        provider_adapter=provider_adapter,
+        provider_catalogs=provider_catalogs,
+        plt_targets_dir_path=plt_targets_dir_path,
+        maintenance_action=maintenance_action,
+    )
+    state_lifecycle.print_run_summary(request.run_id, request.log_file)

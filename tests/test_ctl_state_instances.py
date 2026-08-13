@@ -78,7 +78,7 @@ if __name__ == "__main__":
 
 
 class StateRelpathTests(unittest.TestCase):
-    """namespace-relative state tree compose/parse."""
+    """Namespace-relative state tree compose and parse."""
 
     def test_compose_target_instance(self):
         p = run_addressing.compose_state_relpath(

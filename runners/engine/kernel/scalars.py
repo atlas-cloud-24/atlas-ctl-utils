@@ -10,9 +10,7 @@ from pathlib import Path
 
 
 def str2bool(v: str) -> bool:
-    """
-
-    convert 'true'/'false' string to boolean."""
+    """Convert 'true'/'false' string to boolean."""
 
     if isinstance(v, str):
         value = v.lower()
@@ -25,9 +23,7 @@ def str2bool(v: str) -> bool:
 
 
 def parse_relative_paths_arg(value: str, *, root_dir_name: str, item_label: str) -> list[str]:
-    """
-
-    parse comma-separated relative paths under a cfg root directory."""
+    """Parse comma-separated relative paths under a cfg root directory."""
 
     if value is None:
         return []

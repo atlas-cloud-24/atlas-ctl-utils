@@ -26,7 +26,7 @@ from engine.run import actions as run_actions
 from engine.run import policy as run_policy
 from engine.run import selectors as run_selectors
 from engine.state import render as state_render
-from engine.state import status as state_status
+from engine.state import status_query as state_status_query
 
 
 def parse_selector_pairs(value: str) -> list[tuple[str, str]]:
@@ -74,9 +74,7 @@ class ExecutionParamsAction(argparse.Action):
 
 
 def normalize_ctl_state_local_root(value: str) -> Path:
-    """
-
-    normalize the operator-provided local ctl-state root directory."""
+    """Normalize the operator-provided local ctl-state root directory."""
 
     if not isinstance(value, str) or not value.strip():
         raise RuntimeError("❌ --ctl-state-local-root must be a non-empty directory path")
@@ -267,9 +265,7 @@ def normalize_force_skip_execution_identity_preflight_check(
 
 
 def parse_overlays_arg(value: str) -> list[str]:
-    """
-
-    parse comma-separated plt overlay names."""
+    """Parse comma-separated plt overlay names."""
 
     if value is None:
         return []
@@ -999,18 +995,20 @@ def finalize_status_args(args: argparse.Namespace) -> None:
     if getattr(args, "hide_members", False):
         if not args.all:
             raise RuntimeError("❌ --hide-members renders --all")
-        if args.structure != state_status.StatusStructure.NESTED:
+        if args.structure != state_status_query.StatusStructure.NESTED:
             raise RuntimeError("❌ --hide-members requires --structure nested")
         if getattr(args, "output_format", None) != state_render.StatusFormat.TABLE:
             raise RuntimeError("❌ --hide-members requires --format table")
     if args.all:
         # WITH the structure: a nested map orders sets of rows, so it accepts a
         # narrower field set, and the refusal belongs where the shape is known.
-        state_status.parse_sort(args.sort, structure=args.structure)
+        state_status_query.parse_sort(args.sort, structure=args.structure)
     raw_filters = getattr(args, "filters", None) or []
     if raw_filters and not args.all:
         raise RuntimeError("❌ --filter narrows --all; a targeted query names one instance")
-    args.filters = state_status.parse_filters([f"{field}={value}" for field, value in raw_filters])
+    args.filters = state_status_query.parse_filters(
+        [f"{field}={value}" for field, value in raw_filters]
+    )
     if args.scope == "local":
         if not args.ctl_state_local_root:
             raise RuntimeError("❌ --scope local requires --ctl-state-local-root")

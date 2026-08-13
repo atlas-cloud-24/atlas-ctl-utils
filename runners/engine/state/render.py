@@ -19,7 +19,7 @@ from enum import StrEnum
 
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
-from engine.state import status as state_status
+from engine.state import status_query as state_status_query
 
 
 class StatusFormat(StrEnum):
@@ -59,7 +59,7 @@ FOOTER_FIELDS = ("cache_written", "history_written")
 # displayed scalar facts, which is also what `--filter` matches on. Declaring them
 # apart would let a column exist that could not be sorted by, or a sort field with
 # no column to read the result in, with nothing to say which was intended.
-FLAT_COLUMNS = state_status.SORT_FIELDS
+FLAT_COLUMNS = state_status_query.SORT_FIELDS
 
 # The nested table spends its first column on the tree, so `address` and `group`
 # are POSITIONS there rather than cells, and members become child rows instead of
@@ -159,7 +159,7 @@ def _value(row: dict, column: str) -> str:
         members = row.get("members")
         return str(len(members)) if isinstance(members, list) else ""
     if column == "actions":
-        return state_status.actions_text(row.get("actions"))
+        return state_status_query.actions_text(row.get("actions"))
     value = row.get(column)
     return "" if value is None else str(value)
 
@@ -426,11 +426,11 @@ def render_status_map(report: dict, *, hide_members: bool = False) -> str:
     """
 
     structure = str(report.get("structure") or "")
-    if hide_members and structure != state_status.StatusStructure.NESTED:
+    if hide_members and structure != state_status_query.StatusStructure.NESTED:
         raise RuntimeError("❌ hiding workflow members requires --structure nested")
-    if structure == state_status.StatusStructure.FLAT:
+    if structure == state_status_query.StatusStructure.FLAT:
         body = _flat_lines(list(report.get("instances") or []))
-    elif structure == state_status.StatusStructure.NESTED:
+    elif structure == state_status_query.StatusStructure.NESTED:
         body = _nested_lines(
             {kind: report[kind] for kind in run_actions.STATUS_RESULT_KINDS if kind in report},
             hide_members=hide_members,
@@ -438,7 +438,7 @@ def render_status_map(report: dict, *, hide_members: bool = False) -> str:
     else:
         raise RuntimeError(
             f"❌ status report has structure {structure!r}; expected one of "
-            f"{', '.join(state_status.STATUS_STRUCTURES)}"
+            f"{', '.join(state_status_query.STATUS_STRUCTURES)}"
         )
     sections = [
         _field_lines(report, HEADER_FIELDS),

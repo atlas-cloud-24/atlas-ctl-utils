@@ -6,7 +6,6 @@ on this module without depending on each other."""
 
 import argparse
 import contextlib
-import dataclasses
 import fcntl
 import hashlib
 import json
@@ -253,12 +252,12 @@ def run_workspace_dir(run_dir: Path) -> Path | None:
 
 
 def cleanup_run_workspace(run_dir: Path) -> None:
-    """
+    """Drop the run's build workspace (the materialized repo checkout +
 
-    drop the run's build workspace (the materialized repo checkout +
     provider cache). It is used only DURING the run and is fully
     reproducible from the pinned source_commit/cfg_source_commit in RUN.yaml;
-    nothing reads it after the run."""
+    nothing reads it after the run.
+    """
 
     workspace = run_workspace_dir(run_dir)
     if workspace is not None and workspace.exists():
@@ -502,9 +501,7 @@ def mint_child_lock_grant(ctl_state_local_root: Path, *, child_kind: str, child_
 def consume_child_lock_grant(
     ctl_state_local_root: Path, grant: str | None, *, child_kind: str, child_key: str | None
 ) -> bool:
-    """
-
-    redeem a child grant exactly once, for the child it was minted for."""
+    """Redeem a child grant exactly once, for the child it was minted for."""
 
     global _REDEEMED_CHILD_GRANT
     if not grant:
@@ -553,9 +550,7 @@ def format_ctl_state_lock_error(ctl_state_local_root: Path, metadata: dict, *, r
 
 
 class CtlResultsLock:
-    """
-
-    local ctl-state root lock backed by flock plus explicit metadata."""
+    """Local ctl-state root lock backed by flock plus explicit metadata."""
 
     def __init__(self, ctl_state_local_root: Path):
         self.ctl_state_local_root = Path(ctl_state_local_root)
@@ -914,50 +909,3 @@ def evaluate_mutation_lock(
         logging.info("mutation lock held by parent run %s; proceeding as its child", holder)
         return {"decision": "proceed"}
     return {"decision": "blocked", "holder": holder}
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class Run:
-    """One execution of a target, workflow, fan-out or procedure."""
-
-    run_id: str
-    run_type: str
-    action: str
-    status: str = ""
-    label: str = ""
-    instance_address: str = ""
-
-    @classmethod
-    def from_record(cls, record: dict) -> "Run":
-        """Build from a stored run record."""
-
-        return cls(
-            run_id=str(record.get("run_id") or ""),
-            run_type=str(record.get("run_type") or ""),
-            action=str(record.get("action") or ""),
-            status=str(record.get("status") or ""),
-            label=str(record.get("label") or ""),
-            instance_address=str(record.get("instance_address") or ""),
-        )
-
-    @property
-    def is_finished(self) -> bool:
-        """Whether this run reached a terminal status."""
-
-        return self.status in ("passed", "failed")
-
-    def to_document(self) -> dict:
-        """Render for the run record."""
-
-        return {
-            key: value
-            for key, value in (
-                ("run_id", self.run_id),
-                ("run_type", self.run_type),
-                ("action", self.action),
-                ("status", self.status),
-                ("label", self.label),
-                ("instance_address", self.instance_address),
-            )
-            if value
-        }

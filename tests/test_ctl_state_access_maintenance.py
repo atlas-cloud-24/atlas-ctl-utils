@@ -174,7 +174,7 @@ class AccountRegistryTests(unittest.TestCase):
                 {"execution_identities": {"aws": executions["dev_direct"]}},
                 catalogs,
                 execution_context=context,
-                implementation_key="sso",
+                credential_acquisition="sso",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(dev_cfg_result["status"], "passed")
@@ -184,7 +184,7 @@ class AccountRegistryTests(unittest.TestCase):
                 {"execution_identities": {"aws": executions["management_direct"]}},
                 catalogs,
                 execution_context=context,
-                implementation_key="sso",
+                credential_acquisition="sso",
                 execution_access_mode="agreed_direct",
             )
             self.assertEqual(management_cfg_result["status"], "failed")
@@ -202,7 +202,7 @@ class AccountRegistryTests(unittest.TestCase):
                     {"dev": {"execution_identities": {"aws": executions["dev_direct"]}}},
                     catalogs,
                     execution_context=context,
-                    implementation_key="sso",
+                    credential_acquisition="sso",
                     execution_access_mode="agreed_direct",
                 )
             self.assertEqual(
@@ -222,17 +222,17 @@ class AccountRegistryTests(unittest.TestCase):
                     },
                     catalogs,
                     execution_context=context,
-                    implementation_key="sso",
+                    credential_acquisition="sso",
                     execution_access_mode="agreed_direct",
                 )
 
 
 class AccountSlugTests(unittest.TestCase):
-    """
+    """The account's AWS-facing spelling is a property OF THE ACCOUNT,
 
-    the account's AWS-facing spelling is a property OF THE ACCOUNT,
     so the adapter derives it from the registry rather than every caller passing
-    it. S3 bucket names reject the underscores the internal keys use."""
+    it. S3 bucket names reject the underscores the internal keys use.
+    """
 
     def _root(self, body: str):
         temporary = tempfile.TemporaryDirectory()
@@ -401,9 +401,7 @@ class ToolLockIsNotTheEngineTest(unittest.TestCase):
             self.assertFalse(engine_defines(name), f"{name} still exists in engine core")
 
     def test_maintenance_against_a_target_points_at_the_procedure(self):
-        """
-
-        the error names the replacement rather than only refusing."""
+        """The error names the replacement rather than only refusing."""
 
         source = engine_source()
         self.assertIn("does not operate on a target", source)

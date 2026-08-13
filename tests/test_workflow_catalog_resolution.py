@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from engine.catalog import workflow as catalog_workflow
 from engine.cfg import resources as cfg_resources
+from engine.units import workflow as units_workflow
 
 # Written the way real cfg writes it: member keys are QUALIFIED references, and
 # `default_action` lives inside the list it governs.
@@ -195,6 +196,58 @@ class OnlyTheSelectedWorkflowMustApplyToTheOperationTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "default_action"):
             self._load("env/destroyable", "destroy")
+
+
+class WorkflowMemberAdmissionTests(unittest.TestCase):
+    """The unit and the catalog must read the same resolved shape.
+
+    `TargetCatalog.action_cfg` admits a target whose allowlist intersects
+    `{run action} | member_actions`, so a member action the unit cannot see is a
+    target the run refuses to resolve — reachable only by running a workflow that
+    mixes directions, which no other test does.
+    """
+
+    # what WorkflowCatalog.workflow_cfg returns: `target_runs`, whose entries are
+    # a mapping when the member declares an action and a bare key when it does not
+    RESOLVED = {
+        "default_action": "plan",
+        "target_runs": [
+            {"id": "env/network", "target": "env/network", "action": "destroy"},
+            {"id": "env/audit", "target": "env/audit"},
+            "env/bare",
+        ],
+    }
+
+    def workflow(self):
+        return units_workflow.Workflow.from_cfg("env/mixed", self.RESOLVED, action="provision")
+
+    def test_the_unit_reads_every_member_the_catalog_resolved(self):
+        self.assertEqual(
+            {member.target_key for member in self.workflow().members},
+            {"env/network", "env/audit", "env/bare"},
+        )
+
+    def test_a_member_without_an_action_takes_the_workflow_default(self):
+        by_key = {member.target_key: member.action for member in self.workflow().members}
+        self.assertEqual(by_key["env/network"], "destroy")
+        self.assertEqual(by_key["env/audit"], "plan")
+        self.assertEqual(by_key["env/bare"], "plan")
+
+    def test_the_unit_sees_every_action_the_catalog_sees(self):
+        self.assertLessEqual(
+            catalog_workflow.WorkflowCatalog.member_actions(self.RESOLVED),
+            set(self.workflow().member_actions),
+        )
+
+    def test_every_member_action_is_admitted_by_the_action_cfg(self):
+        workflow = self.workflow()
+        admitted = {
+            catalog_workflow.WorkflowCatalog.representative_action(self.RESOLVED),
+            *workflow.member_actions,
+        }
+        for member in workflow.members:
+            with self.subTest(member=member.target_key, action=member.action):
+                self.assertIn(member.action, admitted)
 
 
 if __name__ == "__main__":

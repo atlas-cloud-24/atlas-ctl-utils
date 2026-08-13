@@ -1,12 +1,5 @@
-"""What more than one unit is given."""
+"""What more than one unit names."""
 
-from collections.abc import Callable
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True, kw_only=True)
-class SpawnContext:
-    """Ports a unit needs to run children rather than steps."""
-
-    spawn: Callable[[dict], int]
-    banner: Callable[[str], None] = lambda _message: None
+# The state layer's published record of one run. A unit carries it back to its
+# caller untouched, so it stays a document instead of becoming a unit's shape.
+type Revision = dict

@@ -12,7 +12,7 @@ from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import addressing as run_addressing
 from engine.state import lifecycle as state_lifecycle
 from engine.state import run_store as state_run_store
-from engine.state import status as state_status
+from engine.state import status_rows as state_status_rows
 
 
 class MaintenanceStatusTest(unittest.TestCase):
@@ -78,7 +78,7 @@ class MaintenanceStatusTest(unittest.TestCase):
         self._manifest()
         self._target()
 
-        rows = state_status.maintenance_status_rows(self.namespace)
+        rows = state_status_rows.maintenance_status_rows(self.namespace)
 
         self.assertEqual(
             ["maintenance", "history-prune", "unlock-ctl-state"],
@@ -93,7 +93,7 @@ class MaintenanceStatusTest(unittest.TestCase):
     def test_ordinary_status_excludes_maintenance(self):
         self._run()
         self._target()
-        self.assertEqual({}, state_status.compute_namespace_status_map(self.namespace))
+        self.assertEqual({}, state_status_rows.compute_namespace_status_map(self.namespace))
 
     def test_remote_index_hydrates_grouped_pointers_and_opted_in_manifests(self):
         class Syncer:

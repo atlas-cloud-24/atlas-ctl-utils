@@ -29,22 +29,23 @@ def collect_provider_cfg_findings(
     return findings
 
 
-def load_selection_provider_catalogs(selection: dict, ctl_cfg_root: Path) -> dict:
-    """Attach the provider adapter + runtime catalogs to a selection resolved with
-    `load_provider_catalogs=False`.
+def load_selection_provider_catalogs(selection, ctl_cfg_root: Path):
+    """The selection, bound to the provider adapter and its runtime catalogs.
+
+    Answers with a new selection rather than filling the given one in: a
+    selection is frozen, so a caller keeping the unbound one still holds what it
+    resolved.
 
     Runtime catalogs are structurally validated but permit unresolved concrete
     provider values. The adapter validates concrete values reachable from the
     selected target runs during target-cfg and execution-identity preflight.
     """
-    execution_context = selection["execution_context"]
+    execution_context = selection.execution_context
     provider_adapter = execution_providers.run_provider_adapter(execution_context)
-    selection["provider_adapter"] = provider_adapter
-    selection["provider_catalogs"] = provider_adapter.load_runtime_catalogs(
-        ctl_cfg_root,
-        execution_context=execution_context,
+    return selection.with_provider(
+        provider_adapter,
+        provider_adapter.load_runtime_catalogs(ctl_cfg_root, execution_context=execution_context),
     )
-    return selection
 
 
 def aggregate_execution_identity_preflight_status(statuses: list[str]) -> str:
@@ -114,9 +115,9 @@ def build_ctl_policy_preflight_report(
                 }
             )
 
-    workflow_cfg = selection["workflow_cfg"]
-    action_cfg = selection["action_cfg"]
-    execution_context = selection["execution_context"]
+    workflow_cfg = selection.workflow_cfg
+    action_cfg = selection.action_cfg
+    execution_context = selection.execution_context
     check(
         "execution_context_constraints",
         lambda: execution_run_context.validate_execution_context_constraints(
@@ -174,7 +175,7 @@ def build_ctl_policy_preflight_report(
     check(
         "ref_policy",
         lambda: cfg_validate.CommitPinning(ctl_ref_policy).check_target_runs(
-            selection["active_target_runs"]
+            selection.active_target_runs
         ),
     )
     # Per-target policy checks (hybrid: selection-scoped checks above, target-
@@ -221,8 +222,8 @@ def build_ctl_policy_preflight_report(
     )
     return {
         "selection": {
-            "kind": selection["selection_kind"],
-            "key": selection["selection_key"],
+            "kind": selection.kind,
+            "key": selection.key,
         },
         "status": status,
         "checks": checks,
@@ -234,7 +235,7 @@ def build_ctl_state_backend_preflight_result(
     selection: dict,
     *,
     ctl_cfg_root: Path,
-    implementation_key: str,
+    credential_acquisition: str,
     execution_access_modes: dict[str, str],
     provider_options: dict[str, str] | None,
     force_skip_providers: list[str],
@@ -262,7 +263,7 @@ def build_ctl_state_backend_preflight_result(
         return result
     try:
         namespace_key, _ = state_sync.CtlStateBackends.resolve_namespace(
-            ctl_cfg_root, selection["execution_context"]
+            ctl_cfg_root, selection.execution_context
         )
     except Exception as error:
         result["status"] = "failed"
@@ -309,9 +310,9 @@ def build_ctl_state_backend_preflight_result(
         checked = provider_adapter.preflight_execution_identity(
             f"ctl_state_backend/{namespace_key}",
             {"execution_identities": operation_execution},
-            selection["provider_catalogs"],
-            execution_context=selection["execution_context"],
-            implementation_key=implementation_key,
+            selection.provider_catalogs,
+            execution_context=selection.execution_context,
+            credential_acquisition=credential_acquisition,
             execution_access_mode=sync_access_mode,
             provider_options=namespace_adapter_options,
             live_check=namespace_provider not in force_skip_providers,
@@ -336,7 +337,7 @@ def build_ctl_state_backend_preflight_result(
 def build_execution_identity_preflight_report(
     selection: dict,
     *,
-    implementation_key: str,
+    credential_acquisition: str,
     execution_access_modes: dict[str, str],
     provider_options: dict[str, str] | None,
     force_skip_providers: list[str],
@@ -348,10 +349,10 @@ def build_execution_identity_preflight_report(
 
     When `ctl_cfg_root` is provided, the run's ctl-state backend synchronizer is
     checked as one more result row (same aggregate rules)."""
-    active_target_runs = selection["active_target_runs"]
-    provider_adapter = selection["provider_adapter"]
-    catalogs = selection["provider_catalogs"]
-    execution_context = selection["execution_context"]
+    active_target_runs = selection.active_target_runs
+    provider_adapter = selection.provider_adapter
+    catalogs = selection.provider_catalogs
+    execution_context = selection.execution_context
 
     target_runs_by_key: dict[str, tuple[str, dict]] = {}
     for target_run_id, target_run in active_target_runs.items():
@@ -371,7 +372,7 @@ def build_execution_identity_preflight_report(
                 target_run,
                 catalogs,
                 execution_context=execution_context,
-                implementation_key=implementation_key,
+                credential_acquisition=credential_acquisition,
                 execution_access_mode=adapter_access_mode,
                 provider_options=adapter_options,
                 live_check=provider_adapter.PROVIDER_NAME not in force_skip_providers,
@@ -414,7 +415,7 @@ def build_execution_identity_preflight_report(
             build_ctl_state_backend_preflight_result(
                 selection,
                 ctl_cfg_root=ctl_cfg_root,
-                implementation_key=implementation_key,
+                credential_acquisition=credential_acquisition,
                 execution_access_modes=execution_access_modes,
                 provider_options=provider_options,
                 force_skip_providers=force_skip_providers,
@@ -428,8 +429,8 @@ def build_execution_identity_preflight_report(
     )
     return {
         "selection": {
-            "kind": selection["selection_kind"],
-            "key": selection["selection_key"],
+            "kind": selection.kind,
+            "key": selection.key,
         },
         "status": status,
         "results": results,
@@ -437,12 +438,12 @@ def build_execution_identity_preflight_report(
 
 
 def instance_axis_exclusions(ctl_cfg_root: Path | None) -> set[str]:
-    """
+    """Axes that are NEVER instance axes: the provider dispatch key and the
 
-    axes that are NEVER instance axes: the provider dispatch key and the
     namespace axes (already encoded in the ctl-state bucket choice, e.g.
     landing_zone) — derived from the ctl_state_backends selectors, not a
-    hand-list."""
+    hand-list.
+    """
 
     excluded = {"provider"}
     if ctl_cfg_root is None:
@@ -459,7 +460,7 @@ def instance_axis_exclusions(ctl_cfg_root: Path | None) -> set[str]:
 def build_target_cfg_validation_report(
     selection: dict,
     *,
-    implementation_key: str,
+    credential_acquisition: str,
     execution_access_modes: dict[str, str],
     provider_options: dict[str, str] | None,
     ctl_cfg_root: Path | None = None,
@@ -468,10 +469,10 @@ def build_target_cfg_validation_report(
     to be concrete. Whole-cfg health remains non-blocking for unrelated values.
     Includes the-axes guard: declared < consumed →
     ERROR (self-override risk); declared > consumed → WARN (unused axis)."""
-    active_target_runs = selection["active_target_runs"]
-    provider_adapter = selection["provider_adapter"]
-    catalogs = selection["provider_catalogs"]
-    execution_context = selection["execution_context"]
+    active_target_runs = selection.active_target_runs
+    provider_adapter = selection.provider_adapter
+    catalogs = selection.provider_catalogs
+    execution_context = selection.execution_context
     by_key: dict[str, tuple[str, dict]] = {}
     for target_run_id, target_run in active_target_runs.items():
         by_key.setdefault(target_run.get("target") or target_run_id, (target_run_id, target_run))
@@ -488,7 +489,7 @@ def build_target_cfg_validation_report(
                 target_run,
                 catalogs,
                 execution_context=execution_context,
-                implementation_key=implementation_key,
+                credential_acquisition=credential_acquisition,
                 execution_access_mode=adapter_access_mode,
                 provider_options=adapter_options,
             )
@@ -504,12 +505,12 @@ def build_target_cfg_validation_report(
         result["target_key"] = target_key
         result["instance"] = run_addressing.target_instance_display(target_run, execution_context)
         # Axes guard
-        action_target = (selection["action_cfg"].get("targets") or {}).get(target_key)
+        action_target = (selection.action_cfg.get("targets") or {}).get(target_key)
         if isinstance(action_target, dict):
             consumed = run_selectors.collect_target_consumed_axes(
                 target_key,
                 action_target,
-                refs=selection.get("refs") or {},
+                refs=selection.refs or {},
                 execution_identities=(catalogs or {}).get("execution_identities") or {},
                 execution_context=execution_context,
             ) - instance_axis_exclusions(ctl_cfg_root)
@@ -541,8 +542,8 @@ def build_target_cfg_validation_report(
     )
     return {
         "selection": {
-            "kind": selection["selection_kind"],
-            "key": selection["selection_key"],
+            "kind": selection.kind,
+            "key": selection.key,
         },
         "status": status,
         "results": results,

@@ -14,6 +14,7 @@ from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_outdating as state_status_outdating
 from engine.state import sync as state_sync
 
 
@@ -150,7 +151,7 @@ def mark_mutation_started(run_dir: Path, target_run_id: str) -> None:
     # changing, so every dependent result IS stale — deferring the marks to
     # mark_run_succeeded/failed leaves readers a `current` verdict across the
     # entire mutation window, the longest stretch of the run.
-    state_status.mark_outdated_for_run(run_dir, include_current_result=False)
+    state_status_outdating.mark_outdated_for_run(run_dir, include_current_result=False)
     state_sync.PUBLICATION.push(f"mutation started ({target_run_id})")
 
 
@@ -175,7 +176,7 @@ def mark_run_succeeded(run_dir: Path) -> None:
     pointer_path = state_run_store.publish_committed_pointer(run_dir, payload)
     state_run_store.remove_state_slot(run_dir, state_run_store.StateSlot.IN_PROGRESS)
     state_run_store.remove_state_slot(run_dir, state_run_store.StateSlot.FAILED)
-    state_status.mark_outdated_for_run(run_dir, include_current_result=False)
+    state_status_outdating.mark_outdated_for_run(run_dir, include_current_result=False)
     metadata = state_run_store.load_run_metadata(run_dir)
     state_run_store.cleanup_run_workspace(run_dir)
     state_sync.PUBLICATION.publish_or_queue_run(
@@ -206,7 +207,7 @@ def mark_run_failed(run_dir: Path, exc: BaseException) -> None:
     state_run_store.write_current_status(run_dir, payload)
     state_run_store.write_state_slot(run_dir, state_run_store.StateSlot.FAILED, payload)
     state_run_store.remove_state_slot(run_dir, state_run_store.StateSlot.IN_PROGRESS)
-    state_status.mark_outdated_for_run(run_dir, include_current_result=True)
+    state_status_outdating.mark_outdated_for_run(run_dir, include_current_result=True)
     state_run_store.cleanup_run_workspace(run_dir)
     state_sync.PUBLICATION.publish_or_queue_run(run_dir, None, reason="run failed")
     state_run_store.release_mutation_lock_if_held()
@@ -244,7 +245,9 @@ def mark_run_force_unlocked(run_dir: Path, metadata: dict, maintenance_run_dir: 
 
     mutating = payload.get("action") in run_actions.MUTATING_ACTIONS
     force_outdated = mutating and payload.get("mutation_started") is not False
-    state_status.mark_outdated_for_run(run_dir, include_current_result=True, force=force_outdated)
+    state_status_outdating.mark_outdated_for_run(
+        run_dir, include_current_result=True, force=force_outdated
+    )
 
 
 def force_unlock_ctl_state_lock(
@@ -366,9 +369,7 @@ def begin_workflow_target_run(
 def finish_workflow_target_run(
     child_run_dir: Path, *, error: BaseException | None = None
 ) -> dict | None:
-    """
-
-    finalize and publish one workflow child without publishing the workflow."""
+    """Finalize and publish one workflow child without publishing the workflow."""
 
     if error is not None:
         payload = state_status.build_status_payload(

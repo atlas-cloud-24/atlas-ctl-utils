@@ -23,9 +23,11 @@ from engine.catalog import workflow as catalog_workflow
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
 from engine.run import addressing as run_addressing
+from engine.run import selection as run_selection
 from engine.run import selectors as run_selectors
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
+from engine.state import status_rows as state_status_rows
 from engine_surface import engine_defines
 
 KEY, SEGMENTS = "env/seed/baseline", ["env.type=dev", "aws.account=dev"]
@@ -118,9 +120,7 @@ class ActionMapsToGroupTest(unittest.TestCase):
 
 
 class GroupsDoNotOverwriteTest(unittest.TestCase):
-    """
-
-    the reason the partition exists: a plan must not erase a deployment."""
+    """The reason the partition exists: a plan must not erase a deployment."""
 
     def test_a_plan_and_a_deployment_pointer_coexist(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,9 +209,7 @@ class RowShapeTest(unittest.TestCase):
             )
 
     def test_a_destroyed_instance_reports_no_freshness(self):
-        """
-
-        nothing is left for the inputs to have moved away from."""
+        """Nothing is left for the inputs to have moved away from."""
 
         with tempfile.TemporaryDirectory() as tmp:
             namespace = Path(tmp)
@@ -242,7 +240,7 @@ class NamespaceMapTest(unittest.TestCase):
             namespace = Path(tmp)
             _publish(namespace, "mutative", action="provision")
             _publish(namespace, "plan", action="plan")
-            rows = state_status.compute_namespace_status_map(namespace)
+            rows = state_status_rows.compute_namespace_status_map(namespace)
             instance = rows["target"][KEY]["instances"]["/".join(SEGMENTS)]
             self.assertEqual({"plan", "mutative"}, set(instance))
             self.assertEqual("passed", instance["mutative"]["status"])
@@ -266,9 +264,7 @@ class MemberEntryActionTest(unittest.TestCase):
         )
 
     def test_a_bare_key_with_no_default_is_refused(self):
-        """
-
-        not runnable: the engine cannot know what to do with the target."""
+        """Not runnable: the engine cannot know what to do with the target."""
 
         with self.assertRaisesRegex(RuntimeError, "has no action"):
             target_catalog.TargetEntries.normalize(["env/ops/ecr"], label="wf")
@@ -282,9 +278,7 @@ class MemberEntryActionTest(unittest.TestCase):
         )
 
     def test_a_key_may_repeat_with_differing_actions(self):
-        """
-
-        order is load-bearing: the last write to the pointer wins."""
+        """Order is load-bearing: the last write to the pointer wins."""
 
         entries = target_catalog.TargetEntries.normalize(
             [
@@ -517,22 +511,22 @@ class WorkflowIsAddressedByParamsTest(unittest.TestCase):
 
     def _status_side_spec(self, action="provision"):
         return catalog_workflow.WorkflowArtifacts.selection_state_spec(
-            {
-                "selection_kind": "workflow",
-                "selection_key": self.KEY,
-                "workflow_cfg": {
+            run_selection.RunSelection(
+                kind="workflow",
+                key=self.KEY,
+                workflow_cfg={
                     "meta": {"name": f"{action}/{self.KEY}", "action": action},
                     "workflow_instance_params": self.PARAMS,
                 },
-                "execution_context": self.CONTEXT,
-                "active_target_runs": {
+                execution_context=self.CONTEXT,
+                active_target_runs={
                     "tr1": {
                         "target": f"{self.KEY}/baseline",
                         "target_instance_params": self.PARAMS,
                         "action": action,
                     }
                 },
-            }
+            )
         )
 
     def test_the_status_path_addresses_what_a_run_writes(self):
@@ -556,11 +550,10 @@ class WorkflowIsAddressedByParamsTest(unittest.TestCase):
         self.assertNotEqual(run_actions.action_group("provision"), run_actions.action_group("plan"))
 
     def test_a_members_shaped_declaration_still_resolves(self):
+        """Params may DISPATCH on context, and both sides must resolve it the same
+
+        way — which is why the resolution has one definition.
         """
-
-        params may DISPATCH on context, and both sides must resolve it the same
-        way — which is why the resolution has one definition."""
-
         declared = {
             "members": [
                 {

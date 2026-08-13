@@ -46,7 +46,7 @@ class RebindScopeTest(unittest.TestCase):
             provider_adapter=adapter,
             provider_catalogs={},
             execution_context={},
-            provider_implementation_key="local",
+            credential_acquisition="local",
             execution_access_modes={"aws": "standard"},
             provider_options={},
         )
@@ -85,7 +85,7 @@ class RebindScopeTest(unittest.TestCase):
             provider_adapter=None,
             provider_catalogs={},
             execution_context={},
-            provider_implementation_key="local",
+            credential_acquisition="local",
             execution_access_modes=None,
             provider_options=None,
         )

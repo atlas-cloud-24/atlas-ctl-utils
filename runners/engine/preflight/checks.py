@@ -40,7 +40,7 @@ class PreflightInputs:
     execution_runtime_mode: str
     execution_access_modes: dict[str, str]
     provider_options: dict[str, str] | None
-    implementation_key: str
+    credential_acquisition: str
     force_skip_execution_identity_preflight_check: list[str]
     agreed_defer_ctl_state_backend_sync: bool
     force_skip_ctl_state_backend_sync: bool
@@ -185,7 +185,7 @@ class TargetCfgValidationCheck(SelectionPreflightCheck):
     def build(self, selection: dict, inputs: PreflightInputs) -> dict:
         return preflight_reports.build_target_cfg_validation_report(
             selection,
-            implementation_key=inputs.implementation_key,
+            credential_acquisition=inputs.credential_acquisition,
             execution_access_modes=inputs.execution_access_modes,
             provider_options=inputs.provider_options,
             ctl_cfg_root=inputs.ctl_cfg_root,
@@ -239,7 +239,7 @@ class ExecutionIdentityPreflightCheck(SelectionPreflightCheck):
     def build(self, selection: dict, inputs: PreflightInputs) -> dict:
         return preflight_reports.build_execution_identity_preflight_report(
             selection,
-            implementation_key=inputs.implementation_key,
+            credential_acquisition=inputs.credential_acquisition,
             execution_access_modes=inputs.execution_access_modes,
             provider_options=inputs.provider_options,
             force_skip_providers=(inputs.force_skip_execution_identity_preflight_check),
@@ -281,8 +281,8 @@ def build_selection_validation_reports(selection: dict, inputs: PreflightInputs)
     fan-out so they stay in lockstep. (cfg_validation is not per-selection: the
     caller builds it once.)"""
     selection_ref = {
-        "kind": selection["selection_kind"],
-        "key": selection["selection_key"],
+        "kind": selection.kind,
+        "key": selection.key,
     }
     reports: dict[str, dict] = {
         check.name: check.build(selection, inputs)

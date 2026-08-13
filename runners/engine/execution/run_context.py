@@ -201,9 +201,7 @@ def load_ctl_sources(ctl_cfg_root: Path) -> dict:
 
 
 def resolve_ref_context(target_ref: str, context: dict[str, object]) -> str:
-    """
-
-    resolve placeholders in a target ref into a refs.scoped context key."""
+    """Resolve placeholders in a target ref into a refs.scoped context key."""
 
     return execution_references.resolve_runtime_scalar(
         target_ref,
@@ -281,9 +279,7 @@ def ref_context_to_result_path(ref_context: str) -> str:
 
 
 def resolve_result_name(args: argparse.Namespace, run_type: str) -> str:
-    """
-
-    resolve the stable ctl result name for the selected runner mode."""
+    """Resolve the stable ctl result name for the selected runner mode."""
 
     if run_type == "workflow":
         if getattr(args, "target", None):
@@ -564,9 +560,7 @@ def build_execution_context(
 
 
 def scope_params_from_context(execution_context: dict[str, object]) -> dict[str, str]:
-    """
-
-    bare param map used for scope-identity activation (scope mechanism)."""
+    """Bare param map used for scope-identity activation (scope mechanism)."""
 
     prefix = f"{execution_references.EXECUTION_CONTEXT_ROOT}.params."
     return {
@@ -668,12 +662,12 @@ def build_target_execution_context(
 
 
 def resolve_ctl_structure(value, execution_context: dict[str, object], *, label: str = "ctl cfg"):
-    """
+    """Deep-resolve every ${execution_context.<ns>.<key>} placeholder in a ctl
 
-    deep-resolve every ${execution_context.<ns>.<key>} placeholder in a ctl
     cfg structure, leaving all other leaves untouched. Used to snapshot the ctl
     cfg that drove the run with its vars filled in (e.g. ref_key env/${…} →
-    env/dev)."""
+    env/dev).
+    """
 
     if isinstance(value, dict):
         return {
@@ -699,12 +693,12 @@ def ensure_repo_execution_context(repo_path: Path, execution_context_path: Path)
 
 
 def load_domain_registry(ctl_cfg_root: Path) -> dict:
-    """
+    """The authored domain registry: bare conceptual
 
-    the authored domain registry: bare conceptual
     declarations with flat keys. Every `domain` value appearing in cfg is
     validated against these keys, so a typo'd domain becomes a load error
-    instead of a silent selector no-match."""
+    instead of a silent selector no-match.
+    """
 
     return cfg_resources.collect_resource(ctl_cfg_root, "domains", entry_depth=1)
 

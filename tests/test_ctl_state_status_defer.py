@@ -10,15 +10,16 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 import atlas_ctl_adapter_aws as aws
 import ctl_cfg_fixture
+from engine.catalog import fan_out as catalog_fan_out
 from engine.catalog import target_catalog
 from engine.cfg import overlays as cfg_overlays
 from engine.kernel import paths as kernel_paths
 from engine.kernel import yaml_io as kernel_yaml_io
 from engine.run import actions as run_actions
+from engine.run import selection as run_selection
 from engine.state import run_store as state_run_store
 from engine.state import status as state_status
 from engine.state import sync as state_sync
-from engine.units import fan_out as units_fan_out
 
 
 class CtlStateAddressAndCommitTests(unittest.TestCase):
@@ -93,20 +94,20 @@ class CtlStateAddressAndCommitTests(unittest.TestCase):
     def test_duplicate_fan_out_materializations_fail(self):
         # resolving each selection's owner goes through the adapter
         ctl_cfg_fixture.cfg_root(self, "aws")
-        selection = {
-            "selection_kind": "target",
-            "selection_key": "env/core",
-            "workflow_cfg": {"meta": {"action": "provision"}},
-            "execution_context": {"execution_context.params.account": "dev"},
-            "active_target_runs": {
+        selection = run_selection.RunSelection(
+            kind="target",
+            key="env/core",
+            workflow_cfg={"meta": {"action": "provision"}},
+            execution_context={"execution_context.params.account": "dev"},
+            active_target_runs={
                 "env/core": {
                     "target": "env/core",
                     "target_instance_params": ["account"],
                 }
             },
-        }
+        )
         with self.assertRaisesRegex(RuntimeError, "duplicate state owners"):
-            units_fan_out.FanOut.validate_unique_materializations([selection, dict(selection)])
+            catalog_fan_out.FanOutCatalog.validate_unique_materializations([selection, selection])
 
     def test_committed_rerun_requires_matching_clean_commits(self):
         with tempfile.TemporaryDirectory() as tmp:

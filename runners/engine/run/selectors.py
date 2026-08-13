@@ -88,12 +88,12 @@ def resolve_selector_group_member(
 
 
 def _selector_param_axes(members: object) -> set[str]:
-    """
+    """The params-namespace axes referenced by a member list's selectors
 
-    the params-namespace axes referenced by a member list's selectors
     (-axes guard input). Non-params refs (ctl.*) are ignored.
     (EXECUTION_CONTEXT_ROOT is defined later in the module — reference it at
-    call time, never at import time.)"""
+    call time, never at import time.)
+    """
 
     prefix = f"{execution_references.EXECUTION_CONTEXT_ROOT}.params."
     axes: set[str] = set()

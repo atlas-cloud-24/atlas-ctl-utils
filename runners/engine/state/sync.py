@@ -59,12 +59,12 @@ def ctl_state_target_address_prefix(action: str, address: str) -> str:
 
 
 def run_provisions_ctl_state_backend(workflow_cfg: dict, action_cfg: dict) -> bool:
-    """
+    """Whether any target in this run is the ctl-state bucket-creating target
 
-    whether any target in this run is the ctl-state bucket-creating target
     (declares provisions_ctl_state_backend: true). Such a run may legitimately start
     before its results bucket exists; every other run must find it already there
-    under a `required` sync policy."""
+    under a `required` sync policy.
+    """
 
     targets = action_cfg.get("targets", {})
     for entry in workflow_cfg.get("target_runs", []):
@@ -169,9 +169,7 @@ class CtlStateBackends:
 
     @staticmethod
     def mutation_lock_ttl(entry: dict | None) -> int:
-        """
-
-        the lock TTL a ctl-state backend entry declares, else the default."""
+        """The lock TTL a ctl-state backend entry declares, else the default."""
 
         field = CtlStateBackends.MUTATION_LOCK_TTL_FIELD
         declared = (entry or {}).get(field)
@@ -346,7 +344,7 @@ class CtlStateAccess:
         ctl_state_local_root: Path,
         *,
         operation: str,
-        provider_implementation_key: str,
+        credential_acquisition: str,
         execution_access_modes: dict[str, str],
         provider_options: dict[str, str] | None,
         object_keys: list[str] | tuple[str, ...] = (),
@@ -376,7 +374,7 @@ class CtlStateAccess:
             operation_execution,
             ctl_cfg_root,
             execution_context=execution_context,
-            implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             operation=operation,
             bucket_name=bucket_name,
             object_keys=object_keys,
@@ -407,16 +405,16 @@ class CtlStateAccess:
         selection: dict,
         ctl_state_local_root: Path,
         *,
-        provider_implementation_key: str,
+        credential_acquisition: str,
         execution_access_modes: dict[str, str],
         provider_options: dict[str, str] | None,
     ):
         return CtlStateAccess.arm_operation(
             ctl_cfg_root,
-            selection["execution_context"],
+            selection.execution_context,
             ctl_state_local_root,
             operation="read",
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
             execution_access_modes=execution_access_modes,
             provider_options=provider_options,
         )
@@ -575,7 +573,7 @@ class CtlStatePublication:
         *,
         execution_access_modes: dict[str, str],
         provider_options: dict[str, str] | None,
-        provider_implementation_key: str,
+        credential_acquisition: str,
     ) -> dict:
         metadata = state_run_store.load_run_metadata(run_dir)
         results_root_value = metadata.get("ctl_state_local_root")
@@ -605,7 +603,7 @@ class CtlStatePublication:
             "bucket_region": str(entry["bucket_region"]),
             "execution_access_modes": execution_access_modes,
             "provider_options": provider_options,
-            "provider_implementation_key": provider_implementation_key,
+            "credential_acquisition": credential_acquisition,
         }
 
     @staticmethod
@@ -652,7 +650,7 @@ class CtlStatePublication:
                 operation_execution,
                 config["ctl_cfg_root"],
                 execution_context=config["execution_context"],
-                implementation_key=config["provider_implementation_key"],
+                credential_acquisition=config["credential_acquisition"],
                 operation="sync",
                 bucket_name=config["bucket_name"],
                 object_keys=object_keys,
@@ -704,11 +702,9 @@ class CtlStatePublication:
         backend_absence_confirmed: bool = False,
         execution_access_modes: dict[str, str] | None = None,
         provider_options: dict[str, str] | None = None,
-        provider_implementation_key: str = "local",
+        credential_acquisition: str = "local",
     ) -> dict[str, str] | None:
-        """
-
-        arm namespace publication or establish an explicitly proven defer queue."""
+        """Arm namespace publication or establish an explicitly proven defer queue."""
 
         del ctl_profile, provisions_ctl_state_backend
         self.reset()
@@ -735,7 +731,7 @@ class CtlStatePublication:
             run_dir,
             execution_access_modes=execution_access_modes,
             provider_options=provider_options,
-            provider_implementation_key=provider_implementation_key,
+            credential_acquisition=credential_acquisition,
         )
         self.sync_config = config
 
@@ -797,9 +793,7 @@ class CtlStatePublication:
         }
 
     def drain_pending(self) -> int:
-        """
-
-        drain pending manifests with one fresh, run-scoped credential per entry."""
+        """Drain pending manifests with one fresh, run-scoped credential per entry."""
 
         syncer = self.syncer
         if syncer is None:

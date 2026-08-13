@@ -71,9 +71,7 @@ def activate_provider_adapters(ctl_cfg_root) -> list[str]:
 
 
 def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str) -> str:
-    """
-
-    one provider's mode from the per-provider map."""
+    """One provider's mode from the per-provider map."""
 
     if isinstance(modes, str):  # already narrowed by a caller
         return modes
@@ -87,9 +85,7 @@ def execution_access_mode_for(modes: dict[str, str] | str | None, provider: str)
 
 
 def run_providers(execution_context: dict[str, object]) -> list[str]:
-    """
-
-    the providers this run DECLARED (--providers), in order."""
+    """The providers this run DECLARED (--providers), in order."""
 
     declared = (
         execution_context.get(f"{execution_references.EXECUTION_CONTEXT_ROOT}.ctl.providers") or []
@@ -123,9 +119,7 @@ def run_provider_adapter(execution_context: dict[str, object]):
 
 
 def run_provider(execution_context: dict[str, object]) -> str:
-    """
-
-    the single participating provider's name (same single-provider fence)."""
+    """The single participating provider's name (same single-provider fence)."""
 
     providers = run_providers(execution_context)
     if len(providers) > 1:
@@ -208,9 +202,7 @@ def parse_provider_options(value: str) -> dict[str, str]:
 
 
 class ProviderOptionsAction(argparse.Action):
-    """
-
-    merge repeated/comma-separated --provider-options into one flat map."""
+    """Merge repeated/comma-separated --provider-options into one flat map."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         merged = dict(getattr(namespace, self.dest, None) or {})
@@ -225,9 +217,7 @@ class ProviderOptionsAction(argparse.Action):
 
 
 def provider_options_for(options: dict[str, str] | None, provider: str) -> dict[str, str]:
-    """
-
-    the subset of options addressed to one provider, with its prefix stripped."""
+    """The subset of options addressed to one provider, with its prefix stripped."""
 
     prefix = f"{provider}."
     return {
@@ -257,9 +247,7 @@ def validate_provider_options(
 def validate_provider_options_addressing(
     options: dict[str, str] | None, providers: list[str] | tuple[str, ...]
 ) -> None:
-    """
-
-    every option must address a provider that is actually participating."""
+    """Every option must address a provider that is actually participating."""
 
     declared = set(providers or ())
     stray = sorted(key for key in (options or {}) if key.split(".", 1)[0] not in declared)
@@ -270,7 +258,7 @@ def validate_provider_options_addressing(
         )
 
 
-def resolve_provider_implementation_key(
+def resolve_credential_acquisition(
     provider_options: dict[str, str] | None,
     provider: str,
     *,
@@ -285,9 +273,9 @@ def resolve_provider_implementation_key(
     """
 
     options = provider_options_for(provider_options, provider)
-    implementation_key = options.get("credential_acquisition")
-    if implementation_key:
-        return implementation_key
+    credential_acquisition = options.get("credential_acquisition")
+    if credential_acquisition:
+        return credential_acquisition
     # A mode that resolves no identity acquires nothing, so there is no
     # acquisition to declare and nothing downstream reads this.
     if execution_access_mode is not None and not adapters.get_adapter(
@@ -301,10 +289,8 @@ def resolve_provider_implementation_key(
     )
 
 
-def run_provider_implementation_key(args: argparse.Namespace) -> str:
-    """
-
-    the single declared provider's credential implementation, from CLI args."""
+def run_credential_acquisition(args: argparse.Namespace) -> str:
+    """The single declared provider's credential implementation, from CLI args."""
 
     providers = list(getattr(args, "providers", ()) or ())
     if len(providers) != 1:
@@ -313,7 +299,7 @@ def run_provider_implementation_key(args: argparse.Namespace) -> str:
             "provider catalog/preflight path is single-provider today; run them as "
             "separate invocations until per-target adapter dispatch lands"
         )
-    return resolve_provider_implementation_key(
+    return resolve_credential_acquisition(
         getattr(args, "provider_options", None),
         providers[0],
         execution_access_mode=(getattr(args, "execution_access_modes", None) or {}).get(

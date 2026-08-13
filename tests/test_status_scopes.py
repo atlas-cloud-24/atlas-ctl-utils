@@ -38,10 +38,10 @@ def _seed_local_only_pointer(root: Path) -> Path:
 
 
 class _RecordingSyncer:
-    """
+    """Stands in for the armed reader; records what it was asked to hydrate and
 
-    stands in for the armed reader; records what it was asked to hydrate and
-    simulates pull_object's unconditional overwrite into its own root."""
+    simulates pull_object's unconditional overwrite into its own root.
+    """
 
     def __init__(self, root: Path):
         self.root = root
@@ -133,11 +133,11 @@ class StatusScopeTests(unittest.TestCase):
 
 class Phase42SweepScopeTests(unittest.TestCase):
     def test_status_sweep_hydrates_into_a_throwaway_root(self):
-        """
+        """The sweep hydrates EVERY pointer in the namespace, so running it
 
-        the sweep hydrates EVERY pointer in the namespace, so running it
         against the real local root would clobber local-only records wholesale.
-        Its advisory status_cache.yaml still reaches the bucket."""
+        Its advisory status_cache.yaml still reaches the bucket.
+        """
 
         with tempfile.TemporaryDirectory() as tmp:
             local_root = Path(tmp)

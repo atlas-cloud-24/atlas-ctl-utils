@@ -27,7 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "runners"))
 
 from engine.run import addressing as run_addressing
 from engine.state import render as state_render
-from engine.state import status as state_status
+from engine.state import status_query as state_status_query
 
 # Two workflow templates and one target, so every axis under test varies: kind,
 # group, status, freshness, time, member count and label.
@@ -87,11 +87,11 @@ MAP = {
 
 
 def _flat(instances: dict, sort: str = "address") -> list[dict]:
-    return state_status.structure_status_map(instances, "flat", sort)["instances"]
+    return state_status_query.structure_status_map(instances, "flat", sort)["instances"]
 
 
 def _filtered(*pairs: str) -> dict:
-    return state_status.filter_status_map(MAP, state_status.parse_filters(list(pairs)))
+    return state_status_query.filter_status_map(MAP, state_status_query.parse_filters(list(pairs)))
 
 
 class OneVocabularyTest(unittest.TestCase):
@@ -100,19 +100,21 @@ class OneVocabularyTest(unittest.TestCase):
         the result in, would each be a defect with nothing to say which was
         intended. They are one tuple, so neither can happen."""
 
-        self.assertEqual(state_render.FLAT_COLUMNS, state_status.SORT_FIELDS)
+        self.assertEqual(state_render.FLAT_COLUMNS, state_status_query.SORT_FIELDS)
 
     def test_filtering_adds_kind_and_nothing_else(self):
         """`kind` is filterable without being a column: the flat shape carries it
         as the first segment of the address, so printing it would repeat what a
         reader can already see — but "only the workflows" is a real question."""
 
-        self.assertEqual(state_status.FILTER_FIELDS, ("kind", *state_status.SORT_FIELDS))
+        self.assertEqual(
+            state_status_query.FILTER_FIELDS, ("kind", *state_status_query.SORT_FIELDS)
+        )
 
     def test_yaml_only_relation_detail_survives_report_structuring(self):
         row = next(item for item in _flat(MAP) if item.get("standing") == "superseded")
         self.assertEqual("workflow/env/core/instances/env.type=dev", row["superseded_by"])
-        self.assertNotIn("superseded_by", state_status.SORT_FIELDS)
+        self.assertNotIn("superseded_by", state_status_query.SORT_FIELDS)
 
     def test_the_time_axis_and_the_time_sort_field_are_one_word(self):
         """They were `at` and `time`: one fact, two names, and `--sort at` reads
@@ -120,7 +122,7 @@ class OneVocabularyTest(unittest.TestCase):
 
         self.assertIn("time", run_addressing.AXIS_ORDER)
         self.assertNotIn("at", run_addressing.AXIS_ORDER)
-        self.assertEqual(state_status.SortField.TIME, "time")
+        self.assertEqual(state_status_query.SortField.TIME, "time")
 
 
 class SortKeysApplyInOrderTest(unittest.TestCase):
@@ -143,7 +145,7 @@ class SortKeysApplyInOrderTest(unittest.TestCase):
 
         rows = _flat(MAP, "members:desc,time")
         self.assertEqual(
-            [(state_status.sort_value(row, "members"), row["time"]) for row in rows],
+            [(state_status_query.sort_value(row, "members"), row["time"]) for row in rows],
             [
                 (3, "2026-08-07T09:00Z"),
                 (2, "2026-08-05T10:00Z"),
@@ -157,8 +159,8 @@ class SortKeysApplyInOrderTest(unittest.TestCase):
 
         many = {"members": list(range(10))}
         self.assertGreater(
-            state_status.sort_value(many, "members"),
-            state_status.sort_value({"members": [1, 2, 3]}, "members"),
+            state_status_query.sort_value(many, "members"),
+            state_status_query.sort_value({"members": [1, 2, 3]}, "members"),
         )
 
     def test_rows_agreeing_on_every_key_still_have_one_order(self):
@@ -181,11 +183,11 @@ class SortKeysApplyInOrderTest(unittest.TestCase):
 class SortRefusalsTest(unittest.TestCase):
     def test_an_unknown_field_is_refused(self):
         with self.assertRaises(RuntimeError):
-            state_status.parse_sort("cost")
+            state_status_query.parse_sort("cost")
 
     def test_a_bad_direction_is_refused(self):
         with self.assertRaises(RuntimeError):
-            state_status.parse_sort("time:newest")
+            state_status_query.parse_sort("time:newest")
 
     def test_naming_one_field_twice_is_refused(self):
         """It cannot break its own ties, so the second key is dead — and the
@@ -193,11 +195,11 @@ class SortRefusalsTest(unittest.TestCase):
 
         for raw in ("time,time", "time:asc,time:desc"):
             with self.subTest(raw=raw), self.assertRaises(RuntimeError):
-                state_status.parse_sort(raw)
+                state_status_query.parse_sort(raw)
 
     def test_an_empty_sort_is_refused(self):
         with self.assertRaises(RuntimeError):
-            state_status.parse_sort("  ")
+            state_status_query.parse_sort("  ")
 
     def test_a_nested_map_takes_only_the_fields_that_aggregate(self):
         """A template holds many rows. Its name is its own and its newest row is
@@ -206,10 +208,10 @@ class SortRefusalsTest(unittest.TestCase):
 
         for field in ("address", "time"):
             with self.subTest(field=field):
-                state_status.parse_sort(field, structure="nested")
+                state_status_query.parse_sort(field, structure="nested")
         for field in ("status", "members", "label", "group"):
             with self.subTest(field=field), self.assertRaises(RuntimeError):
-                state_status.parse_sort(field, structure="nested")
+                state_status_query.parse_sort(field, structure="nested")
 
 
 class FilterNarrowsTest(unittest.TestCase):
@@ -276,8 +278,8 @@ class FilterNarrowsTest(unittest.TestCase):
         self.assertEqual([row["address"] for row in rows], [address])
 
     def test_an_empty_filter_is_the_whole_map(self):
-        self.assertEqual(MAP, state_status.filter_status_map(MAP, {}))
-        self.assertEqual(MAP, state_status.filter_status_map(MAP, None))
+        self.assertEqual(MAP, state_status_query.filter_status_map(MAP, {}))
+        self.assertEqual(MAP, state_status_query.filter_status_map(MAP, None))
 
     def test_a_template_left_with_no_row_is_dropped(self):
         """An empty template would read as "nothing happened here", which is a
@@ -304,34 +306,34 @@ class FilterNarrowsTest(unittest.TestCase):
 class FilterRefusalsTest(unittest.TestCase):
     def test_an_unknown_field_is_refused(self):
         with self.assertRaises(RuntimeError):
-            state_status.parse_filters(["cost=17"])
+            state_status_query.parse_filters(["cost=17"])
 
     def test_yaml_only_relation_detail_is_not_a_query_field(self):
         with self.assertRaises(RuntimeError):
-            state_status.parse_filters(["superseded_by=workflow/env/core"])
+            state_status_query.parse_filters(["superseded_by=workflow/env/core"])
         with self.assertRaises(RuntimeError):
-            state_status.parse_sort("superseded_by")
+            state_status_query.parse_sort("superseded_by")
 
     def test_a_pair_without_a_value_is_refused(self):
         for item in ("group", "group=", "=mutative"):
             with self.subTest(item=item), self.assertRaises(RuntimeError):
-                state_status.parse_filters([item])
+                state_status_query.parse_filters([item])
 
     def test_a_wildcard_is_only_a_single_trailing_prefix_marker(self):
         for value in ("*", "*failed", "fail*ed", "fail**"):
             with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "one trailing"):
-                state_status.parse_filters([f"status={value}"])
+                state_status_query.parse_filters([f"status={value}"])
 
     def test_the_echoed_filters_parse_back(self):
         """The report prints its filters so a reader can copy the line into the
         next command; `field=a,b` would not parse, because a comma separates
         PAIRS."""
 
-        filters = state_status.parse_filters(
+        filters = state_status_query.parse_filters(
             ["group=non_mutative", "group=mutative", "kind=workflow"]
         )
         echoed = state_render._field_text(filters)
-        self.assertEqual(filters, state_status.parse_filters(echoed.split()))
+        self.assertEqual(filters, state_status_query.parse_filters(echoed.split()))
 
 
 class SortAndFilterComposeTest(unittest.TestCase):
@@ -350,8 +352,10 @@ class SortAndFilterComposeTest(unittest.TestCase):
         """Only SORTING is narrowed by the nested shape — a filter tests one row
         at a time, so it works the same in both."""
 
-        kept = state_status.filter_status_map(MAP, state_status.parse_filters(["status=failed"]))
-        nested = state_status.structure_status_map(kept, "nested", "time:desc")
+        kept = state_status_query.filter_status_map(
+            MAP, state_status_query.parse_filters(["status=failed"])
+        )
+        nested = state_status_query.structure_status_map(kept, "nested", "time:desc")
         self.assertEqual(list(nested), ["workflow"])
         self.assertEqual(list(nested["workflow"]), ["env/seed", "env/core"])
 

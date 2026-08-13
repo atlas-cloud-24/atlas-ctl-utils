@@ -150,11 +150,11 @@ class SelectorMatchTests(unittest.TestCase):
 
 
 class ProviderNamespacedParamKeyTests(unittest.TestCase):
-    """
+    """Provider-specific params are namespaced (`aws.account`); neutral params stay
 
-    provider-specific params are namespaced (`aws.account`); neutral params stay
     single-segment. The context is a flat dotted map, so a dotted key is just a
-    longer key and selectors keep matching full paths."""
+    longer key and selectors keep matching full paths.
+    """
 
     def test_neutral_and_dotted_keys_are_valid(self):
         for key in ("env_type", "landing_zone", "aws.account", "azure.subscription", "a.b.c"):
@@ -329,14 +329,14 @@ class ProviderOptionsTests(unittest.TestCase):
     def test_credential_acquisition_is_independent_of_runtime_mode(self):
         # WHERE you run and HOW you authenticate are separate axes.
         self.assertEqual(
-            execution_providers.resolve_provider_implementation_key(
+            execution_providers.resolve_credential_acquisition(
                 {"aws.credential_acquisition": "web_identity"}, "aws"
             ),
             "web_identity",
         )
         # REQUIRED — the engine has no implementation to default to
         with self.assertRaisesRegex(RuntimeError, "no credential implementation declared"):
-            execution_providers.resolve_provider_implementation_key({}, "aws")
+            execution_providers.resolve_credential_acquisition({}, "aws")
 
 
 class ConstraintGateTests(unittest.TestCase):

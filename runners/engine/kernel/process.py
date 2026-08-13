@@ -15,17 +15,13 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def strip_ansi(text: str) -> str:
-    """
-
-    remove ANSI color codes from text."""
+    """Remove ANSI color codes from text."""
 
     return ANSI_ESCAPE.sub("", text)
 
 
 def run_and_log(cmd, shell=False, cwd=None, env=None, check=True):
-    """
-
-    run subprocess and log all output in real-time."""
+    """Run subprocess and log all output in real-time."""
 
     process = subprocess.Popen(
         cmd,
@@ -122,7 +118,7 @@ def extract_error_summary(log_path: str | None, fallback: str) -> dict:
     return {"summary": summary, "tail_lines": tail}
 
 
-def _step_box_name(target_run_id: str, repo_step_id: str) -> str:
+def step_box_name(target_run_id: str, repo_step_id: str) -> str:
     """A valid, unique-per-run Docker tag / box name for a target_run."""
 
     raw = f"atlas-{target_run_id}-{repo_step_id}-target_run-local"

@@ -1,10 +1,10 @@
 """The step a source repository declares."""
 
 import json
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 
 class StepImage(StrEnum):
@@ -14,9 +14,12 @@ class StepImage(StrEnum):
     OPS = "ops"
 
 
-@dataclass(frozen=True, kw_only=True)
-class StepContext:
-    """The ports and run facts a step is given, so it reaches for nothing."""
+class StepContext(Protocol):
+    """What a step is given, so it reaches for nothing.
+
+    A protocol rather than a record of `Callable`s: an argument name is part of
+    a port's contract, and `Callable[..., None]` cannot state one.
+    """
 
     execution_runtime_mode: str
     execution_context_filename: str
@@ -25,9 +28,15 @@ class StepContext:
     origin_cfg_path: Path
     target_cfg_dir: Path
     target_artifacts_dir: Path
-    box_name: Callable[[str], str]
-    launch: Callable[[list[str], dict[str, str]], None]
-    rebind_credentials: Callable[[object, dict[str, str]], None]
+
+    def box_name(self, step_id: str) -> str:
+        """The name of the box this step runs in."""
+
+    def launch(self, argv: list[str], env: dict[str, str]) -> None:
+        """Run the dispatcher, streaming its output into this run's log."""
+
+    def rebind_credentials(self, step: "Step", env: dict[str, str]) -> None:
+        """Refresh the step's provider credentials into `env`, if this run refreshes per step."""
 
 
 @dataclass(frozen=True, kw_only=True)
